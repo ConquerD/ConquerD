@@ -1,0 +1,9 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/assets">
+        <!-- Application icon — embedded so QGuiApplication::setWindowIcon()
+             can load it at runtime (taskbar, alt-tab, window title bar).
+             Path is relative to this QRC file (rust/conquerd-client/). -->
+        <file alias="conquerd.ico">../../assets/conquerd.ico</file>
+    </qresource>
+</RCC>

@@ -1,0 +1,28 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/qt/qml/ConquerD/Client">
+        <file alias="icons/mic.svg">qml/icons/mic.svg</file>
+        <file alias="icons/mic-off.svg">qml/icons/mic-off.svg</file>
+        <file alias="icons/phone.svg">qml/icons/phone.svg</file>
+        <file alias="icons/search.svg">qml/icons/search.svg</file>
+        <file alias="icons/attach.svg">qml/icons/attach.svg</file>
+        <file alias="icons/speech.svg">qml/icons/speech.svg</file>
+        <file alias="icons/lock.svg">qml/icons/lock.svg</file>
+        <file alias="icons/gear.svg">qml/icons/gear.svg</file>
+        <file alias="icons/wm-minimize.svg">qml/icons/wm-minimize.svg</file>
+        <file alias="icons/wm-maximize.svg">qml/icons/wm-maximize.svg</file>
+        <file alias="icons/wm-restore.svg">qml/icons/wm-restore.svg</file>
+        <file alias="icons/wm-close.svg">qml/icons/wm-close.svg</file>
+        <file alias="icons/refresh.svg">qml/icons/refresh.svg</file>
+        <file alias="icons/trash.svg">qml/icons/trash.svg</file>
+        <file alias="icons/play.svg">qml/icons/play.svg</file>
+        <file alias="icons/globe.svg">qml/icons/globe.svg</file>
+        <file alias="icons/chain.svg">qml/icons/chain.svg</file>
+        <file alias="icons/send.svg">qml/icons/send.svg</file>
+        <file alias="icons/check.svg">qml/icons/check.svg</file>
+        <file alias="icons/close.svg">qml/icons/close.svg</file>
+        <file alias="icons/x-circle.svg">qml/icons/x-circle.svg</file>
+        <file alias="icons/stop.svg">qml/icons/stop.svg</file>
+        <file alias="icons/undo.svg">qml/icons/undo.svg</file>
+    </qresource>
+</RCC>

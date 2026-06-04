@@ -1,0 +1,346 @@
+# Agents.md
+
+## Overview
+This document defines agent roles for Conquerd, a privacy-first **modular peer-connectivity framework** with a client-only, invite-only trust model. Voice, chat, files, rooms, and games are *features* negotiated between peers and supernodes — not hard-coded behaviors. See the [Feature Module Reference](#feature-module-reference) below for the full capability catalogue.
+
+Core scope:
+- No first-party backend for identity, discovery, or presence.
+- Invite + handshake bootstraps a signed, end-to-end secure session.
+- Every QUIC primitive (reliable streams, unidirectional streams, datagrams) is exposed as a generic `Channel`.
+- Capability-based feature negotiation: peers and supernodes advertise typed capability sets; consumers pick from what's enabled.
+- Supernodes are optional volunteer peers that provide QUIC relay, SFU rooms, web/WebTransport hosting, and bespoke feature modules.
+
+Transport stack:
+- **Direct sessions**: QUIC peer-to-peer via `ConnectionManager` + embedded `quinn::Endpoint` (conquerd-client) — generic streams + datagrams + channel multiplexer.
+- **Relay sessions**: QUIC relay (`QuicRelayClient` → supernode `QUICRelayServer`); same channel multiplexer; WebSocket used for membership/signaling fallback only.
+- **Signaling**: Signed, transcript-bound messages; prefers QUIC signaling stream when a peer session is connected, falls back to WebSocket.
+- **Web/games**: WebTransport (QUIC, via `wtransport`) and QUIC reliable streams on supernodes let ConquerD web clients participate in the same channel fabric as native peers; access is only available through ConquerD clients, not arbitrary browsers.
+- **Capability exchange**: `CAPABILITY_ANNOUNCE` after handshake; `CAPABILITY_INVOKE` opens feature channels.
+
+## Agent Roles
+
+### 1. Project Manager Agent
+Responsibilities:
+- Track roadmap progress and delivery risks.
+- Coordinate priorities across stability, UX, and security.
+- Escalate lockups, race conditions, and call reliability regressions.
+
+Working style:
+- Keep status updates short: done, in progress, risks.
+- Use the [Roadmap & Status](#roadmap--status) section below as the source of truth for roadmap progress and delivery risks; this file's role definitions and guardrails apply throughout.
+
+### 2. Developer Agent (Signaling + Handshake)
+Responsibilities:
+- Maintain direct client-to-client signaling and handshake lifecycle.
+- Enforce signed, transcript-bound messaging for all signaling.
+  - Invite/handshake bootstrap has strong replay protection (expiry + transcript binding).
+  - Post-handshake signaling is Ed25519-signed and enforces a 5-minute timestamp freshness window (`is_fresh(300.0)` in `protocol.rs`, applied on both the client and supernode signaling paths) **plus** a per-sender sliding-window replay guard (`conquerd_features::ReplayGuard`) keyed on the message signature, which rejects re-delivery of an already-seen message *within* the freshness window. Real-time `SfuAudio` frames are exempt from the dedup guard (ephemeral, high-rate). Negative-path tests cover stale/future timestamps and replayed messages.
+- Keep endpoint/invite behavior stable and restart-safe.
+
+Working style:
+- Prefer deterministic state transitions and de-duplication.
+- Add or update tests for signaling and invite persistence changes.
+
+### 3. Developer Agent (Transport + Features)
+Responsibilities:
+- Maintain QUIC peer-to-peer transport (`ConnectionManager` + embedded `quinn::Endpoint`) and the generic channel multiplexer (datagrams, uni/bidi streams, priority hints, channel-tag registry in `conquerd-client`).
+- Maintain QUIC relay client path (`QuicRelayClient`) using the same channel abstraction as direct sessions.
+- Maintain the `conquerd-features` capability registry, negotiation, quotas, and per-feature auth tiers.
+- Maintain inbound and outbound quota enforcement symmetry: `ConnectionManager` / `QuicRelayClient` datagram-layer quotas and `FeatureRegistry::gate_through_feature` signaling-layer quotas must stay consistent across connect/disconnect cycles.
+- Maintain first-party feature modules: `core.chat.v1`, `core.audio.opus`, `core.file.v1`, `room.audio.sfu`, `room.chat.v1`, `room.file.v1`.
+- Maintain desktop UX consumers (chat panel, call overlay, session banner) on top of the feature modules.
+- Maintain relay ticket auto-renewal and endpoint mailbox for robust connectivity across restarts.
+- Keep session status banner accurate across direct, relay, and room modes; preserve participant-state consistency.
+
+Working style:
+- Avoid renegotiation churn and thread-contention patterns.
+- Keep DSP and per-tick feature loops within real-time budget.
+- Treat first-party UI as one consumer of the framework — don't shortcut around the capability layer.
+- Validate with focused tests first, then broader runs.
+
+### 4. Security Agent
+Responsibilities:
+- Review identity, invite, handshake, and trust transitions.
+- Validate signature checks, transcript binding, and replay controls.
+- Review QUIC relay authentication (Ed25519 session keys from handshake).
+- Review the **capability/feature trust model**: per-feature `auth` tiers, no implicit escalation across features, user-consent prompts for non-`core.*` namespaces, per-feature byte/stream/datagram quotas.
+- Review third-party feature module signing and load-time trust prompts (native cdylib now; WASM sandbox later).
+- Ensure WebTransport surface on supernodes does not bypass capability gates that apply to native peers.
+- Review release manifest verification and Ed25519 signing.
+- Validate peer-to-peer build attestation challenges and responses.
+- Review installer supply-chain trust (SignPath, Apple notary, Sigstore).
+- Ensure action SHA pinning in CI/CD workflows.
+- Keep threat model aligned with client-only topology even as bespoke supernode features are added.
+
+Working style:
+- Add negative-path tests for invalid, expired, or replayed messages.
+- Verify profile/key material isolation across multi-profile runs.
+
+### 5. QA/Testing Agent
+Responsibilities:
+- Run unit and integration tests and targeted manual checks (60 Rust `conquerd-features` unit tests).
+- Stress race-prone flows (rapid connect/disconnect, duplicate signaling).
+- Validate trusted-peer persistence and UI synchronization.
+- Cover QUIC relay path and WebSocket membership signaling for room audio.
+
+Working style:
+- Prioritize lockup prevention, audio continuity, and deterministic outcomes.
+- Keep acceptance checklist current.
+
+### 6. DevOps/Infra Agent (Transport + Feature Hosting)
+Responsibilities:
+- Maintain QUIC relay, SFU, and WebTransport + QUIC-stream deployment guidance and scripts.
+- Maintain the supernode feature manifest (`supernode.toml`-style typed capability list replacing ad-hoc env-var toggles).
+- Support hot-reload of feature modules and bespoke `x.<vendor>.*` plug-ins.
+- Keep infra docs aligned with no-backend policy: supernodes assist transport and host feature modules; they are never identity authorities.
+- Ensure endpoint mailbox (`supernode_endpoints.json`, 24h TTL) and ticket renewal (1h TTL, 10-min renewal window) persist across restarts.
+- Document how to host static + WebTransport-enabled web games under `games/<slug>/`.
+
+Working style:
+- Treat infra as transport + opt-in feature hosting only.
+- Do not introduce app-layer central services or mandatory features.
+
+### 7. Documentation Agent
+Responsibilities:
+- Keep README, plan docs, and runbooks aligned with implementation.
+- Document invite flow, troubleshooting, and migration-impact changes.
+
+Working style:
+- Update docs in the same change as behavior/protocol updates.
+- Keep language user-focused and architecture-accurate.
+
+### 8. UX/UI Agent
+Responsibilities:
+- Improve chat-first usability and call-state clarity in the native Rust Qt/QML client (`rust/conquerd-client/src/ui/`).
+- Keep session status banner consistent across voice modes (direct peer vs room); `AppBridge::connection_mode` property drives the native banner colour.
+- Maintain unread/badge/tray behavior consistency, including the `missed_calls` qproperty increment/clear cycle.
+- Preserve DPI-aware behavior and accessible layout constraints.
+- Keep the Privacy & Data GroupBox in `SettingsPage.qml` in sync with `ChatStore` methods and `keyring_delete_aes_key`.
+- Keep the peer block/unblock context menu toggle in `PeerList.qml` in sync with `ConnectionCommand::BlockPeer` / `UnblockPeer`.
+- Keep the Avatar settings tab (`SettingsPage.qml` Tab 8) in sync with `AvatarConfig` fields in `avatar_config.rs`; the `settings.avatar_config_json` qproperty bridges the two. Avatar SVGs are rendered via `backend.avatarSvg(peerId, configJson)` → `data:image/svg+xml;base64,...` in `Avatar.qml`.
+
+Working style:
+- Avoid backend-dependent UX affordances.
+- Verify key flows with two-client manual checks.
+
+## Global Guardrails
+- Keep architecture client-owned and invite-only.
+- No backend drift; no mandatory features.
+- Supernodes provide transport assistance and *opt-in* feature hosting; they are never identity authorities.
+- Every cross-peer behavior must be expressible as a `FeatureModule` with a stable capability id; no hidden side channels.
+- Per-feature `auth` tier and quota are mandatory — don't bypass the capability layer for convenience.
+- Stability and security take precedence over new features.
+- Pair meaningful code changes with tests or reproducible validation steps.
+
+## Architecture Notes
+
+### Rust Crates
+- `conquerd-client` — **primary native desktop binary** (Qt 6 / QML via CXX-Qt). Contains a full Rust application stack: identity, connection manager, signaling, chat, call controller, file transfer, audio pipeline (CPAL + Opus + DSP), QUIC transport (quinn), relay client, hole punch, STUN, SFU client, room manager, UPnP, github updater, plugin runtime. Key non-UI modules: `chat_store.rs` (SQLite-backed encrypted chat history with per-peer `trim_by_age` / `trim_by_count` / `purge_all`), `identity.rs` (Ed25519 + keyring integration including `keyring_delete_aes_key` for lock-identity), `avatar_config.rs` (deterministic SVG identicon generator — `AvatarConfig` struct, `build_avatar_svg`, HSL→RGB hex conversion; compiled unconditionally so `peer_store.rs` can store `avatar_config: Option<AvatarConfig>` without the `qt-ui` feature). The Qt/QML UI layer lives in `src/ui/` (`bridge.rs` AppBridge QObject, `peer_list_model.rs`, `chat_model.rs`, `call_model.rs`, `room_model.rs`, `settings_model.rs`, `file_transfer_model.rs`). `AppBridge` exposes `call_duration_secs`, `missed_calls`, `mic_level`, `mic_test_active`, and `ollama_available` qproperties in addition to the core peer/session state. `avatar_config_json` is a qproperty on `SettingsModel`, not `AppBridge`. `AppBridge` invokables include `avatarSvg(peer_id, config_json)` (trust-tiered SVG string), `broadcastAvatarConfig(peer_id, config_json)`, `broadcastAvatarConfigToAll(config_json)`, and `setAvatarConfigJson(config_json)`. Built with `cargo build -p conquerd-client --features qt-ui`; requires Qt 6.x (`QMAKE` or `CMAKE_PREFIX_PATH`). Headless (no `qt-ui`) mode is available for integration testing.
+- `conquerd-features` — capability registry, `FeatureModule` trait, channel multiplexer, per-feature quotas and auth tiers. Pure Rust rlib linked into `conquerd-client` and `conquerd-supernode`. Inbound quota enforcement (`quota.rs` token-bucket per `(feature, peer)`) runs inside `dispatch_message` and `dispatch_invoke_datagram` before any module callback. Outbound quota enforcement uses a separate `outbound_quotas: QuotaRegistry` and is exposed via `gate_through_feature(feature_id, peer_id, byte_count) → bool`; the Rust `ConnectionManager::dispatch_outbound` gates `core.chat.v1` and `core.file.v1` messages through it. `clear_peer_outbound_quotas(peer_id)` cleans up on disconnect. Spine of the framework. **79 unit tests** (`cargo test -p conquerd-features`).
+- `conquerd-opus` — first-party libopus 1.6.1 wrapper with DRED and OSCE neural-feature support. Builds libopus from the `xiph/opus` git submodule via cmake. A C shim (`src/shim.c`) wraps all variadic `opus_*_ctl()` calls into fixed-signature functions so Rust FFI stays safe. The `dnn` feature (default) requires the DNN model C source arrays to be extracted from the Xiph.Org `opus_data-<sha256>.tar.gz` tarball into `rust/conquerd-opus/opus/dnn/` before building — run `scripts/fetch_opus_weights.ps1` / `.sh`. cmake compiles those C arrays into libopus statically; DRED and OSCE then activate automatically (no runtime blob loading). `OPUS_SET_DRED_DURATION_REQUEST` is called at encoder creation (100 ms depth); `OPUS_SET_OSCE_BWE_REQUEST` activates wideband-to-fullband enhancement on the decoder. Replaces the `audiopus` third-party crate. Linked into `conquerd-client` only.
+- `conquerd-supernode` — standalone Rust binary (QUIC relay, WebSocket signaling, WebTransport via `wtransport` for `web.host.h3.v1`, QUIC-stream in-app portal for `web.host.app.v1`, SFU rooms, access control, feature-module hosting). Sole supernode implementation.
+- `conquerd-installer` — Rust installer/updater binary used by the desktop client for applying releases.
+
+### Build Notes
+- **`conquerd-opus` DNN model data**: before building with the default `dnn` feature, run `powershell scripts/fetch_opus_weights.ps1` (Windows) or `bash scripts/fetch_opus_weights.sh` (Linux/macOS). This downloads the Xiph.Org `opus_data-<sha256>.tar.gz` tarball (filename = SHA-256, self-verifying) and extracts the C model source arrays into `rust/conquerd-opus/opus/dnn/`. The script is idempotent. To build without DNN support set `default-features = false` on the `conquerd-opus` dep. The cmake build of libopus previously required `CMAKE_POLICY_VERSION_MINIMUM = "3.5"` in `rust/.cargo/config.toml` for CMake ≥ 4.0 — this setting is retained and applies to `conquerd-opus`.
+- **`conquerd-client` (native Qt UI)**: requires Qt 6.x on `PATH`. Set `QMAKE` (e.g. `C:\Qt\6.8.3\msvc2022_64\bin\qmake6.exe`) or `CMAKE_PREFIX_PATH` before building. Build with `cargo build -p conquerd-client --features qt-ui`. Without `--features qt-ui` the binary runs headlessly (useful for integration tests). The Qt/QML UI layer uses [CXX-Qt](https://kdab.github.io/cxx-qt/).
+- **Windows code signing** requires `signtool.exe` on `PATH` (part of the Windows SDK — install via Visual Studio Installer or the standalone Windows SDK). Signing is optional; `build_win64.ps1` skips it gracefully when `signtool.exe` is absent or no certificate env vars are set.
+- **Version sync**: When bumping the version, update `rust/conquerd-client/Cargo.toml` and keep `rust/conquerd-installer/Cargo.toml` in sync. Both must carry the same value so all signed PE files have consistent `ProductVersion` metadata as required by SignPath.
+- **Code signing roles**: GitHub org teams are configured — `conquerd-authors` (trusted committers), `conquerd-reviewers` (PR reviewers), `conquerd-approvers` (release signing approvers). See README.md `## Code Signing Policy` for links.
+- **Supernode PE metadata**: `rust/conquerd-supernode/build.rs` sets `ProductName`, `FileDescription`, `LegalCopyright`, and `ProductVersion`/`FileVersion` from `CARGO_PKG_VERSION` on Windows. Keep `rust/conquerd-supernode/Cargo.toml` version in sync with the app version if the supernode binary is distributed as a signed artifact.
+- **CXX-Qt qproperty alignment**: every `#[qproperty(T, name)]` in the `#[cxx_qt::bridge]` ffi block must have a matching `name: T` field declared in `AppBridgeRust` and initialised in `impl Default`. A missing field compiles silently in headless (`cargo check`) mode but fails with `E0609`/`E0560`/`E0615` errors when the Qt feature is enabled.
+
+## Using the Modular Framework
+
+Every cross-peer behavior is a `FeatureModule` registered against a `CapabilityDescriptor`. Agents working on transport, supernode, or UX must go through the framework — no hidden side channels.
+
+### Registering a feature module (Rust)
+
+```rust
+use conquerd_features::{
+    AuthTier, CapabilityDescriptor, ChannelKind, FeatureModule, PeerId,
+};
+
+pub struct MyModule;
+
+impl FeatureModule for MyModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        CapabilityDescriptor::new("x.vendor.thing", "1.0", ChannelKind::Datagram)
+            .with_auth(AuthTier::TrustedPeer)
+    }
+    fn on_message(&self, source: PeerId, payload: &[u8]) { /* handle */ }
+}
+
+let m = std::sync::Arc::new(MyModule);
+if !state.features.bind_module("x.vendor.thing", m.clone()) {
+    let _ = state.features.register_module(m);
+}
+```
+
+- `register_module` adds descriptor + module in one step (errors on duplicate id).
+- `bind_module(id, m)` attaches a module to a descriptor that the supernode manifest already loaded — preferred for first-party modules so operators retain manifest control.
+- `dispatch_message(id, source, payload)` is the single inbound entry point used by all transports (QUIC peer, QUIC relay, WebTransport). The runtime enforces auth tier + quota before calling the module; returns `false` silently if the quota bucket is exhausted.
+- `dispatch_invoke_datagram(id, source, params)` is the invoke entry point (from `CAPABILITY_INVOKE`). Returns `ModuleError::Internal("quota exceeded")` if over limit.
+
+### Supernode capability surface
+
+Hosted features come from `<data_dir>/supernode.toml` (typed schema in `rust/conquerd-supernode/src/manifest.rs`). The manifest drives `SUPERNODE_INFO` and the WebTransport bridge. **Do not** add new env-var toggles — extend the manifest. Reserved namespaces: `core.*`, `transport.*`, `room.*`, `web.*`, `game.*`. Bespoke modules use `x.<vendor>.*`.
+
+### Capability negotiation
+
+`rust/conquerd-features/src/wellknown.rs` is the source of truth for well-known capability IDs. Negotiation rule: same `id` + same major `version` (see `CapabilityDescriptor.is_compatible_with`). Consumers (chat panel, call overlay, room controller) only enable UI/logic for capabilities present in the negotiated intersection.
+
+### Channel-tag rules
+
+The shared tagged-frame contract lives in `rust/conquerd-features/src/channel_frame.rs` (single source of truth, re-exported from the crate root and mirrored in `web-sdk/conquerd.mjs` as `ChannelTag` / `encodeFrame` / `decodeFrame`). Fixed first-party tags `0x00`–`0x0F`: `CONTROL_TAG=0x00`, `AUDIO_TAG=0x01`, `CHAT_TAG=0x02`, `FILE_TAG=0x03`. On the direct QUIC peer stream, `core.audio.opus` (datagram), `core.chat.v1`, and `core.file.v1` now ride their dedicated fixed tags via `encode_frame`/`classify`; untagged leading-`{` JSON is still accepted as `UntaggedControl` for backward compatibility. The supernode relay (`wire.rs`) is transparent to these tags — the channel byte rides *inside* the forwarded payload.
+
+`conquerd-client` dynamic registry: `0x10`–`0xEF` per session (negotiated/bespoke caps), `0xFF` broadcast, others reserved. Allocate dynamic tags via the registry — never hard-code.
+
+### Auth + quota enforcement
+
+The runtime enforces `auth` (`public` | `room-member` | `trusted-peer`) and per-feature byte/datagram quotas before invoking `on_invoke` / `on_message`. Modules MUST NOT re-implement these checks. Non-`core.*` namespaces without explicit `quota_bytes_per_sec` / `quota_datagrams_per_sec` get `DEFAULT_UNKNOWN_QUOTA_PARAMS` (64 KB/s, 256 datagrams/s) automatically.
+
+Outbound sends are gated symmetrically: `FeatureRegistry::gate_through_feature(feature_id, peer_id, byte_count) → bool` runs the same token-bucket logic against a separate `outbound_quotas` registry. The Rust `ConnectionManager::dispatch_outbound` calls it for `core.chat.v1` and `core.file.v1` before signing and transmitting; `ConnectionManager::send_audio_datagram` gates `core.audio.opus` datagrams the same way. Quota buckets (both directions) are cleared on `drop_peer` / `peer_left` / `disconnect`.
+
+### Browser parity
+
+When `web.host.h3.v1` is enabled, ConquerD web clients use `web-sdk/conquerd.mjs` to participate in the exact same channel fabric over WebTransport. The supernode runs the Ed25519 identity handshake and verifies signed envelopes (`verify_browser_envelope`) before fanning payloads out to native peers. Any new `room.*` or `game.*` feature should be tested with both a native and a ConquerD web client.
+
+### Reference modules in-tree
+
+- `core.chat.v1`, `core.audio.opus`, `core.file.v1` — desktop client (`conquerd-client`).
+- `room.audio.sfu`, `room.chat.v1`, `room.file.v1` — supernode room modules and SFU broadcast paths (`rust/conquerd-supernode/src/sfu_module.rs`, `rust/conquerd-supernode/src/main.rs`).
+- `web.host.h3.v1` — supernode WebTransport listener (`webtransport.rs`).
+- `x.conquerd.matchmaker.v1` — **reference bespoke `x.*` example** (`rust/conquerd-features/src/examples.rs`). A complete `FeatureModule` template (Request kind, `TrustedPeer` auth, explicit quota, stateful lobby `on_invoke` with a "lobby ready" hook). Opt-in only via `register_example_modules`; never auto-advertised. Demonstrates how a coordination feature composes with the opaque `game.relay.v1` relay (the ready roster is exactly the set of peers wired together over `game.relay.v1`).
+
+### Feature trust
+
+Inbound `CAPABILITY_INVOKE` gating is enforced by `conquerd-features` at the Rust layer before any module callback:
+- First-party namespaces (`core.*`, `transport.*`, `room.*`, `web.*`, `game.*`) bypass the user-consent prompt.
+- Bespoke `x.*` namespaces require explicit user consent (prompted once per `(feature, peer)` pair) and are subject to `DEFAULT_UNKNOWN_QUOTA_PARAMS` until the operator sets explicit quotas in the feature descriptor.
+- Three gates are enforced in order: (1) feature intersection check, (2) auth tier (`trusted-peer` / `room-member` / `public`), (3) consent gate for non-first-party namespaces.
+
+## Feature Module Reference
+
+The authoritative implementation is the `conquerd-features` crate (linked into both `conquerd-client` and `conquerd-supernode`). This is the condensed capability catalogue; see "Using the Modular Framework" above for the registration/dispatch API.
+
+### Discovery
+
+Two-layer, no central registry:
+1. **Out-of-band invite** (primary, mandatory): a signed `conquerd://` URL bootstraps the first connection and establishes the trust root — preserving the invite-only model.
+2. **In-band capability gossip** (opt-in): connected peers may exchange each other's supernode capability bundles ("remember peer X's supernode list"), enabling organic discovery while the invite-only trust root stays intact.
+
+On connect, each peer sends `CAPABILITY_ANNOUNCE`; the runtime activates only the **negotiated intersection**. Two descriptors are compatible if they share the same `id` **and** the same major version (`CapabilityDescriptor.is_compatible_with`). Missing support means silent non-negotiation — no fallback, no error.
+
+### Capability descriptor wire shape
+
+Exchanged as JSON inside `CAPABILITY_ANNOUNCE`:
+
+```json
+{ "id": "core.chat.v1", "version": "1.0", "kind": "stream",
+  "auth": "trusted-peer",
+  "params": { "quota_bytes_per_sec": 32768, "quota_datagrams_per_sec": 50 },
+  "experimental": false }
+```
+
+| Field | Description |
+|---|---|
+| `id` | Reverse-DNS capability identifier |
+| `version` | Semver; negotiation uses **major version only** |
+| `kind` | `datagram` (unreliable), `stream` (reliable), or `request` (single-shot RPC) |
+| `auth` | Required auth tier (default `trusted-peer`) |
+| `params` | Optional feature params (codec, quota limits, framing) |
+| `experimental` | Advisory flag; clients may skip experimental features |
+
+### Auth tiers
+
+Enforced by the runtime in `dispatch_message` / `dispatch_invoke_datagram` **before** any callback. Modules must not re-implement these checks.
+
+| Tier (`auth`) | Who can use it |
+|---|---|
+| `public` | Any connected peer, no prior trust |
+| `room-member` | Peers holding a valid room membership token |
+| `trusted-peer` | Peers in the local trust store (default for all `core.*`) |
+
+### First-party module catalogue
+
+Desktop peer modules (active in direct P2P sessions; bundled and audited, never prompt):
+
+| Capability ID | Kind | Auth | Quota (bytes/s · dgram/s) | Notes |
+|---|---|---|---|---|
+| `core.chat.v1` | stream | trusted-peer | 32 KB · 50 | Signed text chat, delivery acks, typing indicators; 20 msg / 10 s sliding rate limit. Send path in `ConnectionManager`. |
+| `core.audio.opus` | datagram | trusted-peer | 32 KB · 200 | Direct voice via Opus over QUIC datagrams; latency-optimised in `ConnectionManager::send_audio_datagram`. |
+| `core.file.v1` | stream | trusted-peer | 8 MB · 4096 | Chunked file transfer; sub-types: offer/accept/reject/chunk/completed/ack/error. |
+
+Supernode-hosted modules (multi-party; require a connected supernode):
+
+| Capability ID | Kind | Auth | Notes |
+|---|---|---|---|
+| `room.audio.sfu` | datagram | room-member | SFU voice rooms; supernode `SfuRoomModule`. |
+| `room.chat.v1` | stream | room-member | Room text chat broadcast via supernode. |
+| `room.file.v1` | stream | room-member | Signed room file broadcast via supernode; recipients verify chunks before saving. |
+| `web.host.app.v1` | stream | public | In-app `conquerd://` portal over QUIC bidi streams in embedded Chromium (4 MB/s). |
+| `web.host.h3.v1` | datagram | public | WebTransport (HTTP/3) bridge so browser clients join the same channel fabric. |
+| `game.relay.v1` | datagram | room-member | Opaque session-scoped datagram relay for in-session games. |
+
+Transport descriptors (handled by the QUIC layer directly; no application module code): `transport.quic.audio.v1`, `transport.quic.relay.v1`, `transport.quic.stream.v1`, `transport.quic.feature_datagram.v1`, `transport.quic.uni_stream.v1`, `transport.quic.stream_priority.v1`, `transport.quic.zero_rtt.v1`, `transport.quic.pmtud.v1`, `transport.quic.migration.v1`, `transport.quic.flow_control.v1`.
+
+### `web.host.app.v1` portal
+
+The native client browses a supernode's in-app portal without leaving the app: an embedded Chromium view navigates to `conquerd://<supernode_pub>/<path>`. The scheme handler issues QUIC bidi-stream requests tagged with this capability instead of HTTPS — one stream per request:
+
+1. Client → supernode: one length-prefixed `WebAppRequest` JSON frame (`{ "path": "/index.html", "method": "GET" }`).
+2. Supernode → client: one `WebAppResponseHeader` JSON frame (`{ "status": 200, "content_type": "text/html", "total_len": N }`) then length-prefixed binary body chunks terminated by a zero-length chunk.
+
+The QUIC connection is the identity gate (the supernode already knows which Ed25519 key opened the stream), so requests are not re-signed. Dynamic routes answered inline: `/health` · `/api/stats` (relay/SFU/peer counts), `/api/peers`, `/api/config`, `/api/metrics`. Static assets are served from `<data_dir>/web/`. The view is restricted to `conquerd://` URLs (external links open in the system browser); a `window.conquerd` JS bridge (`supernodeId`, `ready` → `{ myPeerId, supernodeId, version, fetch() }`) is injected at document creation.
+
+### Quotas and channel tags
+
+Token-bucket per `(feature_id, peer_id)`, refilled each second. On exhaustion `dispatch_message` returns `false` (payload dropped) and `dispatch_invoke_datagram` returns `ModuleError::Internal("quota exceeded")`. Bespoke `x.*` modules without explicit `params` get `DEFAULT_UNKNOWN_QUOTA_PARAMS` (64 KB/s · 256 dgram/s). The channel-tag multiplexer maps a 1-byte tag to a feature: `0x10`–`0xEF` dynamic per session (~224 channels), `0xFF` broadcast, others reserved — always allocate via the registry.
+
+### Non-goals
+
+No central feature registry, no mandatory features, no implicit cross-feature privilege escalation, and supernodes are never identity authorities.
+
+## Roadmap & Status
+
+This section is the single source of truth for delivery status (condensed from the former `ROADMAP.md` / `IMPROVEMENT_PLAN.md` / `TODO.md`).
+
+**Last reviewed:** 2026-06-03 (game relay / WebTransport portal hardening).
+
+### Health summary
+
+ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (≈540 test markers; 81 features + 193 supernode + 119 client + 55 installer suites green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients.
+
+### P0–P2 — Complete ✅
+
+| Item | Outcome |
+|---|---|
+| CI hardening | `fmt --check` + `clippy -D warnings` (both workspaces) + headless client tests + `cargo-audit`; all SHA-pinned. |
+| Post-handshake replay protection | 5-minute timestamp freshness window (`is_fresh(300.0)`) on client + supernode paths, **plus** a per-sender sliding-window dedup guard (`conquerd_features::ReplayGuard`) keyed on the message signature; negative-path tests on both layers. |
+| Relay + SFU smoke tests | Real mTLS QUIC suite: 2-peer room broadcast, unauthorized rejection, leave/rejoin, ticket renewal. |
+| Quota symmetry | Inbound + outbound (`gate_through_feature`) gating across direct/relay/WebTransport; buckets cleared on every disconnect path. |
+| Audio dispatch decision | Documented permanent real-time bypass with a `check_audio_quota` helper so the gate can't be forgotten. |
+| Cross-platform CI | Windows runner (non-Qt tests + client clippy) added. |
+| Platform TODOs | macOS dock badge, Linux D-Bus badge, UPnP all implemented. |
+| Supply-chain | Weekly `supply-chain.yml` (cargo-deny + audit-check) + `deny.toml`. |
+| Operator runbook | `docs/SUPERNODE.md` with full guidance + example `supernode.toml`. |
+| Threat model | `docs/THREAT_MODEL.md`. |
+| Version automation | `scripts/check_version_sync.ps1 -BumpTo X.Y.Z` bumps all crates + prints git/tag commands. |
+| Metrics export | `/api/metrics` via `web.host.app.v1`. |
+| Game relay end-to-end | `game.relay.v1` over WebTransport confirmed working: race condition in `/_conquerd/ctx.json` cache fixed (scheme-layer caches now populated on tokio thread in `connection_manager.rs` before any `FetchWebApp` can succeed); self-signed TLS cert now includes `serverAuth` EKU (Chrome WebTransport requirement); cert fingerprint always re-derived from on-disk DER (stale `.hex` cache bug fixed); old certs missing the EKU detected via OID byte-scan and auto-rotated on next supernode start; template SDK synced with source (`ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, `featureForFixedTag` exports added); SDK now fails fast with a clear error when portal context exists but no WebTransport URL is available; cursor relay demo fixed (`encodeCursorLeave` now carries color so peer tracking is stable). |
+
+### P3 backlog (as capacity allows)
+
+- WASM plugin sandbox (currently native cdylib with load-time trust prompts).
+- Ollama / plugin UX polish (currently experimental).
+
+### Pre-signing checklist (SignPath Foundation)
+
+Code-side items (LICENSE, PE metadata, Code Signing Policy + Uninstalling sections in the README) are done. The remaining human action is to apply for a SignPath Foundation subscription at https://signpath.io — the README `## Code Signing Policy` section (also surfaced on conquerd.com) satisfies the project-home-page policy requirement.
+
+### Process
+
+- Update this section in the same change as any work that shifts status or adds risk.
+- Before touching quotas, dispatch, signaling, or capability paths: run the relay/SFU/room tests + a manual 2-client check.
+- Use the 8 Agent Roles above as the per-release checklist; PM keeps updates short (done / in progress / risks).

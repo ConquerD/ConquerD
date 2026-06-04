@@ -1,0 +1,71 @@
+# cargo-deny configuration for ConquerD
+# https://embarkstudios.github.io/cargo-deny/
+
+# This is a minimal config focused on security for a privacy-first P2P project.
+# Run locally: cargo deny check
+# In CI: scheduled job
+
+[graph]
+# If true, metadata will be collected with `--all-features`.
+all-features = false
+
+[output]
+# The output format for diagnostics.
+format = "human"
+
+# A list of advisory IDs to ignore.
+# e.g. "RUSTSEC-0000-0000"
+[advisories]
+ignore = []
+
+[licenses]
+# The confidence threshold for detecting a license from the license text.
+confidence-threshold = 0.8
+
+# Allow 1 or more licenses on a per-crate basis, so that particular licenses
+# aren't accepted for every possible crate as with the normal allow list.
+exceptions = []
+
+# The list of licenses that are allowed.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+
+[bans]
+# Lint level for when multiple versions of the same crate are detected.
+multiple-versions = "warn"
+
+# Certain crates that are known to be problematic.
+deny = [
+    # Example: ban old ring if a vulnerable version appears
+    # { crate = "ring", version = "<0.17" },
+]
+
+# This is a list of crates that are allowed to use non-default features.
+# The wildcard "*" matches all crates.
+[sources]
+# Lint level for what to happen when a crate from a crate registry that is
+# not in the allow list is encountered.
+unknown-registry = "warn"
+
+# Lint level for what to happen when a crate from a git repository that is not
+# in the allow list is encountered.
+unknown-git = "warn"
+
+# List of URLs for allowed crate registries.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# List of URLs for allowed Git repositories.
+allow-git = []
+
+# If true, then the allow list is the only source of truth for which crates
+# are allowed.
+# If false (the default), then crates from the allow list are allowed, but
+# other sources are also allowed as long as they are not denied.
+# For a strict policy, set to true and populate allow-git / allow-registry.
+strict = false

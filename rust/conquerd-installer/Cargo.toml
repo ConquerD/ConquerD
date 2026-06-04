@@ -1,0 +1,37 @@
+[package]
+name = "conquerd-installer"
+version = "1.0.0"
+edition = "2021"
+description = "ConquerD standalone installer and updater"
+
+[[bin]]
+name = "conquerd-installer"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["svg"] }
+sevenz-rust = "0.6"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+dirs = "6"
+open = "5"
+ureq = { version = "2", features = ["json"] }
+ed25519-dalek = { version = "2", features = [] }
+hex = "0.4"
+base64 = "0.22"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }

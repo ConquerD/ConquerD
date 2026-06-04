@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "conquerd-features",
+    "conquerd-supernode",
+    "conquerd-installer",
+    "conquerd-opus",
+]
+# conquerd-client is intentionally excluded: it has its own workspace root
+# (rust/conquerd-client/Cargo.toml) so the cxx-qt patch stays isolated there
+# and does not affect server-side builds.
+resolver = "2"

@@ -1,0 +1,479 @@
+    Shape {
+        id: historyRing
+        anchors.fill: parent
+        antialiasing: true
+        asynchronous: false
+        preferredRendererType: Shape.CurveRenderer
+
+        ShapePath {
+            id: seg0
+            property var seg: root._ringSegments[0] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg0.seg ? [] : [seg0.seg.from, seg0.seg.to] }
+        }
+
+        ShapePath {
+            id: seg1
+            property var seg: root._ringSegments[1] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg1.seg ? [] : [seg1.seg.from, seg1.seg.to] }
+        }
+
+        ShapePath {
+            id: seg2
+            property var seg: root._ringSegments[2] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg2.seg ? [] : [seg2.seg.from, seg2.seg.to] }
+        }
+
+        ShapePath {
+            id: seg3
+            property var seg: root._ringSegments[3] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg3.seg ? [] : [seg3.seg.from, seg3.seg.to] }
+        }
+
+        ShapePath {
+            id: seg4
+            property var seg: root._ringSegments[4] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg4.seg ? [] : [seg4.seg.from, seg4.seg.to] }
+        }
+
+        ShapePath {
+            id: seg5
+            property var seg: root._ringSegments[5] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg5.seg ? [] : [seg5.seg.from, seg5.seg.to] }
+        }
+
+        ShapePath {
+            id: seg6
+            property var seg: root._ringSegments[6] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg6.seg ? [] : [seg6.seg.from, seg6.seg.to] }
+        }
+
+        ShapePath {
+            id: seg7
+            property var seg: root._ringSegments[7] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg7.seg ? [] : [seg7.seg.from, seg7.seg.to] }
+        }
+
+        ShapePath {
+            id: seg8
+            property var seg: root._ringSegments[8] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg8.seg ? [] : [seg8.seg.from, seg8.seg.to] }
+        }
+
+        ShapePath {
+            id: seg9
+            property var seg: root._ringSegments[9] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg9.seg ? [] : [seg9.seg.from, seg9.seg.to] }
+        }
+
+        ShapePath {
+            id: seg10
+            property var seg: root._ringSegments[10] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg10.seg ? [] : [seg10.seg.from, seg10.seg.to] }
+        }
+
+        ShapePath {
+            id: seg11
+            property var seg: root._ringSegments[11] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg11.seg ? [] : [seg11.seg.from, seg11.seg.to] }
+        }
+
+        ShapePath {
+            id: seg12
+            property var seg: root._ringSegments[12] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg12.seg ? [] : [seg12.seg.from, seg12.seg.to] }
+        }
+
+        ShapePath {
+            id: seg13
+            property var seg: root._ringSegments[13] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg13.seg ? [] : [seg13.seg.from, seg13.seg.to] }
+        }
+
+        ShapePath {
+            id: seg14
+            property var seg: root._ringSegments[14] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg14.seg ? [] : [seg14.seg.from, seg14.seg.to] }
+        }
+
+        ShapePath {
+            id: seg15
+            property var seg: root._ringSegments[15] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg15.seg ? [] : [seg15.seg.from, seg15.seg.to] }
+        }
+
+        ShapePath {
+            id: seg16
+            property var seg: root._ringSegments[16] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg16.seg ? [] : [seg16.seg.from, seg16.seg.to] }
+        }
+
+        ShapePath {
+            id: seg17
+            property var seg: root._ringSegments[17] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg17.seg ? [] : [seg17.seg.from, seg17.seg.to] }
+        }
+
+        ShapePath {
+            id: seg18
+            property var seg: root._ringSegments[18] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg18.seg ? [] : [seg18.seg.from, seg18.seg.to] }
+        }
+
+        ShapePath {
+            id: seg19
+            property var seg: root._ringSegments[19] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg19.seg ? [] : [seg19.seg.from, seg19.seg.to] }
+        }
+
+        ShapePath {
+            id: seg20
+            property var seg: root._ringSegments[20] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg20.seg ? [] : [seg20.seg.from, seg20.seg.to] }
+        }
+
+        ShapePath {
+            id: seg21
+            property var seg: root._ringSegments[21] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg21.seg ? [] : [seg21.seg.from, seg21.seg.to] }
+        }
+
+        ShapePath {
+            id: seg22
+            property var seg: root._ringSegments[22] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg22.seg ? [] : [seg22.seg.from, seg22.seg.to] }
+        }
+
+        ShapePath {
+            id: seg23
+            property var seg: root._ringSegments[23] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg23.seg ? [] : [seg23.seg.from, seg23.seg.to] }
+        }
+
+        ShapePath {
+            id: seg24
+            property var seg: root._ringSegments[24] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg24.seg ? [] : [seg24.seg.from, seg24.seg.to] }
+        }
+
+        ShapePath {
+            id: seg25
+            property var seg: root._ringSegments[25] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg25.seg ? [] : [seg25.seg.from, seg25.seg.to] }
+        }
+
+        ShapePath {
+            id: seg26
+            property var seg: root._ringSegments[26] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg26.seg ? [] : [seg26.seg.from, seg26.seg.to] }
+        }
+
+        ShapePath {
+            id: seg27
+            property var seg: root._ringSegments[27] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg27.seg ? [] : [seg27.seg.from, seg27.seg.to] }
+        }
+
+        ShapePath {
+            id: seg28
+            property var seg: root._ringSegments[28] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg28.seg ? [] : [seg28.seg.from, seg28.seg.to] }
+        }
+
+        ShapePath {
+            id: seg29
+            property var seg: root._ringSegments[29] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg29.seg ? [] : [seg29.seg.from, seg29.seg.to] }
+        }
+
+        ShapePath {
+            id: seg30
+            property var seg: root._ringSegments[30] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg30.seg ? [] : [seg30.seg.from, seg30.seg.to] }
+        }
+
+        ShapePath {
+            id: seg31
+            property var seg: root._ringSegments[31] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg31.seg ? [] : [seg31.seg.from, seg31.seg.to] }
+        }
+
+        ShapePath {
+            id: seg32
+            property var seg: root._ringSegments[32] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg32.seg ? [] : [seg32.seg.from, seg32.seg.to] }
+        }
+
+        ShapePath {
+            id: seg33
+            property var seg: root._ringSegments[33] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg33.seg ? [] : [seg33.seg.from, seg33.seg.to] }
+        }
+
+        ShapePath {
+            id: seg34
+            property var seg: root._ringSegments[34] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg34.seg ? [] : [seg34.seg.from, seg34.seg.to] }
+        }
+
+        ShapePath {
+            id: seg35
+            property var seg: root._ringSegments[35] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg35.seg ? [] : [seg35.seg.from, seg35.seg.to] }
+        }
+
+        ShapePath {
+            id: seg36
+            property var seg: root._ringSegments[36] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg36.seg ? [] : [seg36.seg.from, seg36.seg.to] }
+        }
+
+        ShapePath {
+            id: seg37
+            property var seg: root._ringSegments[37] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg37.seg ? [] : [seg37.seg.from, seg37.seg.to] }
+        }
+
+        ShapePath {
+            id: seg38
+            property var seg: root._ringSegments[38] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg38.seg ? [] : [seg38.seg.from, seg38.seg.to] }
+        }
+
+        ShapePath {
+            id: seg39
+            property var seg: root._ringSegments[39] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg39.seg ? [] : [seg39.seg.from, seg39.seg.to] }
+        }
+
+        ShapePath {
+            id: seg40
+            property var seg: root._ringSegments[40] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg40.seg ? [] : [seg40.seg.from, seg40.seg.to] }
+        }
+
+        ShapePath {
+            id: seg41
+            property var seg: root._ringSegments[41] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg41.seg ? [] : [seg41.seg.from, seg41.seg.to] }
+        }
+
+        ShapePath {
+            id: seg42
+            property var seg: root._ringSegments[42] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg42.seg ? [] : [seg42.seg.from, seg42.seg.to] }
+        }
+
+        ShapePath {
+            id: seg43
+            property var seg: root._ringSegments[43] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg43.seg ? [] : [seg43.seg.from, seg43.seg.to] }
+        }
+
+        ShapePath {
+            id: seg44
+            property var seg: root._ringSegments[44] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg44.seg ? [] : [seg44.seg.from, seg44.seg.to] }
+        }
+
+        ShapePath {
+            id: seg45
+            property var seg: root._ringSegments[45] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg45.seg ? [] : [seg45.seg.from, seg45.seg.to] }
+        }
+
+        ShapePath {
+            id: seg46
+            property var seg: root._ringSegments[46] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg46.seg ? [] : [seg46.seg.from, seg46.seg.to] }
+        }
+
+        ShapePath {
+            id: seg47
+            property var seg: root._ringSegments[47] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg47.seg ? [] : [seg47.seg.from, seg47.seg.to] }
+        }
+
+        ShapePath {
+            id: seg48
+            property var seg: root._ringSegments[48] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg48.seg ? [] : [seg48.seg.from, seg48.seg.to] }
+        }
+
+        ShapePath {
+            id: seg49
+            property var seg: root._ringSegments[49] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg49.seg ? [] : [seg49.seg.from, seg49.seg.to] }
+        }
+
+        ShapePath {
+            id: seg50
+            property var seg: root._ringSegments[50] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg50.seg ? [] : [seg50.seg.from, seg50.seg.to] }
+        }
+
+        ShapePath {
+            id: seg51
+            property var seg: root._ringSegments[51] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg51.seg ? [] : [seg51.seg.from, seg51.seg.to] }
+        }
+
+        ShapePath {
+            id: seg52
+            property var seg: root._ringSegments[52] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg52.seg ? [] : [seg52.seg.from, seg52.seg.to] }
+        }
+
+        ShapePath {
+            id: seg53
+            property var seg: root._ringSegments[53] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg53.seg ? [] : [seg53.seg.from, seg53.seg.to] }
+        }
+
+        ShapePath {
+            id: seg54
+            property var seg: root._ringSegments[54] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg54.seg ? [] : [seg54.seg.from, seg54.seg.to] }
+        }
+
+        ShapePath {
+            id: seg55
+            property var seg: root._ringSegments[55] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg55.seg ? [] : [seg55.seg.from, seg55.seg.to] }
+        }
+
+        ShapePath {
+            id: seg56
+            property var seg: root._ringSegments[56] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg56.seg ? [] : [seg56.seg.from, seg56.seg.to] }
+        }
+
+        ShapePath {
+            id: seg57
+            property var seg: root._ringSegments[57] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg57.seg ? [] : [seg57.seg.from, seg57.seg.to] }
+        }
+
+        ShapePath {
+            id: seg58
+            property var seg: root._ringSegments[58] || null
+            strokeColor: !seg ? "transparent" : Qt.rgba(seg.color.r, seg.color.g, seg.color.b, seg.fade * 0.85)
+            strokeWidth: 1.4; fillColor: "transparent"; capStyle: ShapePath.RoundCap; joinStyle: ShapePath.RoundJoin
+            PathPolyline { path: !seg58.seg ? [] : [seg58.seg.from, seg58.seg.to] }
+        }
+    }

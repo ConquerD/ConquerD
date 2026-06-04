@@ -1,0 +1,361 @@
+# ============================================================================
+# release.yml — Build, sign, and publish ConquerD for all platforms
+# ============================================================================
+# Triggered by pushing a tag like v1.0.0.
+# Builds ConquerD for Windows, macOS, and Linux, applies code signing,
+# then creates a draft GitHub Release with all artifacts attached.
+#
+# Code Signing Setup:
+#
+#   Windows (SignPath.io — free for open source):
+#     1. Apply at https://signpath.org/ with your OSS project
+#     2. Configure a signing policy in SignPath dashboard
+#     3. Add these repository secrets:
+#        - SIGNPATH_API_TOKEN: Your SignPath API token
+#     4. Set these repository variables:
+#        - SIGNPATH_ORGANIZATION_ID: Your org ID from SignPath
+#        - SIGNPATH_SIGNING_POLICY_SLUG: e.g. "release-signing"
+#        - SIGNPATH_PROJECT_SLUG: e.g. "conquerd"
+#
+#   macOS (Apple Developer Program — $99/yr, no free option):
+#     1. Enroll at https://developer.apple.com/programs/
+#     2. Create a "Developer ID Application" certificate
+#     3. Create an App Store Connect API key for notarization
+#     4. Add these repository secrets:
+#        - APPLE_CERTIFICATE_P12: Base64-encoded .p12 certificate
+#        - APPLE_CERTIFICATE_PASSWORD: Password for the .p12
+#        - APPLE_TEAM_ID: Your 10-char team ID
+#        - APPLE_NOTARY_ISSUER: App Store Connect API issuer UUID
+#        - APPLE_NOTARY_KEY_ID: API key ID
+#        - APPLE_NOTARY_KEY: Base64-encoded .p8 private key
+#
+#   Linux: No code signing required. Optional GPG signatures.
+#
+# ============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.78.0"
+
+jobs:
+  preflight:
+    name: Release preflight checks
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Reject all-zero RELEASE_SIGNER_PUBKEY_HEX placeholder
+        run: |
+          PLACEHOLDER=$(printf '%064d' 0)
+          if grep -q "$PLACEHOLDER" rust/conquerd-installer/src/release_manifest.rs; then
+            echo "ERROR: all-zero RELEASE_SIGNER_PUBKEY_HEX placeholder found in conquerd-installer/src/release_manifest.rs"
+            echo "Set a real Ed25519 public key before releasing."
+            exit 1
+          fi
+          echo "OK: RELEASE_SIGNER_PUBKEY_HEX is configured."
+
+  build-windows:
+    needs: preflight
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: windows-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Install Qt 6
+        shell: pwsh
+        run: |
+          pip install aqtinstall
+          aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt
+
+      - name: Build (build_win64.ps1)
+        shell: pwsh
+        run: .\build_win64.ps1
+
+      - name: Copy installer for separate upload
+        shell: pwsh
+        run: Copy-Item "dist\ConquerD\conquerd-installer.exe" "dist\conquerd-installer.exe"
+
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          if (-not (Get-ChildItem "dist\ConquerD-*-win64.7z" -ErrorAction SilentlyContinue)) {
+            throw "Release archive not found in dist/"
+          }
+          if (-not (Test-Path "dist\conquerd-installer.exe")) {
+            throw "conquerd-installer.exe not found in dist/"
+          }
+
+      - name: Upload unsigned artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: windows-unsigned
+          path: |
+            dist/ConquerD-*-win64.7z
+            dist/ConquerD-*-win64.7z.sha256
+            dist/conquerd-installer.exe
+
+  sign-windows:
+    needs: build-windows
+    runs-on: ubuntu-22.04
+    if: vars.SIGNPATH_ORGANIZATION_ID != ''
+    steps:
+      - name: Sign with SignPath
+        uses: signpath/github-action-submit-signing-request@4f13d373e8f0cd8d3c0465ff4877feff27aed2ae # v1.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: "release-artifact"
+          github-artifact-id: windows-unsigned
+          wait-for-completion: true
+          output-artifact-directory: signed/
+
+      - name: Verify signed archive checksum
+        run: |
+          cd signed
+          sha256sum -c ConquerD-*-win64.7z.sha256
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: windows-release
+          path: signed/
+
+  windows-unsigned-fallback:
+    needs: build-windows
+    runs-on: ubuntu-22.04
+    if: vars.SIGNPATH_ORGANIZATION_ID == ''
+    steps:
+      - name: Download unsigned artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: windows-unsigned
+          path: artifacts/
+
+      - name: Verify unsigned archive checksum
+        run: |
+          cd artifacts
+          sha256sum -c ConquerD-*-win64.7z.sha256
+
+      - name: Upload as windows-release
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: windows-release
+          path: artifacts/
+
+  build-macos:
+    needs: preflight
+    runs-on: macos-14
+    env:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: macos-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Install system deps
+        run: brew install cmake create-dmg
+
+      - name: Install Qt 6
+        run: |
+          pip install aqtinstall
+          aqt install-qt mac desktop 6.8.3 clang_64 -O ~/Qt
+          echo "QT_DIR=$HOME/Qt/6.8.3/macos" >> "$GITHUB_ENV"
+
+      - name: Import Apple certificate
+        if: env.APPLE_CERTIFICATE_P12 != '' && env.APPLE_CERTIFICATE_PASSWORD != ''
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Build (build_macos.sh)
+        env:
+          CONQUERD_RELEASE: "1"
+          CONQUERD_SIGN_ID: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: ./build_macos.sh
+
+      - name: Rename DMG to include platform suffix
+        run: |
+          VERSION=$(grep -m1 '^version' rust/conquerd-client/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          mv "dist/ConquerD-${VERSION}.dmg" "dist/ConquerD-${VERSION}-macos-arm64.dmg"
+
+      - name: Notarize DMG
+        if: env.APPLE_NOTARY_KEY != '' && env.APPLE_NOTARY_KEY_ID != '' && env.APPLE_NOTARY_ISSUER != ''
+        run: |
+          VERSION=$(grep -m1 '^version' rust/conquerd-client/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          DMG="dist/ConquerD-${VERSION}-macos-arm64.dmg"
+          KEY_PATH=$RUNNER_TEMP/notary-key.p8
+          echo "$APPLE_NOTARY_KEY" | base64 --decode > "$KEY_PATH"
+          xcrun notarytool submit "$DMG" --key "$KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER" --wait
+          xcrun stapler staple "$DMG"
+
+      - name: Generate and verify SHA-256
+        run: |
+          VERSION=$(grep -m1 '^version' rust/conquerd-client/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          FILE="dist/ConquerD-${VERSION}-macos-arm64.dmg"
+          shasum -a 256 "$FILE" > "${FILE}.sha256"
+          shasum -a 256 -c "${FILE}.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: macos-release
+          path: |
+            dist/ConquerD-*-macos-arm64.dmg
+            dist/ConquerD-*-macos-arm64.dmg.sha256
+
+  build-linux:
+    needs: preflight
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: linux-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake pkg-config fuse libfuse2 \
+            libgl-dev libxkbcommon-dev libdbus-1-dev libpulse-dev \
+            libasound2-dev libminiupnpc-dev \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0
+
+      - name: Install Qt 6
+        run: |
+          pip install aqtinstall
+          aqt install-qt linux desktop 6.8.3 gcc_64 -O /opt/Qt
+          echo "QT_DIR=/opt/Qt/6.8.3/gcc_64" >> "$GITHUB_ENV"
+
+      - name: Download appimagetool
+        run: |
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
+          chmod +x /usr/local/bin/appimagetool
+
+      - name: Build (build_linux.sh)
+        env:
+          CONQUERD_RELEASE: "1"
+        run: ./build_linux.sh
+
+      - name: Verify artifacts
+        run: |
+          ls dist/ConquerD-*-x86_64.AppImage
+          ls dist/ConquerD-*-x86_64.AppImage.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: linux-release
+          path: |
+            dist/ConquerD-*-x86_64.AppImage
+            dist/ConquerD-*-x86_64.AppImage.sha256
+
+  attest:
+    needs: [build-macos, build-linux, sign-windows, windows-unsigned-fallback]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: "*-release"
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate artifact attestations
+        uses: actions/attest-build-provenance@520d128f165991a6c774bcb264f323e3d70747f4 # v2.2.0
+        with:
+          subject-path: |
+            artifacts/ConquerD-*-win64.7z
+            artifacts/conquerd-installer.exe
+            artifacts/ConquerD-*-macos-arm64.dmg
+            artifacts/ConquerD-*-x86_64.AppImage
+
+  publish-release:
+    needs: [attest]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: "*-release"
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@7b4da11513bf3f43f9999e90eabced41ab8bb048 # v2.2.0
+        with:
+          name: "ConquerD ${{ github.ref_name }}"
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/ConquerD-*-win64.7z
+            artifacts/ConquerD-*-win64.7z.sha256
+            artifacts/conquerd-installer.exe
+            artifacts/ConquerD-*-macos-arm64.dmg
+            artifacts/ConquerD-*-macos-arm64.dmg.sha256
+            artifacts/ConquerD-*-x86_64.AppImage
+            artifacts/ConquerD-*-x86_64.AppImage.sha256

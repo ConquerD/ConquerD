@@ -1,0 +1,371 @@
+// VoiceRail.qml — Right-side voice/room panel.
+//
+// Replaces the small floating CallPanel with a proper collapsible strip that
+// Shows during both direct P2P calls and SFU room sessions.
+// 
+//
+// Width animates between 0 (hidden) and 200 (visible) so the centre chat
+// panel expands and contracts smoothly.
+
+import QtQuick
+import QtQuick.Controls.Material
+import QtQuick.Layouts
+import ConquerD.Client 1.0
+
+Rectangle {
+    id: root
+    color: Theme.bg2
+    clip: true
+
+    // ── Public API ────────────────────────────────────────────────────────
+
+    /// The RoomModel (or a synthetic 2-entry ListModel for direct calls).
+    property var participantModel: null
+
+    /// Display name shown in the header (room name or remote peer handle).
+    property string contextName: ""
+
+    /// Call/room state passed from bridge: "idle" | "connecting" | "in_call"
+    property string callState: "idle"
+
+    /// True when in an SFU room session (controls Leave vs End label).
+    property bool inRoom: false
+
+    /// Whether the local mic is muted.
+    property bool muted: false
+
+    /// Elapsed call seconds (driven by bridge.call_duration_secs).
+    property int durationSecs: 0
+
+    /// Connection mode for the header pill.
+    property string connectionMode: "offline"
+
+    // ── Ring history store ─────────────────────────────────────────────────────────────
+    // Keyed by peerId → { samples, wp, ema, peak, ceil }.
+    //   peak — short-window envelope (rises instantly, decays ~3 dB/100 ms).
+    //   ceil — rolling ceiling per peer (rises instantly to new peaks,
+    //          decays toward _ringMinCeil over ~1.5 s).  Samples are
+    //          divided by `ceil` so mics with very different gain
+    //          produce comparable ring heights, while still recovering
+    //          quickly from one-off spikes so subsequent quieter speech
+    //          still registers.
+    property var _ringStore: ({})
+    // Minimum ceiling: prevents division blow-up during long silences.
+    // Kept low (0.10) so even very quiet speech normalises to near full
+    // scale instead of being suppressed by an artificially high floor.
+    readonly property real _ringMinCeil: 0.10
+    // Perceptual compression exponent.  The level from Rust is already
+    // on a dB scale (linear-in-dB ≈ log in amplitude), which partially
+    // compensates for loudness perception.  A mild ^0.75 nudges quiet
+    // voices up further without over-compressing the loud end.
+    readonly property real _ringPerceptualExp: 0.75
+
+    function ringStateForPeer(pid) {
+        if (!_ringStore[pid]) {
+            var arr = new Array(60)
+            for (var i = 0; i < 60; i++) arr[i] = 0.0
+            _ringStore[pid] = { samples: arr, wp: 0, ema: 0.0, peak: 0.0, ceil: _ringMinCeil }
+        }
+        return _ringStore[pid]
+    }
+
+    // Fast envelope tracker: polls audioLevel ~30× per second.
+    //   * `peak` is the short envelope used by ringTimer (1 Hz aliasing fix).
+    //   * `ceil` is the rolling ceiling used for adaptive normalization.
+    Timer {
+        id: peakTimer
+        interval: 33
+        running:  true
+        repeat:   true
+        onTriggered: {
+            for (var i = 0; i < participantsRepeater.count; i++) {
+                var item = participantsRepeater.itemAt(i)
+                if (!item) continue
+                var pid = item.peerId
+                var st  = _ringStore[pid]
+                if (!st) continue
+                var raw = item.isMuted ? 0.0 : item.audioLevel
+                // Mild perceptual compression to nudge quiet voices up.
+                var lvl = raw > 0.0 ? Math.pow(raw, root._ringPerceptualExp) : 0.0
+
+                // Short envelope — fast attack, ~3 dB / 100 ms release.
+                var decayed = st.peak * 0.92
+                st.peak = lvl > decayed ? lvl : decayed
+
+                // Rolling ceiling — instant rise, ~1.5 s half-life decay
+                // (0.985^30 ≈ 0.64 per second @ 30 Hz) so a one-off spike
+                // doesn't suppress the next few seconds of normal speech.
+                var ceilDecayed = st.ceil * 0.985
+                if (ceilDecayed < root._ringMinCeil) ceilDecayed = root._ringMinCeil
+                st.ceil = lvl > ceilDecayed ? lvl : ceilDecayed
+            }
+        }
+    }
+
+    // Single persistent timer — iterates every live Repeater delegate, reads
+    // the per-peer peak envelope (updated by peakTimer above), normalizes
+    // it against the rolling ceiling, then pushes the sample.
+    // The ring renderer is intentionally NOT refreshed here. Each
+    // ParticipantWidget owns a TalkingRing timer with a random phase offset so
+    // adjacent participants' rings don't animate in lockstep.
+    Timer {
+        id: ringTimer
+        interval: 1000
+        running:  true      // VoiceRail is only mounted when voice_active
+        repeat:   true
+        onTriggered: {
+            for (var i = 0; i < participantsRepeater.count; i++) {
+                var item = participantsRepeater.itemAt(i)
+                if (!item) continue
+                var pid = item.peerId
+                var st  = _ringStore[pid]
+                if (!st) continue
+                var raw  = item.isMuted ? 0.0 : st.peak
+                var norm = raw / st.ceil
+                if (norm > 1.0) norm = 1.0
+                if (norm < 0.0) norm = 0.0
+                st.samples[st.wp] = norm
+                st.wp  = (st.wp + 1) % 60
+                st.ema = st.ema * 0.7 + norm * 0.3
+                // Reset short envelope so the next one-second window starts fresh.
+                st.peak = raw * 0.25
+            }
+        }
+    }
+
+    signal endCallRequested()
+    signal muteToggled(bool muted)
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+    function pad(n) { return n < 10 ? "0" + n : n.toString() }
+
+    // ── Left border separator ─────────────────────────────────────────────
+    Rectangle {
+        anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
+        width: 1
+        color: Theme.divider
+    }
+
+    ColumnLayout {
+        anchors { fill: parent; leftMargin: 1 }
+        spacing: 0
+
+        // ── Header ────────────────────────────────────────────────────────
+        Rectangle {
+            Layout.fillWidth: true
+            height: 52
+            color: Theme.bg3
+
+            ColumnLayout {
+                anchors {
+                    fill: parent
+                    leftMargin: Theme.spacingMd
+                    rightMargin: Theme.spacingSm
+                    topMargin: Theme.spacingXs
+                    bottomMargin: Theme.spacingXs
+                }
+                spacing: 2
+
+                // Room/peer name
+                Text {
+                    text: root.contextName || (root.inRoom ? "Voice Room" : "Call")
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeBody
+                    font.bold: true
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+
+                // Connection mode pill
+                Rectangle {
+                    width: modePillText.implicitWidth + 10
+                    height: 16
+                    radius: 0
+                    color: {
+                        if (root.connectionMode === "direct") return "#1a3ba5" // accent tint
+                        if (root.connectionMode === "relay")  return "#3d2c00" // warn tint
+                        return "#3d0008" // danger tint
+                    }
+
+                    Text {
+                        id: modePillText
+                        anchors.centerIn: parent
+                        text: {
+                            if (root.callState === "connecting") return "Connecting\u2026"
+                            if (root.connectionMode === "direct") return "\u25CF Direct"
+                            if (root.connectionMode === "relay")  return "\u21CC Relay"
+                            return "\u2715 Offline"
+                        }
+                        color: {
+                            if (root.connectionMode === "direct") return Theme.accent
+                            if (root.connectionMode === "relay")  return Theme.warn
+                            return Theme.danger
+                        }
+                        font.pixelSize: 9
+                        font.bold: true
+                    }
+                }
+            }
+        }
+
+        // ── Participant tiles ─────────────────────────────────────────────
+        Flow {
+            id: participantFlow
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            padding: Theme.spacingSm
+            spacing: Theme.spacingSm
+
+            // Connecting spinner when no participants yet
+            Item {
+                visible: (root.participantModel === null ||
+                          (root.participantModel && root.participantModel.rowCount &&
+                           root.participantModel.rowCount() === 0)) &&
+                         root.callState === "connecting"
+                width: participantFlow.width - Theme.spacingSm * 2
+                height: 80
+
+                Column {
+                    anchors.centerIn: parent
+                    spacing: 8
+
+                    BusyIndicator {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        running: true
+                        width: 32; height: 32
+                    }
+
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Connecting\u2026"
+                        color: Theme.muted
+                        font.pixelSize: Theme.fontSizeCaption
+                    }
+                }
+            }
+
+            Repeater {
+                id: participantsRepeater
+                model: root.participantModel
+
+                ParticipantWidget {
+                    peerId:      model.peerId
+                    displayName: model.handle || model.peerId || ""
+                    isMuted:     model.muted
+                    audioLevel:  model.isSelf ? backend.mic_level : model.audioLevel
+                    isSelf:      model.isSelf
+                    ringStore:   root.ringStateForPeer(model.peerId)
+                }
+            }
+        }
+
+        // ── Duration counter ──────────────────────────────────────────────
+        Rectangle {
+            Layout.fillWidth: true
+            height: 24
+            color: Theme.bg3
+            visible: root.callState === "in_call" || root.inRoom
+
+            Text {
+                anchors.centerIn: parent
+                text: {
+                    var s = root.durationSecs
+                    var h = Math.floor(s / 3600)
+                    var m = Math.floor((s % 3600) / 60)
+                    var sec = s % 60
+                    if (h > 0) {
+                        return root.pad(h) + ":" + root.pad(m) + ":" + root.pad(sec)
+                    }
+                    return root.pad(m) + ":" + root.pad(sec)
+                }
+                color: Theme.muted
+                font.pixelSize: Theme.fontSizeCaption
+                font.family: "monospace"
+            }
+
+            function pad(n) { return n < 10 ? "0" + n : n.toString() }
+        }
+
+        // ── Controls bar ─────────────────────────────────────────────────
+        Rectangle {
+            Layout.fillWidth: true
+            height: 52
+            color: Theme.bg3
+
+            // Top divider
+            Rectangle {
+                anchors { top: parent.top; left: parent.left; right: parent.right }
+                height: 1
+                color: Theme.divider
+            }
+
+            RowLayout {
+                anchors {
+                    fill: parent
+                    leftMargin: Theme.spacingMd
+                    rightMargin: Theme.spacingMd
+                }
+                spacing: Theme.spacingSm
+
+                // Mute toggle
+                Rectangle {
+                    width: 36; height: 36; radius: 18
+                    color: root.muted ? Theme.danger : Theme.bg2
+
+                    Behavior on color { ColorAnimation { duration: 120 } }
+
+                    Image {
+                        anchors.centerIn: parent
+                        source: root.muted ? "qrc:/qt/qml/ConquerD/Client/icons/mic-off.svg" : "qrc:/qt/qml/ConquerD/Client/icons/mic.svg"
+                        sourceSize.width: 18
+                        sourceSize.height: 18
+                        width: 18
+                        height: 18
+                        fillMode: Image.PreserveAspectFit
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            root.muted = !root.muted
+                            root.muteToggled(root.muted)
+                        }
+                    }
+
+                    ToolTip.text: root.muted ? "Unmute microphone" : "Mute microphone"
+                    ToolTip.visible: muteHover.hovered
+                    HoverHandler { id: muteHover }
+                }
+
+                Item { Layout.fillWidth: true }
+
+                // End / Leave button
+                Rectangle {
+                    width: 36; height: 36; radius: 18
+                    color: Theme.danger
+
+                    Image {
+                        anchors.centerIn: parent
+                        source: root.inRoom
+                            ? "qrc:/qt/qml/ConquerD/Client/icons/stop.svg"
+                            : "qrc:/qt/qml/ConquerD/Client/icons/x-circle.svg"
+                        width: 18; height: 18
+                        smooth: true
+                        antialiasing: true
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.endCallRequested()
+                    }
+
+                    ToolTip.text: root.inRoom ? "Leave room" : "End call"
+                    ToolTip.visible: endHover.hovered
+                    HoverHandler { id: endHover }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,217 @@
+//! First-party client-side `FeatureModule` implementations.
+//!
+//! Each struct corresponds to a capability the Conquerd desktop client
+//! implements natively.  Modules hold an optional callback hook so any Rust
+//! consumer (tests, future native client) can observe or intercept inbound
+//! payloads without subclassing.
+//!
+//! `core.audio.opus` is advertisement-only: the actual audio datagram
+//! pipeline runs through `conquerd_quic::QUICTransport::on_audio_datagram`
+//! for latency reasons and does not route through `on_message`.
+
+use std::sync::Arc;
+
+use crate::{
+    module::{FeatureModule, PeerId},
+    registry::FeatureRegistry,
+    wellknown, CapabilityDescriptor, FeatureError,
+};
+
+/// Callback type used by the three client modules.
+type MessageHook = Arc<dyn Fn(PeerId, &[u8]) + Send + Sync>;
+
+// ── core.chat.v1 ─────────────────────────────────────────────────────────────
+
+/// `core.chat.v1` — signed chat envelope on the signaling channel.
+///
+/// Routes `on_message` to an optional hook so consumers can observe
+/// inbound chat payloads.  Rate-limiting and Qt signal emission live in
+/// the `CoreChatModule`; this struct is the framework-visible
+/// registration.
+pub struct CoreChatModule {
+    hook: Option<MessageHook>,
+}
+
+impl CoreChatModule {
+    /// Create an advertisement-only module (no `on_message` hook).
+    pub fn new() -> Self {
+        Self { hook: None }
+    }
+
+    /// Create a module that forwards `on_message` to *hook*.
+    pub fn with_hook(hook: impl Fn(PeerId, &[u8]) + Send + Sync + 'static) -> Self {
+        Self {
+            hook: Some(Arc::new(hook)),
+        }
+    }
+}
+
+impl Default for CoreChatModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FeatureModule for CoreChatModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::core_chat_v1()
+    }
+
+    fn on_message(&self, source: PeerId, payload: &[u8]) {
+        if let Some(ref hook) = self.hook {
+            hook(source, payload);
+        }
+    }
+}
+
+// ── core.audio.opus ──────────────────────────────────────────────────────────
+
+/// `core.audio.opus` — direct peer voice (Opus over QUIC datagrams).
+///
+/// Advertisement-only: the datagram pipeline runs through a dedicated
+/// low-tag path (`send_audio_datagram`) for latency reasons (see the
+/// detailed "Audio Dispatch Decision" comment in connection_manager.rs).
+/// `on_message` is a no-op; the descriptor exists purely for capability
+/// negotiation and quota definition. Outbound quota is still enforced
+/// via `gate_through_feature` before every send.
+pub struct CoreAudioOpusModule;
+
+impl FeatureModule for CoreAudioOpusModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::core_audio_opus()
+    }
+
+    // on_message: inherits default no-op — audio routes through datagram callback.
+}
+
+// ── core.file.v1 ─────────────────────────────────────────────────────────────
+
+/// `core.file.v1` — chunked file transfer on the signaling channel.
+pub struct CoreFileModule {
+    hook: Option<MessageHook>,
+}
+
+impl CoreFileModule {
+    /// Create an advertisement-only module (no `on_message` hook).
+    pub fn new() -> Self {
+        Self { hook: None }
+    }
+
+    /// Create a module that forwards `on_message` to *hook*.
+    pub fn with_hook(hook: impl Fn(PeerId, &[u8]) + Send + Sync + 'static) -> Self {
+        Self {
+            hook: Some(Arc::new(hook)),
+        }
+    }
+}
+
+impl Default for CoreFileModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FeatureModule for CoreFileModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::core_file_v1()
+    }
+
+    fn on_message(&self, source: PeerId, payload: &[u8]) {
+        if let Some(ref hook) = self.hook {
+            hook(source, payload);
+        }
+    }
+}
+
+// ── Convenience: register all three into a registry ──────────────────────────
+
+/// `room.file.v1` — advertisement-only descriptor for SFU room file broadcasts.
+pub struct RoomFileModule;
+
+impl FeatureModule for RoomFileModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::room_file_v1()
+    }
+}
+
+/// Register the three first-party client modules into *registry*.
+///
+/// Descriptors are taken from their `wellknown` constructors.  All three
+/// use the no-hook (advertisement-only) variant.  Callers that need
+/// `on_message` dispatch should use the `with_hook` constructors directly.
+///
+/// Returns `Err` if any registration fails (e.g. duplicate id).
+pub fn register_client_modules(registry: &FeatureRegistry) -> Result<(), FeatureError> {
+    let modules: Vec<crate::module::SharedModule> = vec![
+        Arc::new(CoreChatModule::new()),
+        Arc::new(CoreAudioOpusModule),
+        Arc::new(CoreFileModule::new()),
+        Arc::new(RoomFileModule),
+    ];
+    for m in modules {
+        registry.register_module(m)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_client_modules_succeeds() {
+        let reg = FeatureRegistry::new();
+        register_client_modules(&reg).expect("registration should succeed");
+        assert!(reg.get("core.chat.v1").is_some());
+        assert!(reg.get("core.audio.opus").is_some());
+        assert!(reg.get("core.file.v1").is_some());
+        assert!(reg.get("room.file.v1").is_some());
+    }
+
+    #[test]
+    fn register_client_modules_fails_on_duplicate() {
+        let reg = FeatureRegistry::new();
+        register_client_modules(&reg).unwrap();
+        // Second call must fail — all ids already registered.
+        assert!(register_client_modules(&reg).is_err());
+    }
+
+    #[test]
+    fn chat_module_with_hook_fires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&counter);
+        let m = CoreChatModule::with_hook(move |_src, _payload| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+        m.on_message("peer-a".into(), b"hello");
+        m.on_message("peer-a".into(), b"world");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn audio_module_is_advertisement_only() {
+        // on_message is a no-op — just verify it doesn't panic.
+        let m = CoreAudioOpusModule;
+        m.on_message("peer-a".into(), b"\x00\x01opus-data");
+    }
+
+    #[test]
+    fn file_module_with_hook_fires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&counter);
+        let m = CoreFileModule::with_hook(move |_src, _payload| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+        m.on_message("peer-b".into(), b"chunk-data");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn descriptors_match_wellknown() {
+        assert_eq!(CoreChatModule::new().descriptor().id, "core.chat.v1");
+        assert_eq!(CoreAudioOpusModule.descriptor().id, "core.audio.opus");
+        assert_eq!(CoreFileModule::new().descriptor().id, "core.file.v1");
+    }
+}

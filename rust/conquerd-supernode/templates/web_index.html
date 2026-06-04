@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conquerd — Supernode Portal</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --border:   #30363d;
+      --text:     #e6edf3;
+      --muted:    #8b949e;
+      --accent:   #58a6ff;
+      --green:    #3fb950;
+      --yellow:   #d29922;
+      --red:      #f85149;
+      --purple:   #d2a8ff;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, "Cascadia Code", "Fira Code", "Menlo", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    header h1 { font-size: 15px; color: var(--accent); letter-spacing: 0.03em; }
+    header .node-id {
+      font-size: 11px;
+      color: var(--muted);
+      word-break: break-all;
+    }
+    #connecting {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 60vh;
+      color: var(--muted);
+      gap: 8px;
+    }
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    main { padding: 24px; display: none; }
+    main.visible { display: block; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+    .card-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .card-value { font-size: 20px; margin-top: 4px; color: var(--text); }
+    .card-value.green { color: var(--green); }
+    .card-value.yellow { color: var(--yellow); }
+    .card-value.accent { color: var(--accent); }
+    section { margin-bottom: 28px; }
+    section h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-size: 11px; font-weight: normal; }
+    td { color: var(--text); }
+    .badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      background: var(--border);
+      color: var(--muted);
+    }
+    .badge.connected { background: #1a3a20; color: var(--green); }
+    .badge.relay    { background: #1a2a3a; color: var(--accent); }
+    .games-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .game-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      text-decoration: none;
+      color: var(--text);
+      transition: border-color 0.15s;
+      display: block;
+    }
+    .game-card:hover { border-color: var(--accent); }
+    .game-card h3 { font-size: 13px; color: var(--accent); margin-bottom: 4px; }
+    .game-card p  { font-size: 11px; color: var(--muted); }
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 14px 24px;
+      color: var(--muted);
+      font-size: 11px;
+      display: flex;
+      justify-content: space-between;
+    }
+    #error-banner {
+      display: none;
+      background: #2d1a1a;
+      border: 1px solid var(--red);
+      color: var(--red);
+      padding: 10px 16px;
+      margin: 16px 24px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Conquerd Supernode Portal</h1>
+      <div class="node-id" id="node-id-display">Connecting…</div>
+    </div>
+  </header>
+
+  <div id="connecting"><div class="spinner"></div> Establishing secure session…</div>
+  <div id="error-banner"></div>
+
+  <main id="main">
+    <!-- Stat cards -->
+    <div class="grid" id="stat-cards">
+      <div class="card">
+        <div class="card-label">Connected Peers</div>
+        <div class="card-value green" id="stat-peers">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Uptime</div>
+        <div class="card-value accent" id="stat-uptime">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Active Rooms</div>
+        <div class="card-value yellow" id="stat-rooms">—</div>
+      </div>
+      <div class="card">
+        <div class="card-label">My Peer ID</div>
+        <div class="card-value" id="stat-my-id" style="font-size:11px;word-break:break-all;">—</div>
+      </div>
+    </div>
+
+    <!-- Peer list -->
+    <section>
+      <h2>Connected Peers</h2>
+      <table>
+        <thead>
+          <tr><th>Peer ID</th><th>Mode</th><th>Connected</th></tr>
+        </thead>
+        <tbody id="peers-tbody">
+          <tr><td colspan="3" style="color:var(--muted)">Loading…</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Games -->
+    <section>
+      <h2>Games (game.relay.v1)</h2>
+      <div class="games-grid" id="games-grid">
+        <a class="game-card" href="conquerd://SUPERNODE_ID/games/example/" id="game-example">
+          <h3>Cursor Relay</h3>
+          <p>Multiplayer cursor tracking. Everyone sees everyone else’s pointer in real time.</p>
+        </a>
+        <a class="game-card" href="conquerd://SUPERNODE_ID/games/shared-drawing/" id="game-drawing">
+          <h3>Shared Drawing</h3>
+          <p>Collaborative canvas. Draw together — strokes are relayed instantly to everyone in the room.</p>
+        </a>
+        <a class="game-card" href="conquerd://SUPERNODE_ID/games/brick-breaker/" id="game-brick">
+          <h3>Brick Breaker</h3>
+          <p>Multiplayer Breakout. Every paddle is live; the ball bounces off anyone. Co-op fun.</p>
+        </a>
+      </div>
+      <p style="margin-top:8px;font-size:11px;color:#484f58">
+        Open the same <code>?room=xxx</code> link (or <code>conquerd://...</code> path) in multiple windows/tabs.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <span id="footer-version">Conquerd</span>
+    <span id="footer-refresh">Auto-refreshes every 10 s</span>
+  </footer>
+
+  <script>
+    // ── Helpers ────────────────────────────────────────────────────────────
+    function el(id) { return document.getElementById(id); }
+
+    function fmtUptime(secs) {
+      if (!secs && secs !== 0) return "—";
+      const s = Math.floor(secs);
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      if (d > 0) return `${d}d ${h}h ${m}m`;
+      if (h > 0) return `${h}h ${m}m ${sec}s`;
+      if (m > 0) return `${m}m ${sec}s`;
+      return `${sec}s`;
+    }
+
+    function badge(text, cls) {
+      return `<span class="badge ${cls || ''}">${text}</span>`;
+    }
+
+    // ── Portal bootstrap ───────────────────────────────────────────────────
+    let myPeerId = "";
+    let supernodeId = "";
+    let conquerdFetch = null;
+
+    async function bootstrap() {
+      try {
+        // window.conquerd is injected by the native client's scheme handler.
+        if (typeof window.conquerd === "undefined") {
+          showError("window.conquerd bridge not available. Open this page through the Conquerd client.");
+          return;
+        }
+        const ctx = await window.conquerd.ready;
+        myPeerId    = ctx.myPeerId   || "";
+        supernodeId = ctx.supernodeId || window.location.hostname;
+        conquerdFetch = ctx.fetch.bind(ctx);
+
+        // Update header
+        el("node-id-display").textContent = `supernode: ${supernodeId}`;
+        el("stat-my-id").textContent = myPeerId || "—";
+
+        // Fix all game links to use the correct supernode id
+        const gameExample = el("game-example");
+        if (gameExample) gameExample.href = `conquerd://${supernodeId}/games/example/`;
+
+        const gameDrawing = el("game-drawing");
+        if (gameDrawing) gameDrawing.href = `conquerd://${supernodeId}/games/shared-drawing/`;
+
+        const gameBrick = el("game-brick");
+        if (gameBrick) gameBrick.href = `conquerd://${supernodeId}/games/brick-breaker/`;
+
+        // Hide spinner, show content
+        el("connecting").style.display = "none";
+        el("main").classList.add("visible");
+
+        // Initial load + start polling
+        await refresh();
+        setInterval(refresh, 10000);
+      } catch (e) {
+        showError(`Bridge error: ${e.message || e}`);
+      }
+    }
+
+    async function refresh() {
+      try {
+        const [statsRaw, peersRaw, cfgRaw] = await Promise.allSettled([
+          conquerdFetch("/api/stats"),
+          conquerdFetch("/api/peers"),
+          conquerdFetch("/api/config"),
+        ]);
+
+        if (statsRaw.status === "fulfilled") {
+          const s = await statsRaw.value.json().catch(() => ({}));
+          el("stat-peers").textContent  = s.connected_peers  ?? "—";
+          el("stat-uptime").textContent = fmtUptime(s.uptime_secs);
+          el("stat-rooms").textContent  = s.active_rooms     ?? "—";
+          if (s.version) el("footer-version").textContent = `Conquerd ${s.version}`;
+        }
+
+        if (peersRaw.status === "fulfilled") {
+          const peers = await peersRaw.value.json().catch(() => []);
+          renderPeers(Array.isArray(peers) ? peers : (peers.peers || []));
+        }
+
+        if (cfgRaw.status === "fulfilled") {
+          // config available for future use
+        }
+      } catch (e) {
+        console.warn("[portal] refresh error:", e);
+      }
+    }
+
+    function renderPeers(peers) {
+      const tbody = el("peers-tbody");
+      if (!peers.length) {
+        tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted)">No peers connected</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = peers.map(p => {
+        const mode = p.via_relay ? badge("relay", "relay") : badge("direct", "connected");
+        const since = p.connected_since ? new Date(p.connected_since * 1000).toLocaleTimeString() : "—";
+        const shortId = (p.peer_id || "").slice(0, 16) + "…";
+        return `<tr>
+          <td title="${p.peer_id || ''}">${shortId}</td>
+          <td>${mode}</td>
+          <td>${since}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function showError(msg) {
+      el("connecting").style.display = "none";
+      const banner = el("error-banner");
+      banner.style.display = "block";
+      banner.textContent = msg;
+    }
+
+    // ── Boot ───────────────────────────────────────────────────────────────
+    bootstrap().catch(e => showError(String(e)));
+  </script>
+</body>
+</html>

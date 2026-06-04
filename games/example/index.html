@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conquerd — Cursor Relay Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+      overflow: hidden;
+    }
+    #canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: crosshair;
+    }
+    #overlay {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      background: rgba(13, 17, 23, 0.85);
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-size: 13px;
+      line-height: 1.6;
+      min-width: 220px;
+      max-width: 300px;
+    }
+    #overlay h1 { font-size: 14px; color: #58a6ff; margin-bottom: 8px; }
+    #status { color: #8b949e; }
+    #status.connected { color: #3fb950; }
+    #status.error { color: #f85149; }
+    #peers-count { color: #d29922; }
+    #room-label { color: #a5d6ff; font-size: 11px; word-break: break-all; }
+    #hint { margin-top: 8px; color: #484f58; font-size: 11px; }
+    .dot-label {
+      position: fixed;
+      font-size: 10px;
+      pointer-events: none;
+      user-select: none;
+      white-space: nowrap;
+      text-shadow: 0 0 4px #0d1117;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="overlay">
+    <h1>Cursor Relay — game.relay.v1</h1>
+    <div id="status">Connecting…</div>
+    <div id="peers-count"></div>
+    <div id="room-label"></div>
+    <div id="hint">Move your cursor on the canvas.<br>Others see it in real time.</div>
+  </div>
+  <script type="module" src="game.js"></script>
+</body>
+</html>

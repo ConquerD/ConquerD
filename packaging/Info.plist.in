@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ConquerD macOS application bundle Info.plist template.
+  =====================================================
+  The build script substitutes @VERSION@ with the current APP_VERSION_STRING.
+
+  CFBundleURLTypes registers the conquerd:// URI scheme so clicking an
+  invite link in a browser launches ConquerD with the URL as argv[1].
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>ConquerD</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>ConquerD</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.conquerd.app</string>
+
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+
+    <key>CFBundleExecutable</key>
+    <string>conquerd</string>
+
+    <key>CFBundleIconFile</key>
+    <string>conquerd.icns</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleSignature</key>
+    <string>????</string>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <key>NSMicrophoneUsageDescription</key>
+    <string>ConquerD needs microphone access for voice calls.</string>
+
+    <!-- conquerd:// URI scheme registration -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>ConquerD Invite Protocol</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>conquerd</string>
+            </array>
+        </dict>
+    </array>
+
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.social-networking</string>
+</dict>
+</plist>

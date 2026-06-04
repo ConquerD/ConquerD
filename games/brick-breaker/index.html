@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conquerd — Brick Breaker • game.relay.v1</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    #game-container {
+      position: relative;
+      width: min(800px, 96vw);
+    }
+    #canvas {
+      display: block;
+      border: 2px solid #30363d;
+      background: #0d1117;
+      touch-action: none;
+      width: min(800px, 96vw);
+      height: auto;
+      image-rendering: crisp-edges;
+    }
+    #overlay {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      background: rgba(13, 17, 23, 0.9);
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 14px 18px;
+      font-size: 13px;
+      min-width: 240px;
+      max-width: 300px;
+      z-index: 10;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    #overlay h1 {
+      font-size: 16px;
+      color: #58a6ff;
+      margin-bottom: 8px;
+    }
+    #status { color: #8b949e; }
+    #status.connected { color: #3fb950; }
+    #status.error { color: #f85149; }
+    #info {
+      margin-top: 10px;
+      color: #484f58;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .score {
+      color: #d29922;
+      font-size: 14px;
+      margin-top: 6px;
+    }
+    #room-label {
+      color: #a5d6ff;
+      font-size: 11px;
+      margin-top: 4px;
+    }
+    button {
+      background: #21262d;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+    button:hover { background: #30363d; }
+    #hint {
+      margin-top: 8px;
+      color: #484f58;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+  </style>
+</head>
+<body>
+  <div id="game-container">
+    <canvas id="canvas" width="800" height="600"></canvas>
+    <div id="overlay">
+      <h1>🧱 Brick Breaker</h1>
+      <div id="status">Connecting…</div>
+      <div id="room-label"></div>
+      <div class="score" id="score">Score: 0 &nbsp;&nbsp; Lives: 3</div>
+      <div id="info">
+        Mouse / ←→ / A D — move paddle<br>
+        Same <code>?room=...</code> = shared game<br>
+        R or button = request reset
+      </div>
+      <button id="reset">Reset Level</button>
+      <div id="hint">Ball bounces off every paddle in the room. Driver keeps the physics alive.</div>
+    </div>
+  </div>
+  <script type="module" src="brick-breaker.js"></script>
+</body>
+</html>

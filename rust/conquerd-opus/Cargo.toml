@@ -1,0 +1,25 @@
+[package]
+name = "conquerd-opus"
+version = "0.1.0"
+edition = "2021"
+description = "First-party libopus wrapper with DRED/OSCE support for ConquerD."
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# When enabled (default), build.rs requires that the DNN model C source arrays
+# are present in `rust/conquerd-opus/opus/dnn/` before building.  These files
+# are compiled into libopus directly, enabling DRED packet generation and OSCE
+# neural speech enhancement with zero runtime I/O overhead.
+#
+# Run scripts/fetch_opus_weights.ps1 (Windows) or scripts/fetch_opus_weights.sh
+# (Linux/macOS) to download the Xiph.Org tarball and extract the C files first.
+# Disable this feature for CI environments without network access to the Xiph
+# media server, or where libopus is built without DNN support.
+default = ["dnn"]
+dnn = []
+
+[build-dependencies]
+cmake = "0.1"
+cc = "1"

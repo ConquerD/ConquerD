@@ -1,0 +1,96 @@
+<svg class="wordmark-svg" viewBox="0 0 415 90" fill="none"
+         xmlns="http://www.w3.org/2000/svg"
+         role="img" aria-label="ConquerD://">
+      <defs>
+        <!-- Gradient: white → purple, matching the site h1 -->
+        <linearGradient id="wm-grad" x1="0" y1="0" x2="288" y2="0"
+                        gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stop-color="#ffffff"/>
+          <stop offset="100%" stop-color="#a78bfa"/>
+        </linearGradient>
+      </defs>
+
+      <!-- ════ GRADIENT LETTERS: C o n q u e r ════ -->
+      <g fill="url(#wm-grad)">
+
+        <!--
+          C — angular "C": the D shape mirrored (points left) and open.
+              Outer: right wall at x=46, top-left chevron vertex at x=0 y=45,
+                     bottom returns to x=46.
+              Inner cutout opens the same direction.
+              Open on the right side (gap between top-right and bottom-right arms).
+        -->
+        <path d="
+          M46,17 L14,17 L0,45 L14,73 L46,73 L46,62 L20,62 L10,45 L20,28 L46,28 Z
+        "/>
+
+        <!--
+          o — angular hexagon with cutout (x-height: y 33–73).
+              Outer hex:  left vertex at x=51, right at x=87, top/bot at y 33/73,
+                          mid-height vertices at y=53.
+              Inner hex:  inset 10 uu.
+        -->
+        <path fill-rule="evenodd" d="
+          M63,33 L75,33 L87,53 L75,73 L63,73 L51,53 Z
+          M66,42 L72,42 L80,53 L72,64 L66,64 L58,53 Z
+        "/>
+
+        <!--
+          n — angular: left vertical bar + angled top connecting to right vertical bar.
+              x-height: y 33–73.  x: 92–126.
+        -->
+        <path d="
+          M92,33 L103,33 L103,40 L115,33 L126,33 L126,73 L115,73 L115,44 L103,51 L103,73 L92,73 Z
+        "/>
+
+        <!--
+          q — angular: hexagonal bowl (like 'o') with a right vertical bar
+              extending as descender.  x: 131–167.  Bowl: y 33–73.  Descender: to 86.
+        -->
+        <path fill-rule="evenodd" d="
+          M143,33 L156,33 L167,53 L167,86 L156,86 L156,73 L143,73 L131,53 Z
+          M146,42 L153,42 L160,53 L153,64 L146,64 L139,53 Z
+        "/>
+
+        <!--
+          u — angular U: two vertical bars joined by an angled bottom.
+              x-height: y 33–73.  x: 172–206.
+        -->
+        <path d="
+          M172,33 L183,33 L183,58 L195,66 L195,33 L206,33 L206,73 L189,73 L172,58 Z
+        "/>
+
+        <!--
+          e — angular: hexagonal shape with a horizontal crossbar gap.
+              x-height: y 33–73.  x: 211–247.
+              Outer shape with a notch cut on the right at mid-height to
+              form the counter opening, plus a horizontal bar.
+        -->
+        <path d="
+          M223,33 L247,33 L247,42 L222,42 L222,49 L244,49 L244,57 L222,57 L222,64 L247,64 L247,73 L211,73 L211,53 L223,33 Z
+        "/>
+
+        <!--
+          r — angular: left vertical bar + angled arm pointing right.
+              x-height: y 33–73.  x: 252–278.
+        -->
+        <path d="
+          M252,33 L278,33 L278,42 L263,42 L263,73 L252,73 Z
+        "/>
+
+      </g>
+
+      <!-- ════ RED LETTER: D (icon-mark pentagon) ════ -->
+      <path fill-rule="evenodd" clip-rule="evenodd" fill="#FF2B40" d="
+        M288,17 L324,17 L336,45 L324,73 L288,73 Z
+        M299,28 L316,28 L325,45 L316,62 L299,62 Z
+      "/>
+
+      <!-- ════ RED COLON ════ -->
+      <rect x="346" y="34" width="8" height="8" rx="1" fill="#FF2B40"/>
+      <rect x="346" y="58" width="8" height="8" rx="1" fill="#FF2B40"/>
+
+      <!-- ════ RED PARALLELOGRAM SLASHES ════ -->
+      <polygon points="364,73 375,73 393,17 382,17" fill="#FF2B40"/>
+      <polygon points="380,73 391,73 409,17 398,17" fill="#FF2B40"/>
+    </svg>

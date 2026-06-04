@@ -1,0 +1,22 @@
+# DNN model C data files are extracted from the Xiph opus_data tarball
+# into the opus submodule's dnn/ directory at build time.
+# They are not tracked by the xiph/opus git repo and must not be committed here.
+# Run scripts/fetch_opus_weights.ps1 / .sh to populate them.
+opus/dnn/lace_data.c
+opus/dnn/nolace_data.c
+opus/dnn/fargan_data.c
+opus/dnn/pitchdnn_data.c
+opus/dnn/plc_data.c
+opus/dnn/dred_rdovae_enc_data.c
+opus/dnn/dred_rdovae_dec_data.c
+opus/dnn/dred_rdovae_stats_data.c
+opus/dnn/bbwenet_data.c
+opus/dnn/lossgen_data.c
+opus/dnn/models/
+
+# Git submodule build artifacts
+opus/build/
+opus/build-*/
+
+# Cargo build output
+target/

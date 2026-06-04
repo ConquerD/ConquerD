@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conquerd — Shared Drawing • game.relay.v1</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+      overflow: hidden;
+    }
+    #canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: crosshair;
+      background: #161b22;
+      touch-action: none;
+    }
+    #overlay {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      background: rgba(13, 17, 23, 0.9);
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 14px 18px;
+      font-size: 13px;
+      line-height: 1.5;
+      min-width: 240px;
+      max-width: 320px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      z-index: 10;
+    }
+    #overlay h1 {
+      font-size: 15px;
+      color: #58a6ff;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #status { color: #8b949e; font-size: 12px; }
+    #status.connected { color: #3fb950; }
+    #status.error { color: #f85149; }
+    #controls {
+      margin-top: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    button {
+      background: #21262d;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    button:hover { background: #30363d; }
+    #color {
+      width: 28px;
+      height: 28px;
+      border: none;
+      border-radius: 4px;
+      padding: 0;
+      cursor: pointer;
+    }
+    #room-label {
+      color: #a5d6ff;
+      font-size: 11px;
+      margin-top: 6px;
+      word-break: break-all;
+    }
+    #hint {
+      margin-top: 10px;
+      color: #484f58;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .peer-dot {
+      position: fixed;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      pointer-events: none;
+      z-index: 5;
+      box-shadow: 0 0 6px currentColor;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="overlay">
+    <h1>🖌️ Shared Drawing</h1>
+    <div id="status">Connecting…</div>
+    <div id="room-label"></div>
+    <div id="controls">
+      <input type="color" id="color" value="#58a6ff">
+      <button id="clear">Clear Canvas</button>
+    </div>
+    <div id="hint">
+      Draw with your mouse.<br>
+      Everyone in the same <code>?room=...</code> sees your strokes in real time.
+    </div>
+  </div>
+  <script type="module" src="drawing.js"></script>
+</body>
+</html>

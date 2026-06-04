@@ -1,0 +1,78 @@
+﻿# External project junction — tracked by its own repo
+ConquerD_www/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Identity keys (never commit!)
+.conquerd/
+
+# Logs
+*.log
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+test_results.txt
+test_run_output.txt
+test_check.txt
+
+# Build / CI logs (PowerShell capture artifacts)
+build_check.txt
+build_output.txt
+rust/build_check.txt
+rust/build_check_phase3.txt
+rust/check_out.txt
+
+# Local debug / run capture artifacts (from client and tools)
+debug_*.txt
+rust/conquerd-client/debug_*.txt
+
+# Loose compiled extensions (dev-only copies)
+conquerd_crypto.dll
+conquerd_quic.dll
+conquerd_audio.dll
+
+# Auto-generated packaging metadata
+packaging/version_info.txt
+
+# Linting / type-checking caches and reports
+.mypy_cache/
+.ruff_cache/
+ruff_audit.json
+/.clientA/Downloads
+/.clientB/AppData
+/.clientB/Downloads
+/.clientC/AppData
+/.tmp-run
+/.clientA/AppData
+/.clientA
+/.clientB
+/.clientC
+/rust/target
+/rust/conquerd-client/target-check
+/rust/conquerd-client/target

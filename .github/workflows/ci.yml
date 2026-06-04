@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  RUST_TOOLCHAIN: "1.78.0"
+
+jobs:
+  test:
+    name: Rust tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+            rust/conquerd-client/target
+          key: linux-cargo-ci-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}-${{ hashFiles('rust/conquerd-client/Cargo.lock') }}
+
+      - name: Verify version metadata stays in sync
+        run: pwsh scripts/check_version_sync.ps1
+
+      # --- Lint (fail fast) -------------------------------------------------
+      - name: Check formatting (rust/ workspace)
+        run: cargo fmt --all -- --check
+        working-directory: rust
+
+      - name: Clippy (rust/ workspace, deny warnings)
+        run: cargo clippy --all -- -D warnings
+        working-directory: rust
+
+      # --- Tests ------------------------------------------------------------
+      - name: Run Rust tests (rust/ workspace)
+        working-directory: rust
+        run: cargo test --all --release
+
+      - name: Test client workspace (headless, no qt-ui feature)
+        working-directory: rust/conquerd-client
+        run: cargo test
+
+      # Client workspace also needs its own fmt/clippy pass (separate Cargo workspace)
+      - name: Check formatting (client workspace)
+        run: cargo fmt --all -- --check
+        working-directory: rust/conquerd-client
+
+      - name: Clippy (client workspace, headless)
+        run: cargo clippy -p conquerd-client --no-default-features -- -D warnings
+        working-directory: rust/conquerd-client
+
+      # --- Security ---------------------------------------------------------
+      - name: Security audit (cargo-audit)
+        # Uses the official rustsec action for better reporting and caching.
+        # Non-blocking while we gain experience with the signal.
+        uses: rustsec/audit-check@69366f33c96575abad1ee0d60cf0bfa3f382b1e4 # v2 (pinned)
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  test-windows:
+    name: Rust tests (Windows, non-Qt)
+    runs-on: windows-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+            rust/conquerd-client/target
+          key: windows-cargo-ci-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}-${{ hashFiles('rust/conquerd-client/Cargo.lock') }}
+
+      - name: Verify version metadata stays in sync
+        shell: pwsh
+        run: pwsh scripts/check_version_sync.ps1
+
+      - name: Check formatting (rust/ workspace)
+        shell: pwsh
+        run: cargo fmt --all -- --check
+        working-directory: rust
+
+      - name: Clippy (rust/ workspace, deny warnings)
+        shell: pwsh
+        run: cargo clippy --all -- -D warnings
+        working-directory: rust
+
+      - name: Run Rust tests (rust/ workspace, non-Qt)
+        shell: pwsh
+        run: cargo test --all --release
+        working-directory: rust
+
+      - name: Test client workspace (headless, no qt-ui)
+        shell: pwsh
+        run: cargo test
+        working-directory: rust/conquerd-client
+
+      - name: Clippy (client workspace, headless)
+        shell: pwsh
+        run: cargo clippy -p conquerd-client --no-default-features -- -D warnings
+        working-directory: rust/conquerd-client
+

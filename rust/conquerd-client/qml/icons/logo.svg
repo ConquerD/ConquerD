@@ -1,0 +1,7 @@
+<svg class="logo-svg" viewBox="0 0 122 56" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" width="48" height="22">
+  <path fill-rule="evenodd" clip-rule="evenodd" d="M0,0 L36,0 L48,28 L36,56 L0,56 Z M11,11 L28,11 L37,28 L28,45 L11,45 Z" fill="#FF2B40"/>
+  <rect x="58" y="17" width="8" height="8" rx="1" fill="#FF2B40"/>
+  <rect x="58" y="41" width="8" height="8" rx="1" fill="#FF2B40"/>
+  <polygon points="76,56 87,56 105,0 94,0" fill="#FF2B40"/>
+  <polygon points="92,56 103,56 121,0 110,0" fill="#FF2B40"/>
+</svg>
