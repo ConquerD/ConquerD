@@ -1,4 +1,6 @@
 ﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none">
-  <path d="M8,5 Q4,5 4,9 Q4,14 9,14 L16,14" stroke="#C8C8C8" stroke-width="1.4" stroke-linecap="round" fill="none"/>
-  <polyline points="4,2 4,6 8,6" stroke="#C8C8C8" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- 180-degree U-turn body: enter top-right, loop left and down, exit bottom-right -->
+  <polyline points="16,7 5,7 5,13 16,13" stroke="#C8C8C8" stroke-width="1.5" stroke-linejoin="miter"/>
+  <!-- Arrowhead at exit (bottom-right) pointing right -->
+  <polyline points="13,10 16,13 13,16" stroke="#C8C8C8" stroke-width="1.5" stroke-linejoin="miter"/>
 </svg>
