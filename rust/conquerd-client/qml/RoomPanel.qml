@@ -183,11 +183,13 @@ Item {
                                 elide: Text.ElideMiddle
                                 Layout.fillWidth: true
                             }
-                            Button {
-                                text: "X"
+                            ToolButton {
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
+                                icon.width: 12
+                                icon.height: 12
+                                icon.color: Theme.muted
                                 visible: chip.state === "done" || chip.state === "failed"
                                 flat: true
-                                font.pixelSize: 11
                                 onClicked: root.fileTransferModel && root.fileTransferModel.removeTransfer(chip.transferId)
                             }
                         }

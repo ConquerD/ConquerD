@@ -53,14 +53,14 @@ ApplicationWindow {
             Layout.alignment: Qt.AlignVCenter
             implicitHeight: 28
             placeholderText: "Paste invite or peer ID\u2026"
-            color: "#DCDDDE"
-            placeholderTextColor: "#72767D"
+            color: Theme.text
+            placeholderTextColor: Theme.muted
             leftPadding: 8
             rightPadding: 8
             background: Rectangle {
-                color: "#383A40"
+                color: Theme.bg3
                 radius: 0
-                border.color: inviteField.activeFocus ? "#5865F2" : "transparent"
+                border.color: inviteField.activeFocus ? Theme.accent : "transparent"
                 border.width: 1
             }
             Keys.onReturnPressed: {
@@ -80,7 +80,7 @@ ApplicationWindow {
             Layout.alignment: Qt.AlignVCenter
             enabled: inviteField.text.trim().length > 0
             flat: true
-            Material.foreground: enabled ? "#DCDDDE" : "#72767D"
+            Material.foreground: enabled ? Theme.text : Theme.muted
             ToolTip.text: "Connect to peer / accept invite"
             ToolTip.visible: hovered
             onClicked: {
@@ -99,11 +99,11 @@ ApplicationWindow {
             icon.source: "qrc:/qt/qml/ConquerD/Client/icons/invite.svg"
             icon.width: 16
             icon.height: 16
-            icon.color: "#DCDDDE"
+            icon.color: Theme.text
             implicitHeight: 28
             Layout.alignment: Qt.AlignVCenter
             flat: true
-            Material.foreground: "#DCDDDE"
+            Material.foreground: Theme.text
             ToolTip.text: "Copy new invite link to clipboard (Ctrl+N)"
             ToolTip.visible: hovered
             onClicked: {
@@ -415,7 +415,7 @@ ApplicationWindow {
         z: 90
         anchors { top: customTitleBar.bottom; left: parent.left; right: parent.right }
         height: 36
-        color: "#5865F2"
+        color: Theme.accent
 
         RowLayout {
             anchors.fill: parent
@@ -426,13 +426,13 @@ ApplicationWindow {
             Label {
                 Layout.fillWidth: true
                 text: "Update " + updateBanner.tag + " is available!"
-                color: "#FFFFFF"
+                color: Theme.textInv
                 font.pixelSize: 12
             }
             Button {
                 text: "Install"
                 flat: true
-                Material.foreground: "#FFFFFF"
+                Material.foreground: Theme.textInv
                 onClicked: {
                     backend.applyUpdate()
                     updateBanner.visible = false
@@ -441,7 +441,7 @@ ApplicationWindow {
             Button {
                 text: "\u00D7"
                 flat: true
-                Material.foreground: "#FFFFFF"
+                Material.foreground: Theme.textInv
                 onClicked: updateBanner.visible = false
             }
         }
@@ -461,9 +461,9 @@ ApplicationWindow {
         z: 200
 
         background: Rectangle {
-            color: "#2B2D31"
+            color: Theme.bg2
             radius: 0
-            border.color: "#1E1F22"
+            border.color: Theme.border
             border.width: 1
         }
 
@@ -474,7 +474,7 @@ ApplicationWindow {
 
             Label {
                 text: "Invite link copied to clipboard:"
-                color: "#DCDDDE"
+                color: Theme.text
                 font.pixelSize: 11
             }
 
@@ -487,20 +487,20 @@ ApplicationWindow {
                     implicitHeight: 28
                     text: backend.invite_url
                     readOnly: true
-                    color: "#DCDDDE"
+                    color: Theme.text
                     font.pixelSize: 10
-                    background: Rectangle { color: "#383A40"; radius: 0 }
+                    background: Rectangle { color: Theme.bg3; radius: 0 }
                 }
 
                 Button {
                     icon.source: "qrc:/qt/qml/ConquerD/Client/icons/clipboard.svg"
                     icon.width: 16
                     icon.height: 16
-                    icon.color: "#DCDDDE"
+                    icon.color: Theme.text
                     implicitHeight: 28
                     implicitWidth: 36
                     flat: true
-                    Material.foreground: "#DCDDDE"
+                    Material.foreground: Theme.text
                     ToolTip.text: "Copy to clipboard"
                     ToolTip.visible: hovered
                     onClicked: {
@@ -654,14 +654,38 @@ ApplicationWindow {
                         clip: true
 
                         // Empty state
-                        Label {
+                        ColumnLayout {
                             anchors.centerIn: parent
                             visible: sfuRoomListModel.count === 0
-                            text: "Connect to a supernode\nto browse rooms."
-                            horizontalAlignment: Text.AlignHCenter
-                            color: Theme.muted
-                            font.pixelSize: 11
-                            wrapMode: Text.WordWrap
+                            width: Math.min(parent.width - 32, 170)
+                            spacing: 8
+
+                            Image {
+                                source: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg"
+                                sourceSize.width: 30
+                                sourceSize.height: 30
+                                Layout.preferredWidth: 30
+                                Layout.preferredHeight: 30
+                                Layout.alignment: Qt.AlignHCenter
+                                fillMode: Image.PreserveAspectFit
+                                opacity: 0.72
+                            }
+                            Label {
+                                text: "No rooms visible"
+                                horizontalAlignment: Text.AlignHCenter
+                                color: Theme.text
+                                font.pixelSize: 12
+                                font.bold: true
+                                Layout.fillWidth: true
+                            }
+                            Label {
+                                text: "Connect to a supernode to browse rooms."
+                                horizontalAlignment: Text.AlignHCenter
+                                color: Theme.muted
+                                font.pixelSize: 11
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
                         }
 
                         delegate: ItemDelegate {
@@ -763,14 +787,38 @@ ApplicationWindow {
                         model: nodeListModel
                         clip: true
 
-                        Label {
+                        ColumnLayout {
                             anchors.centerIn: parent
                             visible: nodeListModel.count === 0
-                            text: "No supernodes connected."
-                            horizontalAlignment: Text.AlignHCenter
-                            color: Theme.muted
-                            font.pixelSize: 11
-                            wrapMode: Text.WordWrap
+                            width: Math.min(parent.width - 32, 170)
+                            spacing: 8
+
+                            Image {
+                                source: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
+                                sourceSize.width: 30
+                                sourceSize.height: 30
+                                Layout.preferredWidth: 30
+                                Layout.preferredHeight: 30
+                                Layout.alignment: Qt.AlignHCenter
+                                fillMode: Image.PreserveAspectFit
+                                opacity: 0.72
+                            }
+                            Label {
+                                text: "No supernodes"
+                                horizontalAlignment: Text.AlignHCenter
+                                color: Theme.text
+                                font.pixelSize: 12
+                                font.bold: true
+                                Layout.fillWidth: true
+                            }
+                            Label {
+                                text: "Connected nodes and portals appear here."
+                                horizontalAlignment: Text.AlignHCenter
+                                color: Theme.muted
+                                font.pixelSize: 11
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
                         }
 
                         delegate: ItemDelegate {
@@ -880,11 +928,11 @@ ApplicationWindow {
                 Rectangle {
                     Layout.fillWidth: true
                     height: 36
-                    color: "#2B2D31"
+                    color: Theme.bg2
                     Label {
                         anchors.centerIn: parent
                         text: "Settings"
-                        color: "#DCDDDE"
+                        color: Theme.text
                         font.pixelSize: 12
                         font.bold: true
                     }
@@ -895,25 +943,51 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
-                    model: ["Audio", "Identity", "General", "AI",
-                            "Network", "Security", "Privacy", "Diagnostics"]
+                    model: ListModel {
+                        ListElement { label: "Audio"; icon: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg" }
+                        ListElement { label: "Identity"; icon: "qrc:/qt/qml/ConquerD/Client/icons/person.svg" }
+                        ListElement { label: "General"; icon: "qrc:/qt/qml/ConquerD/Client/icons/gear.svg" }
+                        ListElement { label: "AI"; icon: "qrc:/qt/qml/ConquerD/Client/icons/lightning.svg" }
+                        ListElement { label: "Network"; icon: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg" }
+                        ListElement { label: "Security"; icon: "qrc:/qt/qml/ConquerD/Client/icons/lock.svg" }
+                        ListElement { label: "Privacy"; icon: "qrc:/qt/qml/ConquerD/Client/icons/key.svg" }
+                        ListElement { label: "Diagnostics"; icon: "qrc:/qt/qml/ConquerD/Client/icons/logs.svg" }
+                    }
                     delegate: ItemDelegate {
                         id: _sNavItem
                         width: settingsNavList.width
                         height: 36
                         highlighted: index === settingsTab
                         background: Rectangle {
-                            color: _sNavItem.highlighted ? "#5865F2"
-                                 : _sNavItem.hovered ? "#36393F"
+                               color: _sNavItem.highlighted ? Theme.accent
+                                   : _sNavItem.hovered ? Theme.bg3
                                  : "transparent"
                         }
-                        contentItem: Label {
-                            leftPadding: 16
-                            text: modelData
-                            color: _sNavItem.highlighted ? "#FFFFFF" : "#B9BBBE"
-                            font.pixelSize: 12
-                            font.bold: _sNavItem.highlighted
-                            verticalAlignment: Text.AlignVCenter
+                        contentItem: RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 14
+                            anchors.rightMargin: 8
+                            spacing: 10
+
+                            Image {
+                                source: model.icon
+                                sourceSize.width: 16
+                                sourceSize.height: 16
+                                Layout.preferredWidth: 16
+                                Layout.preferredHeight: 16
+                                fillMode: Image.PreserveAspectFit
+                                opacity: _sNavItem.highlighted ? 1.0 : 0.72
+                            }
+
+                            Label {
+                                Layout.fillWidth: true
+                                text: model.label
+                                color: _sNavItem.highlighted ? Theme.textInv : Theme.muted
+                                font.pixelSize: 12
+                                font.bold: _sNavItem.highlighted
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                            }
                         }
                         onClicked: settingsTab = index
                     }

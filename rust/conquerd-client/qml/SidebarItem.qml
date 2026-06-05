@@ -2,7 +2,7 @@
 //
 // Usage:
 //   SidebarItem {
-//       icon: "icons/speech.svg"
+//       icon: "qrc:/qt/qml/ConquerD/Client/icons/speech.svg"
 //       label: "Chat"
 //       badge: 3        // 0 = no badge
 //       selected: true
@@ -46,10 +46,15 @@ ItemDelegate {
         anchors { fill: parent; leftMargin: 12; rightMargin: 8 }
         spacing: 10
 
-        Text {
-            text: root.icon
-            font.pixelSize: 18
+        Image {
+            source: root.icon
             visible: root.icon !== ""
+            sourceSize.width: 18
+            sourceSize.height: 18
+            Layout.preferredWidth: 18
+            Layout.preferredHeight: 18
+            fillMode: Image.PreserveAspectFit
+            opacity: root.selected ? 1.0 : 0.72
         }
 
         Text {

@@ -189,13 +189,17 @@ Item {
                     Layout.preferredWidth: 34
                     Layout.preferredHeight: 24
                     radius: 0
-                    color: preview.kindName === "youtube" ? "#FF0000" : Theme.bg3
-                    Text {
+                    color: preview.kindName === "youtube" ? Theme.danger : Theme.bg3
+                    Image {
                         anchors.centerIn: parent
-                        text: preview.kindName === "link" ? "\u2197" : "\u25B6"
-                        color: Theme.text
-                        font.pixelSize: 12
-                        font.bold: true
+                        source: preview.kindName === "link"
+                            ? "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
+                            : "qrc:/qt/qml/ConquerD/Client/icons/play.svg"
+                        sourceSize.width: 13
+                        sourceSize.height: 13
+                        width: 13
+                        height: 13
+                        fillMode: Image.PreserveAspectFit
                     }
                 }
 

@@ -230,7 +230,7 @@ Dialog {
                     onClicked: {
                         if (backend) backend.registerUriScheme()
                         root._setupDone = true
-                        uriLabel.text = "✓ Registered"
+                        uriLabel.text = "Registered"
                     }
                 }
                 Text {
@@ -248,7 +248,7 @@ Dialog {
                     onClicked: {
                         if (backend) backend.createDesktopShortcuts()
                         root._setupDone = true
-                        shortcutLabel.text = "✓ Created"
+                        shortcutLabel.text = "Created"
                     }
                 }
                 Text {
@@ -270,10 +270,13 @@ Dialog {
 
             Item { Layout.fillHeight: true }
 
-            Text {
-                text: "✓"
-                font.pixelSize: 48
-                color: Theme.online
+            Image {
+                source: "qrc:/qt/qml/ConquerD/Client/icons/check-circle.svg"
+                sourceSize.width: 48
+                sourceSize.height: 48
+                Layout.preferredWidth: 48
+                Layout.preferredHeight: 48
+                fillMode: Image.PreserveAspectFit
                 Layout.alignment: Qt.AlignHCenter
             }
             Text {

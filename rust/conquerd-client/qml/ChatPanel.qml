@@ -77,19 +77,35 @@ Item {
                     Layout.alignment: Qt.AlignVCenter
                 }
 
-                Text {
-                    text: root.selectedPeerName || root.selectedPeerId || "No peer selected"
-                    color: Theme.text
-                    font.pixelSize: 14
-                    font.bold: true
+                ColumnLayout {
                     Layout.fillWidth: true
-                    elide: Text.ElideRight
+                    spacing: 1
+
+                    Text {
+                        text: root.selectedPeerName || root.selectedPeerId || "No peer selected"
+                        color: Theme.text
+                        font.pixelSize: 14
+                        font.bold: true
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+
+                    Text {
+                        text: root.selectedPeerId === ""
+                            ? "Choose a peer to begin"
+                            : "Private trusted-peer conversation"
+                        color: Theme.muted
+                        font.pixelSize: Theme.fontSizeCaption
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
                 }
 
                 ToolButton {
                     icon.source: "qrc:/qt/qml/ConquerD/Client/icons/search.svg"
                     icon.width: 18
                     icon.height: 18
+                    visible: root.selectedPeerId !== ""
                     flat: true
                     ToolTip.text: "Search messages"
                     ToolTip.visible: hovered
@@ -143,9 +159,11 @@ Item {
                 }
 
                 ToolButton {
-                    text: "X"
+                    icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
+                    icon.width: 12
+                    icon.height: 12
+                    icon.color: Theme.muted
                     flat: true
-                    font.pixelSize: 13
                     onClicked: {
                         root._searchOpen = false
                         root._searchText = ""
@@ -177,6 +195,47 @@ Item {
             verticalLayoutDirection: ListView.BottomToTop
             spacing: 2
             onCountChanged: Qt.callLater(function() { msgList.positionViewAtBeginning() })
+
+            ColumnLayout {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - 48, 260)
+                spacing: 10
+                visible: root.selectedPeerId === "" || msgList.count === 0
+
+                Image {
+                    source: root.selectedPeerId === ""
+                        ? "qrc:/qt/qml/ConquerD/Client/icons/speech.svg"
+                        : "qrc:/qt/qml/ConquerD/Client/icons/send.svg"
+                    sourceSize.width: 40
+                    sourceSize.height: 40
+                    Layout.preferredWidth: 40
+                    Layout.preferredHeight: 40
+                    Layout.alignment: Qt.AlignHCenter
+                    fillMode: Image.PreserveAspectFit
+                    opacity: 0.72
+                }
+
+                Text {
+                    text: root.selectedPeerId === "" ? "Select a peer" : "No messages yet"
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeTitle
+                    font.bold: true
+                    horizontalAlignment: Text.AlignHCenter
+                    Layout.fillWidth: true
+                }
+
+                Text {
+                    text: root.selectedPeerId === ""
+                        ? "Choose a trusted peer from the left rail to open a private conversation."
+                        : "Send a message or attach a file to start this conversation."
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeCaption
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    lineHeight: 1.3
+                    Layout.fillWidth: true
+                }
+            }
 
             delegate: ChatRichMessageDelegate {
                 property bool searchMatch: root._searchText === "" ||
@@ -365,11 +424,13 @@ Item {
                             root.aiStreaming = false
                         }
                     }
-                    Button {
-                        text: "X"
+                    ToolButton {
+                        icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
+                        icon.width: 12
+                        icon.height: 12
+                        icon.color: Theme.muted
                         visible: !root.aiStreaming
                         flat: true
-                        font.pixelSize: 11
                         onClicked: {
                             root.aiResponse = ""
                             root.aiError = ""

@@ -76,15 +76,41 @@ Rectangle {
             }
 
             // Empty state
-            Text {
+            ColumnLayout {
                 anchors.centerIn: parent
                 visible: root.peerCount === 0
-                text: "No peers yet.\nPaste an invite link\nabove to add one."
-                horizontalAlignment: Text.AlignHCenter
-                color: Theme.muted
-                font.pixelSize: Theme.fontSizeCaption
-                wrapMode: Text.WordWrap
-                lineHeight: 1.4
+                width: Math.min(parent.width - 32, 170)
+                spacing: 8
+
+                Image {
+                    source: "qrc:/qt/qml/ConquerD/Client/icons/peers.svg"
+                    sourceSize.width: 32
+                    sourceSize.height: 32
+                    Layout.preferredWidth: 32
+                    Layout.preferredHeight: 32
+                    Layout.alignment: Qt.AlignHCenter
+                    fillMode: Image.PreserveAspectFit
+                    opacity: 0.72
+                }
+
+                Text {
+                    text: "No peers yet"
+                    horizontalAlignment: Text.AlignHCenter
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeBody
+                    font.bold: true
+                    Layout.fillWidth: true
+                }
+
+                Text {
+                    text: "Paste an invite above to add a trusted peer."
+                    horizontalAlignment: Text.AlignHCenter
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeCaption
+                    wrapMode: Text.WordWrap
+                    lineHeight: 1.3
+                    Layout.fillWidth: true
+                }
             }
 
             delegate: Rectangle {

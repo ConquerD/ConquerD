@@ -54,33 +54,35 @@ Item {
         id: toolbar
         anchors { top: parent.top; left: parent.left; right: parent.right }
         height: 40
-        color: "#1E2124"
+        color: Theme.bg1
 
         RowLayout {
             anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
             spacing: 4
 
             // Back button
-            Button {
+            ToolButton {
                 id: _backBtn
-                text: "‹"
+                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/connect.svg"
+                icon.width: 14
+                icon.height: 14
+                icon.color: _webView.loading ? Theme.muted : Theme.text
                 flat: true
                 implicitWidth: 32; implicitHeight: 30
-                font.pixelSize: 16
-                Material.foreground: _webView.loading ? "#5D6A73" : "#DCDDDE"
                 enabled: !_webView.loading
                 onClicked: _webView.goBack()
                 ToolTip.text: "Back"; ToolTip.visible: hovered
             }
 
             // Forward button
-            Button {
+            ToolButton {
                 id: _fwdBtn
-                text: "›"
+                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/send.svg"
+                icon.width: 14
+                icon.height: 14
+                icon.color: _webView.loading ? Theme.muted : Theme.text
                 flat: true
                 implicitWidth: 32; implicitHeight: 30
-                font.pixelSize: 16
-                Material.foreground: _webView.loading ? "#5D6A73" : "#DCDDDE"
                 enabled: !_webView.loading
                 onClicked: _webView.goForward()
                 ToolTip.text: "Forward"; ToolTip.visible: hovered
@@ -94,7 +96,7 @@ Item {
                     : "qrc:/qt/qml/ConquerD/Client/icons/refresh.svg"
                 icon.width: 14
                 icon.height: 14
-                icon.color: "#DCDDDE"
+                icon.color: Theme.text
                 flat: true
                 implicitWidth: 32
                 implicitHeight: 30
@@ -108,11 +110,11 @@ Item {
                 Layout.fillWidth: true
                 implicitHeight: 28
                 font.pixelSize: 11
-                color: "#DCDDDE"
+                color: Theme.text
                 placeholderText: "Enter URL or search…"
                 background: Rectangle {
-                    color: "#111214"
-                    border.color: _addressBar.activeFocus ? Theme.accent : "#2F3136"
+                    color: Theme.bg0
+                    border.color: _addressBar.activeFocus ? Theme.accent : Theme.bg3
                     border.width: 1
                     radius: 0
                 }
@@ -135,12 +137,13 @@ Item {
             }
 
             // Open in system browser
-            Button {
-                text: "⬡"
+            ToolButton {
+                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
+                icon.width: 14
+                icon.height: 14
+                icon.color: Theme.muted
                 flat: true
                 implicitWidth: 32; implicitHeight: 30
-                font.pixelSize: 13
-                Material.foreground: "#8E9297"
                 ToolTip.text: "Open in system browser"
                 ToolTip.visible: hovered
                 // Hidden for conquerd:// URLs — they can only be served
@@ -177,21 +180,31 @@ Item {
         id: _privacyBar
         anchors { top: toolbar.bottom; left: parent.left; right: parent.right }
         height: visible ? 30 : 0
-        color: "#2F3136"
+        color: Theme.bg2
         visible: false   // set true on first navigateTo() until acknowledged
 
         RowLayout {
             anchors { fill: parent; leftMargin: 10; rightMargin: 6 }
+            Image {
+                source: "qrc:/qt/qml/ConquerD/Client/icons/lock.svg"
+                sourceSize.width: 12
+                sourceSize.height: 12
+                Layout.preferredWidth: 12
+                Layout.preferredHeight: 12
+                fillMode: Image.PreserveAspectFit
+            }
             Label {
                 Layout.fillWidth: true
-                text: "🔒 Off-the-record — no cookies or history are saved."
-                color: "#8E9297"
+                text: "Off-the-record - no cookies or history are saved."
+                color: Theme.muted
                 font.pixelSize: 10
             }
-            Button {
-                text: "✕"
+            ToolButton {
+                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
+                icon.width: 12
+                icon.height: 12
+                icon.color: Theme.muted
                 flat: true; implicitWidth: 24; implicitHeight: 24
-                font.pixelSize: 11; Material.foreground: "#8E9297"
                 onClicked: _privacyBar.visible = false
             }
         }

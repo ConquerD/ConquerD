@@ -76,7 +76,7 @@ Item {
                 spacing: 10
 
                 // ── Input mode toggle ─────────────────────────────────────
-                Label { text: "Input mode"; color: "#B9BBBE"; font.pixelSize: 12 }
+                Label { text: "Input mode"; color: Theme.muted; font.pixelSize: 12 }
 
                 RowLayout {
                     spacing: 0
@@ -85,13 +85,13 @@ Item {
 
                     Rectangle {
                         width: 130; height: 30; radius: 0
-                        color: parent.pttOn ? "#5865F2" : "#383A40"
-                        border.color: parent.pttOn ? "#5865F2" : "#4F545C"
+                        color: parent.pttOn ? Theme.accent : Theme.bg3
+                        border.color: parent.pttOn ? Theme.accent : Theme.divider
                         border.width: 1
                         Label {
                             anchors.centerIn: parent
                             text: "Push to Talk"
-                            color: parent.parent.pttOn ? "#FFFFFF" : "#B9BBBE"
+                            color: parent.parent.pttOn ? Theme.textInv : Theme.muted
                             font.pixelSize: 12
                             font.bold: parent.parent.pttOn
                         }
@@ -107,13 +107,13 @@ Item {
                     }
                     Rectangle {
                         width: 130; height: 30; radius: 0
-                        color: parent.vadOn ? "#5865F2" : "#383A40"
-                        border.color: parent.vadOn ? "#5865F2" : "#4F545C"
+                        color: parent.vadOn ? Theme.accent : Theme.bg3
+                        border.color: parent.vadOn ? Theme.accent : Theme.divider
                         border.width: 1
                         Label {
                             anchors.centerIn: parent
                             text: "Voice Activation"
-                            color: parent.parent.vadOn ? "#FFFFFF" : "#B9BBBE"
+                            color: parent.parent.vadOn ? Theme.textInv : Theme.muted
                             font.pixelSize: 12
                             font.bold: parent.parent.vadOn
                         }
@@ -133,7 +133,7 @@ Item {
                 RowLayout {
                     visible: root.settings ? root.settings.push_to_talk : false
                     spacing: 8
-                    Label { text: "PTT key"; color: "#B9BBBE" }
+                    Label { text: "PTT key"; color: Theme.muted }
 
                     FocusScope {
                         id: pttCapture
@@ -175,15 +175,15 @@ Item {
 
                         Rectangle {
                             anchors.fill: parent; radius: 0
-                            color: pttCapture.capturing ? "#5865F2" : "#383A40"
-                            border.color: pttCapture.capturing ? "#5865F2" : "#4F545C"; border.width: 1
+                            color: pttCapture.capturing ? Theme.accent : Theme.bg3
+                            border.color: pttCapture.capturing ? Theme.accent : Theme.divider; border.width: 1
 
                             Label {
                                 anchors.centerIn: parent
                                 text: pttCapture.capturing
                                     ? "Press a key or click…"
                                     : (root.settings ? root.settings.ptt_key : "space")
-                                color: pttCapture.capturing ? "#FFFFFF" : "#DCDDDE"
+                                color: pttCapture.capturing ? Theme.textInv : Theme.text
                                 font.pixelSize: 12
                             }
 
@@ -213,14 +213,14 @@ Item {
 
                     Label {
                         text: "Click the box, then press a key or mouse button"
-                        color: "#8E9297"; font.pixelSize: 11
+                        color: Theme.muted; font.pixelSize: 11
                     }
                 }
 
                 // ── Noise suppression ─────────────────────────────────────
                 RowLayout {
                     spacing: 8
-                    Label { text: "Noise suppression"; color: "#B9BBBE" }
+                    Label { text: "Noise suppression"; color: Theme.muted }
                     ComboBox {
                         id: noiseCombo
                         width: 150
@@ -245,7 +245,7 @@ Item {
                 // ── Jitter buffer ─────────────────────────────────────────
                 RowLayout {
                     spacing: 8
-                    Label { text: "Jitter buffer depth"; color: "#B9BBBE" }
+                    Label { text: "Jitter buffer depth"; color: Theme.muted }
                     SpinBox {
                         from: 1; to: 20
                         value: root.settings ? root.settings.jitter_buffer_depth : 3
@@ -257,12 +257,12 @@ Item {
                             }
                         }
                     }
-                    Label { text: "packets"; color: "#8E9297"; font.pixelSize: 11 }
+                    Label { text: "packets"; color: Theme.muted; font.pixelSize: 11 }
                 }
 
                 // ── Volume sliders ────────────────────────────────────────
                 RowLayout {
-                    Label { text: "Microphone volume"; color: "#B9BBBE" }
+                    Label { text: "Microphone volume"; color: Theme.muted }
                     Slider {
                         from: 0; to: 200; stepSize: 1
                         value: root.settings ? root.settings.input_volume : 100
@@ -277,12 +277,12 @@ Item {
                     }
                     Label {
                         text: (root.settings ? root.settings.input_volume : 100) + "%"
-                        color: "#B9BBBE"; width: 36
+                        color: Theme.muted; width: 36
                     }
                 }
 
                 RowLayout {
-                    Label { text: "Speaker volume"; color: "#B9BBBE" }
+                    Label { text: "Speaker volume"; color: Theme.muted }
                     Slider {
                         from: 0; to: 200; stepSize: 1
                         value: root.settings ? root.settings.output_volume : 100
@@ -297,7 +297,7 @@ Item {
                     }
                     Label {
                         text: (root.settings ? root.settings.output_volume : 100) + "%"
-                        color: "#B9BBBE"; width: 36
+                        color: Theme.muted; width: 36
                     }
                 }
 
@@ -306,7 +306,7 @@ Item {
                 // Audio section first becomes visible.
                 RowLayout {
                     spacing: 8
-                    Label { text: "Input device"; color: "#B9BBBE"; Layout.preferredWidth: 110 }
+                    Label { text: "Input device"; color: Theme.muted; Layout.preferredWidth: 110 }
                     ComboBox {
                         id: inputDeviceCombo
                         Layout.fillWidth: true
@@ -328,12 +328,12 @@ Item {
                         }
                         contentItem: Text {
                             leftPadding: 8; text: inputDeviceCombo.displayText
-                            color: "#DCDDDE"; font.pixelSize: 12; verticalAlignment: Text.AlignVCenter
+                            color: Theme.text; font.pixelSize: 12; verticalAlignment: Text.AlignVCenter
                             elide: Text.ElideRight
                         }
                         background: Rectangle {
-                            color: "#383A40"; radius: 0
-                            border.color: inputDeviceCombo.activeFocus ? "#5865F2" : "#4E5058"; border.width: 1
+                            color: Theme.bg3; radius: 0
+                            border.color: inputDeviceCombo.activeFocus ? Theme.accent : Theme.divider; border.width: 1
                         }
                         popup: Popup {
                             width: inputDeviceCombo.width
@@ -342,14 +342,14 @@ Item {
                                 model: inputDeviceCombo.popup.visible ? inputDeviceCombo.delegateModel : null
                                 ScrollIndicator.vertical: ScrollIndicator {}
                             }
-                            background: Rectangle { color: "#383A40"; radius: 0; border.color: "#4E5058"; border.width: 1 }
+                            background: Rectangle { color: Theme.bg3; radius: 0; border.color: Theme.divider; border.width: 1 }
                         }
                     }
                 }
 
                 RowLayout {
                     spacing: 8
-                    Label { text: "Output device"; color: "#B9BBBE"; Layout.preferredWidth: 110 }
+                    Label { text: "Output device"; color: Theme.muted; Layout.preferredWidth: 110 }
                     ComboBox {
                         id: outputDeviceCombo
                         Layout.fillWidth: true
@@ -370,12 +370,12 @@ Item {
                         }
                         contentItem: Text {
                             leftPadding: 8; text: outputDeviceCombo.displayText
-                            color: "#DCDDDE"; font.pixelSize: 12; verticalAlignment: Text.AlignVCenter
+                            color: Theme.text; font.pixelSize: 12; verticalAlignment: Text.AlignVCenter
                             elide: Text.ElideRight
                         }
                         background: Rectangle {
-                            color: "#383A40"; radius: 0
-                            border.color: outputDeviceCombo.activeFocus ? "#5865F2" : "#4E5058"; border.width: 1
+                            color: Theme.bg3; radius: 0
+                            border.color: outputDeviceCombo.activeFocus ? Theme.accent : Theme.divider; border.width: 1
                         }
                         popup: Popup {
                             width: outputDeviceCombo.width
@@ -384,7 +384,7 @@ Item {
                                 model: outputDeviceCombo.popup.visible ? outputDeviceCombo.delegateModel : null
                                 ScrollIndicator.vertical: ScrollIndicator {}
                             }
-                            background: Rectangle { color: "#383A40"; radius: 0; border.color: "#4E5058"; border.width: 1 }
+                            background: Rectangle { color: Theme.bg3; radius: 0; border.color: Theme.divider; border.width: 1 }
                         }
                     }
                 }
@@ -416,17 +416,17 @@ Item {
                 // ── Mic / speaker test ────────────────────────────────────
                 RowLayout {
                     spacing: 10
-                    Label { text: "Mic test"; color: "#B9BBBE" }
+                    Label { text: "Mic test"; color: Theme.muted }
 
                     // Level bar
                     Rectangle {
-                        width: 90; height: 10; radius: 0; color: "#383A40"
+                        width: 90; height: 10; radius: 0; color: Theme.bg3
                         Rectangle {
                             width: parent.width * (backend ? Math.min(backend.mic_level, 1.0) : 0)
                             height: parent.height; radius: 0
                             color: {
                                 var lv = backend ? backend.mic_level : 0
-                                return lv > 0.85 ? "#e03428" : lv > 0.55 ? "#f0a020" : "#43b581"
+                                return lv > 0.85 ? Theme.danger : lv > 0.55 ? Theme.warn : Theme.online
                             }
                             Behavior on width { NumberAnimation { duration: 40 } }
                         }
@@ -449,7 +449,7 @@ Item {
 
                     Label {
                         text: "Use headphones to avoid feedback"
-                        color: "#8E9297"; font.pixelSize: 11
+                        color: Theme.muted; font.pixelSize: 11
                     }
                 }
             }
@@ -542,13 +542,14 @@ Item {
                                     Layout.fillWidth: true
                                     spacing: 4
 
-                                    Label { text: "Display name"; color: "#B9BBBE" }
+                                    Label { text: "Display name"; color: Theme.muted }
                                     TextField {
                                         Layout.fillWidth: true
                                         text: root.settings ? root.settings.local_handle : ""
                                         placeholderText: "Optional display name"
-                                        color: "#DCDDDE"
-                                        background: Rectangle { color: "#383A40"; radius: 0 }
+                                        color: Theme.text
+                                        placeholderTextColor: Theme.muted
+                                        background: Rectangle { color: Theme.bg3; radius: 0 }
                                         onEditingFinished: if (root.settings) root.settings.local_handle = text
                                     }
                                 }
@@ -556,7 +557,7 @@ Item {
 
                             Label {
                                 text: "Public ID: " + (backend.public_id || "(loading...)")
-                                color: "#8E9297"
+                                color: Theme.muted
                                 font.pixelSize: 11
                                 wrapMode: Text.WrapAnywhere
                                 Layout.fillWidth: true
@@ -634,10 +635,10 @@ Item {
                                 columnSpacing: 10
                                 rowSpacing: 3
 
-                                Label { text: "COLOUR"; color: "#5865F2"; font.pixelSize: 10; font.bold: true
+                                Label { text: "COLOUR"; color: Theme.accent; font.pixelSize: 10; font.bold: true
                                         Layout.columnSpan: 2; bottomPadding: 1 }
 
-                                Label { text: "Grid size"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Grid size"; color: Theme.muted; font.pixelSize: 12 }
                                 ComboBox {
                                     implicitHeight: 22; font.pixelSize: 11
                                     model: [8, 12, 16, 20, 24]
@@ -648,45 +649,45 @@ Item {
                                     onActivated: avatarTab._setCfg("grid", parseInt(currentText))
                                 }
 
-                                Label { text: "Saturation"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Saturation"; color: Theme.muted; font.pixelSize: 12 }
                                 Slider {
                                     Layout.fillWidth: true; from: 0.1; to: 1.0; stepSize: 0.01
                                     value: avatarTab._getCfg("sat", 0.55)
                                     onMoved: avatarTab._setCfg("sat", parseFloat(value.toFixed(2)))
                                 }
 
-                                Label { text: "Lightness"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Lightness"; color: Theme.muted; font.pixelSize: 12 }
                                 Slider {
                                     Layout.fillWidth: true; from: 0.1; to: 0.9; stepSize: 0.01
                                     value: avatarTab._getCfg("lig", 0.55)
                                     onMoved: avatarTab._setCfg("lig", parseFloat(value.toFixed(2)))
                                 }
 
-                                Label { text: "Hue spread"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Hue spread"; color: Theme.muted; font.pixelSize: 12 }
                                 Slider {
                                     Layout.fillWidth: true; from: 0.0; to: 0.5; stepSize: 0.01
                                     value: avatarTab._getCfg("spread", 0.15)
                                     onMoved: avatarTab._setCfg("spread", parseFloat(value.toFixed(2)))
                                 }
 
-                                Label { text: "BG tint"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "BG tint"; color: Theme.muted; font.pixelSize: 12 }
                                 Switch {
                                     scale: 0.72; Layout.preferredHeight: 34
                                     checked: avatarTab._getCfg("bg_tint", true)
                                     onToggled: avatarTab._setCfg("bg_tint", checked)
                                 }
 
-                                Label { text: "BG lightness"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "BG lightness"; color: Theme.muted; font.pixelSize: 12 }
                                 Slider {
                                     Layout.fillWidth: true; from: 0.0; to: 0.35; stepSize: 0.01
                                     value: avatarTab._getCfg("bg_lig", 0.12)
                                     onMoved: avatarTab._setCfg("bg_lig", parseFloat(value.toFixed(2)))
                                 }
 
-                                Label { text: "SHADING & STYLE"; color: "#5865F2"; font.pixelSize: 10; font.bold: true
+                                Label { text: "SHADING & STYLE"; color: Theme.accent; font.pixelSize: 10; font.bold: true
                                         Layout.columnSpan: 2; topPadding: 6; bottomPadding: 1 }
 
-                                Label { text: "Shade mode"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Shade mode"; color: Theme.muted; font.pixelSize: 12 }
                                 ComboBox {
                                     implicitHeight: 22; font.pixelSize: 11
                                     model: ["flat", "gradient", "radial"]
@@ -694,31 +695,31 @@ Item {
                                     onActivated: avatarTab._setCfg("shade_mode", currentIndex + 1)
                                 }
 
-                                Label { text: "Crisp edges"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Crisp edges"; color: Theme.muted; font.pixelSize: 12 }
                                 Switch {
                                     scale: 0.72; Layout.preferredHeight: 34
                                     checked: avatarTab._getCfg("svg_crisp", true)
                                     onToggled: avatarTab._setCfg("svg_crisp", checked)
                                 }
 
-                                Label { text: "Rounded cells"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Rounded cells"; color: Theme.muted; font.pixelSize: 12 }
                                 Switch {
                                     scale: 0.72; Layout.preferredHeight: 34
                                     checked: avatarTab._getCfg("svg_round_cells", false)
                                     onToggled: avatarTab._setCfg("svg_round_cells", checked)
                                 }
 
-                                Label { text: "DUAL HUE"; color: "#5865F2"; font.pixelSize: 10; font.bold: true
+                                Label { text: "DUAL HUE"; color: Theme.accent; font.pixelSize: 10; font.bold: true
                                         Layout.columnSpan: 2; topPadding: 6; bottomPadding: 1 }
 
-                                Label { text: "Enable"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Enable"; color: Theme.muted; font.pixelSize: 12 }
                                 Switch {
                                     scale: 0.72; Layout.preferredHeight: 34
                                     checked: avatarTab._getCfg("dual_hue", false)
                                     onToggled: avatarTab._setCfg("dual_hue", checked)
                                 }
 
-                                Label { text: "Mode"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Mode"; color: Theme.muted; font.pixelSize: 12 }
                                 ComboBox {
                                     implicitHeight: 22; font.pixelSize: 11
                                     model: ["topbot", "leftright", "diagonal", "checker"]
@@ -730,17 +731,17 @@ Item {
                                     onActivated: avatarTab._setCfg("dual_hue_mode", currentText)
                                 }
 
-                                Label { text: "ISLANDS"; color: "#5865F2"; font.pixelSize: 10; font.bold: true
+                                Label { text: "ISLANDS"; color: Theme.accent; font.pixelSize: 10; font.bold: true
                                         Layout.columnSpan: 2; topPadding: 6; bottomPadding: 1 }
 
-                                Label { text: "Enable"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Enable"; color: Theme.muted; font.pixelSize: 12 }
                                 Switch {
                                     scale: 0.72; Layout.preferredHeight: 34
                                     checked: avatarTab._getCfg("islands", true)
                                     onToggled: avatarTab._setCfg("islands", checked)
                                 }
 
-                                Label { text: "Connectivity"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Connectivity"; color: Theme.muted; font.pixelSize: 12 }
                                 ComboBox {
                                     implicitHeight: 22; font.pixelSize: 11
                                     model: ["4-conn", "8-conn"]
@@ -748,14 +749,14 @@ Item {
                                     onActivated: avatarTab._setCfg("island_conn", currentIndex === 1 ? 8 : 4)
                                 }
 
-                                Label { text: "Island step"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Island step"; color: Theme.muted; font.pixelSize: 12 }
                                 Slider {
                                     Layout.fillWidth: true; from: 0.1; to: 1.0; stepSize: 0.01
                                     value: avatarTab._getCfg("island_step", 0.62)
                                     onMoved: avatarTab._setCfg("island_step", parseFloat(value.toFixed(2)))
                                 }
 
-                                Label { text: "Varied sat"; color: "#B9BBBE"; font.pixelSize: 12 }
+                                Label { text: "Varied sat"; color: Theme.muted; font.pixelSize: 12 }
                                 Switch {
                                     scale: 0.72; Layout.preferredHeight: 34
                                     checked: avatarTab._getCfg("island_varsat", true)
@@ -817,7 +818,7 @@ Item {
                 // ── Appearance ───────────────────────────────────────────
                 RowLayout {
                     spacing: 8
-                    Label { text: "Theme"; color: "#B9BBBE" }
+                    Label { text: "Theme"; color: Theme.muted }
                     ComboBox {
                         id: themeCombo
                         width: 130
@@ -865,14 +866,15 @@ Item {
                     enabled: ollamaEnabledCheck.checked
                     opacity: enabled ? 1.0 : 0.45
 
-                    Label { text: "Base URL"; color: "#B9BBBE" }
+                    Label { text: "Base URL"; color: Theme.muted }
                     TextField {
                         id: ollamaUrlField
                         Layout.fillWidth: true
                         text: root.settings ? root.settings.ollama_base_url : "http://localhost:11434"
                         placeholderText: "http://localhost:11434"
-                        color: "#DCDDDE"
-                        background: Rectangle { color: "#383A40"; radius: 0 }
+                        color: Theme.text
+                        placeholderTextColor: Theme.muted
+                        background: Rectangle { color: Theme.bg3; radius: 0 }
                         onEditingFinished: {
                             if (root.settings) root.settings.ollama_base_url = text
                             // Re-fetch models whenever the URL changes
@@ -883,7 +885,7 @@ Item {
                         }
                     }
 
-                    Label { text: "Model"; color: "#B9BBBE" }
+                    Label { text: "Model"; color: Theme.muted }
                     RowLayout {
                         spacing: 4
                         Layout.fillWidth: true
@@ -899,17 +901,19 @@ Item {
                             contentItem: TextField {
                                 text: ollamaModelCombo.editText
                                 onTextChanged: ollamaModelCombo.editText = text
-                                color: "#DCDDDE"
-                                background: Rectangle { color: "#383A40"; radius: 0 }
+                                color: Theme.text
+                                background: Rectangle { color: Theme.bg3; radius: 0 }
                                 leftPadding: 6
                             }
-                            background: Rectangle { color: "#383A40"; radius: 0 }
+                            background: Rectangle { color: Theme.bg3; radius: 0 }
                         }
-                        Button {
-                            text: "\u21BB"
+                        ToolButton {
+                            icon.source: "qrc:/qt/qml/ConquerD/Client/icons/refresh.svg"
+                            icon.width: 14
+                            icon.height: 14
+                            icon.color: Theme.muted
                             flat: true
                             implicitWidth: 32; implicitHeight: 32
-                            font.pixelSize: 16
                             ToolTip.text: "Fetch available models from Ollama"
                             ToolTip.visible: hovered
                             onClicked: {
@@ -923,12 +927,12 @@ Item {
                     Item {}  // spacer for grid alignment
                     Label {
                         id: ollamaModelStatus
-                        text: "Click \u21BB to load available models"
-                        color: "#8E9297"; font.pixelSize: 11
+                        text: "Use refresh to load available models"
+                        color: Theme.muted; font.pixelSize: 11
                         wrapMode: Text.Wrap; Layout.fillWidth: true
                     }
 
-                    Label { text: "System Prompt"; color: "#B9BBBE"; Layout.alignment: Qt.AlignTop }
+                    Label { text: "System Prompt"; color: Theme.muted; Layout.alignment: Qt.AlignTop }
                     ScrollView {
                         Layout.fillWidth: true
                         implicitHeight: 80
@@ -938,8 +942,9 @@ Item {
                             text: root.settings ? root.settings.ollama_system_prompt
                                                : "You are a helpful assistant."
                             placeholderText: "You are a helpful assistant."
-                            color: "#DCDDDE"
-                            background: Rectangle { color: "#383A40"; radius: 0 }
+                            color: Theme.text
+                            placeholderTextColor: Theme.muted
+                            background: Rectangle { color: Theme.bg3; radius: 0 }
                             onEditingFinished: if (root.settings) root.settings.ollama_system_prompt = text
                         }
                     }
@@ -962,7 +967,7 @@ Item {
 
                 Label {
                     text: "Ollama must be running locally. Responses are never sent off-device."
-                    color: "#8E9297"; font.pixelSize: 11
+                    color: Theme.muted; font.pixelSize: 11
                     wrapMode: Text.Wrap; Layout.fillWidth: true
                 }
             }
@@ -1032,14 +1037,14 @@ Item {
 
                 RowLayout {
                     spacing: 8
-                    Label { text: "Relay port (0 = automatic)"; color: "#B9BBBE" }
+                    Label { text: "Relay port (0 = automatic)"; color: Theme.muted }
                     TextField {
                         text: root.settings ? root.settings.relay_port.toString() : "0"
                         inputMethodHints: Qt.ImhDigitsOnly
                         validator: IntValidator { bottom: 0; top: 65535 }
                         onEditingFinished: if (root.settings) root.settings.relay_port = parseInt(text) || 0
-                        color: "#DCDDDE"
-                        background: Rectangle { color: "#383A40"; radius: 0 }
+                        color: Theme.text
+                        background: Rectangle { color: Theme.bg3; radius: 0 }
                         width: 70
                     }
                 }
@@ -1066,7 +1071,7 @@ Item {
 
                 RowLayout {
                     spacing: 8
-                    Label { text: "Build attestation"; color: "#B9BBBE" }
+                    Label { text: "Build attestation"; color: Theme.muted }
                     ComboBox {
                         id: attCombo
                         width: 130
@@ -1082,7 +1087,7 @@ Item {
 
                 Label {
                     text: "Warn: challenge peers after handshake · Strict: deny relay for invalid attestation"
-                    color: "#8E9297"; font.pixelSize: 11
+                    color: Theme.muted; font.pixelSize: 11
                     wrapMode: Text.Wrap; Layout.fillWidth: true
                 }
 
@@ -1124,19 +1129,19 @@ Item {
 
                 Label {
                     text: "Chat messages are stored encrypted on this device only."
-                    color: "#8E9297"; font.pixelSize: 11
+                    color: Theme.muted; font.pixelSize: 11
                     wrapMode: Text.Wrap; Layout.fillWidth: true
                 }
 
                 Label {
                     text: "Stored messages: " + privacyBox.storedCount
-                    color: "#B9BBBE"
+                    color: Theme.muted
                 }
 
                 // ── Trim by age ──────────────────────────────────────
                 RowLayout {
                     spacing: 8
-                    Label { text: "Trim messages older than"; color: "#B9BBBE" }
+                    Label { text: "Trim messages older than"; color: Theme.muted }
                     SpinBox {
                         id: trimAgeSpin
                         from: 1; to: 3650; value: 30
@@ -1157,7 +1162,7 @@ Item {
                 // ── Trim by count ────────────────────────────────────
                 RowLayout {
                     spacing: 8
-                    Label { text: "Keep most recent"; color: "#B9BBBE" }
+                    Label { text: "Keep most recent"; color: Theme.muted }
                     SpinBox {
                         id: trimCountSpin
                         from: 1; to: 100000; value: 500
@@ -1165,7 +1170,7 @@ Item {
                         valueFromText: function(t) { return parseInt(t) || 500 }
                         implicitWidth: 110
                     }
-                    Label { text: "per conversation"; color: "#B9BBBE" }
+                    Label { text: "per conversation"; color: Theme.muted }
                     Button {
                         text: "Trim to Limit"
                         font.pixelSize: 12
@@ -1185,7 +1190,7 @@ Item {
 
                     Label {
                         text: "This will permanently delete ALL chat history. Are you sure?"
-                        color: "#ED4245"; wrapMode: Text.Wrap; Layout.fillWidth: true
+                        color: Theme.danger; wrapMode: Text.Wrap; Layout.fillWidth: true
                         font.pixelSize: 11
                     }
                     RowLayout {
@@ -1193,8 +1198,8 @@ Item {
                         Button {
                             text: "Yes, delete everything"
                             font.pixelSize: 12
-                            background: Rectangle { color: "#ED4245"; radius: 0 }
-                            contentItem: Text { text: parent.text; color: "#FFFFFF"; font: parent.font; horizontalAlignment: Text.AlignHCenter }
+                            background: Rectangle { color: Theme.danger; radius: 0 }
+                            contentItem: Text { text: parent.text; color: Theme.textInv; font: parent.font; horizontalAlignment: Text.AlignHCenter }
                             onClicked: {
                                 if (backend) backend.purgeAllChatHistory()
                                 privacyBox.storedCount = backend ? backend.getStoredMessageCount() : 0
@@ -1214,8 +1219,8 @@ Item {
                     visible: !privacyBox._confirmPurge
                     text: "Purge All Chat History"
                     font.pixelSize: 12
-                    background: Rectangle { color: "#ED4245"; radius: 0 }
-                    contentItem: Text { text: parent.text; color: "#FFFFFF"; font: parent.font; horizontalAlignment: Text.AlignHCenter }
+                    background: Rectangle { color: Theme.danger; radius: 0 }
+                    contentItem: Text { text: parent.text; color: Theme.textInv; font: parent.font; horizontalAlignment: Text.AlignHCenter }
                     onClicked: privacyBox._confirmPurge = true
                 }
 
@@ -1225,7 +1230,7 @@ Item {
                 }
                 Label {
                     text: "Removes the saved key from your OS keyring and quits. You will need your passphrase on next launch."
-                    color: "#8E9297"; font.pixelSize: 11
+                    color: Theme.muted; font.pixelSize: 11
                     wrapMode: Text.Wrap; Layout.fillWidth: true
                 }
 
@@ -1235,15 +1240,15 @@ Item {
 
                     Label {
                         text: "Lock identity and quit now?"
-                        color: "#ED4245"; font.pixelSize: 11
+                        color: Theme.danger; font.pixelSize: 11
                     }
                     RowLayout {
                         spacing: 8
                         Button {
                             text: "Yes, lock & quit"
                             font.pixelSize: 12
-                            background: Rectangle { color: "#ED4245"; radius: 0 }
-                            contentItem: Text { text: parent.text; color: "#FFFFFF"; font: parent.font; horizontalAlignment: Text.AlignHCenter }
+                            background: Rectangle { color: Theme.danger; radius: 0 }
+                            contentItem: Text { text: parent.text; color: Theme.textInv; font: parent.font; horizontalAlignment: Text.AlignHCenter }
                             onClicked: if (backend) backend.lockIdentityAndQuit()
                         }
                         Button {
@@ -1259,8 +1264,8 @@ Item {
                     visible: !privacyBox._confirmLock
                     text: "Lock Identity \u0026 Quit"
                     font.pixelSize: 12
-                    background: Rectangle { color: "#ED4245"; radius: 0 }
-                    contentItem: Text { text: parent.text; color: "#FFFFFF"; font: parent.font; horizontalAlignment: Text.AlignHCenter }
+                    background: Rectangle { color: Theme.danger; radius: 0 }
+                    contentItem: Text { text: parent.text; color: Theme.textInv; font: parent.font; horizontalAlignment: Text.AlignHCenter }
                     onClicked: privacyBox._confirmLock = true
                 }
             }
@@ -1300,13 +1305,13 @@ Item {
                     Layout.fillWidth: true
                     implicitHeight: 160
                     clip: true
-                    background: Rectangle { color: "#1E2124"; radius: 0 }
+                    background: Rectangle { color: Theme.bg1; radius: 0 }
                     ScrollBar.vertical.policy: ScrollBar.AlwaysOn
 
                     TextArea {
                         readOnly: true
                         text: diagnosticsBox._logText
-                        color: "#8E9297"
+                        color: Theme.muted
                         font.family: "Courier New, monospace"
                         font.pixelSize: 11
                         wrapMode: Text.WrapAnywhere
@@ -1358,8 +1363,8 @@ Item {
             ColumnLayout {
                 anchors.left: parent.left
                 anchors.right: parent.right
-                Label { text: "ConquerD — Privacy-first peer connectivity"; color: "#8E9297" }
-                Label { text: "Version " + Qt.application.version; color: "#8E9297" }
+                Label { text: "ConquerD — Privacy-first peer connectivity"; color: Theme.muted }
+                Label { text: "Version " + Qt.application.version; color: Theme.muted }
 
                 // ── Desktop shortcuts (Windows) ───────────────────────────
                 ColumnLayout {
@@ -1392,8 +1397,8 @@ Item {
                         id: shortcutStatusLabel
                         font.pixelSize: 11
                         property bool _hasShortcuts: backend ? backend.hasDesktopShortcuts() : false
-                        color: _hasShortcuts ? "#43B581" : "#72767D"
-                        text: _hasShortcuts ? "Status: Shortcuts exist ✓" : "Status: No shortcuts found"
+                        color: _hasShortcuts ? Theme.online : Theme.muted
+                        text: _hasShortcuts ? "Status: Shortcuts exist" : "Status: No shortcuts found"
                     }
                 }
             }

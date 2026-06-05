@@ -190,7 +190,7 @@ Item {
     // ── Loading overlay ───────────────────────────────────────────────────
     Rectangle {
         anchors.fill: parent
-        color: "#1A1A1A"
+        color: Theme.bg0
         visible: _view.loading && !_errorVisible
 
         ColumnLayout {
@@ -204,7 +204,7 @@ Item {
             Label {
                 Layout.alignment: Qt.AlignHCenter
                 text: "Loading…"
-                color: "#8E9297"
+                color: Theme.muted
                 font.pixelSize: 11
             }
         }
@@ -229,7 +229,7 @@ Item {
 
     Rectangle {
         anchors.fill: parent
-        color: "#1A1A1A"
+        color: Theme.bg0
         visible: root._errorVisible
 
         ColumnLayout {
@@ -237,10 +237,19 @@ Item {
             spacing: 12
             width: Math.min(parent.width - 32, 300)
 
+            Image {
+                source: "qrc:/qt/qml/ConquerD/Client/icons/warning.svg"
+                sourceSize.width: 28
+                sourceSize.height: 28
+                Layout.preferredWidth: 28
+                Layout.preferredHeight: 28
+                Layout.alignment: Qt.AlignHCenter
+                fillMode: Image.PreserveAspectFit
+            }
             Label {
                 Layout.alignment: Qt.AlignHCenter
-                text: "⚠  Could not load page"
-                color: "#DCDDDE"
+                text: "Could not load page"
+                color: Theme.text
                 font.pixelSize: 13
                 font.bold: true
             }
@@ -252,7 +261,7 @@ Item {
                 // would just spawn a second client instance.
                 visible: root._errorUrl !== "" &&
                          !root._errorUrl.startsWith("conquerd:")
-                color: "#8E9297"
+                color: Theme.muted
                 font.pixelSize: 10
                 wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                 elide: Text.ElideRight

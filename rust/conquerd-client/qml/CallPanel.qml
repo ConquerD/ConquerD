@@ -3,14 +3,15 @@
 import QtQuick
 import QtQuick.Controls.Material
 import QtQuick.Layouts
+import ConquerD.Client 1.0
 
 Rectangle {
     id: root
     width: 240
     height: 80
     radius: 0
-    color: "#2B2D31"
-    border.color: "#5865F2"
+    color: Theme.bg2
+    border.color: Theme.accent
     border.width: 1
 
     signal endCall()
@@ -29,16 +30,16 @@ Rectangle {
             width: 10
             height: 10
             radius: 5
-            color: root.callState === "in_call" ? "#57F287"
-                 : root.callState === "connecting" ? "#FEE75C"
-                 : "#ED4245"
+              color: root.callState === "in_call" ? Theme.online
+                  : root.callState === "connecting" ? Theme.warn
+                  : Theme.danger
         }
 
         Text {
             text: root.callState === "in_call" ? "In Call"
                 : root.callState === "connecting" ? "Connecting…"
                 : root.callState
-            color: "#FFFFFF"
+            color: Theme.textInv
             font.pixelSize: 13
             Layout.fillWidth: true
         }
@@ -51,7 +52,7 @@ Rectangle {
             flat: true
             implicitWidth: 32
             implicitHeight: 32
-            Material.foreground: root.muted ? "#ED4245" : "#57F287"
+            Material.foreground: root.muted ? Theme.danger : Theme.online
             onClicked: {
                 root.muted = !root.muted
                 root.muteToggled(root.muted)
@@ -62,7 +63,7 @@ Rectangle {
             icon.source: "qrc:/qt/qml/ConquerD/Client/icons/x-circle.svg"
             icon.width: 16
             icon.height: 16
-            icon.color: "#ED4245"
+            icon.color: Theme.danger
             flat: true
             implicitWidth: 32
             implicitHeight: 32

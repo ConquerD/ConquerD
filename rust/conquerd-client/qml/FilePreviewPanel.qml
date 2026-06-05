@@ -53,7 +53,7 @@ Item {
     // ── Background ────────────────────────────────────────────────────────
     Rectangle {
         anchors.fill: parent
-        color: "#111214"
+        color: Theme.bg0
         radius: 0
         clip: true
 
@@ -62,7 +62,7 @@ Item {
             id: headerBar
             anchors { top: parent.top; left: parent.left; right: parent.right }
             height: 36
-            color: "#1E2124"
+            color: Theme.bg1
 
             RowLayout {
                 anchors { fill: parent; leftMargin: 10; rightMargin: 6 }
@@ -73,29 +73,34 @@ Item {
                     text: root.filePath.length > 0
                           ? root.filePath.replace(/\\/g, "/").split("/").pop()
                           : "File Preview"
-                    color: "#DCDDDE"
+                    color: Theme.text
                     font.pixelSize: 11
                     elide: Text.ElideMiddle
                 }
 
-                Button {
-                    text: "⬡ Open"
+                ToolButton {
+                    icon.source: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
+                    icon.width: 14
+                    icon.height: 14
+                    icon.color: Theme.accent
                     flat: true
+                    implicitWidth: 32
                     implicitHeight: 24
-                    font.pixelSize: 10
-                    Material.foreground: Theme.accent
                     ToolTip.text: "Open in system application"
                     ToolTip.visible: hovered
                     onClicked: Qt.openUrlExternally("file:///" + root.filePath.replace(/\\/g, "/"))
                 }
 
-                Button {
-                    text: "✕"
+                ToolButton {
+                    icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
+                    icon.width: 12
+                    icon.height: 12
+                    icon.color: Theme.muted
                     flat: true
                     implicitHeight: 24
                     implicitWidth: 28
-                    font.pixelSize: 12
-                    Material.foreground: "#8E9297"
+                    ToolTip.text: "Close preview"
+                    ToolTip.visible: hovered
                     onClicked: root.closeRequested()
                 }
             }
@@ -126,21 +131,25 @@ Item {
                 visible: !root._canPreview(root.filePath) && root.filePath !== ""
                 spacing: 12
 
-                Label {
+                Image {
                     Layout.alignment: Qt.AlignHCenter
-                    text: "📎"
-                    font.pixelSize: 32
+                    source: "qrc:/qt/qml/ConquerD/Client/icons/attach.svg"
+                    sourceSize.width: 32
+                    sourceSize.height: 32
+                    Layout.preferredWidth: 32
+                    Layout.preferredHeight: 32
+                    fillMode: Image.PreserveAspectFit
                 }
                 Label {
                     Layout.alignment: Qt.AlignHCenter
                     text: "No preview available"
-                    color: "#8E9297"
+                    color: Theme.muted
                     font.pixelSize: 13
                 }
                 Label {
                     Layout.alignment: Qt.AlignHCenter
                     text: root.filePath.replace(/\\/g, "/").split("/").pop()
-                    color: "#5D6A73"
+                    color: Theme.muted
                     font.pixelSize: 10
                 }
                 Button {
