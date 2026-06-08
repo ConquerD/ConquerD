@@ -1,3 +1,4 @@
 [submodule "conquerd-opus-libopus"]
 	path = rust/conquerd-opus/opus
 	url = https://github.com/xiph/opus
+	ignore = untracked
