@@ -71,7 +71,7 @@ jobs:
       - name: Security audit (cargo-audit)
         # Uses the official rustsec action for better reporting and caching.
         # Non-blocking while we gain experience with the signal.
-        uses: rustsec/audit-check@69366f33c96575abad1ee0d60cf0bfa3f382b1e4 # v2 (pinned)
+        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2 (pinned)
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
