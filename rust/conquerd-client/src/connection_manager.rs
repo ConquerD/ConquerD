@@ -3595,9 +3595,9 @@ async fn run_quic_peer_session(
             let _ = stats_tx.try_send(InternalEvent::QuicStats {
                 peer_id: stats_peer.clone(),
                 rtt_ms,
-                    packet_loss_pct,
-                    jitter_ms,
-                    bandwidth_kbps,
+                packet_loss_pct,
+                jitter_ms,
+                bandwidth_kbps,
             });
         }
     });
