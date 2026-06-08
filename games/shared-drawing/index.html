@@ -20,6 +20,7 @@
       background: #161b22;
       touch-action: none;
     }
+    #canvas.eraser-cursor { cursor: cell; }
     #overlay {
       position: fixed;
       top: 16px;
@@ -46,11 +47,47 @@
     #status { color: #8b949e; font-size: 12px; }
     #status.connected { color: #3fb950; }
     #status.error { color: #f85149; }
+    #overlay, #controls, #palette, #sizes { pointer-events: auto; }
     #controls {
       margin-top: 12px;
       display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    #controls-row {
+      display: flex;
       gap: 8px;
       align-items: center;
+    }
+    #palette-label {
+      color: #8b949e;
+      font-size: 11px;
+    }
+    #palette, #sizes {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .size-btn {
+      width: 32px;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 2px solid transparent;
+      border-radius: 6px;
+      padding: 0;
+      flex-shrink: 0;
+    }
+    .size-btn:hover { border-color: #484f58; }
+    .size-btn.active {
+      border-color: #e6edf3;
+      box-shadow: 0 0 0 1px #30363d;
+    }
+    .size-btn .dot {
+      display: block;
+      background: #e6edf3;
+      border-radius: 50%;
     }
     button {
       background: #21262d;
@@ -62,13 +99,25 @@
       cursor: pointer;
     }
     button:hover { background: #30363d; }
-    #color {
-      width: 28px;
-      height: 28px;
-      border: none;
+    .swatch {
+      width: 24px;
+      height: 24px;
+      border: 2px solid transparent;
       border-radius: 4px;
       padding: 0;
       cursor: pointer;
+      flex-shrink: 0;
+    }
+    .swatch:hover { border-color: #484f58; }
+    .swatch.active {
+      border-color: #e6edf3;
+      box-shadow: 0 0 0 1px #30363d;
+    }
+    #palette.disabled { opacity: 0.45; pointer-events: none; }
+    #eraser.active {
+      background: #30363d;
+      border-color: #58a6ff;
+      color: #58a6ff;
     }
     #room-label {
       color: #a5d6ff;
@@ -100,11 +149,17 @@
     <div id="status">Connecting…</div>
     <div id="room-label"></div>
     <div id="controls">
-      <input type="color" id="color" value="#58a6ff">
-      <button id="clear">Clear Canvas</button>
+      <div id="palette-label">Color</div>
+      <div id="palette"></div>
+      <div id="palette-label">Stroke size</div>
+      <div id="sizes"></div>
+      <div id="controls-row">
+        <button id="eraser" type="button" title="Toggle eraser">Eraser</button>
+        <button id="clear" type="button">Clear Canvas</button>
+      </div>
     </div>
     <div id="hint">
-      Draw with your mouse.<br>
+      Draw with your mouse. Toggle eraser to remove ink.<br>
       Everyone in the same <code>?room=...</code> sees your strokes in real time.
     </div>
   </div>

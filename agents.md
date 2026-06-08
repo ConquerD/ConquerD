@@ -78,7 +78,7 @@ Working style:
 
 ### 5. QA/Testing Agent
 Responsibilities:
-- Run unit and integration tests and targeted manual checks (60 Rust `conquerd-features` unit tests).
+- Run unit and integration tests and targeted manual checks (116 Rust `conquerd-features` unit tests).
 - Stress race-prone flows (rapid connect/disconnect, duplicate signaling).
 - Validate trusted-peer persistence and UI synchronization.
 - Cover QUIC relay path and WebSocket membership signaling for room audio.
@@ -136,7 +136,7 @@ Working style:
 
 ### Rust Crates
 - `conquerd-client` — **primary native desktop binary** (Qt 6 / QML via CXX-Qt). Contains a full Rust application stack: identity, connection manager, signaling, chat, call controller, file transfer, audio pipeline (CPAL + Opus + DSP), QUIC transport (quinn), relay client, hole punch, STUN, SFU client, room manager, UPnP, github updater, plugin runtime. Key non-UI modules: `chat_store.rs` (SQLite-backed encrypted chat history with per-peer `trim_by_age` / `trim_by_count` / `purge_all`), `identity.rs` (Ed25519 + keyring integration including `keyring_delete_aes_key` for lock-identity), `avatar_config.rs` (deterministic SVG identicon generator — `AvatarConfig` struct, `build_avatar_svg`, HSL→RGB hex conversion; compiled unconditionally so `peer_store.rs` can store `avatar_config: Option<AvatarConfig>` without the `qt-ui` feature). The Qt/QML UI layer lives in `src/ui/` (`bridge.rs` AppBridge QObject, `peer_list_model.rs`, `chat_model.rs`, `call_model.rs`, `room_model.rs`, `settings_model.rs`, `file_transfer_model.rs`). `AppBridge` exposes `call_duration_secs`, `missed_calls`, `mic_level`, `mic_test_active`, and `ollama_available` qproperties in addition to the core peer/session state. `avatar_config_json` is a qproperty on `SettingsModel`, not `AppBridge`. `AppBridge` invokables include `avatarSvg(peer_id, config_json)` (trust-tiered SVG string), `broadcastAvatarConfig(peer_id, config_json)`, `broadcastAvatarConfigToAll(config_json)`, and `setAvatarConfigJson(config_json)`. Built with `cargo build -p conquerd-client --features qt-ui`; requires Qt 6.x (`QMAKE` or `CMAKE_PREFIX_PATH`). Headless (no `qt-ui`) mode is available for integration testing.
-- `conquerd-features` — capability registry, `FeatureModule` trait, channel multiplexer, per-feature quotas and auth tiers. Pure Rust rlib linked into `conquerd-client` and `conquerd-supernode`. Inbound quota enforcement (`quota.rs` token-bucket per `(feature, peer)`) runs inside `dispatch_message` and `dispatch_invoke_datagram` before any module callback. Outbound quota enforcement uses a separate `outbound_quotas: QuotaRegistry` and is exposed via `gate_through_feature(feature_id, peer_id, byte_count) → bool`; the Rust `ConnectionManager::dispatch_outbound` gates `core.chat.v1` and `core.file.v1` messages through it. `clear_peer_outbound_quotas(peer_id)` cleans up on disconnect. Spine of the framework. **79 unit tests** (`cargo test -p conquerd-features`).
+- `conquerd-features` — capability registry, `FeatureModule` trait, channel multiplexer, per-feature quotas and auth tiers. Pure Rust rlib linked into `conquerd-client` and `conquerd-supernode`. Inbound quota enforcement (`quota.rs` token-bucket per `(feature, peer)`) runs inside `dispatch_message` and `dispatch_invoke_datagram` before any module callback; transport hot paths that bypass module dispatch call `gate_inbound_through_feature(feature_id, peer_id, byte_count) → bool` directly. Outbound quota enforcement uses a separate `outbound_quotas: QuotaRegistry` and is exposed via `gate_through_feature(feature_id, peer_id, byte_count) → bool`; the Rust `ConnectionManager::dispatch_outbound` gates `core.chat.v1` and `core.file.v1` messages through it. `clear_peer_outbound_quotas(peer_id)` / `clear_peer_quotas(peer_id)` clean up on disconnect. Spine of the framework. **116 unit tests** (`cargo test -p conquerd-features`).
 - `conquerd-opus` — first-party libopus 1.6.1 wrapper with DRED and OSCE neural-feature support. Builds libopus from the `xiph/opus` git submodule via cmake. A C shim (`src/shim.c`) wraps all variadic `opus_*_ctl()` calls into fixed-signature functions so Rust FFI stays safe. The `dnn` feature (default) requires the DNN model C source arrays to be extracted from the Xiph.Org `opus_data-<sha256>.tar.gz` tarball into `rust/conquerd-opus/opus/dnn/` before building — run `scripts/fetch_opus_weights.ps1` / `.sh`. cmake compiles those C arrays into libopus statically; DRED and OSCE then activate automatically (no runtime blob loading). `OPUS_SET_DRED_DURATION_REQUEST` is called at encoder creation (100 ms depth); `OPUS_SET_OSCE_BWE_REQUEST` activates wideband-to-fullband enhancement on the decoder. Replaces the `audiopus` third-party crate. Linked into `conquerd-client` only.
 - `conquerd-supernode` — standalone Rust binary (QUIC relay, WebSocket signaling, WebTransport via `wtransport` for `web.host.h3.v1`, QUIC-stream in-app portal for `web.host.app.v1`, SFU rooms, access control, feature-module hosting). Sole supernode implementation.
 - `conquerd-installer` — Rust installer/updater binary used by the desktop client for applying releases.
@@ -200,7 +200,7 @@ The shared tagged-frame contract lives in `rust/conquerd-features/src/channel_fr
 
 The runtime enforces `auth` (`public` | `room-member` | `trusted-peer`) and per-feature byte/datagram quotas before invoking `on_invoke` / `on_message`. Modules MUST NOT re-implement these checks. Non-`core.*` namespaces without explicit `quota_bytes_per_sec` / `quota_datagrams_per_sec` get `DEFAULT_UNKNOWN_QUOTA_PARAMS` (64 KB/s, 256 datagrams/s) automatically.
 
-Outbound sends are gated symmetrically: `FeatureRegistry::gate_through_feature(feature_id, peer_id, byte_count) → bool` runs the same token-bucket logic against a separate `outbound_quotas` registry. The Rust `ConnectionManager::dispatch_outbound` calls it for `core.chat.v1` and `core.file.v1` before signing and transmitting; `ConnectionManager::send_audio_datagram` gates `core.audio.opus` datagrams the same way. Quota buckets (both directions) are cleared on `drop_peer` / `peer_left` / `disconnect`.
+Outbound sends are gated symmetrically: `FeatureRegistry::gate_through_feature(feature_id, peer_id, byte_count) → bool` runs the same token-bucket logic against a separate `outbound_quotas` registry. The Rust `ConnectionManager::dispatch_outbound` calls it for `core.chat.v1` and `core.file.v1` before signing and transmitting; `ConnectionManager::send_audio_datagram` / `send_room_audio` gate `core.audio.opus` and `room.audio.sfu` datagrams via dedicated helpers. Transport-layer inbound paths that skip `dispatch_message` (direct QUIC `AUDIO_TAG`, client `SfuAudio`, supernode QUIC relay `handle_datagram`, supernode WS `SfuAudio` fan-out) call `gate_inbound_through_feature` with the same token buckets. Quota buckets (both directions) are cleared on `drop_peer` / `peer_left` / `disconnect` (native WS signaling); WebTransport `release_session` cleanup is a known follow-up.
 
 ### Browser parity
 
@@ -306,11 +306,11 @@ No central feature registry, no mandatory features, no implicit cross-feature pr
 
 This section is the single source of truth for delivery status (condensed from the former `ROADMAP.md` / `IMPROVEMENT_PLAN.md` / `TODO.md`).
 
-**Last reviewed:** 2026-06-03 (game relay / WebTransport portal hardening).
+**Last reviewed:** 2026-06-06 (quota symmetry hardening on direct/relay/WS-audio paths; doc + test-count sync).
 
 ### Health summary
 
-ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (≈540 test markers; 81 features + 193 supernode + 119 client + 55 installer suites green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients.
+ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (486 unit tests; 116 features + 195 supernode + 120 client + 55 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients.
 
 ### P0–P2 — Complete ✅
 
@@ -319,8 +319,8 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 | CI hardening | `fmt --check` + `clippy -D warnings` (both workspaces) + headless client tests + `cargo-audit`; all SHA-pinned. |
 | Post-handshake replay protection | 5-minute timestamp freshness window (`is_fresh(300.0)`) on client + supernode paths, **plus** a per-sender sliding-window dedup guard (`conquerd_features::ReplayGuard`) keyed on the message signature; negative-path tests on both layers. |
 | Relay + SFU smoke tests | Real mTLS QUIC suite: 2-peer room broadcast, unauthorized rejection, leave/rejoin, ticket renewal. |
-| Quota symmetry | Inbound + outbound (`gate_through_feature`) gating across direct/relay/WebTransport; buckets cleared on every disconnect path. |
-| Audio dispatch decision | Documented permanent real-time bypass with a `check_audio_quota` helper so the gate can't be forgotten. |
+| Quota symmetry | Inbound + outbound gating on direct P2P (`core.audio.opus`), client room audio (`room.audio.sfu`), supernode WS `SfuAudio`/`SfuChat`/`SfuFile*` relay, QUIC relay datagram fan-out, and WebTransport browser fan-out (`BrowserBridge::on_inbound` + `send` + `release_session` cleanup). |
+| Audio dispatch decision | Real-time Opus bypasses `dispatch_message` module callbacks but is explicitly gated at the transport layer via `check_audio_quota` / `check_room_audio_outbound_quota` / `check_inbound_feature_quota` so quota enforcement cannot be skipped accidentally. |
 | Cross-platform CI | Windows runner (non-Qt tests + client clippy) added. |
 | Platform TODOs | macOS dock badge, Linux D-Bus badge, UPnP all implemented. |
 | Supply-chain | Weekly `supply-chain.yml` (cargo-deny + audit-check) + `deny.toml`. |
@@ -329,15 +329,37 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 | Version automation | `scripts/check_version_sync.ps1 -BumpTo X.Y.Z` bumps all crates + prints git/tag commands. |
 | Metrics export | `/api/metrics` via `web.host.app.v1`. |
 | Game relay end-to-end | `game.relay.v1` over WebTransport confirmed working: race condition in `/_conquerd/ctx.json` cache fixed (scheme-layer caches now populated on tokio thread in `connection_manager.rs` before any `FetchWebApp` can succeed); self-signed TLS cert now includes `serverAuth` EKU (Chrome WebTransport requirement); cert fingerprint always re-derived from on-disk DER (stale `.hex` cache bug fixed); old certs missing the EKU detected via OID byte-scan and auto-rotated on next supernode start; template SDK synced with source (`ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, `featureForFixedTag` exports added); SDK now fails fast with a clear error when portal context exists but no WebTransport URL is available; cursor relay demo fixed (`encodeCursorLeave` now carries color so peer tracking is stable). |
+| Test suite integrity | Full test run across all four crates: 486 unit tests all green (116 `conquerd-features` + 195 `conquerd-supernode` + 120 `conquerd-client` + 55 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
 
 ### P3 backlog (as capacity allows)
 
 - WASM plugin sandbox (currently native cdylib with load-time trust prompts).
 - Ollama / plugin UX polish (currently experimental).
 
+
 ### Pre-signing checklist (SignPath Foundation)
 
-Code-side items (LICENSE, PE metadata, Code Signing Policy + Uninstalling sections in the README) are done. The remaining human action is to apply for a SignPath Foundation subscription at https://signpath.io — the README `## Code Signing Policy` section (also surfaced on conquerd.com) satisfies the project-home-page policy requirement.
+Code-side items (LICENSE, PE metadata, Code Signing Policy + Uninstalling sections in the README) are done.
+
+**Release manifest signing (Ed25519)**: A project-controlled Ed25519 keypair is used for `releases_manifest.json` (the list of version+build_hash+build_id verified by the installer). The public key is committed in source (`keys/release-signer-public.pem` and the hex constant). The private key is kept offline/secure.
+
+Because SignPath Foundation (for Windows Authenticode / PE signatures) and similar programs usually require a public OSS project with at least one release to grant free access, the first release(s) may use unsigned binaries for the PE files while still shipping a properly signed manifest (using the project Ed25519 key).
+
+Once approved for SignPath:
+- Subsequent releases get automated binary signatures.
+- The Ed25519 manifest key continues to be the canonical root of trust for the manifest (easy to rotate via a signed rotation entry).
+
+The remaining human action for binary signing is to apply for a SignPath Foundation subscription at https://signpath.io — the README `## Code Signing Policy` section satisfies the project-home-page requirement. See the bootstrap language in README.md for details on the initial release(s).
+
+Update `agents.md` (this section) in the same change as any signing-related work.
+
+**Initial / per-release manifest steps (approvers):**
+- `cargo run -p conquerd-installer --bin sign-release-manifest -- --generate-unsigned`
+- Fill the three platform entries with the real `build_hash` (from CI artifacts or local `build_*.ps1` .sha256) and `build_id` (the exact string injected via `CONQUERD_BUILD_ID` or derived at tag build time; this is what peers will see in attestations).
+- Sign with the private key → produces `releases_manifest.json` (overwrite).
+- Commit the signed manifest (public) as part of the release prep / tag.
+- The release workflow (publish-release job) now includes it in the GitHub Release assets.
+- The skeleton generator + signer live in the installer crate so the canonical + verify code never drifts from the signing code.
 
 ### Process
 

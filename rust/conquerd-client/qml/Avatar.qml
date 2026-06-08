@@ -21,6 +21,7 @@ Item {
     property real audioLevel: 0.0
     property string _svgSource: ""
     property string _tintHex: "#747F8D"
+    property bool _imageSmooth: true
     readonly property color tintColor: _tintHex
     readonly property bool _ringVisible: root.showRing || root.speaking
     readonly property int _ringWidth: {
@@ -38,11 +39,13 @@ Item {
         if (!peerId) {
             _svgSource = ""
             _tintHex = "#747F8D"
+            _imageSmooth = true
             return
         }
         var svgStr = backend.avatarSvg(peerId, configJson)
         _svgSource = "data:image/svg+xml;base64," + Qt.btoa(svgStr)
         _tintHex = backend.avatarTintColor(peerId, configJson)
+        _imageSmooth = backend.avatarImageSmooth(peerId, configJson)
     }
 
     Component.onCompleted: _refresh()
@@ -86,8 +89,8 @@ Item {
             sourceSize.width: root.size
             sourceSize.height: root.size
             fillMode: Image.Stretch
-            smooth: true
-            mipmap: root.size > 32
+            smooth: root._imageSmooth
+            mipmap: root._imageSmooth && root.size > 32
             visible: root._svgSource !== ""
         }
     }

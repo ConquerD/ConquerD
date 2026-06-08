@@ -34,6 +34,9 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const SAMPLES_PER_FRAME: usize = (SAMPLE_RATE as usize) * 20 / 1000; // 960
 /// 5 ms fade window.
 pub const FADE_SAMPLES: usize = (SAMPLE_RATE as usize) * 5 / 1000; // 240
+pub const DEFAULT_OUTGOING_BITRATE_BPS: u32 = 128_000;
+const MIN_OUTGOING_BITRATE_BPS: u32 = 16_000;
+const MAX_OUTGOING_BITRATE_BPS: u32 = 192_000;
 
 // ---------------------------------------------------------------------------
 // Audio pipeline
@@ -54,6 +57,8 @@ struct AudioPipeline {
     /// Noise gate strength (0=off, 1=mild, 2=moderate, 3=aggressive, 4=max).
     /// Shared with the capture callback so it can be updated mid-call.
     noise_strength: Arc<AtomicU32>,
+    /// Outgoing Opus bitrate in bits per second. Shared with the capture callback.
+    outgoing_bitrate_bps: Arc<AtomicU32>,
     /// Input gain 0–200 (100 = unity). Shared with the capture callback.
     input_gain: Arc<AtomicU32>,
     /// Output gain 0–200 (100 = unity). Applied in push_inbound.
@@ -106,6 +111,26 @@ fn resolve_cpal_device(
     dev.ok_or_else(|| anyhow::anyhow!("No default audio {kind} device"))
 }
 
+fn apply_encoder_bitrate(
+    encoder: &mut OpusEncoder,
+    bitrate_bps: &Arc<AtomicU32>,
+    current_bitrate_bps: &mut u32,
+) {
+    let desired = bitrate_bps
+        .load(Ordering::Relaxed)
+        .clamp(MIN_OUTGOING_BITRATE_BPS, MAX_OUTGOING_BITRATE_BPS);
+    if desired == *current_bitrate_bps {
+        return;
+    }
+    match encoder.set_bitrate(desired as i32) {
+        Ok(()) => {
+            *current_bitrate_bps = desired;
+            debug!("Applied outgoing Opus bitrate: {desired} bps");
+        }
+        Err(e) => warn!("Failed to apply outgoing Opus bitrate {desired}: {e}"),
+    }
+}
+
 impl AudioPipeline {
     /// Open CPAL I/O devices and start audio capture + playback.
     ///
@@ -124,6 +149,7 @@ impl AudioPipeline {
         initial_input_vol: u32,
         initial_output_vol: u32,
         initial_noise_idx: u32,
+        outgoing_bitrate_bps: u32,
     ) -> anyhow::Result<(
         Self,
         mpsc::Receiver<Vec<u8>>,
@@ -176,11 +202,14 @@ impl AudioPipeline {
         let input_gain_cap = Arc::clone(&input_gain_arc);
         let output_gain_arc = Arc::new(AtomicU32::new(initial_output_vol.min(200)));
         let mut noise_floor_rms: f32 = 100.0;
+        let outgoing_bitrate_bps =
+            outgoing_bitrate_bps.clamp(MIN_OUTGOING_BITRATE_BPS, MAX_OUTGOING_BITRATE_BPS);
+        let bitrate_arc = Arc::new(AtomicU32::new(outgoing_bitrate_bps));
 
         let mut encoder = OpusEncoder::new(48_000, 1, OpusApp::Voip)
             .map_err(|e| anyhow::anyhow!("Opus encoder init: {e}"))?;
         encoder
-            .set_bitrate(48_000)
+            .set_bitrate(outgoing_bitrate_bps as i32)
             .map_err(|e| anyhow::anyhow!("Set bitrate: {e}"))?;
         encoder
             .set_inband_fec(true)
@@ -217,105 +246,132 @@ impl AudioPipeline {
         let resamp_ratio: f64 = in_sr as f64 / SAMPLE_RATE as f64;
 
         let capture_stream = match in_sample_fmt {
-            cpal::SampleFormat::F32 => input_dev
-                .build_input_stream(
-                    &input_cfg,
-                    move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                        let ns = noise_strength_cap.load(Ordering::Relaxed);
-                        let ig = input_gain_cap.load(Ordering::Relaxed) as f32 / 100.0;
-                        capture_callback_f32(
-                            data,
-                            in_ch,
-                            &muted_cap,
-                            &mut capture_accum,
-                            &mut resamp_prev,
-                            &mut resamp_phase,
-                            resamp_ratio,
-                            &mut vad_speaking,
-                            &mut vad_above_count,
-                            &mut vad_below_count,
-                            VAD_THRESHOLD,
-                            VAD_ATTACK_FRAMES,
-                            VAD_RELEASE_FRAMES,
-                            &speaking_tx,
-                            &level_tx,
-                            &mut encoder,
-                            &encoded_tx,
-                            &mut noise_floor_rms,
-                            ns,
-                            ig,
-                        );
-                    },
-                    |err| warn!("Capture stream error: {err}"),
-                    None,
-                )
-                .map_err(|e| anyhow::anyhow!("Build capture stream (f32): {e}"))?,
-            cpal::SampleFormat::I16 => input_dev
-                .build_input_stream(
-                    &input_cfg,
-                    move |data: &[i16], _info: &cpal::InputCallbackInfo| {
-                        let ns = noise_strength_cap.load(Ordering::Relaxed);
-                        let ig = input_gain_cap.load(Ordering::Relaxed) as f32 / 100.0;
-                        capture_callback_i16(
-                            data,
-                            in_ch,
-                            &muted_cap,
-                            &mut capture_accum,
-                            &mut resamp_prev,
-                            &mut resamp_phase,
-                            resamp_ratio,
-                            &mut vad_speaking,
-                            &mut vad_above_count,
-                            &mut vad_below_count,
-                            VAD_THRESHOLD,
-                            VAD_ATTACK_FRAMES,
-                            VAD_RELEASE_FRAMES,
-                            &speaking_tx,
-                            &level_tx,
-                            &mut encoder,
-                            &encoded_tx,
-                            &mut noise_floor_rms,
-                            ns,
-                            ig,
-                        );
-                    },
-                    |err| warn!("Capture stream error: {err}"),
-                    None,
-                )
-                .map_err(|e| anyhow::anyhow!("Build capture stream (i16): {e}"))?,
-            cpal::SampleFormat::U16 => input_dev
-                .build_input_stream(
-                    &input_cfg,
-                    move |data: &[u16], _info: &cpal::InputCallbackInfo| {
-                        let ns = noise_strength_cap.load(Ordering::Relaxed);
-                        let ig = input_gain_cap.load(Ordering::Relaxed) as f32 / 100.0;
-                        capture_callback_u16(
-                            data,
-                            in_ch,
-                            &muted_cap,
-                            &mut capture_accum,
-                            &mut resamp_prev,
-                            &mut resamp_phase,
-                            resamp_ratio,
-                            &mut vad_speaking,
-                            &mut vad_above_count,
-                            &mut vad_below_count,
-                            VAD_THRESHOLD,
-                            VAD_ATTACK_FRAMES,
-                            VAD_RELEASE_FRAMES,
-                            &speaking_tx,
-                            &level_tx,
-                            &mut encoder,
-                            &encoded_tx,
-                            &mut noise_floor_rms,
-                            ns,
-                            ig,
-                        );
-                    },
-                    |err| warn!("Capture stream error: {err}"),
-                    None,
-                )
-                .map_err(|e| anyhow::anyhow!("Build capture stream (u16): {e}"))?,
+            cpal::SampleFormat::F32 => {
+                let bitrate_cap = Arc::clone(&bitrate_arc);
+                let mut encoder_bitrate_bps = outgoing_bitrate_bps;
+                input_dev
+                    .build_input_stream(
+                        &input_cfg,
+                        move |data: &[f32], _info: &cpal::InputCallbackInfo| {
+                            apply_encoder_bitrate(
+                                &mut encoder,
+                                &bitrate_cap,
+                                &mut encoder_bitrate_bps,
+                            );
+                            let ns = noise_strength_cap.load(Ordering::Relaxed);
+                            let ig = input_gain_cap.load(Ordering::Relaxed) as f32 / 100.0;
+                            capture_callback_f32(
+                                data,
+                                in_ch,
+                                &muted_cap,
+                                &mut capture_accum,
+                                &mut resamp_prev,
+                                &mut resamp_phase,
+                                resamp_ratio,
+                                &mut vad_speaking,
+                                &mut vad_above_count,
+                                &mut vad_below_count,
+                                VAD_THRESHOLD,
+                                VAD_ATTACK_FRAMES,
+                                VAD_RELEASE_FRAMES,
+                                &speaking_tx,
+                                &level_tx,
+                                &mut encoder,
+                                &encoded_tx,
+                                &mut noise_floor_rms,
+                                ns,
+                                ig,
+                            );
+                        },
+                        |err| warn!("Capture stream error: {err}"),
+                        None,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Build capture stream (f32): {e}"))?
+            }
+            cpal::SampleFormat::I16 => {
+                let bitrate_cap = Arc::clone(&bitrate_arc);
+                let mut encoder_bitrate_bps = outgoing_bitrate_bps;
+                input_dev
+                    .build_input_stream(
+                        &input_cfg,
+                        move |data: &[i16], _info: &cpal::InputCallbackInfo| {
+                            apply_encoder_bitrate(
+                                &mut encoder,
+                                &bitrate_cap,
+                                &mut encoder_bitrate_bps,
+                            );
+                            let ns = noise_strength_cap.load(Ordering::Relaxed);
+                            let ig = input_gain_cap.load(Ordering::Relaxed) as f32 / 100.0;
+                            capture_callback_i16(
+                                data,
+                                in_ch,
+                                &muted_cap,
+                                &mut capture_accum,
+                                &mut resamp_prev,
+                                &mut resamp_phase,
+                                resamp_ratio,
+                                &mut vad_speaking,
+                                &mut vad_above_count,
+                                &mut vad_below_count,
+                                VAD_THRESHOLD,
+                                VAD_ATTACK_FRAMES,
+                                VAD_RELEASE_FRAMES,
+                                &speaking_tx,
+                                &level_tx,
+                                &mut encoder,
+                                &encoded_tx,
+                                &mut noise_floor_rms,
+                                ns,
+                                ig,
+                            );
+                        },
+                        |err| warn!("Capture stream error: {err}"),
+                        None,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Build capture stream (i16): {e}"))?
+            }
+            cpal::SampleFormat::U16 => {
+                let bitrate_cap = Arc::clone(&bitrate_arc);
+                let mut encoder_bitrate_bps = outgoing_bitrate_bps;
+                input_dev
+                    .build_input_stream(
+                        &input_cfg,
+                        move |data: &[u16], _info: &cpal::InputCallbackInfo| {
+                            apply_encoder_bitrate(
+                                &mut encoder,
+                                &bitrate_cap,
+                                &mut encoder_bitrate_bps,
+                            );
+                            let ns = noise_strength_cap.load(Ordering::Relaxed);
+                            let ig = input_gain_cap.load(Ordering::Relaxed) as f32 / 100.0;
+                            capture_callback_u16(
+                                data,
+                                in_ch,
+                                &muted_cap,
+                                &mut capture_accum,
+                                &mut resamp_prev,
+                                &mut resamp_phase,
+                                resamp_ratio,
+                                &mut vad_speaking,
+                                &mut vad_above_count,
+                                &mut vad_below_count,
+                                VAD_THRESHOLD,
+                                VAD_ATTACK_FRAMES,
+                                VAD_RELEASE_FRAMES,
+                                &speaking_tx,
+                                &level_tx,
+                                &mut encoder,
+                                &encoded_tx,
+                                &mut noise_floor_rms,
+                                ns,
+                                ig,
+                            );
+                        },
+                        |err| warn!("Capture stream error: {err}"),
+                        None,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Build capture stream (u16): {e}"))?
+            }
             other => {
                 return Err(anyhow::anyhow!(
                     "Unsupported input sample format: {other:?}"
@@ -410,6 +466,7 @@ impl AudioPipeline {
                 playback_prod,
                 muted,
                 noise_strength: noise_strength_arc,
+                outgoing_bitrate_bps: bitrate_arc,
                 input_gain: input_gain_arc,
                 output_gain: output_gain_arc,
                 decoders: HashMap::new(),
@@ -472,6 +529,13 @@ impl AudioPipeline {
     fn set_noise_strength(&self, strength_idx: u32) {
         self.noise_strength
             .store(strength_idx.min(4), Ordering::Relaxed);
+    }
+
+    fn set_outgoing_bitrate(&self, bps: u32) {
+        self.outgoing_bitrate_bps.store(
+            bps.clamp(MIN_OUTGOING_BITRATE_BPS, MAX_OUTGOING_BITRATE_BPS),
+            Ordering::Relaxed,
+        );
     }
 
     fn set_input_gain(&self, pct: u32) {
@@ -561,6 +625,8 @@ pub enum CallCommand {
     SetInputGain(u32),
     /// Set output speaker gain (0–200, 100=unity).
     SetOutputGain(u32),
+    /// Set outgoing Opus bitrate in bits per second.
+    SetOutgoingBitrate(u32),
     /// Inbound direct-peer audio frame (Opus bytes from a 1:1 QUIC session).
     DirectAudioInbound { peer_id: String, opus_data: Vec<u8> },
     /// Switch PTT ↔ voice-activation.
@@ -704,6 +770,8 @@ pub struct CallController {
     output_vol: u32,
     /// Noise gate strength index 0–4. Sent to AudioPipeline on start.
     noise_strength_idx: u32,
+    /// Outgoing Opus bitrate in bits per second. Used for direct and room audio.
+    outgoing_bitrate_bps: u32,
 }
 
 impl CallController {
@@ -744,6 +812,7 @@ impl CallController {
             input_vol: 100,
             output_vol: 100,
             noise_strength_idx: 2,
+            outgoing_bitrate_bps: DEFAULT_OUTGOING_BITRATE_BPS,
         };
         (cmd_tx, event_rx, ctrl.run())
     }
@@ -784,6 +853,7 @@ impl CallController {
             self.input_vol,
             self.output_vol,
             self.noise_strength_idx,
+            self.outgoing_bitrate_bps,
         ) {
             Ok((pipeline, encoded_rx, speaking_rx, level_rx)) => {
                 self.audio = Some(pipeline);
@@ -1010,6 +1080,7 @@ impl CallController {
             self.input_vol,
             self.output_vol,
             self.noise_strength_idx,
+            self.outgoing_bitrate_bps,
         ) {
             Ok((pipeline, encoded_rx, speaking_rx, level_rx)) => {
                 self.audio = Some(pipeline);
@@ -1197,6 +1268,19 @@ impl CallController {
                             if let Some(p) = &self.audio {
                                 p.set_output_gain(self.output_vol);
                             }
+                        }
+                        CallCommand::SetOutgoingBitrate(bps) => {
+                            self.outgoing_bitrate_bps = bps.clamp(
+                                MIN_OUTGOING_BITRATE_BPS,
+                                MAX_OUTGOING_BITRATE_BPS,
+                            );
+                            if let Some(p) = &self.audio {
+                                p.set_outgoing_bitrate(self.outgoing_bitrate_bps);
+                            }
+                            debug!(
+                                "Outgoing Opus bitrate set to {} bps",
+                                self.outgoing_bitrate_bps
+                            );
                         }
                         CallCommand::DirectAudioInbound { peer_id, opus_data } => {
                             // Treat direct 1:1 audio through the same jitter-buffered

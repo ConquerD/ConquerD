@@ -1,4 +1,4 @@
-use crate::{extract, github, manifest, shortcuts, state};
+use crate::{extract, github, manifest, release_manifest, shortcuts, state};
 use eframe::egui;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -712,6 +712,26 @@ fn run_download_and_install(
 
         let expected = github::fetch_sha256(&release.sha256_url)?;
         github::verify_download(&dest, &expected)?;
+    }
+
+    // 3b. Cross-check against the signed release manifest when available.
+    if !release.manifest_url.is_empty() {
+        {
+            let mut st = app_state.lock().unwrap();
+            st.progress_text = "Verifying release manifest\u{2026}".into();
+        }
+        ctx.request_repaint();
+
+        let raw_json = github::fetch_release_manifest(&release.manifest_url)?;
+        let mf = release_manifest::ReleaseManifest::parse_and_verify(&raw_json)?;
+        let archive_hash = extract::hash_file(&dest)?;
+        if !mf.contains(&release.version, &archive_hash) {
+            anyhow::bail!(
+                "Archive hash {} not found in release manifest for v{}",
+                &archive_hash[..archive_hash.len().min(12)],
+                release.version
+            );
+        }
     }
 
     // 4. Kill running instances if requested

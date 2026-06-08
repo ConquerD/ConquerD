@@ -272,11 +272,11 @@ mod tests {
     fn empty_intersection_when_no_compatible_caps() {
         // Simulate peer A with chat v1 and audio v2; peer B with chat v2 and audio v2.
         // Only audio v2 should appear in the negotiated intersection.
-        let local = vec![
+        let local = [
             CapabilityDescriptor::new("core.chat.v1", "1.0", ChannelKind::Stream),
             CapabilityDescriptor::new("core.audio.opus", "2.0", ChannelKind::Datagram),
         ];
-        let remote = vec![
+        let remote = [
             CapabilityDescriptor::new("core.chat.v1", "2.0", ChannelKind::Stream),
             CapabilityDescriptor::new("core.audio.opus", "2.0", ChannelKind::Datagram),
         ];
@@ -294,12 +294,12 @@ mod tests {
 
     #[test]
     fn fully_empty_intersection() {
-        let local = vec![CapabilityDescriptor::new(
+        let local = [CapabilityDescriptor::new(
             "core.chat.v1",
             "1.0",
             ChannelKind::Stream,
         )];
-        let remote = vec![CapabilityDescriptor::new(
+        let remote = [CapabilityDescriptor::new(
             "core.chat.v1",
             "2.0",
             ChannelKind::Stream,

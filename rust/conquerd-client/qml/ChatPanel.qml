@@ -26,9 +26,19 @@ Item {
     property string aiError: ""
     property int _aiSeq: 0
     property string _currentAiRequestId: ""
+    property bool _statsPanelOpen: false
 
     Connections {
         target: backend
+        function onConnectionStats(json) {
+            try {
+                var stats = JSON.parse(json)
+                if (stats.peer_id !== root.selectedPeerId)
+                    return
+                connStatsPanel.applyStats(json)
+                connStatsPanel.isRelay = backend.connection_mode === "relay"
+            } catch (e) {}
+        }
         function onOllamaChunk(requestId, text) {
             if (requestId === root._currentAiRequestId) root.aiResponse += text
         }
@@ -52,22 +62,51 @@ Item {
         }
     }
 
+    onSelectedPeerIdChanged: {
+        root._statsPanelOpen = false
+        connStatsPanel.applyStats(JSON.stringify({
+            peer_id: root.selectedPeerId,
+            rtt_ms: 0,
+            packet_loss_pct: 0,
+            jitter_ms: 0,
+            relay: backend.connection_mode === "relay",
+            bandwidth_kbps: 0
+        }))
+    }
+
+    StatsPanel {
+        id: connStatsPanel
+        z: 60
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.margins: Theme.spacingMd
+        anchors.topMargin: Theme.touchTarget + Theme.spacingMd + Theme.spacingXs
+        visible: root._statsPanelOpen && root.selectedPeerId !== ""
+    }
+
+    MouseArea {
+        z: 55
+        anchors.fill: parent
+        visible: root._statsPanelOpen
+        onClicked: root._statsPanelOpen = false
+    }
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
 
         Rectangle {
             Layout.fillWidth: true
-            height: 48
+            height: Theme.touchTarget + Theme.spacingXs
             color: Theme.bg2
 
             RowLayout {
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.leftMargin: 12
-                anchors.rightMargin: 12
-                spacing: 8
+                anchors.leftMargin: Theme.spacingMd
+                anchors.rightMargin: Theme.spacingMd
+                spacing: Theme.spacingSm
 
                 Avatar {
                     visible: root.selectedPeerId !== ""
@@ -84,7 +123,7 @@ Item {
                     Text {
                         text: root.selectedPeerName || root.selectedPeerId || "No peer selected"
                         color: Theme.text
-                        font.pixelSize: 14
+                        font.pixelSize: Theme.fontSizeTitle
                         font.bold: true
                         elide: Text.ElideRight
                         Layout.fillWidth: true
@@ -99,6 +138,17 @@ Item {
                         elide: Text.ElideRight
                         Layout.fillWidth: true
                     }
+                }
+
+                ConnectionStatsChip {
+                    id: statsChip
+                    Layout.alignment: Qt.AlignVCenter
+                    peerId: root.selectedPeerId
+                    rttMs: connStatsPanel.rttMs
+                    packetLossPct: connStatsPanel.packetLossPct
+                    isRelay: backend.connection_mode === "relay"
+                    expanded: root._statsPanelOpen
+                    onToggleExpanded: root._statsPanelOpen = !root._statsPanelOpen
                 }
 
                 ToolButton {
@@ -132,24 +182,21 @@ Item {
 
         Rectangle {
             Layout.fillWidth: true
-            height: root._searchOpen ? 38 : 0
+            height: root._searchOpen ? Theme.controlHeight + Theme.spacingXs : 0
             clip: true
             color: Theme.bg3
-            Behavior on height { NumberAnimation { duration: 150 } }
+            Behavior on height { NumberAnimation { duration: Theme.animFast } }
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: 10
-                anchors.rightMargin: 6
-                spacing: 4
+                anchors.leftMargin: Theme.spacingMd
+                anchors.rightMargin: Theme.spacingSm
+                spacing: Theme.spacingXs
 
-                TextField {
+                StyledTextField {
                     id: msgSearchField
                     Layout.fillWidth: true
                     placeholderText: "Search messages..."
-                    background: Item {}
-                    color: Theme.text
-                    font.pixelSize: 13
                     onTextChanged: root._searchText = text.toLowerCase()
                     Keys.onEscapePressed: {
                         root._searchOpen = false
@@ -306,12 +353,12 @@ Item {
                             Text {
                                 text: chip.isSelf ? "up" : "down"
                                 color: Theme.muted
-                                font.pixelSize: 11
+                                font.pixelSize: Theme.fontSizeCaption
                             }
                             Text {
                                 text: chip.relPath
                                 color: Theme.text
-                                font.pixelSize: 12
+                                font.pixelSize: Theme.fontSizeBody
                                 elide: Text.ElideMiddle
                                 Layout.fillWidth: true
                             }
@@ -365,7 +412,7 @@ Item {
                             visible: chip.state === "done" || chip.state === "failed"
                             text: chip.state === "done" ? "Complete" : "Failed"
                             color: chip.state === "done" ? Theme.online : Theme.danger
-                            font.pixelSize: 11
+                            font.pixelSize: Theme.fontSizeCaption
                         }
                     }
                 }
@@ -383,7 +430,7 @@ Item {
                 anchors { left: parent.left; leftMargin: 14; verticalCenter: parent.verticalCenter }
                 text: (root.selectedPeerName || root.typingPeerId) + " is typing..."
                 color: Theme.muted
-                font.pixelSize: 11
+                font.pixelSize: Theme.fontSizeCaption
                 font.italic: true
             }
         }
@@ -391,7 +438,7 @@ Item {
         Rectangle {
             id: aiPanel
             Layout.fillWidth: true
-            Layout.margins: 8
+            Layout.margins: Theme.spacingSm
             implicitHeight: aiContent.implicitHeight + 16
             visible: root.aiResponse !== "" || root.aiStreaming || root.aiError !== ""
             color: Theme.bg1
@@ -410,15 +457,14 @@ Item {
                     Text {
                         text: "AI"
                         color: Theme.accent
-                        font.pixelSize: 11
+                        font.pixelSize: Theme.fontSizeCaption
                         font.bold: true
                     }
                     Item { Layout.fillWidth: true }
-                    Button {
+                    StyledButton {
                         text: "Cancel"
                         visible: root.aiStreaming
-                        flat: true
-                        font.pixelSize: 11
+                        compact: true
                         onClicked: {
                             backend.cancelOllama(root._currentAiRequestId)
                             root.aiStreaming = false
@@ -443,7 +489,7 @@ Item {
                     visible: root.aiError !== ""
                     text: "Error: " + root.aiError
                     color: Theme.danger
-                    font.pixelSize: 12
+                    font.pixelSize: Theme.fontSizeBody
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
                 }
@@ -452,7 +498,7 @@ Item {
                     visible: root.aiResponse !== ""
                     text: root.aiResponse
                     color: Theme.text
-                    font.pixelSize: 13
+                    font.pixelSize: Theme.fontSizeBody
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
                 }
@@ -461,14 +507,14 @@ Item {
                     visible: root.aiStreaming && root.aiResponse === ""
                     text: "..."
                     color: Theme.muted
-                    font.pixelSize: 13
+                    font.pixelSize: Theme.fontSizeBody
                     font.italic: true
                 }
             }
         }
 
         RichChatComposer {
-            Layout.margins: 8
+            Layout.margins: Theme.spacingSm
             targetName: root.selectedPeerName || root.selectedPeerId
             enabledForTarget: root.selectedPeerId !== ""
             fileTransferEnabled: true

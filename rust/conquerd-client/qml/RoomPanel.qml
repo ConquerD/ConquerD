@@ -64,18 +64,18 @@ Item {
 
         Rectangle {
             Layout.fillWidth: true
-            height: 48
+            height: Theme.touchTarget + Theme.spacingXs
             color: Theme.bg2
 
             RowLayout {
                 anchors.fill: parent
-                anchors.margins: 12
-                spacing: 8
+                anchors.margins: Theme.spacingMd
+                spacing: Theme.spacingSm
 
                 Text {
                     text: root.roomName
                     color: Theme.text
-                    font.pixelSize: 14
+                    font.pixelSize: Theme.fontSizeTitle
                     font.bold: true
                     Layout.fillWidth: true
                     elide: Text.ElideRight
@@ -84,7 +84,7 @@ Item {
                 Text {
                     text: root.participantCount > 0 ? root.participantCount + " in room" : ""
                     color: Theme.muted
-                    font.pixelSize: 11
+                    font.pixelSize: Theme.fontSizeCaption
                     visible: root.participantCount > 0
                 }
             }
@@ -100,14 +100,14 @@ Item {
             spacing: 2
             onCountChanged: Qt.callLater(function() { roomChat.positionViewAtBeginning() })
 
-            Text {
+            EmptyState {
                 anchors.centerIn: parent
                 visible: roomChatModel.count === 0
-                text: "Room chat\nMessages appear here."
-                horizontalAlignment: Text.AlignHCenter
-                color: Theme.muted
-                font.pixelSize: 12
-                wrapMode: Text.WordWrap
+                width: Math.min(parent.width - Theme.spacingXl, 200)
+                iconSource: "qrc:/qt/qml/ConquerD/Client/icons/speech.svg"
+                iconSize: 36
+                title: "Room chat"
+                subtitle: "Messages from room members appear here."
             }
 
             delegate: ChatRichMessageDelegate {

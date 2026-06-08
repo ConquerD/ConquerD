@@ -14,6 +14,8 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
+use conquerd_features::{feature_for_fixed_tag, FeatureRegistry};
+
 use crate::wire;
 
 /// Relay idle timeout.
@@ -133,6 +135,7 @@ pub struct QUICRelayServer {
     shutdown: Arc<Notify>,
     identity_pub_id: String,
     bidi_hook: Arc<RwLock<Option<BidiStreamHook>>>,
+    features: Arc<FeatureRegistry>,
 }
 
 /// Fire-and-forget hook invoked for every server-accepted bidi stream
@@ -144,12 +147,13 @@ pub type BidiStreamHook =
     Arc<dyn Fn(String, quinn::SendStream, quinn::RecvStream) + Send + Sync + 'static>;
 
 impl QUICRelayServer {
-    pub fn new(identity_pub_id: String) -> Self {
+    pub fn new(identity_pub_id: String, features: Arc<FeatureRegistry>) -> Self {
         Self {
             state: Arc::new(RwLock::new(RelayState::new())),
             shutdown: Arc::new(Notify::new()),
             identity_pub_id,
             bidi_hook: Arc::new(RwLock::new(None)),
+            features,
         }
     }
 
@@ -284,6 +288,7 @@ impl QUICRelayServer {
         let state = self.state.clone();
         let shutdown = self.shutdown.clone();
         let bidi_hook = self.bidi_hook.clone();
+        let features = self.features.clone();
 
         // Accept loop
         tokio::spawn(async move {
@@ -297,8 +302,11 @@ impl QUICRelayServer {
                         // This fixes a race where peers connecting before
                         // set_bidi_hook() is called get hook=None forever.
                         let hook = bidi_hook.clone();
+                        let features = features.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(incoming, state, hook).await {
+                            if let Err(e) =
+                                handle_connection(incoming, state, hook, features).await
+                            {
                                 debug!("Relay connection error: {e}");
                             }
                         });
@@ -341,6 +349,7 @@ async fn handle_connection(
     incoming: quinn::Incoming,
     state: Arc<RwLock<RelayState>>,
     bidi_hook: Arc<RwLock<Option<BidiStreamHook>>>,
+    features: Arc<FeatureRegistry>,
 ) -> anyhow::Result<()> {
     let connection = incoming.await?;
     let remote_addr = connection.remote_address();
@@ -440,6 +449,7 @@ async fn handle_connection(
     // Handle datagrams and watch for connection close
     let state_clone = state.clone();
     let peer_id_clone = peer_id.clone();
+    let features_clone = features.clone();
 
     // Datagram forwarding loop
     loop {
@@ -447,7 +457,12 @@ async fn handle_connection(
             dgram = connection.read_datagram() => {
                 match dgram {
                     Ok(data) => {
-                        handle_datagram(&state_clone, &peer_id_clone, &data);
+                        handle_datagram(
+                            &state_clone,
+                            &features_clone,
+                            &peer_id_clone,
+                            &data,
+                        );
                     }
                     Err(_) => break, // Connection closed
                 }
@@ -474,37 +489,76 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Forward a datagram from a peer.
-///
-/// NOTE (P1 #6 quota audit): This forwarding path for room.* features (when
-/// sent by native peers over the relay) does **not** go through
-/// FeatureRegistry::gate_through_feature on the *outbound* leg to other
-/// room members. Sender-side gating (in the originating client's
-/// ConnectionManager) and the per-feature quotas in the descriptor provide
-/// the primary protection. The relay does rate limiting at a coarser level.
-/// WebTransport/browser paths go through the FeatureRegistry for both
-/// directions via SfuRoomModule + ModuleNativeDispatcher.
-fn handle_datagram(state: &Arc<RwLock<RelayState>>, from_peer: &str, data: &[u8]) {
+/// Map a relayed inner payload to the capability id used for quota accounting.
+fn relay_datagram_feature(payload: &[u8]) -> (&'static str, usize) {
+    if payload.is_empty() {
+        return ("game.relay.v1", 0);
+    }
+    if let Some(fid) = feature_for_fixed_tag(payload[0]) {
+        return (fid, payload.len());
+    }
+    // Dynamic tags (`0x10..=0xEF`) and untagged opaque room/game payloads.
+    ("game.relay.v1", payload.len())
+}
+
+/// Try to forward `fwd` to `recipient` if outbound `room.*` / core / game quota
+/// allows it. Returns true when the datagram was sent.
+fn try_forward_datagram(
+    features: &FeatureRegistry,
+    feature_id: &str,
+    recipient: &str,
+    fwd: &[u8],
+    member: &RelayPeer,
+) -> bool {
+    if !features.gate_through_feature(feature_id, recipient, fwd.len()) {
+        return false;
+    }
+    member
+        .connection
+        .send_datagram(Bytes::copy_from_slice(fwd))
+        .is_ok()
+}
+
+/// Forward a datagram from a peer with symmetric per-feature quota gating.
+fn handle_datagram(
+    state: &Arc<RwLock<RelayState>>,
+    features: &FeatureRegistry,
+    from_peer: &str,
+    data: &[u8],
+) {
     let Some((target_idx, payload)) = wire::parse_datagram(data) else {
         return;
     };
+
+    let (feature_id, quota_bytes) = relay_datagram_feature(payload);
+    if quota_bytes > 0 && !features.gate_inbound_through_feature(feature_id, from_peer, quota_bytes)
+    {
+        debug!(
+            "[relay] inbound quota exceeded for {} on {}; dropping datagram",
+            &from_peer[..12.min(from_peer.len())],
+            feature_id
+        );
+        return;
+    }
 
     let st = state.read();
     let Some(from) = st.peers.get(from_peer) else {
         return;
     };
     let sender_index = from.peer_index;
+    let mut relayed = 0u64;
 
     if target_idx == wire::BROADCAST_INDEX {
         // Broadcast to all room members except sender
         if let Some(ref room_id) = from.room_id {
             if let Some(members) = st.rooms.get(room_id) {
                 let fwd = wire::build_forwarded_datagram(sender_index, payload);
-                let fwd_bytes = Bytes::from(fwd);
                 for member_id in members {
                     if member_id != from_peer {
                         if let Some(member) = st.peers.get(member_id) {
-                            let _ = member.connection.send_datagram(fwd_bytes.clone());
+                            if try_forward_datagram(features, feature_id, member_id, &fwd, member) {
+                                relayed += fwd.len() as u64;
+                            }
                         }
                     }
                 }
@@ -522,7 +576,9 @@ fn handle_datagram(state: &Arc<RwLock<RelayState>>, from_peer: &str, data: &[u8]
                 };
                 if same_room {
                     let fwd = wire::build_forwarded_datagram(sender_index, payload);
-                    let _ = target.connection.send_datagram(Bytes::from(fwd));
+                    if try_forward_datagram(features, feature_id, target_peer_id, &fwd, target) {
+                        relayed += fwd.len() as u64;
+                    }
                 } else {
                     warn!(
                         "Dropping cross-room datagram from {} (idx={}) → idx={}",
@@ -535,12 +591,16 @@ fn handle_datagram(state: &Arc<RwLock<RelayState>>, from_peer: &str, data: &[u8]
         }
     }
 
+    if relayed == 0 {
+        return;
+    }
+
     // Update stats (drop read lock, take write)
     drop(st);
     let mut st = state.write();
-    st.total_bytes_relayed += data.len() as u64;
+    st.total_bytes_relayed += relayed;
     if let Some(peer) = st.peers.get_mut(from_peer) {
-        peer.bytes_relayed += data.len() as u64;
+        peer.bytes_relayed += relayed;
     }
 }
 
@@ -875,11 +935,42 @@ mod tests {
         assert!(!s.rooms.contains_key("room-solo"));
     }
 
+    fn test_features() -> Arc<FeatureRegistry> {
+        let r = Arc::new(FeatureRegistry::new());
+        for cap in [
+            conquerd_features::wellknown::core_audio_opus(),
+            conquerd_features::wellknown::core_chat_v1(),
+            conquerd_features::wellknown::core_file_v1(),
+            conquerd_features::wellknown::game_relay_v1(),
+        ] {
+            let _ = r.upsert(cap);
+        }
+        r
+    }
+
+    #[test]
+    fn relay_datagram_feature_maps_channel_tags() {
+        use conquerd_features::channel_frame::{encode_frame, AUDIO_TAG, CHAT_TAG, FILE_TAG};
+
+        let (fid, n) = relay_datagram_feature(&encode_frame(AUDIO_TAG, b"opus"));
+        assert_eq!(fid, "core.audio.opus");
+        assert_eq!(n, 5);
+
+        let (fid, _) = relay_datagram_feature(&encode_frame(CHAT_TAG, b"{}"));
+        assert_eq!(fid, "core.chat.v1");
+
+        let (fid, _) = relay_datagram_feature(&encode_frame(FILE_TAG, b"chunk"));
+        assert_eq!(fid, "core.file.v1");
+
+        let (fid, _) = relay_datagram_feature(b"opaque-game-payload");
+        assert_eq!(fid, "game.relay.v1");
+    }
+
     // ── QUICRelayServer (no live QUIC needed) ───────────────────────────────
 
     #[test]
     fn allow_and_revoke_peer() {
-        let srv = QUICRelayServer::new("test-id".into());
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
         srv.allow_peer("peer-x");
         assert!(srv.state.read().allowed.contains("peer-x"));
         srv.revoke_peer("peer-x");
@@ -888,7 +979,7 @@ mod tests {
 
     #[test]
     fn allow_peer_strips_padding() {
-        let srv = QUICRelayServer::new("test-id".into());
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
         srv.allow_peer("peer-padded==");
         assert!(srv.state.read().allowed.contains("peer-padded"));
         assert!(!srv.state.read().allowed.contains("peer-padded=="));
@@ -896,7 +987,7 @@ mod tests {
 
     #[test]
     fn join_room_creates_room_entry() {
-        let srv = QUICRelayServer::new("test-id".into());
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
         srv.allow_peer("peer-a");
         srv.join_room("peer-a", "room-1");
         assert!(srv.get_room_peers("room-1").contains(&"peer-a".to_string()));
@@ -907,7 +998,7 @@ mod tests {
         // Without a live QUIC connection the peer has no RelayPeer entry, so
         // join_room cannot look up the previous room_id.  The peer ends up in
         // every room it was asked to join rather than being moved between them.
-        let srv = QUICRelayServer::new("test-id".into());
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
         srv.allow_peer("peer-a");
         srv.join_room("peer-a", "room-1");
         srv.join_room("peer-a", "room-2");
@@ -919,7 +1010,7 @@ mod tests {
     fn leave_room_is_noop_without_quic_connection() {
         // Without a live QUIC connection the peer has no RelayPeer entry.
         // leave_room looks up room_id via state.peers, so it is a safe no-op.
-        let srv = QUICRelayServer::new("test-id".into());
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
         srv.allow_peer("peer-a");
         srv.join_room("peer-a", "room-1");
         srv.leave_room("peer-a"); // no-op — peer-a has no RelayPeer entry
@@ -930,13 +1021,13 @@ mod tests {
 
     #[test]
     fn get_room_peers_empty_room_returns_empty() {
-        let srv = QUICRelayServer::new("test-id".into());
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
         assert!(srv.get_room_peers("nonexistent").is_empty());
     }
 
     #[test]
     fn stats_reflects_allowed_and_room_counts() {
-        let srv = QUICRelayServer::new("test-id".into());
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
         srv.allow_peer("peer-a");
         srv.allow_peer("peer-b");
         srv.join_room("peer-a", "room-1");
@@ -952,7 +1043,7 @@ mod tests {
 
     #[test]
     fn shutdown_is_safe_to_call() {
-        let srv = QUICRelayServer::new("test-id".into());
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
         srv.shutdown();
     }
 
@@ -1057,7 +1148,7 @@ mod tests {
         let server_pub_bytes = server_signing_key.verifying_key().to_bytes();
         let server_id = crate::crypto::b64url_encode(&server_pub_bytes);
 
-        let srv = QUICRelayServer::new(server_id.clone());
+        let srv = QUICRelayServer::new(server_id.clone(), test_features());
 
         // --- Client identity that we will allow ---
         let client_signing_key = SigningKey::generate(&mut rand::thread_rng());
@@ -1109,7 +1200,10 @@ mod tests {
         // This is the key expansion of the P0 smoke: we now drive actual
         // room membership and a room-broadcast datagram over a *real* QUIC
         // connection (not just in-memory state objects).
+        let (_conn_b, peer_b, _ep_b) =
+            connect_second_test_peer(&srv, port, &server_id).await;
         srv.join_room(&client_peer_id, "p0-smoke-room");
+        srv.join_room(&peer_b, "p0-smoke-room");
 
         // Give the server a moment to process the room membership update
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1120,7 +1214,7 @@ mod tests {
             "one room should be active"
         );
         assert_eq!(stats_after_join.rooms.len(), 1);
-        assert_eq!(stats_after_join.rooms[0].members, 1);
+        assert_eq!(stats_after_join.rooms[0].members, 2);
 
         // Send a real broadcast datagram from the client (0xFF = room broadcast)
         // This exercises handle_datagram + room forwarding logic.
@@ -1194,7 +1288,7 @@ mod tests {
         let server_pub = server_key.verifying_key().to_bytes();
         let server_id = crate::crypto::b64url_encode(&server_pub);
 
-        let srv = QUICRelayServer::new(server_id.clone());
+        let srv = QUICRelayServer::new(server_id.clone(), test_features());
         let port = srv.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
 
         // Peer A
@@ -1261,7 +1355,7 @@ mod tests {
         let server_pub = server_key.verifying_key().to_bytes();
         let server_id = crate::crypto::b64url_encode(&server_pub);
 
-        let srv = QUICRelayServer::new(server_id.clone());
+        let srv = QUICRelayServer::new(server_id.clone(), test_features());
         let port = srv.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
 
         // A peer that is NOT allowed
@@ -1304,7 +1398,7 @@ mod tests {
         let server_pub = server_key.verifying_key().to_bytes();
         let server_id = crate::crypto::b64url_encode(&server_pub);
 
-        let srv = QUICRelayServer::new(server_id.clone());
+        let srv = QUICRelayServer::new(server_id.clone(), test_features());
         let port = srv.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
 
         let client_key = SigningKey::generate(&mut rand::thread_rng());

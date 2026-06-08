@@ -105,9 +105,8 @@ Rectangle {
     // Single persistent timer — iterates every live Repeater delegate, reads
     // the per-peer peak envelope (updated by peakTimer above), normalizes
     // it against the rolling ceiling, then pushes the sample.
-    // The ring renderer is intentionally NOT refreshed here. Each
-    // ParticipantWidget owns a TalkingRing timer with a random phase offset so
-    // adjacent participants' rings don't animate in lockstep.
+    // ParticipantWidget reads live audio levels directly for its lightweight
+    // visual ring; this history remains available for richer renderers.
     Timer {
         id: ringTimer
         interval: 1000
@@ -178,30 +177,22 @@ Rectangle {
 
                 // Connection mode pill
                 Rectangle {
-                    width: modePillText.implicitWidth + 10
-                    height: 16
-                    radius: 0
-                    color: {
-                        if (root.connectionMode === "direct") return "#1a3ba5" // accent tint
-                        if (root.connectionMode === "relay")  return "#3d2c00" // warn tint
-                        return "#3d0008" // danger tint
-                    }
+                    width: modePillText.implicitWidth + Theme.spacingSm
+                    height: Theme.fontSizeCaption + Theme.spacingXs
+                    radius: Theme.radiusSm
+                    color: Theme.semanticTint(
+                        Theme.connectionModeColor(root.connectionMode),
+                        0.18
+                    )
 
                     Text {
                         id: modePillText
                         anchors.centerIn: parent
-                        text: {
-                            if (root.callState === "connecting") return "Connecting\u2026"
-                            if (root.connectionMode === "direct") return "\u25CF Direct"
-                            if (root.connectionMode === "relay")  return "\u21CC Relay"
-                            return "\u2715 Offline"
-                        }
-                        color: {
-                            if (root.connectionMode === "direct") return Theme.accent
-                            if (root.connectionMode === "relay")  return Theme.warn
-                            return Theme.danger
-                        }
-                        font.pixelSize: 9
+                        text: root.callState === "connecting"
+                            ? "Connecting..."
+                            : Theme.connectionModeLabel(root.connectionMode)
+                        color: Theme.connectionModeColor(root.connectionMode)
+                        font.pixelSize: Theme.fontSizeCaption
                         font.bold: true
                     }
                 }
@@ -237,7 +228,7 @@ Rectangle {
 
                     Text {
                         anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Connecting\u2026"
+                        text: "Connecting..."
                         color: Theme.muted
                         font.pixelSize: Theme.fontSizeCaption
                     }

@@ -1,0 +1,28 @@
+{
+  "comment": "UNSIGNED skeleton for ConquerD 1.0.0. Replace build_hash (full lowercase SHA-256 of the final published archive from the .sha256 asset) and build_id (exact CONQUERD_BUILD_ID baked at build time) for each platform. Example build_id: 'release-1.0.0-18eae80' or CI value. Then sign with your private key using the sign-release-manifest binary (or the .ps1 wrapper). The signed result (containing 'signature') is the file to commit and attach to the release.",
+  "releases": [
+    {
+      "build_hash": "REPLACE_WITH_SHA256_OF_ConquerD-1.0.0-win64.7z",
+      "build_id": "release-1.0.0-18eae80",
+      "platform": "win64",
+      "published_at": 0.0,
+      "version": "1.0.0"
+    },
+    {
+      "build_hash": "REPLACE_WITH_SHA256_OF_ConquerD-1.0.0-macos-arm64.dmg",
+      "build_id": "release-1.0.0-18eae80",
+      "platform": "macos-arm64",
+      "published_at": 0.0,
+      "version": "1.0.0"
+    },
+    {
+      "build_hash": "REPLACE_WITH_SHA256_OF_ConquerD-1.0.0-x86_64.AppImage",
+      "build_id": "release-1.0.0-18eae80",
+      "platform": "linux-x86_64",
+      "published_at": 0.0,
+      "version": "1.0.0"
+    }
+  ],
+  "signed_at": 0.0,
+  "signer_pubkey": "d31f43fcfba1fae04313d384d7fba026bd52796550c57def6cf47b069c18043f"
+}

@@ -53,14 +53,17 @@ Item {
     Rectangle {
         id: toolbar
         anchors { top: parent.top; left: parent.left; right: parent.right }
-        height: 40
+        height: Theme.touchTarget
         color: Theme.bg1
 
         RowLayout {
-            anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
-            spacing: 4
+            anchors {
+                fill: parent
+                leftMargin: Theme.spacingSm
+                rightMargin: Theme.spacingSm
+            }
+            spacing: Theme.spacingXs
 
-            // Back button
             ToolButton {
                 id: _backBtn
                 icon.source: "qrc:/qt/qml/ConquerD/Client/icons/connect.svg"
@@ -68,13 +71,14 @@ Item {
                 icon.height: 14
                 icon.color: _webView.loading ? Theme.muted : Theme.text
                 flat: true
-                implicitWidth: 32; implicitHeight: 30
+                implicitWidth: Theme.controlHeight
+                implicitHeight: Theme.controlHeight
                 enabled: !_webView.loading
                 onClicked: _webView.goBack()
-                ToolTip.text: "Back"; ToolTip.visible: hovered
+                ToolTip.text: "Back"
+                ToolTip.visible: hovered
             }
 
-            // Forward button
             ToolButton {
                 id: _fwdBtn
                 icon.source: "qrc:/qt/qml/ConquerD/Client/icons/send.svg"
@@ -82,13 +86,14 @@ Item {
                 icon.height: 14
                 icon.color: _webView.loading ? Theme.muted : Theme.text
                 flat: true
-                implicitWidth: 32; implicitHeight: 30
+                implicitWidth: Theme.controlHeight
+                implicitHeight: Theme.controlHeight
                 enabled: !_webView.loading
                 onClicked: _webView.goForward()
-                ToolTip.text: "Forward"; ToolTip.visible: hovered
+                ToolTip.text: "Forward"
+                ToolTip.visible: hovered
             }
 
-            // Reload / stop button
             ToolButton {
                 id: _reloadBtn
                 icon.source: _webView.loading
@@ -98,35 +103,23 @@ Item {
                 icon.height: 14
                 icon.color: Theme.text
                 flat: true
-                implicitWidth: 32
-                implicitHeight: 30
+                implicitWidth: Theme.controlHeight
+                implicitHeight: Theme.controlHeight
                 onClicked: _webView.loading ? _webView.navigate(_webView.currentUrl) : _webView.reload()
-                ToolTip.text: _webView.loading ? "Stop" : "Reload"; ToolTip.visible: hovered
+                ToolTip.text: _webView.loading ? "Stop" : "Reload"
+                ToolTip.visible: hovered
             }
 
-            // Address bar
-            TextField {
+            StyledTextField {
                 id: _addressBar
                 Layout.fillWidth: true
-                implicitHeight: 28
-                font.pixelSize: 11
-                color: Theme.text
                 placeholderText: "Enter URL or search…"
-                background: Rectangle {
-                    color: Theme.bg0
-                    border.color: _addressBar.activeFocus ? Theme.accent : Theme.bg3
-                    border.width: 1
-                    radius: 0
-                }
-                leftPadding: 8; rightPadding: 8
+                font.pixelSize: Theme.fontSizeCaption
                 text: _webView.currentUrl === "about:blank" ? "" : _webView.currentUrl
-                // Navigate on Enter
                 Keys.onReturnPressed: {
                     var input = _addressBar.text.trim()
                     if (input === "") return
-                    // Auto-prepend https:// if no scheme is present
                     if (!input.match(/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//)) {
-                        // Looks like a URL (has a dot) → prepend https://
                         if (input.match(/^[^\s]+\.[^\s]+/))
                             input = "https://" + input
                         else
@@ -136,20 +129,16 @@ Item {
                 }
             }
 
-            // Open in system browser
             ToolButton {
                 icon.source: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
                 icon.width: 14
                 icon.height: 14
                 icon.color: Theme.muted
                 flat: true
-                implicitWidth: 32; implicitHeight: 30
+                implicitWidth: Theme.controlHeight
+                implicitHeight: Theme.controlHeight
                 ToolTip.text: "Open in system browser"
                 ToolTip.visible: hovered
-                // Hidden for conquerd:// URLs — they can only be served
-                // by *this* client over its authenticated QUIC relay,
-                // and Windows has the scheme registered to ConquerD.exe
-                // so handing it off would just spawn a second instance.
                 enabled: _webView.currentUrl !== "" &&
                          _webView.currentUrl !== "about:blank" &&
                          !_webView.currentUrl.startsWith("conquerd:")
@@ -164,10 +153,8 @@ Item {
         }
     }
 
-    // Keep address bar in sync with navigation
     Connections {
         target: _webView
-        // currentUrl is a read-only alias, so we watch it via the view
         function onCurrentUrlChanged() {
             if (!_addressBar.activeFocus)
                 _addressBar.text = _webView.currentUrl === "about:blank"
@@ -179,12 +166,18 @@ Item {
     Rectangle {
         id: _privacyBar
         anchors { top: toolbar.bottom; left: parent.left; right: parent.right }
-        height: visible ? 30 : 0
+        height: visible ? Theme.bannerHeight : 0
         color: Theme.bg2
-        visible: false   // set true on first navigateTo() until acknowledged
+        visible: false
 
         RowLayout {
-            anchors { fill: parent; leftMargin: 10; rightMargin: 6 }
+            anchors {
+                fill: parent
+                leftMargin: Theme.spacingMd
+                rightMargin: Theme.spacingSm
+            }
+            spacing: Theme.spacingSm
+
             Image {
                 source: "qrc:/qt/qml/ConquerD/Client/icons/lock.svg"
                 sourceSize.width: 12
@@ -195,16 +188,18 @@ Item {
             }
             Label {
                 Layout.fillWidth: true
-                text: "Off-the-record - no cookies or history are saved."
+                text: "Off-the-record — no cookies or history are saved."
                 color: Theme.muted
-                font.pixelSize: 10
+                font.pixelSize: Theme.fontSizeCaption
             }
             ToolButton {
                 icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
                 icon.width: 12
                 icon.height: 12
                 icon.color: Theme.muted
-                flat: true; implicitWidth: 24; implicitHeight: 24
+                flat: true
+                implicitWidth: Theme.controlHeight
+                implicitHeight: Theme.controlHeight
                 onClicked: _privacyBar.visible = false
             }
         }
@@ -217,13 +212,11 @@ Item {
             top: _privacyBar.bottom
             left: parent.left; right: parent.right; bottom: parent.bottom
         }
-        // In node-portal mode allow only conquerd://; otherwise allow all.
         allowConquerd: root.nodeMode
         allowAll: !root.nodeMode
         startUrl: root.startUrl !== "" ? root.startUrl : "about:blank"
 
         onCurrentUrlChanged: {
-            // Show the privacy reminder bar whenever a new page loads
             if (_webView.currentUrl !== "about:blank" && _webView.currentUrl !== "")
                 _privacyBar.visible = true
         }

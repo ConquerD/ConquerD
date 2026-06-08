@@ -53,6 +53,11 @@ pub struct PeerRecord {
     pub peer_version: String,
     #[serde(default)]
     pub peer_build_hash: String,
+    /// Content hash of the sources the peer was built from (computed at build time
+    /// by hashing relevant files). Helps detect source modifications even if
+    /// the git-based build_id is spoofed via environment variable.
+    #[serde(default)]
+    pub peer_source_hash: String,
     #[serde(default)]
     pub peer_protocol_hash: String,
     #[serde(default)]

@@ -11,6 +11,7 @@ Rectangle {
 
     property int peerCount: 0
     property var peerModel: null
+    property string selectedPeerId: ""
     signal peerSelected(string peerId, string handle)
     signal startCallRequested(string peerId)
     signal removePeerRequested(string peerId)
@@ -68,58 +69,33 @@ Rectangle {
                     }
                     text: (section === "true" ? "Online" : "Offline").toUpperCase()
                     color: Theme.muted
-                    font.pixelSize: 10
+                    font.pixelSize: Theme.fontSizeCaption
                     font.capitalization: Font.AllUppercase
-                    font.letterSpacing: 0.8
+                    font.letterSpacing: 1.2
                     font.bold: true
                 }
             }
 
-            // Empty state
-            ColumnLayout {
+            EmptyState {
                 anchors.centerIn: parent
                 visible: root.peerCount === 0
-                width: Math.min(parent.width - 32, 170)
-                spacing: 8
-
-                Image {
-                    source: "qrc:/qt/qml/ConquerD/Client/icons/peers.svg"
-                    sourceSize.width: 32
-                    sourceSize.height: 32
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
-                    Layout.alignment: Qt.AlignHCenter
-                    fillMode: Image.PreserveAspectFit
-                    opacity: 0.72
-                }
-
-                Text {
-                    text: "No peers yet"
-                    horizontalAlignment: Text.AlignHCenter
-                    color: Theme.text
-                    font.pixelSize: Theme.fontSizeBody
-                    font.bold: true
-                    Layout.fillWidth: true
-                }
-
-                Text {
-                    text: "Paste an invite above to add a trusted peer."
-                    horizontalAlignment: Text.AlignHCenter
-                    color: Theme.muted
-                    font.pixelSize: Theme.fontSizeCaption
-                    wrapMode: Text.WordWrap
-                    lineHeight: 1.3
-                    Layout.fillWidth: true
-                }
+                width: Math.min(parent.width - Theme.spacingXl, 170)
+                iconSource: "qrc:/qt/qml/ConquerD/Client/icons/peers.svg"
+                iconSize: 32
+                title: "No peers yet"
+                subtitle: "Paste an invite above to add a trusted peer."
             }
 
             delegate: Rectangle {
                 id: delegateItem
                 width: ListView.view.width
                 height: 56
-                color: mouseArea.containsMouse ? Theme.bg3 : "transparent"
+                color: delegateItem.selected
+                    ? Theme.selectedFill()
+                    : (mouseArea.containsMouse ? Theme.bg3 : "transparent")
 
                 required property string peerId
+                readonly property bool selected: delegateItem.peerId === root.selectedPeerId
                 required property string handle
                 required property bool online
                 required property bool inCall
@@ -128,14 +104,15 @@ Rectangle {
                 required property bool isTyping
                 required property bool blocked
 
-                // 3px left accent bar (visible when in call or unread)
                 Rectangle {
-                    visible: delegateItem.unreadCount > 0 || delegateItem.inCall
+                    visible: delegateItem.selected || delegateItem.unreadCount > 0 || delegateItem.inCall
                     width: 3
                     anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
                     color: delegateItem.inCall ? Theme.online : Theme.accent
                     radius: 0
                 }
+
+                Behavior on color { ColorAnimation { duration: Theme.animNormal } }
 
                 RowLayout {
                     anchors {
@@ -224,8 +201,8 @@ Rectangle {
                             text: delegateItem.unreadCount > 99
                                 ? "99+"
                                 : delegateItem.unreadCount.toString()
-                            color: "#ffffff"
-                            font.pixelSize: 10
+                            color: Theme.textInv
+                            font.pixelSize: Theme.fontSizeCaption
                             font.bold: true
                         }
                     }

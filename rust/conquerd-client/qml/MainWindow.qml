@@ -15,15 +15,26 @@ ApplicationWindow {
     width: 1100
     height: 700
     visible: true
-    minimumWidth: 700
-    minimumHeight: 500
+    minimumWidth: 960
+    minimumHeight: 640
     // Qt.CustomizeWindowHint hides the native title bar while keeping
     // WS_THICKFRAME + WS_CAPTION so DWM provides Aero Snap, Snap Layouts
     // (Win11 hover-maximize), and Win+Arrow snapping.
     flags: Qt.Window | Qt.CustomizeWindowHint
 
-    Material.theme: Material.Dark
+    Material.theme: Theme.isDark ? Material.Dark : Material.Light
     Material.accent: Material.Blue
+
+    function applyThemePreference(value) {
+        var useDark = true
+        if (value === "light") {
+            useDark = false
+        } else if (value === "system") {
+            useDark = Qt.styleHints.colorScheme === Qt.ColorScheme.Dark
+        }
+        Theme.isDark = useDark
+        Material.theme = useDark ? Material.Dark : Material.Light
+    }
 
     // ── Custom frameless title bar with embedded logo + invite controls ─────
     TitleBar {
@@ -51,17 +62,19 @@ ApplicationWindow {
             id: inviteField
             Layout.preferredWidth: 220
             Layout.alignment: Qt.AlignVCenter
-            implicitHeight: 28
+            implicitHeight: Theme.controlHeight
             placeholderText: "Paste invite or peer ID\u2026"
             color: Theme.text
             placeholderTextColor: Theme.muted
-            leftPadding: 8
-            rightPadding: 8
+            font.pixelSize: Theme.fontSizeBody
+            leftPadding: Theme.spacingSm
+            rightPadding: Theme.spacingSm
             background: Rectangle {
                 color: Theme.bg3
-                radius: 0
-                border.color: inviteField.activeFocus ? Theme.accent : "transparent"
+                radius: Theme.radiusMd
+                border.color: inviteField.activeFocus ? Theme.accent : Theme.bg3
                 border.width: 1
+                Behavior on border.color { ColorAnimation { duration: Theme.animFast } }
             }
             Keys.onReturnPressed: {
                 if (text.trim().length > 0) {
@@ -168,6 +181,21 @@ ApplicationWindow {
         id: settingsModel
     }
 
+    Connections {
+        target: settingsModel
+        function onThemeChanged() {
+            applyThemePreference(settingsModel.theme)
+        }
+    }
+
+    Connections {
+        target: Qt.styleHints
+        function onColorSchemeChanged() {
+            if (settingsModel.theme === "system")
+                applyThemePreference("system")
+        }
+    }
+
     // Live-data models
     PeerListModel     { id: peerModel }
     ChatModel         { id: chatModel }
@@ -182,18 +210,30 @@ ApplicationWindow {
 
     Component.onCompleted: {
         settingsModel.load()
+        applyThemePreference(settingsModel.theme)
 
         // ── Push saved avatar config into the bridge so avatarSvg() uses it ─
         backend.setAvatarConfigJson(settingsModel.avatar_config_json)
 
-        // ── Restore window geometry ───────────────────────────────────────
+        // ── Restore window geometry (clamp to minimum usable size) ───────
         root._restoringGeometry = true
-        if (settingsModel.window_width  > 0) root.width  = settingsModel.window_width
-        if (settingsModel.window_height > 0) root.height = settingsModel.window_height
+        if (settingsModel.window_width > 0)
+            root.width = Math.max(root.minimumWidth, settingsModel.window_width)
+        if (settingsModel.window_height > 0)
+            root.height = Math.max(root.minimumHeight, settingsModel.window_height)
         root._restoringGeometry = false
 
-        // ── Apply start-minimized preference ─────────────────────────────
-        if (settingsModel.start_minimized) root.showMinimized()
+        // ── Present the main window ───────────────────────────────────────
+        // start_minimized only when the tray icon is available; otherwise
+        // users would see a process with no visible UI.
+        if (settingsModel.start_minimized && trayIcon.available) {
+            root.showMinimized()
+        } else {
+            root.visible = true
+            root.show()
+            root.raise()
+            root.requestActivate()
+        }
 
         backend.peersUpdated.connect(peerModel.setPeers)
         backend.chatMessageReceived.connect(chatModel.appendMessage)
@@ -427,7 +467,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 text: "Update " + updateBanner.tag + " is available!"
                 color: Theme.textInv
-                font.pixelSize: 12
+                font.pixelSize: Theme.fontSizeBody
             }
             Button {
                 text: "Install"
@@ -475,21 +515,17 @@ ApplicationWindow {
             Label {
                 text: "Invite link copied to clipboard:"
                 color: Theme.text
-                font.pixelSize: 11
+                font.pixelSize: Theme.fontSizeCaption
             }
 
             RowLayout {
                 Layout.fillWidth: true
-                spacing: 6
+                spacing: Theme.spacingXs
 
-                TextField {
+                StyledTextField {
                     Layout.fillWidth: true
-                    implicitHeight: 28
                     text: backend.invite_url
                     readOnly: true
-                    color: Theme.text
-                    font.pixelSize: 10
-                    background: Rectangle { color: Theme.bg3; radius: 0 }
                 }
 
                 Button {
@@ -520,7 +556,7 @@ ApplicationWindow {
             left: parent.left
             right: parent.right
         }
-        height: 32
+        height: Theme.bannerHeight
         bannerText: backend.session_banner
         connectionMode: backend.connection_mode
     }
@@ -575,9 +611,9 @@ ApplicationWindow {
 
         // ── Left sidebar: Peers | Rooms | Nodes tabs ─────────────────────────
         ColumnLayout {
-            Layout.preferredWidth: 220
-            Layout.minimumWidth: 220
-            Layout.maximumWidth: 220
+            Layout.preferredWidth: Theme.sidebarWidth
+            Layout.minimumWidth: Theme.sidebarWidth
+            Layout.maximumWidth: Theme.sidebarWidth
             Layout.fillHeight: true
             clip: true
             spacing: 0
@@ -592,21 +628,21 @@ ApplicationWindow {
 
                 TabButton {
                     text: "Peers"
-                    font.pixelSize: 11
+                    font.pixelSize: Theme.fontSizeCaption
                     font.bold: sidebarTabBar.currentIndex === 0
-                    implicitHeight: 36
+                    implicitHeight: Theme.touchTarget
                 }
                 TabButton {
                     text: "Rooms"
-                    font.pixelSize: 11
+                    font.pixelSize: Theme.fontSizeCaption
                     font.bold: sidebarTabBar.currentIndex === 1
-                    implicitHeight: 36
+                    implicitHeight: Theme.touchTarget
                 }
                 TabButton {
                     text: "Nodes"
-                    font.pixelSize: 11
+                    font.pixelSize: Theme.fontSizeCaption
                     font.bold: sidebarTabBar.currentIndex === 2
-                    implicitHeight: 36
+                    implicitHeight: Theme.touchTarget
                 }
             }
 
@@ -622,6 +658,7 @@ ApplicationWindow {
                     id: peerList
                     peerCount: backend.peer_count
                     peerModel: peerModel
+                    selectedPeerId: chatPanel.selectedPeerId
                     onPeerSelected: function(peerId, handle) {
                         chatPanel.selectedPeerId = peerId
                         chatPanel.selectedPeerName = handle
@@ -653,45 +690,36 @@ ApplicationWindow {
                         model: sfuRoomListModel
                         clip: true
 
-                        // Empty state
-                        ColumnLayout {
+                        EmptyState {
                             anchors.centerIn: parent
                             visible: sfuRoomListModel.count === 0
-                            width: Math.min(parent.width - 32, 170)
-                            spacing: 8
-
-                            Image {
-                                source: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg"
-                                sourceSize.width: 30
-                                sourceSize.height: 30
-                                Layout.preferredWidth: 30
-                                Layout.preferredHeight: 30
-                                Layout.alignment: Qt.AlignHCenter
-                                fillMode: Image.PreserveAspectFit
-                                opacity: 0.72
-                            }
-                            Label {
-                                text: "No rooms visible"
-                                horizontalAlignment: Text.AlignHCenter
-                                color: Theme.text
-                                font.pixelSize: 12
-                                font.bold: true
-                                Layout.fillWidth: true
-                            }
-                            Label {
-                                text: "Connect to a supernode to browse rooms."
-                                horizontalAlignment: Text.AlignHCenter
-                                color: Theme.muted
-                                font.pixelSize: 11
-                                wrapMode: Text.WordWrap
-                                Layout.fillWidth: true
-                            }
+                            width: Math.min(parent.width - Theme.spacingXl, 170)
+                            iconSource: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg"
+                            iconSize: 30
+                            title: "No rooms visible"
+                            subtitle: "Connect to a supernode to browse rooms."
                         }
 
                         delegate: ItemDelegate {
+                            id: roomDelegate
                             width: roomsListView.width
                             height: 48
-                            highlighted: backend.in_room && navIndex === 1
+                            readonly property bool roomSelected: roomPanel.roomId !== ""
+                                && roomPanel.roomId === model.room_id
+
+                            background: Rectangle {
+                                color: roomDelegate.roomSelected
+                                    ? Theme.selectedFill()
+                                    : (roomDelegate.hovered ? Theme.bg3 : "transparent")
+                                Behavior on color { ColorAnimation { duration: Theme.animNormal } }
+
+                                Rectangle {
+                                    visible: roomDelegate.roomSelected
+                                    width: 3
+                                    anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
+                                    color: Theme.accent
+                                }
+                            }
                             // Single click: subscribe to room chat (no voice join, no voice disruption)
                             onClicked: {
                                 roomPanel.switchToRoom(model.name || model.room_id, model.room_id)
@@ -732,22 +760,23 @@ ApplicationWindow {
                             ColumnLayout {
                                 anchors.verticalCenter: parent.verticalCenter
                                 anchors.left: parent.left
-                                anchors.leftMargin: 12
+                                anchors.leftMargin: Theme.spacingMd
                                 anchors.right: parent.right
-                                anchors.rightMargin: 8
-                                spacing: 2
+                                anchors.rightMargin: Theme.spacingSm
+                                spacing: Theme.spacingXs
 
                                 Label {
                                     Layout.fillWidth: true
                                     text: model.name
                                     color: Theme.text
-                                    font.pixelSize: 12
+                                    font.pixelSize: Theme.fontSizeBody
+                                    font.bold: roomDelegate.roomSelected
                                     elide: Text.ElideRight
                                 }
                                 Label {
                                     text: model.kind + (model.count > 0 ? " \u00B7 " + model.count : "")
                                     color: Theme.muted
-                                    font.pixelSize: 10
+                                    font.pixelSize: Theme.fontSizeCaption
                                 }
                             }
                         }
@@ -756,22 +785,14 @@ ApplicationWindow {
                     // Room action buttons
                     Rectangle {
                         Layout.fillWidth: true
-                        height: 44
+                        height: Theme.touchTarget
                         color: Theme.bg0
 
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.margins: 6
-                            spacing: 6
-
-                            Button {
-                                Layout.fillWidth: true
-                                text: "Join Room"
-                                implicitHeight: 30
-                                flat: true
-                                Material.foreground: Theme.text
-                                onClicked: joinRoomDialog.show()
-                            }
+                        StyledButton {
+                            anchors.centerIn: parent
+                            width: parent.width - Theme.spacingMd * 2
+                            text: "Join Room"
+                            onClicked: joinRoomDialog.show()
                         }
                     }
                 }
@@ -787,38 +808,14 @@ ApplicationWindow {
                         model: nodeListModel
                         clip: true
 
-                        ColumnLayout {
+                        EmptyState {
                             anchors.centerIn: parent
                             visible: nodeListModel.count === 0
-                            width: Math.min(parent.width - 32, 170)
-                            spacing: 8
-
-                            Image {
-                                source: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
-                                sourceSize.width: 30
-                                sourceSize.height: 30
-                                Layout.preferredWidth: 30
-                                Layout.preferredHeight: 30
-                                Layout.alignment: Qt.AlignHCenter
-                                fillMode: Image.PreserveAspectFit
-                                opacity: 0.72
-                            }
-                            Label {
-                                text: "No supernodes"
-                                horizontalAlignment: Text.AlignHCenter
-                                color: Theme.text
-                                font.pixelSize: 12
-                                font.bold: true
-                                Layout.fillWidth: true
-                            }
-                            Label {
-                                text: "Connected nodes and portals appear here."
-                                horizontalAlignment: Text.AlignHCenter
-                                color: Theme.muted
-                                font.pixelSize: 11
-                                wrapMode: Text.WordWrap
-                                Layout.fillWidth: true
-                            }
+                            width: Math.min(parent.width - Theme.spacingXl, 170)
+                            iconSource: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
+                            iconSize: 30
+                            title: "No supernodes"
+                            subtitle: "Connected nodes and portals appear here."
                         }
 
                         delegate: ItemDelegate {
@@ -829,12 +826,11 @@ ApplicationWindow {
                             RowLayout {
                                 anchors.verticalCenter: parent.verticalCenter
                                 anchors.left: parent.left
-                                anchors.leftMargin: 12
+                                anchors.leftMargin: Theme.spacingMd
                                 anchors.right: parent.right
-                                anchors.rightMargin: 8
-                                spacing: 8
+                                anchors.rightMargin: Theme.spacingSm
+                                spacing: Theme.spacingSm
 
-                                // Status dot
                                 Rectangle {
                                     width: 8; height: 8; radius: 4
                                     color: model.connected ? Theme.online : Theme.muted
@@ -842,7 +838,7 @@ ApplicationWindow {
 
                                 ColumnLayout {
                                     Layout.fillWidth: true
-                                    spacing: 2
+                                    spacing: Theme.spacingXs
 
                                     Label {
                                         Layout.fillWidth: true
@@ -851,7 +847,7 @@ ApplicationWindow {
                                                ? model.node_id.substring(0, 16) + "\u2026"
                                                : model.node_id)
                                         color: model.connected ? Theme.text : Theme.muted
-                                        font.pixelSize: 11
+                                        font.pixelSize: Theme.fontSizeCaption
                                         elide: Text.ElideRight
                                         ToolTip.text: model.node_id
                                         ToolTip.visible: hovered
@@ -861,7 +857,7 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         text: model.homepage_url
                                         color: Theme.muted
-                                        font.pixelSize: 9
+                                        font.pixelSize: Theme.fontSizeMicro
                                         elide: Text.ElideRight
                                     }
                                 }
@@ -919,125 +915,74 @@ ApplicationWindow {
 
             // ── Settings section navigation ──────────────────────────────────
             // Replaces the peer/room/nodes area when Settings is the active nav.
-            ColumnLayout {
+            SettingsSidebar {
                 visible: navIndex === 2
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                spacing: 0
-
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 36
-                    color: Theme.bg2
-                    Label {
-                        anchors.centerIn: parent
-                        text: "Settings"
-                        color: Theme.text
-                        font.pixelSize: 12
-                        font.bold: true
-                    }
-                }
-
-                ListView {
-                    id: settingsNavList
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    clip: true
-                    model: ListModel {
-                        ListElement { label: "Audio"; icon: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg" }
-                        ListElement { label: "Identity"; icon: "qrc:/qt/qml/ConquerD/Client/icons/person.svg" }
-                        ListElement { label: "General"; icon: "qrc:/qt/qml/ConquerD/Client/icons/gear.svg" }
-                        ListElement { label: "AI"; icon: "qrc:/qt/qml/ConquerD/Client/icons/lightning.svg" }
-                        ListElement { label: "Network"; icon: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg" }
-                        ListElement { label: "Security"; icon: "qrc:/qt/qml/ConquerD/Client/icons/lock.svg" }
-                        ListElement { label: "Privacy"; icon: "qrc:/qt/qml/ConquerD/Client/icons/key.svg" }
-                        ListElement { label: "Diagnostics"; icon: "qrc:/qt/qml/ConquerD/Client/icons/logs.svg" }
-                    }
-                    delegate: ItemDelegate {
-                        id: _sNavItem
-                        width: settingsNavList.width
-                        height: 36
-                        highlighted: index === settingsTab
-                        background: Rectangle {
-                               color: _sNavItem.highlighted ? Theme.accent
-                                   : _sNavItem.hovered ? Theme.bg3
-                                 : "transparent"
-                        }
-                        contentItem: RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: 14
-                            anchors.rightMargin: 8
-                            spacing: 10
-
-                            Image {
-                                source: model.icon
-                                sourceSize.width: 16
-                                sourceSize.height: 16
-                                Layout.preferredWidth: 16
-                                Layout.preferredHeight: 16
-                                fillMode: Image.PreserveAspectFit
-                                opacity: _sNavItem.highlighted ? 1.0 : 0.72
-                            }
-
-                            Label {
-                                Layout.fillWidth: true
-                                text: model.label
-                                color: _sNavItem.highlighted ? Theme.textInv : Theme.muted
-                                font.pixelSize: 12
-                                font.bold: _sNavItem.highlighted
-                                verticalAlignment: Text.AlignVCenter
-                                elide: Text.ElideRight
-                            }
-                        }
-                        onClicked: settingsTab = index
-                    }
-                }
-
-                Rectangle {
-                    Layout.fillWidth: true
-                    height: 44
-                    color: Theme.bg0
-                    Button {
-                        anchors.centerIn: parent
-                        text: "Save Settings"
-                        flat: true
-                        font.pixelSize: 12
-                        Material.foreground: Theme.accent
-                        onClicked: if (settingsModel) settingsModel.save()
-                    }
-                }
+                currentIndex: settingsTab
+                onSectionActivated: (index) => settingsTab = index
+                onSaveRequested: if (settingsModel) settingsModel.save()
             }
 
-            // Bottom nav: Chat | Settings (Room join moved to Rooms tab)
             Rectangle {
                 Layout.fillWidth: true
-                height: 44
+                height: Theme.touchTarget
                 color: Theme.bg0
 
                 RowLayout {
                     anchors.fill: parent
-                    anchors.margins: 4
-                    spacing: 2
+                    anchors.margins: Theme.spacingXs
+                    spacing: Theme.spacingXs
 
-                    ToolButton {
-                        Layout.fillWidth: true
-                        icon.source: "qrc:/qt/qml/ConquerD/Client/icons/speech.svg"
-                        icon.width: 20
-                        icon.height: 20
-                        ToolTip.text: "Chat"
-                        ToolTip.visible: hovered
-                        highlighted: navIndex === 0
-                        onClicked: { navIndex = 0; backend.clearUnread() }
-                    }
-                    ToolButton {
-                        Layout.fillWidth: true
-                        icon.source: "qrc:/qt/qml/ConquerD/Client/icons/gear.svg"
-                        icon.width: 20
-                        icon.height: 20
-                        ToolTip.text: "Settings"
-                        ToolTip.visible: hovered
-                        highlighted: navIndex === 2
-                        onClicked: navIndex = 2
+                    Repeater {
+                        model: [
+                            { icon: "qrc:/qt/qml/ConquerD/Client/icons/speech.svg", label: "Chat", index: 0 },
+                            { icon: "qrc:/qt/qml/ConquerD/Client/icons/gear.svg", label: "Settings", index: 2 }
+                        ]
+
+                        delegate: Item {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            property bool active: navIndex === modelData.index
+
+                            Rectangle {
+                                anchors.fill: parent
+                                color: active ? Theme.selectedFill() : (navMouse.containsMouse ? Theme.bg3 : "transparent")
+                                Behavior on color { ColorAnimation { duration: Theme.animNormal } }
+
+                                Rectangle {
+                                    visible: active
+                                    anchors.left: parent.left
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: 3
+                                    height: parent.height - Theme.spacingSm
+                                    color: Theme.accent
+                                }
+                            }
+
+                            Image {
+                                anchors.centerIn: parent
+                                source: modelData.icon
+                                sourceSize.width: 20
+                                sourceSize.height: 20
+                                width: 20
+                                height: 20
+                                opacity: active ? 1.0 : 0.72
+                            }
+
+                            MouseArea {
+                                id: navMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                ToolTip.text: modelData.label
+                                ToolTip.visible: containsMouse
+                                onClicked: {
+                                    navIndex = modelData.index
+                                    if (modelData.index === 0) backend.clearUnread()
+                                }
+                            }
+                        }
                     }
                 }
             }

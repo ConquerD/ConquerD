@@ -134,6 +134,23 @@ impl FeatureModule for RoomFileModule {
     }
 }
 
+/// `room.audio.sfu` — SFU room voice relayed via supernode signaling.
+///
+/// Advertisement-only on the desktop client: inbound `SfuAudio` frames are
+/// decoded in `connection_manager` and gated through
+/// `FeatureRegistry::dispatch_message` for per-sender quota enforcement
+/// before the call controller sees them. Outbound room audio is gated through
+/// `room.audio.sfu` in `send_room_audio`.
+pub struct RoomAudioSfuModule;
+
+impl FeatureModule for RoomAudioSfuModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::room_audio_sfu()
+    }
+
+    // on_message: inherits default no-op — audio is handled in connection_manager.
+}
+
 /// Register the three first-party client modules into *registry*.
 ///
 /// Descriptors are taken from their `wellknown` constructors.  All three
@@ -147,6 +164,7 @@ pub fn register_client_modules(registry: &FeatureRegistry) -> Result<(), Feature
         Arc::new(CoreAudioOpusModule),
         Arc::new(CoreFileModule::new()),
         Arc::new(RoomFileModule),
+        Arc::new(RoomAudioSfuModule),
     ];
     for m in modules {
         registry.register_module(m)?;
@@ -166,6 +184,7 @@ mod tests {
         assert!(reg.get("core.audio.opus").is_some());
         assert!(reg.get("core.file.v1").is_some());
         assert!(reg.get("room.file.v1").is_some());
+        assert!(reg.get("room.audio.sfu").is_some());
     }
 
     #[test]
@@ -197,6 +216,26 @@ mod tests {
     }
 
     #[test]
+    fn room_audio_sfu_module_is_advertisement_only() {
+        let m = RoomAudioSfuModule;
+        m.on_message("peer-a".into(), b"opus-frame");
+    }
+
+    #[test]
+    fn room_audio_sfu_inbound_quota_enforced_via_dispatch() {
+        let reg = FeatureRegistry::new();
+        reg.register_module(Arc::new(RoomAudioSfuModule)).unwrap();
+        // room.audio.sfu: 200 datagrams/s burst bucket.
+        for _ in 0..200 {
+            assert!(reg.dispatch_message("room.audio.sfu", "peer-a".into(), b"x"));
+        }
+        assert!(
+            !reg.dispatch_message("room.audio.sfu", "peer-a".into(), b"x"),
+            "inbound room.audio.sfu quota should exhaust after burst"
+        );
+    }
+
+    #[test]
     fn file_module_with_hook_fires() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let counter = Arc::new(AtomicUsize::new(0));
@@ -213,5 +252,6 @@ mod tests {
         assert_eq!(CoreChatModule::new().descriptor().id, "core.chat.v1");
         assert_eq!(CoreAudioOpusModule.descriptor().id, "core.audio.opus");
         assert_eq!(CoreFileModule::new().descriptor().id, "core.file.v1");
+        assert_eq!(RoomAudioSfuModule.descriptor().id, "room.audio.sfu");
     }
 }

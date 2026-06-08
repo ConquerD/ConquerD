@@ -118,6 +118,58 @@ $ErrorActionPreference = $_prevPref
 Pop-Location
 if ($_clientExit -ne 0) { Write-Error "cargo build conquerd-client failed (exit $_clientExit)" }
 
+function Get-ClientSourceHash {
+    $outGlob = Join-Path $RUST_DIR "target\$PROFILE_NAME\build\conquerd-client-*\output"
+    $outFile = Get-ChildItem -Path $outGlob -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $outFile) { return $null }
+    foreach ($line in Get-Content $outFile.FullName) {
+        if ($line -match 'cargo:rustc-env=CONQUERD_SOURCE_HASH=(.+)') {
+            return $Matches[1]
+        }
+    }
+    return $null
+}
+
+# Optional second pass: bake CONQUERD_RELEASE_PROOF for official CI/local release builds.
+if ($env:CONQUERD_RELEASE_SIGN_KEY -and (Test-Path $env:CONQUERD_RELEASE_SIGN_KEY)) {
+    $sourceHash = Get-ClientSourceHash
+    $buildId = if ($env:CONQUERD_BUILD_ID) {
+        $env:CONQUERD_BUILD_ID
+    } else {
+        $tag = (& git -C $ROOT describe --tags --exact-match HEAD 2>$null)
+        $sha = (& git -C $ROOT rev-parse --short=12 HEAD 2>$null)
+        if ($tag) { "release-$($tag -replace '^v','')-$sha" } else { $sha }
+    }
+    Write-Host "`n==> Signing release build claim (build_id=$buildId)..."
+    $claimArgs = @(
+        "run", "-p", "conquerd-installer", "--manifest-path", (Join-Path $RUST_DIR "Cargo.toml"),
+        "--bin", "sign-release-manifest", "--",
+        "--sign-build-claim",
+        "--private-key", $env:CONQUERD_RELEASE_SIGN_KEY,
+        "--build-id", $buildId,
+        "--claim-version", $VERSION
+    )
+    if ($sourceHash) { $claimArgs += @("--source-hash", $sourceHash) }
+    Push-Location $ROOT
+    $_prevPrefClaim = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    $proof = & cargo @claimArgs 2>$null
+    $_claimExit = $LASTEXITCODE
+    $ErrorActionPreference = $_prevPrefClaim
+    Pop-Location
+    if ($_claimExit -ne 0 -or -not $proof) {
+        Write-Error "Failed to sign release build claim (exit $_claimExit)"
+    }
+    $env:CONQUERD_RELEASE_PROOF = $proof.Trim()
+    Write-Host "    Rebuilding conquerd-client with CONQUERD_RELEASE_PROOF..."
+    Push-Location $CLIENT_DIR
+    $_prevPref4 = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    & cargo build @CARGO_ARGS --features $_features
+    $_clientExit2 = $LASTEXITCODE
+    $ErrorActionPreference = $_prevPref4
+    Pop-Location
+    if ($_clientExit2 -ne 0) { Write-Error "cargo rebuild with release proof failed (exit $_clientExit2)" }
+}
+
 $CLIENT_EXE = Join-Path $RUST_DIR "target\$PROFILE_NAME\conquerd-client.exe"
 if (-not (Test-Path $CLIENT_EXE)) {
     Write-Error "conquerd-client.exe not found at $CLIENT_EXE"
@@ -218,9 +270,52 @@ Copy-Item $INSTALLER_EXE $DIST_INSTALLER -Force
 Write-Host "`n    Copied conquerd-installer.exe to dist\ (detect-archive entry point)"
 
 # ── Create .7z archive ────────────────────────────────────────────────────────
-# Archiving is handled by the release workflow; skipped in local builds.
+# The installer downloads this 7z from GitHub Releases for updates.
+# It contains the full self-contained portable `ConquerD/` folder (exe + Qt runtime + QML + resources).
 $archiveName = "ConquerD-${VERSION}-win64.7z"
 $archivePath = Join-Path $DIST $archiveName
+
+$sevenZip = Get-Command "7z" -ErrorAction SilentlyContinue
+if (-not $sevenZip) {
+    # Common locations on GitHub runners and dev machines
+    $candidates = @(
+        "C:\Program Files\7-Zip\7z.exe",
+        "C:\Program Files (x86)\7-Zip\7z.exe",
+        "${env:ProgramFiles}\7-Zip\7z.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) {
+            $sevenZip = @{ Source = $c }
+            break
+        }
+    }
+}
+if ($sevenZip) {
+    Write-Host "`n==> Creating 7z archive with 7-Zip..."
+    & $sevenZip.Source a -t7z -mx=9 $archivePath "$BUNDLE\*" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error "7z failed to create archive" }
+} else {
+    Write-Host "`n==> 7z.exe not found — trying Python py7zr fallback..."
+    $py = Get-Command "python" -ErrorAction SilentlyContinue
+    if ($py) {
+        & python -m pip install --quiet py7zr
+        python -c "
+import py7zr
+src = r'$BUNDLE'
+dst = r'$archivePath'
+with py7zr.SevenZipFile(dst, 'w') as z:
+    z.writeall(src, 'ConquerD')
+print('Archive created via py7zr')
+" 
+        if ($LASTEXITCODE -ne 0) { Write-Warning "py7zr archive creation may have failed" }
+    } else {
+        Write-Warning "Neither 7z.exe nor python found. No .7z will be produced. Install 7-Zip for full release packaging."
+    }
+}
+
+if (Test-Path $archivePath) {
+    Write-Host "    Archive ready: $archivePath"
+}
 
 # ── Report results ────────────────────────────────────────────────────────────
 Write-Host ""

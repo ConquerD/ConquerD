@@ -98,9 +98,19 @@ fn maybe_apply_hidpi_scale() {}
 fn run_qt_ui() {
     use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};
 
+    extern "C" {
+        fn conquerd_install_qt_message_handler();
+        fn conquerd_qml_post_load_check(engine: *mut std::ffi::c_void);
+    }
+
     // On HiDPI displays set QT_SCALE_FACTOR before Qt is initialised so
     // Material controls render at desktop-compact sizes.
     maybe_apply_hidpi_scale();
+
+    // Mirror Qt/QML warnings and errors to stderr (visible with the `console` feature).
+    unsafe {
+        conquerd_install_qt_message_handler();
+    }
 
     // Windows taskbar / alt-tab icon — set via C++ shim so that
     // QGuiApplication::setWindowIcon() is called before exec().
@@ -160,10 +170,19 @@ fn run_qt_ui() {
     }
 
     let mut engine = QQmlApplicationEngine::new();
-    if let Some(engine) = engine.as_mut() {
+    if let Some(mut engine) = engine.as_mut() {
+        let engine_ptr = unsafe {
+            std::ptr::from_mut(std::pin::Pin::get_unchecked_mut(engine.as_mut()))
+                as *mut std::ffi::c_void
+        };
         engine.load(&QUrl::from(
             "qrc:/qt/qml/ConquerD/Client/qml/MainWindow.qml",
         ));
+        unsafe {
+            conquerd_qml_post_load_check(engine_ptr);
+        }
+    } else {
+        error!("QQmlApplicationEngine::new() returned null — UI cannot start");
     }
     if let Some(app) = app.as_mut() {
         app.exec();
@@ -596,6 +615,7 @@ async fn handle_event(
         | ConnectionEvent::RelayPaymentRequired { .. }
         | ConnectionEvent::SfuAudioReceived { .. }
         | ConnectionEvent::DirectAudioReceived { .. }
-        | ConnectionEvent::AvatarConfigUpdated { .. } => {}
+        | ConnectionEvent::AvatarConfigUpdated { .. }
+        | ConnectionEvent::ConnectionStats { .. } => {}
     }
 }

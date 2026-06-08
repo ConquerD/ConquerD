@@ -81,40 +81,15 @@ Item {
         id: _view
         anchors.fill: parent
 
-        // NOTE: no `profile:` binding on purpose.
-        //
-        // We deliberately use QWebEngineProfile::defaultProfile() (the
-        // implicit profile when none is specified).  The conquerd://
-        // URL scheme handler is installed on the default profile from
-        // C++ (`conquerd_install_scheme_handler`), as are the
-        // user-agent string, spell-check setting, and the
-        // window.conquerd bridge script.
-        //
-        // The default profile in Qt 6 is off-the-record (no persistent
-        // cookies, cache, history, localStorage, or IndexedDB), so the
-        // privacy contract documented at the top of this file still
-        // holds — but every WebEngineView in the process now shares
-        // the profile that owns the conquerd:// handler.  Using an
-        // inline `WebEngineProfile { ... }` here would silently
-        // bypass the handler, causing Chromium to fall back to
-        // QDesktopServices::openUrl() and (on Windows) spawn a fresh
-        // ConquerD.exe via the OS-registered URI association.
-
-        // Start loading the initial URL after the component is ready.
         Component.onCompleted: {
             if (root.startUrl !== "")
                 _view.url = root.startUrl
         }
 
-        // ── Navigation policy ─────────────────────────────────────────────
         onNavigationRequested: function(request) {
-            // `request.url` is a QML `url` type whose `.scheme` / `.host`
-            // JS properties are NOT exposed.  Convert to string and parse
-            // manually.
             var urlStr = request.url.toString()
             var colonIdx = urlStr.indexOf(":")
             var scheme = colonIdx > 0 ? urlStr.substring(0, colonIdx) : ""
-            // Best-effort host extraction (only valid for "scheme://host/…").
             var host = ""
             if (urlStr.substring(colonIdx, colonIdx + 3) === "://") {
                 var rest = urlStr.substring(colonIdx + 3)
@@ -123,16 +98,12 @@ Item {
             }
             console.log("[portal] onNavigationRequested scheme=" + scheme + " host=" + host + " url=" + urlStr + " allowConquerd=" + root.allowConquerd)
 
-            // Always permit local content and injected HTML.
             if (scheme === "file" || scheme === "data" ||
                 scheme === "qrc"  || scheme === "about") {
                 request.accept()
                 return
             }
 
-            // conquerd:// — secure in-app portal scheme served by the
-            // scheme handler over the QUIC relay connection.  Allowed
-            // when allowConquerd (node portal panel) OR allowAll.
             if (scheme === "conquerd") {
                 if (root.allowConquerd || root.allowAll) {
                     request.accept()
@@ -142,21 +113,17 @@ Item {
                 return
             }
 
-            // Node-portal panel: conquerd:// is the ONLY allowed scheme.
-            // Any outbound http/https link opens in the system browser.
             if (root.allowConquerd && !root.allowAll) {
                 request.reject()
                 Qt.openUrlExternally(request.url)
                 return
             }
 
-            // General browser panel: permit everything.
             if (root.allowAll) {
                 request.accept()
                 return
             }
 
-            // Whitelist check: allow if host ends with any allowed domain.
             for (var i = 0; i < root.allowedDomains.length; i++) {
                 if (host === root.allowedDomains[i] ||
                     host.endsWith("." + root.allowedDomains[i])) {
@@ -165,23 +132,14 @@ Item {
                 }
             }
 
-            // Blocked — open in the system browser so the user isn't stranded.
             request.reject()
             Qt.openUrlExternally(request.url)
         }
 
-        // Suppress context menu (no "Inspect Element", etc.)
         onContextMenuRequested: function(request) {
             request.accepted = true
         }
 
-        // ── Popup / new-window policy ─────────────────────────────────────
-        // Without this handler, QtWebEngine creates a fresh top-level
-        // WebEngineView window for any `window.open()`, target="_blank"
-        // link, middle-click, or framework-initiated popup.  We never
-        // want that — route everything back into this same view (the
-        // node-portal navigation policy above will then accept/reject
-        // it based on scheme).
         onNewWindowRequested: function(request) {
             request.openIn(_view)
         }
@@ -195,7 +153,7 @@ Item {
 
         ColumnLayout {
             anchors.centerIn: parent
-            spacing: 12
+            spacing: Theme.spacingMd
 
             BusyIndicator {
                 Layout.alignment: Qt.AlignHCenter
@@ -205,7 +163,7 @@ Item {
                 Layout.alignment: Qt.AlignHCenter
                 text: "Loading…"
                 color: Theme.muted
-                font.pixelSize: 11
+                font.pixelSize: Theme.fontSizeCaption
             }
         }
     }
@@ -217,7 +175,6 @@ Item {
     Connections {
         target: _view
         function onLoadingChanged(loadRequest) {
-            // LoadFailedStatus = 2 in QtWebEngine
             if (loadRequest.status === WebEngineLoadingInfo.LoadFailedStatus) {
                 root._errorUrl = loadRequest.url.toString()
                 root._errorVisible = true
@@ -234,8 +191,8 @@ Item {
 
         ColumnLayout {
             anchors.centerIn: parent
-            spacing: 12
-            width: Math.min(parent.width - 32, 300)
+            spacing: Theme.spacingMd
+            width: Math.min(parent.width - Theme.spacingXl * 2, 300)
 
             Image {
                 source: "qrc:/qt/qml/ConquerD/Client/icons/warning.svg"
@@ -250,28 +207,26 @@ Item {
                 Layout.alignment: Qt.AlignHCenter
                 text: "Could not load page"
                 color: Theme.text
-                font.pixelSize: 13
+                font.pixelSize: Theme.fontSizeTitle
                 font.bold: true
             }
             Label {
                 Layout.fillWidth: true
                 text: root._errorUrl
-                // Never hand a conquerd:// URL to the OS — Windows has
-                // the scheme registered to ConquerD.exe, so doing so
-                // would just spawn a second client instance.
                 visible: root._errorUrl !== "" &&
                          !root._errorUrl.startsWith("conquerd:")
                 color: Theme.muted
-                font.pixelSize: 10
+                font.pixelSize: Theme.fontSizeMicro
                 wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                 elide: Text.ElideRight
                 maximumLineCount: 2
             }
-            Button {
+            StyledButton {
                 Layout.alignment: Qt.AlignHCenter
                 text: "Open in system browser"
-                flat: true
-                Material.foreground: Theme.accent
+                primary: true
+                visible: root._errorUrl !== "" &&
+                         !root._errorUrl.startsWith("conquerd:")
                 onClicked: Qt.openUrlExternally(root._errorUrl)
             }
         }

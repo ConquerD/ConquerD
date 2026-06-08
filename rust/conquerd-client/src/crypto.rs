@@ -195,6 +195,17 @@ pub fn derive_public_id(public_key_bytes: &[u8]) -> String {
     URL_SAFE.encode(public_key_bytes)
 }
 
+/// Sign `data` with a 32-byte Ed25519 seed, returning the 64-byte signature.
+///
+/// Returns an error if `seed` is not exactly 32 bytes.
+pub fn ed25519_sign(seed: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    let Ok(arr): std::result::Result<[u8; 32], _> = seed.try_into() else {
+        return Err(ClientError::Crypto("seed must be 32 bytes".into()));
+    };
+    let signing_key = SigningKey::from_bytes(&arr);
+    Ok(signing_key.sign(data).to_bytes().to_vec())
+}
+
 /// Verify an Ed25519 signature against `data` using the raw 32-byte public key.
 ///
 /// Returns `false` if `public_key_bytes` is not exactly 32 bytes or
@@ -213,13 +224,56 @@ pub fn ed25519_verify(public_key_bytes: &[u8], signature_bytes: &[u8], data: &[u
     pk.verify(data, &sig).is_ok()
 }
 
-/// Sign `data` with the raw 32-byte Ed25519 signing key seed.
-pub fn ed25519_sign(seed: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    let arr: [u8; 32] = seed
-        .try_into()
-        .map_err(|_| ClientError::Crypto("Ed25519 seed must be 32 bytes".into()))?;
-    let key = SigningKey::from_bytes(&arr);
-    Ok(key.sign(data).to_bytes().to_vec())
+/// Hex-encoded Ed25519 public key of the ConquerD release signer.
+/// Must be kept in sync with the one in conquerd-installer/src/release_manifest.rs.
+const RELEASE_SIGNER_PUBKEY_HEX: &str =
+    "d31f43fcfba1fae04313d384d7fba026bd52796550c57def6cf47b069c18043f";
+
+/// Verify a claim that this binary is an official release build of the given
+/// build_id and version (and optionally the exact source content hash).
+///
+/// The `release_sig_b64` (if present) should be a base64-encoded Ed25519 signature
+/// produced by the release private key over a canonical claim:
+///   `build_id=...,version=...,source_hash=...`
+/// (source_hash is included when the official build provided one).
+///
+/// Returns true only if the release signer key is configured
+/// and the signature verifies.
+///
+/// This is the main defense against an attacker who modifies sources and then
+/// spoofs the build_id / source_hash via env var or post-build patching.
+pub fn verify_official_release_build(
+    build_id: &str,
+    version: &str,
+    source_hash: &str,
+    release_sig_b64: Option<&str>,
+) -> bool {
+    if RELEASE_SIGNER_PUBKEY_HEX == "0".repeat(64) {
+        // Safety net: no configured release signer key yet.
+        return false;
+    }
+    let Some(sig_b64) = release_sig_b64 else {
+        return false;
+    };
+
+    let pubkey_bytes: [u8; 32] = match hex::decode(RELEASE_SIGNER_PUBKEY_HEX) {
+        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
+        _ => return false,
+    };
+
+    let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(sig_b64) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return false,
+    };
+
+    // Canonical claim. Must match exactly what the release process signed.
+    let claim = if !source_hash.is_empty() {
+        format!("build_id={build_id},version={version},source_hash={source_hash}")
+    } else {
+        format!("build_id={build_id},version={version}")
+    };
+
+    ed25519_verify(&pubkey_bytes, &sig_bytes, claim.as_bytes())
 }
 
 /// Generate a cryptographically random nonce of `length` bytes.

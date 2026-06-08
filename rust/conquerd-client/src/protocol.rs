@@ -235,8 +235,9 @@ impl MessageType {
 ///   ([`conquerd_features::ReplayGuard`]) rejects re-delivery of an already-seen
 ///   signature *within* the window. Together they close the replay gap for all
 ///   non-realtime signaling. Real-time `SfuAudio` frames are exempt from the
-///   dedup guard (ephemeral, high-rate, covered by the freshness window +
-///   jitter buffer), mirroring the audio quota bypass.
+///   dedup guard only (ephemeral, high-rate, covered by the freshness window +
+///   jitter buffer); they are still subject to per-feature byte quotas on the
+///   transport relay path.
 ///
 /// See `connection_manager::verify_inbound_signature` (freshness) +
 /// `connection_manager::check_replay` (dedup) and the supernode WS handler,

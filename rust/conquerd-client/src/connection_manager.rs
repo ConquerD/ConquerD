@@ -197,6 +197,9 @@ pub enum ConnectionEvent {
     },
     /// Transfer failed or was rejected.
     FileFailed { transfer_id: String, reason: String },
+    /// Periodic transport statistics for a connected peer.
+    /// `json` = `{peer_id, rtt_ms, packet_loss_pct, jitter_ms, relay, bandwidth_kbps}`.
+    ConnectionStats { peer_id: String, json: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +414,14 @@ enum InternalEvent {
     },
     /// QUIC connection lost.
     QuicDisconnected { peer_id: String },
+    /// Periodic transport stats sampled from `quinn::Connection::stats()`.
+    QuicStats {
+        peer_id: String,
+        rtt_ms: f64,
+        packet_loss_pct: f64,
+        jitter_ms: f64,
+        bandwidth_kbps: f64,
+    },
     /// Inbound signaling payload from the QUIC peer.
     QuicSignalingData { peer_id: String, data: Vec<u8> },
     // ── WebSocket / supernode events ───────────────────────────────────────
@@ -570,6 +581,16 @@ pub struct ConnectionManager {
     /// timestamp freshness window by rejecting re-delivery of an already-seen
     /// signed message *within* that window.
     replay_guard: ReplayGuard,
+    /// Latest QUIC transport stats keyed by peer id.
+    transport_stats: HashMap<String, PeerTransportStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PeerTransportStats {
+    rtt_ms: f64,
+    packet_loss_pct: f64,
+    jitter_ms: f64,
+    bandwidth_kbps: f64,
 }
 
 impl ConnectionManager {
@@ -639,6 +660,7 @@ impl ConnectionManager {
             current_supernode_id: String::new(),
             quic_relays: HashMap::new(),
             replay_guard: ReplayGuard::new(Self::MAX_MESSAGE_AGE_SECS),
+            transport_stats: HashMap::new(),
         };
         (cmd_tx, event_rx, mgr.run_inner())
     }
@@ -691,6 +713,7 @@ impl ConnectionManager {
 
         // Main event loop
         let mut ping_interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_S));
+        let mut stats_interval = tokio::time::interval(Duration::from_secs(2));
 
         loop {
             tokio::select! {
@@ -873,9 +896,36 @@ impl ConnectionManager {
                 _ = ping_interval.tick() => {
                     self.send_pings().await;
                 }
+                _ = stats_interval.tick() => {
+                    self.emit_connection_stats();
+                }
             }
         }
         info!("ConnectionManager stopped");
+    }
+
+    fn emit_connection_stats(&self) {
+        for (peer_id, peer) in &self.peers {
+            if peer.state != PeerConnectionState::Connected {
+                continue;
+            }
+            let Some(stats) = self.transport_stats.get(peer_id) else {
+                continue;
+            };
+            let relay = peer.state == PeerConnectionState::Relay;
+            let payload = serde_json::json!({
+                "peer_id": peer_id,
+                "rtt_ms": stats.rtt_ms,
+                "packet_loss_pct": stats.packet_loss_pct,
+                "jitter_ms": stats.jitter_ms,
+                "relay": relay,
+                "bandwidth_kbps": stats.bandwidth_kbps,
+            });
+            let _ = self.event_tx.try_send(ConnectionEvent::ConnectionStats {
+                peer_id: peer_id.clone(),
+                json: payload.to_string(),
+            });
+        }
     }
 
     // -- supernode WebSocket -------------------------------------------------
@@ -1214,8 +1264,28 @@ impl ConnectionManager {
                     .try_send(ConnectionEvent::PeerConnected(peer_id.clone()));
                 // Send capability announce to the newly-connected peer.
                 self.send_capability_announce(&peer_id).await;
+                // Also send build attestation so the peer knows our reproducible build ID.
+                self.send_build_attestation(&peer_id).await;
+            }
+            InternalEvent::QuicStats {
+                peer_id,
+                rtt_ms,
+                packet_loss_pct,
+                jitter_ms,
+                bandwidth_kbps,
+            } => {
+                self.transport_stats.insert(
+                    peer_id,
+                    PeerTransportStats {
+                        rtt_ms,
+                        packet_loss_pct,
+                        jitter_ms,
+                        bandwidth_kbps,
+                    },
+                );
             }
             InternalEvent::QuicDisconnected { peer_id } => {
+                self.transport_stats.remove(&peer_id);
                 if let Some(conn) = self.peers.get_mut(&peer_id) {
                     conn.state = PeerConnectionState::Disconnected;
                     conn.quic_sig_tx = None;
@@ -1253,12 +1323,23 @@ impl ConnectionManager {
                             let opus_data = rest[1 + id_len..].to_vec();
                             // Use the session-level peer_id (verified from
                             // the handshake) rather than the embedded id.
-                            let _ = self
-                                .event_tx
-                                .try_send(ConnectionEvent::DirectAudioReceived {
-                                    peer_id,
-                                    opus_data,
-                                });
+                            if !self.check_inbound_feature_quota(
+                                "core.audio.opus",
+                                &peer_id,
+                                opus_data.len(),
+                            ) {
+                                debug!(
+                                    "[core.audio.opus] inbound quota exceeded for {}; dropping frame",
+                                    &peer_id[..8.min(peer_id.len())]
+                                );
+                            } else {
+                                let _ =
+                                    self.event_tx
+                                        .try_send(ConnectionEvent::DirectAudioReceived {
+                                            peer_id,
+                                            opus_data,
+                                        });
+                            }
                         }
                     }
                     // Chat / file / control all carry signed JSON; route
@@ -1303,6 +1384,8 @@ impl ConnectionManager {
                 self.send_room_list_request(&peer_id).await;
                 // Request supernode info (portal URL, title) for the Nodes tab.
                 self.send_supernode_info_request(&peer_id).await;
+                // Tell the supernode our build attestation (reproducible build ID).
+                self.send_build_attestation(&peer_id).await;
             }
             InternalEvent::WsDisconnected { peer_id } => {
                 if let Some(sn) = self.supernodes.get_mut(&peer_id) {
@@ -1501,6 +1584,23 @@ impl ConnectionManager {
             .gate_through_feature("core.audio.opus", target, byte_count)
     }
 
+    #[inline]
+    fn check_room_audio_outbound_quota(&self, target: &str, byte_count: usize) -> bool {
+        self.feature_registry
+            .gate_through_feature("room.audio.sfu", target, byte_count)
+    }
+
+    #[inline]
+    fn check_inbound_feature_quota(
+        &self,
+        feature_id: &str,
+        sender: &str,
+        byte_count: usize,
+    ) -> bool {
+        self.feature_registry
+            .gate_inbound_through_feature(feature_id, sender, byte_count)
+    }
+
     /// Send a real-time Opus audio frame to a directly-connected peer.
     ///
     /// ## Audio Dispatch Decision (P2 #9 - Option A)
@@ -1559,8 +1659,8 @@ impl ConnectionManager {
 
     /// Send a room audio frame to the supernode via WebSocket SFU_AUDIO.
     ///
-    /// See the detailed "Audio Dispatch Decision" comment in `send_audio_datagram`
-    /// for the rationale behind the dedicated real-time path for `core.audio.opus`.
+    /// Outbound quota uses `room.audio.sfu` (gated against the supernode peer id).
+    /// See `send_audio_datagram` for the direct P2P `core.audio.opus` path.
     ///
     /// This is the fallback path for when no direct QUIC connections exist
     /// between room members (typical over the Internet behind separate NATs).
@@ -1569,9 +1669,11 @@ impl ConnectionManager {
         if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
             return; // Not in a room
         }
-        // Gate through core.audio.opus outbound quota (via dedicated helper).
-        if !self.check_audio_quota(&self.current_supernode_id, opus_data.len()) {
-            debug!("[core.audio.opus] outbound quota exceeded for room audio; dropping frame");
+        if !self.check_room_audio_outbound_quota(&self.current_supernode_id, opus_data.len()) {
+            debug!(
+                "[room.audio.sfu] outbound quota exceeded for {}; dropping frame",
+                &self.current_supernode_id[..8.min(self.current_supernode_id.len())]
+            );
             return;
         }
         let sender = self.identity.public_id();
@@ -1664,6 +1766,38 @@ impl ConnectionManager {
             "CAPABILITY_ANNOUNCE sent to {} ({} caps)",
             &peer_id[..8.min(peer_id.len())],
             descriptors.len()
+        );
+    }
+
+    /// Send our build attestation (reproducible build ID + version) to a peer.
+    /// This lets the remote verify we are running a build from a known / trusted
+    /// source commit (or official release) per the user's intent for build attestation.
+    async fn send_build_attestation(&mut self, peer_id: &str) {
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::BuildAttestation, sender);
+        msg.target = Some(peer_id.to_owned());
+        msg.payload.insert(
+            "build_id".to_owned(),
+            Value::String(env!("CONQUERD_BUILD_ID").to_owned()),
+        );
+        msg.payload.insert(
+            "version".to_owned(),
+            Value::String(env!("CARGO_PKG_VERSION").to_owned()),
+        );
+        msg.payload.insert(
+            "source_hash".to_owned(),
+            Value::String(env!("CONQUERD_SOURCE_HASH").to_owned()),
+        );
+        if let Some(proof) = option_env!("CONQUERD_RELEASE_PROOF") {
+            if !proof.is_empty() {
+                msg.payload
+                    .insert("release_sig".to_owned(), Value::String(proof.to_owned()));
+            }
+        }
+        self.dispatch_outbound(msg).await;
+        debug!(
+            "BUILD_ATTESTATION sent to {}",
+            &peer_id[..8.min(peer_id.len())]
         );
     }
 
@@ -2024,10 +2158,10 @@ impl ConnectionManager {
         // Sliding-window replay guard: reject re-delivery of an already-seen
         // signed message within the freshness window. Runs only after the
         // signature + freshness checks above have passed. Real-time audio
-        // frames (SfuAudio, ~50 Hz) are exempt — they are ephemeral, already
-        // protected by the freshness window + jitter buffer, and would
-        // otherwise flood the per-sender window (mirrors the audio quota
-        // bypass).
+        // frames (SfuAudio, ~50 Hz) are exempt from signature dedup only —
+        // they are ephemeral, already protected by the freshness window +
+        // jitter buffer, and would otherwise flood the per-sender window.
+        // Per-feature byte quotas still apply on the transport relay path.
         if msg.msg_type != MessageType::SfuAudio && !self.check_replay(&msg) {
             warn!(
                 "[signaling] dropping {:?} from {} — replayed message",
@@ -2262,7 +2396,8 @@ impl ConnectionManager {
             MessageType::SfuAudio => {
                 // Inbound room audio relayed by the supernode.  The `sender`
                 // field is the originating peer (preserved by the supernode
-                // broadcast).  Decode the base64 Opus payload and forward to
+                // broadcast).  Decode the base64 Opus payload, enforce the
+                // room.audio.sfu per-sender inbound quota, then forward to
                 // the call controller via a `SfuAudioReceived` event.
                 use base64::Engine;
                 let audio_b64 = msg
@@ -2272,6 +2407,17 @@ impl ConnectionManager {
                     .unwrap_or("");
                 if let Ok(opus_data) = base64::engine::general_purpose::URL_SAFE.decode(audio_b64) {
                     if !opus_data.is_empty() {
+                        if !self.check_inbound_feature_quota(
+                            "room.audio.sfu",
+                            &msg.sender,
+                            opus_data.len(),
+                        ) {
+                            debug!(
+                                "[room.audio.sfu] inbound quota exceeded for {}; dropping frame",
+                                &msg.sender[..8.min(msg.sender.len())]
+                            );
+                            return;
+                        }
                         let _ = self.event_tx.try_send(ConnectionEvent::SfuAudioReceived {
                             peer_id: msg.sender.clone(),
                             opus_data,
@@ -2775,6 +2921,73 @@ impl ConnectionManager {
                     .to_owned();
                 let evs = self.file_mgr.on_transfer_error(&tid, &reason);
                 self.dispatch_transfer_events(evs).await;
+            }
+            MessageType::BuildAttestation | MessageType::AttestationResponse => {
+                // Store the peer's reported build info for reproducible-build / trusted-build attestation.
+                // The message is already signature + replay verified by the caller.
+                let build_id = msg
+                    .payload
+                    .get("build_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let version = msg
+                    .payload
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let source_hash = msg
+                    .payload
+                    .get("source_hash")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let release_sig = msg.payload.get("release_sig").and_then(Value::as_str);
+
+                if !build_id.is_empty() {
+                    let is_official = crate::crypto::verify_official_release_build(
+                        &build_id,
+                        &version,
+                        &source_hash,
+                        release_sig,
+                    );
+
+                    let mut store = self.peer_store.write();
+                    if let Some(rec) = store.get_mut(&msg.sender) {
+                        rec.peer_build_hash = build_id.clone();
+                        rec.peer_source_hash = source_hash.clone();
+                        if !version.is_empty() {
+                            rec.peer_version = version.clone();
+                        }
+                        rec.last_attestation_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64())
+                            .unwrap_or(0.0);
+                        rec.attestation_status = if is_official {
+                            "official".to_string()
+                        } else {
+                            "claimed".to_string()
+                        };
+                    }
+                    let _ = store.save();
+                    drop(store);
+
+                    debug!(
+                        "Build attestation from {}: build_id={}, source_hash={}, version={}, official={}",
+                        &msg.sender[..8.min(msg.sender.len())],
+                        build_id,
+                        if source_hash.is_empty() { "n/a" } else { &source_hash },
+                        if version.is_empty() { "n/a" } else { &version },
+                        is_official
+                    );
+
+                    // Also forward so the UI layer (bridge, models) can react if desired
+                    // (e.g. update peer list with build info, enforce policy).
+                    let _ = self
+                        .event_tx
+                        .try_send(ConnectionEvent::SignalingMessage(msg));
+                }
             }
             _ => {
                 // Forward unhandled messages to the app layer
@@ -3347,6 +3560,50 @@ async fn run_quic_peer_session(
             sig_tx,
         })
         .await;
+
+    // Sample QUIC transport stats for the connection stats overlay.
+    let stats_conn = connection.clone();
+    let stats_tx = internal_tx.clone();
+    let stats_peer = peer_id.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        let mut prev_bytes: u64 = 0;
+        let mut prev_rtt_ms: Option<f64> = None;
+        loop {
+            interval.tick().await;
+            if stats_conn.close_reason().is_some() {
+                break;
+            }
+            let s = stats_conn.stats();
+            let rtt_ms = s.path.rtt.as_secs_f64() * 1000.0;
+            let sent = s.path.sent_packets;
+            let lost = s.path.lost_packets;
+            let packet_loss_pct = if sent > 0 {
+                (lost as f64 / sent as f64) * 100.0
+            } else {
+                0.0
+            };
+            let jitter_ms = prev_rtt_ms
+                .map(|prev| (rtt_ms - prev).abs())
+                .unwrap_or(0.0);
+            prev_rtt_ms = Some(rtt_ms);
+            let bytes = s.udp_tx.bytes;
+            let bandwidth_kbps = if prev_bytes > 0 && bytes >= prev_bytes {
+                ((bytes - prev_bytes) * 8) as f64 / 2000.0
+            } else {
+                0.0
+            };
+            prev_bytes = bytes;
+            let _ = stats_tx
+                .try_send(InternalEvent::QuicStats {
+                    peer_id: stats_peer.clone(),
+                    rtt_ms,
+                    packet_loss_pct,
+                    jitter_ms,
+                    bandwidth_kbps,
+                });
+        }
+    });
 
     // Outbound write buffer
     let peer_id_w = peer_id.clone();

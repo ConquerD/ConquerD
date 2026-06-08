@@ -5,22 +5,17 @@ import QtQuick.Controls.Material
 import QtQuick.Layouts
 import ConquerD.Client 1.0
 
-Rectangle {
+Item {
     id: root
     visible: false
-    color: "#2F3136"
-    radius: 0
     width: 320
-    height: 220
+    height: 240
 
-    // Provided by the parent when a call comes in
     property string callPeerId: ""
 
-    // Emitted when the user accepts/rejects
     signal accepted(string peerId)
     signal rejected(string peerId)
 
-    // Auto-dismiss if no action within 30 seconds
     Timer {
         id: dismissTimer
         interval: 30000
@@ -44,53 +39,71 @@ Rectangle {
         root.callPeerId = ""
     }
 
-    ColumnLayout {
+    Rectangle {
         anchors.fill: parent
-        anchors.margins: 20
-        spacing: 12
+        color: Theme.overlayScrim
+        opacity: 0.72
+    }
 
-        Avatar {
-            Layout.alignment: Qt.AlignHCenter
-            peerId: root.callPeerId
-            size: 56
-            showRing: true
-        }
+    Rectangle {
+        anchors.centerIn: parent
+        width: 320
+        height: cardColumn.implicitHeight + Theme.spacingXl * 2
+        color: Theme.bg2
+        radius: Theme.radiusMd
+        border.color: Theme.border
+        border.width: 1
 
-        Label {
-            Layout.fillWidth: true
-            text: "Incoming call"
-            font.pixelSize: 15
-            font.bold: true
-            color: "#FFFFFF"
-            horizontalAlignment: Text.AlignHCenter
-        }
+        ColumnLayout {
+            id: cardColumn
+            anchors {
+                fill: parent
+                margins: Theme.spacingXl
+            }
+            spacing: Theme.spacingMd
 
-        Label {
-            Layout.fillWidth: true
-            text: root.callPeerId || "Unknown"
-            font.pixelSize: 13
-            color: "#B9BBBE"
-            elide: Text.ElideMiddle
-            horizontalAlignment: Text.AlignHCenter
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 12
-
-            Button {
-                Layout.fillWidth: true
-                text: "\u274C  Decline"
-                Material.background: "#ED4245"
-                onClicked: root.dismiss(false)
+            Avatar {
+                Layout.alignment: Qt.AlignHCenter
+                peerId: root.callPeerId
+                size: 56
+                showRing: true
             }
 
-            Button {
+            Label {
                 Layout.fillWidth: true
-                text: "\u2705  Accept"
-                Material.background: "#57F287"
-                Material.foreground: "#000000"
-                onClicked: root.dismiss(true)
+                text: "Incoming call"
+                font.pixelSize: Theme.fontSizeTitle
+                font.bold: true
+                color: Theme.text
+                horizontalAlignment: Text.AlignHCenter
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: root.callPeerId || "Unknown"
+                font.pixelSize: Theme.fontSizeBody
+                color: Theme.muted
+                elide: Text.ElideMiddle
+                horizontalAlignment: Text.AlignHCenter
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingMd
+
+                StyledButton {
+                    Layout.fillWidth: true
+                    text: "Decline"
+                    danger: true
+                    onClicked: root.dismiss(false)
+                }
+
+                StyledButton {
+                    Layout.fillWidth: true
+                    text: "Accept"
+                    success: true
+                    onClicked: root.dismiss(true)
+                }
             }
         }
     }

@@ -585,6 +585,7 @@ dependencies = [
  "hex",
  "image",
  "open",
+ "pem",
  "serde",
  "serde_json",
  "sevenz-rust",

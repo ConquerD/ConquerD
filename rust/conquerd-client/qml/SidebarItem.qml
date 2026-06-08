@@ -2,7 +2,7 @@
 //
 // Usage:
 //   SidebarItem {
-//       icon: "qrc:/qt/qml/ConquerD/Client/icons/speech.svg"
+//       iconSource: "qrc:/qt/qml/ConquerD/Client/icons/speech.svg"
 //       label: "Chat"
 //       badge: 3        // 0 = no badge
 //       selected: true
@@ -17,7 +17,7 @@ import ConquerD.Client 1.0
 ItemDelegate {
     id: root
 
-    property string icon: ""
+    property string iconSource: ""
     property string label: ""
     property int badge: 0
     property bool selected: false
@@ -30,8 +30,8 @@ ItemDelegate {
 
     background: Rectangle {
         color: root.selected
-            ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.15)
-            : (root.hovered ? Theme.bg2 : "transparent")
+            ? Theme.selectedFill()
+            : (root.hovered ? Theme.bg3 : "transparent")
         radius: 0
 
         Rectangle {
@@ -43,12 +43,12 @@ ItemDelegate {
     }
 
     contentItem: RowLayout {
-        anchors { fill: parent; leftMargin: 12; rightMargin: 8 }
-        spacing: 10
+        anchors { fill: parent; leftMargin: Theme.spacingMd; rightMargin: Theme.spacingSm }
+        spacing: Theme.spacingSm
 
         Image {
-            source: root.icon
-            visible: root.icon !== ""
+            source: root.iconSource
+            visible: root.iconSource !== ""
             sourceSize.width: 18
             sourceSize.height: 18
             Layout.preferredWidth: 18
@@ -78,8 +78,8 @@ ItemDelegate {
                 id: badgeLabel
                 anchors.centerIn: parent
                 text: root.badge > 99 ? "99+" : root.badge.toString()
-                color: "white"
-                font.pixelSize: 10
+                color: Theme.textInv
+                font.pixelSize: Theme.fontSizeCaption
                 font.bold: true
             }
         }

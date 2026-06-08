@@ -1,6 +1,12 @@
 ﻿# External project junction — tracked by its own repo
 ConquerD_www/
 
+# Release signing keys (public key + hex are committed; private must never be committed)
+keys/*-private.pem
+keys/*-private.key
+*-private.pem
+*-private.key
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

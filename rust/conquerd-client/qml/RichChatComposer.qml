@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls.Material
 import QtQuick.Dialogs
 import QtQuick.Layouts
+import ConquerD.Client 1.0
 
 Rectangle {
     id: root
@@ -19,9 +20,9 @@ Rectangle {
     property bool aiStreaming: false
 
     Layout.fillWidth: true
-    implicitHeight: composerLayout.implicitHeight + 14
+    implicitHeight: composerLayout.implicitHeight + Theme.spacingMd
     color: Theme.bg3
-    radius: 0
+    radius: Theme.radiusMd
 
     function selectedText() {
         return composer.selectedText || ""
@@ -65,8 +66,8 @@ Rectangle {
     ColumnLayout {
         id: composerLayout
         anchors.fill: parent
-        anchors.margins: 7
-        spacing: 5
+        anchors.margins: Theme.spacingSm
+        spacing: Theme.spacingXs
 
         RowLayout {
             Layout.fillWidth: true

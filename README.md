@@ -874,7 +874,7 @@ cd conquerd-client
 cargo test
 ```
 
-The outer workspace currently runs **321 unit tests** (79 `conquerd-features` + 193 `conquerd-supernode` + 55 `conquerd-installer`) covering: capability negotiation/invocation, quota enforcement (inbound and outbound), channel-tag allocation, feature module loader, supernode manifest parsing, access control gates, handshake signing/verification, relay ticket lifecycle, WebTransport cert lifecycle, and installer signature verification.
+The outer workspace currently runs **366 unit tests** (116 `conquerd-features` + 195 `conquerd-supernode` + 55 `conquerd-installer`) covering: capability negotiation/invocation, quota enforcement (inbound and outbound), channel-tag allocation, feature module loader, supernode manifest parsing, access control gates, handshake signing/verification, relay ticket lifecycle, WebTransport cert lifecycle, and installer signature verification. `conquerd-client` adds a further **120 unit tests** (crypto, identity, chat store, room/SFU state, call controller, peer store, plugin manager, network monitor, and more) for a combined total of **486** across all four crates.
 
 ### Two-Client Local Testing
 
@@ -1039,6 +1039,40 @@ Free code signing provided by [SignPath.io](https://signpath.io), certificate by
 | **Authors** (trusted committers) | [Members](https://github.com/orgs/ConquerD/teams/conquerd-authors) |
 | **Reviewers** (PR reviewers) | [Members](https://github.com/orgs/ConquerD/teams/conquerd-reviewers) |
 | **Approvers** (release signing) | [Owners](https://github.com/orgs/ConquerD/teams/conquerd-approvers) |
+
+### Bootstrap for Free OSS Code Signing
+
+ConquerD uses a project-controlled Ed25519 key for signing `releases_manifest.json` (verified by the installer for update integrity and build hashes). This key was generated locally with `openssl genpkey -algorithm Ed25519`.
+
+The public key is committed in source (see `keys/release-signer-public.pem` and the hex constant in `rust/conquerd-installer/src/release_manifest.rs`).
+
+A helper binary to produce signed manifests lives in the installer crate:
+
+```
+# 1. Generate a skeleton for the current version (no private key needed)
+cargo run -p conquerd-installer --bin sign-release-manifest -- --generate-unsigned
+
+# 2. Edit the generated releases_manifest.json: fill real build_hash (from the .sha256
+#    asset or `sha256sum` of the final archive) + build_id (the value of CONQUERD_BUILD_ID
+#    that was baked into the binaries for that release, visible via `--version` or attestation).
+
+# 3. Sign it (approver only, with the offline private seed)
+cargo run -p conquerd-installer --bin sign-release-manifest -- \
+  -i releases_manifest.json -o releases_manifest.json \
+  --private-key /path/to/secure/release-signer-private.pem
+```
+
+It accepts the PEM from `openssl genpkey` (after the `openssl pkey ... | tail -c 32` extract), raw 32-byte seed, or hex seed. It always uses BTreeMap canonicalization + Ed25519 over the no-`signature` object (matching `parse_and_verify` in the installer).
+
+The signed `releases_manifest.json` is committed to the repo (public) and also attached as a release asset by the publish job. The installer fetches it (when present) and verifies before trusting any archive hash for an update.
+
+Windows and macOS *binary* signatures (Authenticode / Apple Developer ID) are provided by SignPath Foundation and Apple programs. Because these services typically require a public OSS project with releases to approve free access, the first 1–2 releases may ship with unsigned (or self-signed) binaries. The release manifest is still signed with the project Ed25519 key from the start.
+
+Once approved:
+- Future releases use automated SignPath signing for the PE files.
+- The Ed25519 manifest key remains the root of trust for `releases_manifest.json` (you control rotation).
+
+Users downloading the very first release should verify the GitHub release page, checksums, and (when available) the manifest signature using the published public key. See the installer source for verification details.
 
 ### Privacy Policy
 

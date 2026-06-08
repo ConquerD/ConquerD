@@ -1,9 +1,13 @@
 # ============================================================================
 # release.yml — Build, sign, and publish ConquerD for all platforms
 # ============================================================================
-# Triggered by pushing a tag like v1.0.0.
-# Builds ConquerD for Windows, macOS, and Linux, applies code signing,
-# then creates a draft GitHub Release with all artifacts attached.
+# Triggers:
+#   - Tags (v*) → full signed release (draft)
+#   - Push to develop or daily schedule → nightly/dev build (prerelease "nightly" tag, unsigned manifest)
+#   - workflow_dispatch for manual runs
+#
+# Builds ConquerD for Windows, macOS, and Linux, applies code signing (when configured),
+# then creates GitHub Releases with the 7z/dmg/AppImage + standalone installer + manifest.
 #
 # Code Signing Setup:
 #
@@ -31,14 +35,47 @@
 #
 #   Linux: No code signing required. Optional GPG signatures.
 #
+# Automated manifest signing (Ed25519 for releases_manifest.json):
+#   Until you have a code-signing certificate (SignPath etc.), the workflow can
+#   automatically generate the manifest with real build_hash + build_id from
+#   the artifacts and sign it using your project Ed25519 private key.
+#
+#   Option A — Repository secret (simpler):
+#     - Settings → Secrets and variables → Actions → New repository secret
+#     - Name: RELEASE_SIGNER_PRIVATE_PEM
+#     - Value: full content of your .pem file (BEGIN ... END lines included)
+#
+#   Option B — Environment secret (recommended — allows protection rules, required reviewers, etc.):
+#     - Settings → Environments → New environment (e.g. name it "release")
+#     - Add secret: RELEASE_SIGNER_PRIVATE_PEM (same value as above)
+#     - Then declare the environment on the publish-release job below.
+#
+#   The workflow only uses the secret in the publish step and never logs it.
+#   The signed releases_manifest.json is attached to the release.
+#
+#   When you later get binary code signing, you can still keep using this for the
+#   manifest (or switch back to manual pre-signed commit if preferred).
+#
+# Development Nightlies:
+#   - Triggered by push to `develop` or daily cron schedule.
+#   - Produces "nightly" prerelease on GitHub (tag `nightly`, updated in place).
+#   - Binaries use CONQUERD_BUILD_ID = nightly-<sha>-<run>
+#   - Manifest is generated unsigned (for dev use; the updater will still work with sha256 fallback).
+#   - No environment protection / signing key required.
+#
 # ============================================================================
 
 name: Release
 
 on:
   push:
+    branches:
+      - develop
     tags:
       - "v*"
+  schedule:
+    # Nightly build from develop branch (02:00 UTC)
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 permissions:
@@ -53,24 +90,45 @@ jobs:
   preflight:
     name: Release preflight checks
     runs-on: ubuntu-22.04
+    # Only run the strict preflight (key placeholder + committed manifest verify) for tagged releases.
+    # Nightly/dev builds on develop skip this or run a lighter version.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Reject all-zero RELEASE_SIGNER_PUBKEY_HEX placeholder
+      - name: Reject all-zero RELEASE_SIGNER_PUBKEY_HEX placeholder (safety net)
         run: |
           PLACEHOLDER=$(printf '%064d' 0)
           if grep -q "$PLACEHOLDER" rust/conquerd-installer/src/release_manifest.rs; then
             echo "ERROR: all-zero RELEASE_SIGNER_PUBKEY_HEX placeholder found in conquerd-installer/src/release_manifest.rs"
-            echo "Set a real Ed25519 public key before releasing."
+            echo "A real Ed25519 public key must be configured before releasing."
             exit 1
           fi
-          echo "OK: RELEASE_SIGNER_PUBKEY_HEX is configured."
+          echo "OK: RELEASE_SIGNER_PUBKEY_HEX appears to be a real key."
+
+      - name: Install Rust toolchain (for signed manifest verification in preflight)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+
+      - name: Verify releases_manifest.json (if present in the tag tree) using the in-tree signer
+        run: |
+          if [ -f releases_manifest.json ]; then
+            echo "Found releases_manifest.json — running strict signature verification..."
+            cargo run -p conquerd-installer --manifest-path rust/Cargo.toml --bin sign-release-manifest -- --verify -i releases_manifest.json
+          else
+            echo "No releases_manifest.json present in this checkout."
+            echo "For the first release you may add+sign it together with the tag (or upload manually to the draft release)."
+            echo "Subsequent releases should commit the signed manifest before tagging so this check enforces it."
+          fi
 
   build-windows:
-    needs: preflight
+    # preflight is only required for tagged releases. Develop/nightly builds run independently.
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # For scheduled nightlies, force checkout of develop (schedule runs on default branch).
+          # For push to develop or tags, use the event ref.
+          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
@@ -92,8 +150,34 @@ jobs:
           pip install aqtinstall
           aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt
 
+      - name: Set build metadata
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}".StartsWith("refs/tags/")) {
+            $ver = "${{ github.ref_name }}" -replace '^v',''
+            $sha = "${{ github.sha }}".Substring(0, 12)
+            "build_id=release-${ver}-${sha}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            $sha = "${{ github.sha }}".Substring(0, 12)
+            "build_id=nightly-${sha}-${{ github.run_number }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Prepare release signer key (for build attestation)
+        if: ${{ secrets.RELEASE_SIGNER_PRIVATE_PEM != '' }}
+        shell: pwsh
+        env:
+          PEM: ${{ secrets.RELEASE_SIGNER_PRIVATE_PEM }}
+        run: |
+          Set-Content -Path "$env:RUNNER_TEMP\release-signer-private.pem" -Value $env:PEM
+          "CONQUERD_RELEASE_SIGN_KEY=$env:RUNNER_TEMP\release-signer-private.pem" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Build (build_win64.ps1)
         shell: pwsh
+        env:
+          # Tagged: release-X.Y.Z-<12-char sha> (matches local tag checkout in build.rs)
+          # Nightly: nightly-<12-char sha>-<run>
+          CONQUERD_BUILD_ID: ${{ steps.meta.outputs.build_id }}
         run: .\build_win64.ps1
 
       - name: Copy installer for separate upload
@@ -136,10 +220,12 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: signed/
 
-      - name: Verify signed archive checksum
+      - name: Recompute checksum after SignPath signing
         run: |
           cd signed
-          sha256sum -c ConquerD-*-win64.7z.sha256
+          ARCHIVE=$(ls ConquerD-*-win64.7z | head -1)
+          sha256sum "$ARCHIVE" | tee "${ARCHIVE}.sha256"
+          sha256sum -c "${ARCHIVE}.sha256"
 
       - name: Upload signed artifacts
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
@@ -170,7 +256,7 @@ jobs:
           path: artifacts/
 
   build-macos:
-    needs: preflight
+    # preflight is only required for tagged releases. Develop/nightly builds run independently.
     runs-on: macos-14
     env:
       APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
@@ -181,6 +267,10 @@ jobs:
       APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # For scheduled nightlies, force checkout of develop (schedule runs on default branch).
+          # For push to develop or tags, use the event ref.
+          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
@@ -218,10 +308,23 @@ jobs:
           security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
+      - name: Set build metadata
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            SHORT_SHA="${GITHUB_SHA:0:12}"
+            echo "build_id=release-${VERSION}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            SHORT_SHA="${GITHUB_SHA:0:12}"
+            echo "build_id=nightly-${SHORT_SHA}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build (build_macos.sh)
         env:
           CONQUERD_RELEASE: "1"
           CONQUERD_SIGN_ID: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          CONQUERD_BUILD_ID: ${{ steps.meta.outputs.build_id }}
         run: ./build_macos.sh
 
       - name: Rename DMG to include platform suffix
@@ -255,10 +358,14 @@ jobs:
             dist/ConquerD-*-macos-arm64.dmg.sha256
 
   build-linux:
-    needs: preflight
+    # preflight is only required for tagged releases. Develop/nightly builds run independently.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # For scheduled nightlies, force checkout of develop (schedule runs on default branch).
+          # For push to develop or tags, use the event ref.
+          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
@@ -294,9 +401,22 @@ jobs:
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
           chmod +x /usr/local/bin/appimagetool
 
+      - name: Set build metadata
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            SHORT_SHA="${GITHUB_SHA:0:12}"
+            echo "build_id=release-${VERSION}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            SHORT_SHA="${GITHUB_SHA:0:12}"
+            echo "build_id=nightly-${SHORT_SHA}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build (build_linux.sh)
         env:
           CONQUERD_RELEASE: "1"
+          CONQUERD_BUILD_ID: ${{ steps.meta.outputs.build_id }}
         run: ./build_linux.sh
 
       - name: Verify artifacts
@@ -314,7 +434,9 @@ jobs:
 
   attest:
     needs: [build-macos, build-linux, sign-windows, windows-unsigned-fallback]
-    if: ${{ !failure() && !cancelled() }}
+    # Only run artifact attestations for official tagged releases.
+    # For develop nightlies we skip this job entirely.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && ( !failure() && !cancelled() )
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
@@ -335,6 +457,15 @@ jobs:
   publish-release:
     needs: [attest]
     runs-on: ubuntu-22.04
+    # Only for official tagged releases (v*). Nightly/dev builds on develop use publish-nightly instead.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    # If you put RELEASE_SIGNER_PRIVATE_PEM in an environment secret,
+    # declare the environment name here (must match what you created in Settings → Environments).
+    # This makes the environment's secrets (including the private key) available to the job.
+    # Common names: "release", "production", or "github-pages".
+    # IMPORTANT: Change "release" below to the exact name of the environment
+    # you created if it is different (e.g. "production", "github-release", etc.).
+    environment: release
     steps:
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
@@ -344,6 +475,97 @@ jobs:
 
       - name: List artifacts
         run: find artifacts -type f | sort
+
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - name: Remove any pre-existing manifest from checkout (we will (re)generate if secret present)
+        run: rm -f releases_manifest.json || true
+
+      - name: Setup Rust (for manifest signer)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+
+      - name: Prepare release signer private key (from secret)
+        if: ${{ secrets.RELEASE_SIGNER_PRIVATE_PEM != '' }}
+        env:
+          PEM: ${{ secrets.RELEASE_SIGNER_PRIVATE_PEM }}
+        run: |
+          printf '%s\n' "$PEM" > /tmp/release-signer-private.pem
+          chmod 600 /tmp/release-signer-private.pem
+          echo "Private key prepared (size: $(stat -c%s /tmp/release-signer-private.pem) bytes)"
+
+      - name: Generate, populate and sign releases_manifest.json (using project key)
+        if: ${{ secrets.RELEASE_SIGNER_PRIVATE_PEM != '' }}
+        run: |
+          set -euo pipefail
+
+          echo "==> Generating unsigned skeleton..."
+          cargo run -p conquerd-installer --manifest-path rust/Cargo.toml --bin sign-release-manifest -- \
+            --generate-unsigned -o /tmp/unsigned.json
+
+          echo "==> Locating build artifacts and hashes..."
+          # Hash the actual release archives (post-signing for Windows when SignPath ran).
+          WIN_FILE=$(find artifacts -name '*win64.7z' ! -name '*.sha256' | head -1 || true)
+          WIN_HASH=$( [ -n "$WIN_FILE" ] && sha256sum "$WIN_FILE" | awk '{print tolower($1)}' || echo "" )
+
+          MAC_FILE=$(find artifacts -name '*macos-arm64.dmg' ! -name '*.sha256' | head -1 || true)
+          MAC_HASH=$( [ -n "$MAC_FILE" ] && sha256sum "$MAC_FILE" | awk '{print tolower($1)}' || echo "" )
+
+          LIN_FILE=$(find artifacts -name '*x86_64.AppImage' ! -name '*.sha256' | head -1 || true)
+          LIN_HASH=$( [ -n "$LIN_FILE" ] && sha256sum "$LIN_FILE" | awk '{print tolower($1)}' || echo "" )
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHORT_SHA="${GITHUB_SHA:0:12}"
+          BUILD_ID="release-${VERSION}-${SHORT_SHA}"
+
+          if [ -z "$WIN_HASH" ] || [ -z "$MAC_HASH" ] || [ -z "$LIN_HASH" ]; then
+            echo "ERROR: one or more platform archive hashes are empty."
+            echo "  WIN_HASH=$WIN_HASH  MAC_HASH=$MAC_HASH  LIN_HASH=$LIN_HASH"
+            exit 1
+          fi
+
+          echo "    VERSION=$VERSION"
+          echo "    BUILD_ID=$BUILD_ID"
+          echo "    WIN_HASH=$WIN_HASH"
+          echo "    MAC_HASH=$MAC_HASH"
+          echo "    LIN_HASH=$LIN_HASH"
+
+          echo "==> Building populated manifest JSON..."
+          jq -n \
+            --arg version "$VERSION" \
+            --arg build_id "$BUILD_ID" \
+            --arg win_h "$WIN_HASH" \
+            --arg mac_h "$MAC_HASH" \
+            --arg lin_h "$LIN_HASH" \
+            --arg pubkey "d31f43fcfba1fae04313d384d7fba026bd52796550c57def6cf47b069c18043f" \
+            '{
+              "comment": "Signed by ConquerD release workflow (Ed25519 project key). Build IDs and archive hashes taken from CI artifacts.",
+              "releases": [
+                {"version": $version, "platform": "win64", "build_hash": $win_h, "build_id": $build_id, "published_at": 0.0},
+                {"version": $version, "platform": "macos-arm64", "build_hash": $mac_h, "build_id": $build_id, "published_at": 0.0},
+                {"version": $version, "platform": "linux-x86_64", "build_hash": $lin_h, "build_id": $build_id, "published_at": 0.0}
+              ],
+              "signed_at": 0.0,
+              "signer_pubkey": $pubkey
+            }' > /tmp/populated.json
+
+          echo "==> Signing manifest with project private key..."
+          cargo run -p conquerd-installer --manifest-path rust/Cargo.toml --bin sign-release-manifest -- \
+            -i /tmp/populated.json \
+            -o releases_manifest.json \
+            --private-key /tmp/release-signer-private.pem
+
+          echo "==> Signed manifest:"
+          cat releases_manifest.json
+
+      - name: Verify the just-signed manifest against the committed public key
+        if: ${{ secrets.RELEASE_SIGNER_PRIVATE_PEM != '' }}
+        run: |
+          cargo run -p conquerd-installer --manifest-path rust/Cargo.toml --bin sign-release-manifest -- \
+            --verify -i releases_manifest.json
+          echo "Manifest signature verified successfully."
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@7b4da11513bf3f43f9999e90eabced41ab8bb048 # v2.2.0
@@ -359,3 +581,136 @@ jobs:
             artifacts/ConquerD-*-macos-arm64.dmg.sha256
             artifacts/ConquerD-*-x86_64.AppImage
             artifacts/ConquerD-*-x86_64.AppImage.sha256
+            releases_manifest.json
+
+  publish-nightly:
+    # Run for pushes to develop and scheduled nightlies.
+    # Does not require the protected "release" environment or signing secrets.
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'schedule'
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: "*-unsigned"  # from build-windows
+          path: artifacts
+          merge-multiple: true
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: "macos-release"
+          path: artifacts
+          merge-multiple: true
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: "linux-release"
+          path: artifacts
+          merge-multiple: true
+
+      - name: Rename nightly artifacts to use "nightly" in the name
+        run: |
+          cd artifacts
+          # Windows 7z and sha
+          for f in ConquerD-*-win64.7z; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-win64.7z"; done
+          for f in ConquerD-*-win64.7z.sha256; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-win64.7z.sha256"; done
+          # Standalone installer
+          [ -f "conquerd-installer.exe" ] && mv "conquerd-installer.exe" "conquerd-installer-nightly.exe"
+          # macOS
+          for f in ConquerD-*-macos-arm64.dmg; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-macos-arm64.dmg"; done
+          for f in ConquerD-*-macos-arm64.dmg.sha256; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-macos-arm64.dmg.sha256"; done
+          # Linux
+          for f in ConquerD-*-x86_64.AppImage; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-x86_64.AppImage"; done
+          for f in ConquerD-*-x86_64.AppImage.sha256; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-x86_64.AppImage.sha256"; done
+          echo "Renamed artifacts:"
+          find . -type f | sort
+
+      - name: List nightly artifacts (after renaming)
+        run: find artifacts -type f | sort
+
+      - name: Checkout source (for manifest generator)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          ref: develop  # ensure we are on develop for scheduled runs
+
+      - name: Setup Rust (for unsigned manifest generator)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+
+      - name: Generate unsigned nightly manifest
+        run: |
+          set -euo pipefail
+
+          # After the checkout step (which forces develop on schedule), get the actual commit sha
+          # of the tree being built. This ensures correct build_id even for scheduled runs.
+          NIGHTLY_SHA=$(git rev-parse HEAD)
+
+          cargo run -p conquerd-installer --manifest-path rust/Cargo.toml --bin sign-release-manifest -- \
+            --generate-unsigned -o /tmp/nightly-manifest.json
+
+          # Populate with real values from the just-built artifacts (no signing for nightlies)
+          WIN_SHA_FILE=$(find artifacts -name '*win64.7z.sha256' | head -1 || true)
+          WIN_HASH=$( [ -n "$WIN_SHA_FILE" ] && awk '{print tolower($1)}' "$WIN_SHA_FILE" || echo "" )
+
+          MAC_SHA_FILE=$(find artifacts -name '*macos-arm64.dmg.sha256' | head -1 || true)
+          MAC_HASH=$( [ -n "$MAC_SHA_FILE" ] && awk '{print tolower($1)}' "$MAC_SHA_FILE" || echo "" )
+
+          LIN_SHA_FILE=$(find artifacts -name '*x86_64.AppImage.sha256' | head -1 || true)
+          LIN_HASH=$( [ -n "$LIN_SHA_FILE" ] && awk '{print tolower($1)}' "$LIN_SHA_FILE" || echo "" )
+
+          # Use a date-based version for the manifest entries
+          DATE=$(date -u +%Y%m%d)
+          BUILD_ID="nightly-${NIGHTLY_SHA}-${{ github.run_number }}"
+
+          jq -n \
+            --arg version "nightly-$DATE" \
+            --arg build_id "$BUILD_ID" \
+            --arg win_h "$WIN_HASH" \
+            --arg mac_h "$MAC_HASH" \
+            --arg lin_h "$LIN_HASH" \
+            '{
+              "comment": "Development nightly build from develop branch. Not for production use. No Ed25519 signature.",
+              "releases": [
+                {"version": $version, "platform": "win64", "build_hash": $win_h, "build_id": $build_id, "published_at": 0.0},
+                {"version": $version, "platform": "macos-arm64", "build_hash": $mac_h, "build_id": $build_id, "published_at": 0.0},
+                {"version": $version, "platform": "linux-x86_64", "build_hash": $lin_h, "build_id": $build_id, "published_at": 0.0}
+              ],
+              "signed_at": 0.0
+            }' > releases_manifest.json
+
+          echo "Nightly manifest (unsigned):"
+          cat releases_manifest.json
+
+      - name: Create or update Nightly GitHub Release
+        uses: softprops/action-gh-release@7b4da11513bf3f43f9999e90eabced41ab8bb048 # v2.2.0
+        with:
+          tag_name: nightly
+          name: "Nightly Build ${{ github.sha }}"
+          prerelease: true
+          draft: false
+          generate_release_notes: false
+          body: |
+            **Development nightly build** from the `develop` branch.
+
+            - Built on: ${{ github.event_name == 'schedule' && 'schedule' || 'push' }}
+            - Commit: ${{ github.sha }}
+            - Build ID in binaries: see the attached manifest or run the app with --version / check attestation.
+
+            **Not signed** with the release key. For testing and development only.
+            Use at your own risk. The `conquerd-installer` can consume these for updates (basic sha256 verification).
+
+            Artifacts:
+            - Windows portable 7z + standalone installer
+            - macOS dmg
+            - Linux AppImage
+
+            The `releases_manifest.json` is unsigned and provided for reference.
+          files: |
+            artifacts/ConquerD-nightly-win64.7z
+            artifacts/ConquerD-nightly-win64.7z.sha256
+            artifacts/conquerd-installer-nightly.exe
+            artifacts/ConquerD-nightly-macos-arm64.dmg
+            artifacts/ConquerD-nightly-macos-arm64.dmg.sha256
+            artifacts/ConquerD-nightly-x86_64.AppImage
+            artifacts/ConquerD-nightly-x86_64.AppImage.sha256
+            releases_manifest.json

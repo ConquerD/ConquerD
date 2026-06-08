@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 env:
   RUST_TOOLCHAIN: "1.78.0"
@@ -43,6 +43,10 @@ jobs:
 
       - name: Clippy (rust/ workspace, deny warnings)
         run: cargo clippy --all -- -D warnings
+        working-directory: rust
+
+      - name: Release manifest signer self-test
+        run: cargo run -p conquerd-installer --bin sign-release-manifest -- --self-test
         working-directory: rust
 
       # --- Tests ------------------------------------------------------------
@@ -106,6 +110,11 @@ jobs:
       - name: Clippy (rust/ workspace, deny warnings)
         shell: pwsh
         run: cargo clippy --all -- -D warnings
+        working-directory: rust
+
+      - name: Release manifest signer self-test
+        shell: pwsh
+        run: cargo run -p conquerd-installer --bin sign-release-manifest -- --self-test
         working-directory: rust
 
       - name: Run Rust tests (rust/ workspace, non-Qt)

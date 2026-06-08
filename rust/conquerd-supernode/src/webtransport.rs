@@ -18,7 +18,8 @@
 //! * **Per-feature send/recv counters** — observable by `BridgeStats`
 //!   for telemetry. Quotas remain owned by the per-session
 //!   [`crate::ChannelTagBinder`] equivalent on the consumer side; the
-//!   bridge only counts and routes.
+//!   bridge counts, routes, and enforces per-feature quotas when a
+//!   [`FeatureRegistry`] is installed via [`BrowserBridge::set_features`].
 //!
 //! ## Lifecycle
 //!
@@ -41,6 +42,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use conquerd_features::channel_tag::{DYNAMIC_TAG_END, DYNAMIC_TAG_START};
+use conquerd_features::FeatureRegistry;
 
 /// 1-byte channel tag at the head of every feature datagram.
 pub type FeatureTag = u8;
@@ -142,6 +144,7 @@ struct BridgeInner {
     sessions: HashMap<BrowserPeerId, Session>,
     send: Option<SendHook>,
     dispatcher: Option<Arc<dyn FeatureDispatcher>>,
+    features: Option<Arc<FeatureRegistry>>,
     stats: BridgeStats,
 }
 
@@ -162,6 +165,13 @@ impl BrowserBridge {
     /// this dispatcher to decide what to do with the payload.
     pub fn set_dispatcher(&self, dispatcher: Arc<dyn FeatureDispatcher>) {
         self.inner.write().dispatcher = Some(dispatcher);
+    }
+
+    /// Install the supernode feature registry used for symmetric inbound/
+    /// outbound quota gating on browser fan-out and quota cleanup on
+    /// [`release_session`].
+    pub fn set_features(&self, features: Arc<FeatureRegistry>) {
+        self.inner.write().features = Some(features);
     }
 
     /// True when a dispatcher has already been installed.
@@ -248,11 +258,20 @@ impl BrowserBridge {
             .is_some_and(|s| s.verified_identity.is_some())
     }
 
-    /// Drop all state for *peer_id*.
+    /// Drop all state for *peer_id* and clear quota buckets when a registry
+    /// is installed.
     pub fn release_session(&self, peer_id: &str) {
-        let mut inner = self.inner.write();
-        if inner.sessions.remove(peer_id).is_some() {
-            inner.stats.sessions_closed += 1;
+        let features = {
+            let mut inner = self.inner.write();
+            let removed = inner.sessions.remove(peer_id).is_some();
+            if removed {
+                inner.stats.sessions_closed += 1;
+            }
+            inner.features.clone()
+        };
+        if let Some(features) = features {
+            features.clear_peer_quotas(peer_id);
+            features.clear_peer_outbound_quotas(peer_id);
         }
     }
 
@@ -305,10 +324,27 @@ impl BrowserBridge {
             entry.inbound_dropped_unverified += 1;
             return None;
         }
-        entry.inbound_ok += 1;
-        // Drop the lock before invoking the handler so the handler can
-        // call back into the bridge (e.g. echo).
+        let features = inner.features.clone();
         drop(inner);
+        if let Some(ref features) = features {
+            if !features.gate_inbound_through_feature(&feature, peer_id, payload.len()) {
+                tracing::debug!(
+                    "[webtransport] inbound quota exceeded for {} on {}; dropping datagram",
+                    &peer_id[..12.min(peer_id.len())],
+                    feature
+                );
+                return None;
+            }
+        }
+        {
+            let mut inner = self.inner.write();
+            inner
+                .stats
+                .per_pair
+                .entry((peer_id.to_string(), feature.clone()))
+                .or_default()
+                .inbound_ok += 1;
+        }
         handler(&feature, payload);
         Some(feature)
     }
@@ -346,9 +382,18 @@ impl BrowserBridge {
             Some(s) => s,
             None => return false,
         };
+        let features = inner.features.clone();
         // Drop the read lock before invoking the hook so the hook may
         // touch the bridge.
         drop(inner);
+        if let Some(ref features) = features {
+            if !features.gate_through_feature(feature_id, peer_id, payload.len()) {
+                let mut inner = self.inner.write();
+                let key = (peer_id.to_string(), feature_id.to_string());
+                inner.stats.per_pair.entry(key).or_default().outbound_failed += 1;
+                return false;
+            }
+        }
         let ok = send(&peer_id.to_string(), tag, payload);
         let mut inner = self.inner.write();
         let key = (peer_id.to_string(), feature_id.to_string());

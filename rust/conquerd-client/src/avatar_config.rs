@@ -34,7 +34,7 @@ fn def_bg_lig() -> f32 {
     0.12
 }
 fn def_shade_mode() -> u8 {
-    3
+    1
 }
 fn def_dual_hue_mode() -> String {
     "topbot".to_owned()
@@ -61,7 +61,7 @@ fn def_island_step() -> f32 {
 /// instead of falling back to the whole-struct default.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AvatarConfig {
-    /// Grid side length in cells.  Valid values: 5, 8, 16, 32.
+    /// Grid side length in cells.  UI offers 8–32 in steps of 2.
     #[serde(default = "def_grid")]
     pub grid: u8,
     /// Foreground saturation 0–1.
@@ -119,7 +119,7 @@ impl Default for AvatarConfig {
             spread: 0.15,
             bg_tint: true,
             bg_lig: 0.12,
-            shade_mode: 3,
+            shade_mode: 1,
             dual_hue: false,
             dual_hue_mode: "topbot".to_owned(),
             islands: true,
@@ -356,7 +356,8 @@ pub fn build_avatar_svg(peer_id: &str, config: &AvatarConfig) -> String {
     } else {
         "auto"
     };
-    let cell_w = 1.01f32; // slight overshoot to eliminate sub-pixel seams
+    // Slight overshoot only when crisp: fills sub-pixel gaps without blurring.
+    let cell_w = if config.svg_crisp { 1.01 } else { 1.0 };
     let rx_cell = if config.svg_round_cells { "0.25" } else { "0" };
 
     // Pre-allocate a generous buffer.
@@ -649,6 +650,209 @@ mod tests {
         assert_eq!(cfg.shade_mode, 1);
         assert!(!cfg.islands);
         assert!(!cfg.bg_tint);
+    }
+
+    #[test]
+    fn default_config_matches_settings_ui_contract() {
+        let cfg = AvatarConfig::default();
+        assert_eq!(cfg.grid, 16);
+        assert!((cfg.sat - 0.55).abs() < f32::EPSILON);
+        assert!((cfg.lig - 0.55).abs() < f32::EPSILON);
+        assert!((cfg.spread - 0.15).abs() < f32::EPSILON);
+        assert!(cfg.bg_tint);
+        assert!((cfg.bg_lig - 0.12).abs() < f32::EPSILON);
+        assert_eq!(cfg.shade_mode, 1);
+        assert!(!cfg.dual_hue);
+        assert_eq!(cfg.dual_hue_mode, "topbot");
+        assert!(cfg.islands);
+        assert_eq!(cfg.island_conn, 8);
+        assert!((cfg.island_step - 0.62).abs() < f32::EPSILON);
+        assert!(cfg.island_varsat);
+        assert!(cfg.svg_crisp);
+        assert!(!cfg.svg_round_cells);
+    }
+
+    #[test]
+    fn partial_json_deserializes_with_field_defaults() {
+        let cfg: AvatarConfig = serde_json::from_str(r#"{"grid":8,"svg_crisp":false}"#).unwrap();
+        assert_eq!(cfg.grid, 8);
+        assert!(!cfg.svg_crisp);
+        assert!((cfg.sat - 0.55).abs() < f32::EPSILON);
+        assert!(cfg.islands);
+    }
+
+    #[test]
+    fn avatar_settings_change_svg_output() {
+        let peer = "settings-matrix";
+        let base = default_cfg();
+
+        let grid8 = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                grid: 8,
+                ..base.clone()
+            },
+        );
+        let grid32 = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                grid: 32,
+                ..base.clone()
+            },
+        );
+        assert!(grid8.contains(r#"viewBox="0 0 8 8""#));
+        assert!(grid32.contains(r#"viewBox="0 0 32 32""#));
+
+        let tinted = build_avatar_svg(peer, &base);
+        let flat_bg = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                bg_tint: false,
+                ..base.clone()
+            },
+        );
+        assert!(flat_bg.contains("fill=\"#2B2D31\""));
+        assert_ne!(tinted, flat_bg);
+
+        let rounded = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                svg_round_cells: true,
+                ..base.clone()
+            },
+        );
+        let square = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                svg_round_cells: false,
+                ..base.clone()
+            },
+        );
+        assert!(rounded.contains(r#"rx="0.25" ry="0.25""#));
+        assert!(!square.contains(r#"rx="0.25" ry="0.25""#));
+
+        let dual = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                dual_hue: true,
+                dual_hue_mode: "topbot".to_owned(),
+                islands: false,
+                shade_mode: 1,
+                ..base.clone()
+            },
+        );
+        let single = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                dual_hue: false,
+                islands: false,
+                shade_mode: 1,
+                ..base.clone()
+            },
+        );
+        assert_ne!(dual, single);
+
+        let islands_on = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                islands: true,
+                island_conn: 4,
+                shade_mode: 1,
+                dual_hue: false,
+                ..base.clone()
+            },
+        );
+        let islands_off = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                islands: false,
+                shade_mode: 1,
+                dual_hue: false,
+                ..base.clone()
+            },
+        );
+        assert_ne!(islands_on, islands_off);
+
+        let shade1 = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                shade_mode: 1,
+                islands: false,
+                dual_hue: false,
+                ..base.clone()
+            },
+        );
+        let shade3 = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                shade_mode: 3,
+                islands: false,
+                dual_hue: false,
+                ..base.clone()
+            },
+        );
+        assert_ne!(shade1, shade3);
+
+        let low_sat = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                sat: 0.15,
+                islands: false,
+                shade_mode: 1,
+                dual_hue: false,
+                ..base.clone()
+            },
+        );
+        let high_sat = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                sat: 0.95,
+                islands: false,
+                shade_mode: 1,
+                dual_hue: false,
+                ..base.clone()
+            },
+        );
+        assert_ne!(low_sat, high_sat);
+    }
+
+    #[test]
+    fn avatar_tint_hex_tracks_bg_tint_setting() {
+        let peer = "tint-peer";
+        let cfg = default_cfg();
+        let tinted = avatar_tint_hex(peer, &cfg);
+        let flat = avatar_tint_hex(
+            peer,
+            &AvatarConfig {
+                bg_tint: false,
+                ..cfg
+            },
+        );
+        assert_eq!(flat, "#2B2D31");
+        assert_ne!(tinted, flat);
+    }
+
+    #[test]
+    fn svg_crisp_edges_affects_rendering_hints() {
+        let peer = "crisp-test";
+        let crisp = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                svg_crisp: true,
+                ..default_cfg()
+            },
+        );
+        let soft = build_avatar_svg(
+            peer,
+            &AvatarConfig {
+                svg_crisp: false,
+                ..default_cfg()
+            },
+        );
+        assert!(crisp.contains(r#"shape-rendering="crispEdges""#));
+        assert!(soft.contains(r#"shape-rendering="auto""#));
+        assert!(crisp.contains(r#"width="1.01" height="1.01""#));
+        assert!(!soft.contains(r#"width="1.01" height="1.01""#));
     }
 
     #[test]

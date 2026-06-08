@@ -46,6 +46,8 @@ pub mod ffi {
         #[qproperty(QString, session_banner)]
         #[qproperty(QString, call_state)]
         #[qproperty(QString, public_id)]
+        /// Our embedded build ID (for reproducible build attestation).
+        #[qproperty(QString, build_id)]
         #[qproperty(QString, invite_url)]
         /// One of "direct", "relay", "offline", "error" — drives SessionBanner colour.
         #[qproperty(QString, connection_mode)]
@@ -539,6 +541,12 @@ pub mod ffi {
         #[rust_name = "set_output_volume"]
         fn setOutputVolume(self: Pin<&mut AppBridge>, pct: i32);
 
+        /// Set outgoing voice bitrate preset: "low", "balanced", "high", or "ultra".
+        /// Takes effect immediately for direct and SFU room audio.
+        #[qinvokable]
+        #[rust_name = "set_voice_bitrate"]
+        fn setVoiceBitrate(self: Pin<&mut AppBridge>, preset: &QString);
+
         /// Create Start Menu and Desktop `.lnk` shortcuts for this executable.
         /// Windows only — no-op on other platforms.
         #[qinvokable]
@@ -593,6 +601,16 @@ pub mod ffi {
             peer_id: &QString,
             config_json: &QString,
         ) -> QString;
+
+        /// Whether Qt should bilinear-filter the rasterized avatar (`Image.smooth`).
+        /// Returns false when `svg_crisp` is enabled so cell edges stay sharp.
+        #[qinvokable]
+        #[rust_name = "avatar_image_smooth"]
+        fn avatarImageSmooth(
+            self: Pin<&mut AppBridge>,
+            peer_id: &QString,
+            config_json: &QString,
+        ) -> bool;
 
         /// Broadcast the user's avatar config (as JSON) to a specific trusted peer.
         /// Silently does nothing if `config_json` is empty or peer is not trusted.
@@ -706,6 +724,8 @@ pub struct AppBridgeRust {
     session_banner: QString,
     call_state: QString,
     public_id: QString,
+    /// Build ID exposed as qproperty for QML (e.g. Settings or status display).
+    build_id: QString,
     invite_url: QString,
     connection_mode: QString,
     call_duration_secs: i32,
@@ -722,6 +742,10 @@ pub struct AppBridgeRust {
     my_peer_id: String,
     /// Our own public_id (base64url Ed25519 pubkey) — used as `sender` in signaling messages.
     my_public_id: String,
+    /// Embedded build identifier (short git sha or CI-provided reproducible build ID).
+    /// Peers exchange this via build attestation so you can verify they are on a
+    /// reproducible build from the same source as you (or an official release).
+    my_build_id: String,
 
     /// The Ed25519 identity — held after unlock so invite generation works.
     identity: Option<Arc<crate::identity::Identity>>,
@@ -800,6 +824,7 @@ impl Default for AppBridgeRust {
             session_banner: QString::default(),
             call_state: QString::from("idle"),
             public_id: QString::default(),
+            build_id: QString::from(env!("CONQUERD_BUILD_ID")),
             invite_url: QString::default(),
             connection_mode: QString::from("offline"),
             call_duration_secs: 0,
@@ -811,6 +836,7 @@ impl Default for AppBridgeRust {
             updater_cmd_tx: None,
             my_peer_id: String::new(),
             my_public_id: String::new(),
+            my_build_id: env!("CONQUERD_BUILD_ID").to_owned(),
             identity: None,
             pending_release: None,
             rt_thread: None,
@@ -1101,6 +1127,14 @@ impl ffi::AppBridge {
                 if let Some(ref tx) = self.rust().call_cmd_tx {
                     let _ = tx.try_send(CallCommand::SetJitterDepth(depth));
                 }
+            }
+        }
+
+        // Apply persisted outgoing voice bitrate to the call controller.
+        {
+            let bitrate = read_voice_bitrate_setting();
+            if let Some(ref tx) = self.rust().call_cmd_tx {
+                let _ = tx.try_send(CallCommand::SetOutgoingBitrate(bitrate));
             }
         }
 
@@ -1715,6 +1749,28 @@ impl ffi::AppBridge {
             r.current_supernode_id = sid;
             r.current_room_id = rid;
         }
+
+        // Immediately seed room_participant_ids with just the local peer so
+        // that any stale RoomPeerLeft closures already queued to the Qt thread
+        // (from the previous room session) emit [self] rather than []. Without
+        // this seed those closures re-emit the empty list that was left by
+        // leave_room(), wiping the model before the authoritative SfuMembers
+        // round-trip completes — the "join room, avatar missing" race.
+        let my_id = self.rust().my_public_id.clone();
+        if !my_id.is_empty() {
+            self.as_mut().rust_mut().room_participant_ids = vec![my_id.clone()];
+            let json = serde_json::json!([{
+                "peer_id": my_id,
+                "handle": my_id,
+                "speaking": false,
+                "muted": false,
+                "is_self": true,
+            }])
+            .to_string();
+            self.as_mut()
+                .participants_updated(QString::from(json.as_str()));
+        }
+
         self.as_mut().set_in_room(true);
     }
 
@@ -1879,47 +1935,22 @@ impl ffi::AppBridge {
         }
     }
 
+    fn set_voice_bitrate(self: Pin<&mut Self>, preset: &QString) {
+        let bitrate = voice_bitrate_preset_to_bps(&preset.to_string());
+        if let Some(ref tx) = self.rust().call_cmd_tx {
+            let _ = tx.try_send(CallCommand::SetOutgoingBitrate(bitrate));
+        }
+    }
+
     fn clear_unread(mut self: Pin<&mut Self>) {
         self.as_mut().rust_mut().unread_chat = 0;
         crate::platform::clear_taskbar_badge();
     }
 
     fn avatar_svg(self: Pin<&mut Self>, peer_id: &QString, config_json: &QString) -> QString {
-        use super::avatar::{build_avatar_svg, AvatarConfig};
+        use super::avatar::build_avatar_svg;
 
-        let id = peer_id.to_string();
-        let cfg_str = config_json.to_string();
-
-        let config: AvatarConfig = if !cfg_str.is_empty() {
-            // Caller provided an explicit config (own-avatar preview).
-            serde_json::from_str(&cfg_str).unwrap_or_default()
-        } else if id == self.rust().public_id.to_string() {
-            // Local user's own avatar (e.g. self-tile in a voice room).
-            // The peer store has no self-entry, so fall back to the stored
-            // avatar_config_json instead of returning AvatarConfig::untrusted().
-            let own_cfg = &self.rust().avatar_config_json;
-            if own_cfg.is_empty() {
-                AvatarConfig::default()
-            } else {
-                serde_json::from_str(own_cfg).unwrap_or_default()
-            }
-        } else {
-            // Look up the peer's trust tier.
-            // A peer is trusted once they have a non-empty `identity_pub`,
-            // which is set during the invite handshake exchange.
-            // (`transcript_hash` was the intended field but is never populated.)
-            if let Some(ref ps) = self.rust().peer_store {
-                let store = ps.read();
-                match store.get(&id) {
-                    None => AvatarConfig::untrusted(),
-                    Some(rec) if rec.identity_pub.is_empty() => AvatarConfig::untrusted(),
-                    Some(rec) => rec.avatar_config.clone().unwrap_or_default(),
-                }
-            } else {
-                AvatarConfig::untrusted()
-            }
-        };
-
+        let (id, config) = resolve_avatar_config(self.rust(), peer_id, config_json);
         QString::from(build_avatar_svg(&id, &config).as_str())
     }
 
@@ -1928,32 +1959,19 @@ impl ffi::AppBridge {
         peer_id: &QString,
         config_json: &QString,
     ) -> QString {
-        use super::avatar::{avatar_tint_hex, AvatarConfig};
+        use super::avatar::avatar_tint_hex;
 
-        let id = peer_id.to_string();
-        let cfg_str = config_json.to_string();
-
-        let config: AvatarConfig = if !cfg_str.is_empty() {
-            serde_json::from_str(&cfg_str).unwrap_or_default()
-        } else if id == self.rust().public_id.to_string() {
-            let own_cfg = &self.rust().avatar_config_json;
-            if own_cfg.is_empty() {
-                AvatarConfig::default()
-            } else {
-                serde_json::from_str(own_cfg).unwrap_or_default()
-            }
-        } else if let Some(ref ps) = self.rust().peer_store {
-            let store = ps.read();
-            match store.get(&id) {
-                None => AvatarConfig::untrusted(),
-                Some(rec) if rec.identity_pub.is_empty() => AvatarConfig::untrusted(),
-                Some(rec) => rec.avatar_config.clone().unwrap_or_default(),
-            }
-        } else {
-            AvatarConfig::untrusted()
-        };
-
+        let (id, config) = resolve_avatar_config(self.rust(), peer_id, config_json);
         QString::from(avatar_tint_hex(&id, &config).as_str())
+    }
+
+    fn avatar_image_smooth(
+        self: Pin<&mut Self>,
+        peer_id: &QString,
+        config_json: &QString,
+    ) -> bool {
+        let (_, config) = resolve_avatar_config(self.rust(), peer_id, config_json);
+        !config.svg_crisp
     }
 
     fn broadcast_avatar_config(self: Pin<&mut Self>, peer_id: &QString, config_json: &QString) {
@@ -1982,6 +2000,10 @@ impl ffi::AppBridge {
 
     fn set_avatar_config_json(mut self: Pin<&mut Self>, config_json: &QString) {
         self.as_mut().rust_mut().avatar_config_json = config_json.to_string();
+        let pid = self.rust().public_id.clone();
+        if !pid.is_empty() {
+            self.as_mut().avatar_config_updated(pid);
+        }
     }
 
     fn remove_peer(self: Pin<&mut Self>, peer_id: &QString) {
@@ -2316,6 +2338,41 @@ impl ffi::AppBridge {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve the effective [`AvatarConfig`] for `peer_id`, matching the trust-tier
+/// rules used by `avatarSvg` / `avatarTintColor`.
+fn resolve_avatar_config(
+    bridge: &AppBridgeRust,
+    peer_id: &QString,
+    config_json: &QString,
+) -> (String, super::avatar::AvatarConfig) {
+    use super::avatar::AvatarConfig;
+
+    let id = peer_id.to_string();
+    let cfg_str = config_json.to_string();
+
+    let config = if !cfg_str.is_empty() {
+        // Caller provided an explicit config (own-avatar preview).
+        serde_json::from_str(&cfg_str).unwrap_or_default()
+    } else if id == bridge.my_public_id {
+        // Empty configJson means "factory defaults" for the local user.
+        // Do not fall back to AppBridgeRust::avatar_config_json here —
+        // that field can lag behind SettingsModel during reset and would
+        // keep rendering the previous custom avatar until the next edit.
+        AvatarConfig::default()
+    } else if let Some(ref ps) = bridge.peer_store {
+        let store = ps.read();
+        match store.get(&id) {
+            None => AvatarConfig::untrusted(),
+            Some(rec) if rec.identity_pub.is_empty() => AvatarConfig::untrusted(),
+            Some(rec) => rec.avatar_config.clone().unwrap_or_default(),
+        }
+    } else {
+        AvatarConfig::untrusted()
+    };
+
+    (id, config)
+}
+
 /// Read the persisted `audio_input_device` / `audio_output_device` strings
 /// from the settings file.  Empty / missing fields map to `None` so the
 /// CallController falls back to the host's default device.
@@ -2354,6 +2411,32 @@ fn read_voice_activation_setting() -> bool {
         }
     }
     false
+}
+
+fn voice_bitrate_preset_to_bps(preset: &str) -> u32 {
+    match preset.trim().to_lowercase().as_str() {
+        "low" => 32_000,
+        "balanced" => 64_000,
+        "high" => 96_000,
+        "ultra" => 128_000,
+        _ => crate::call_controller::DEFAULT_OUTGOING_BITRATE_BPS,
+    }
+}
+
+/// Read the persisted outgoing voice bitrate preset from disk.
+/// Defaults to Ultra (128 kbps) to preserve the current release behavior.
+fn read_voice_bitrate_setting() -> u32 {
+    let path = crate::ui::settings_model::settings_file();
+    if let Ok(txt) = std::fs::read_to_string(&path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            return v
+                .get("voice_bitrate")
+                .and_then(|x| x.as_str())
+                .map(voice_bitrate_preset_to_bps)
+                .unwrap_or(crate::call_controller::DEFAULT_OUTGOING_BITRATE_BPS);
+        }
+    }
+    crate::call_controller::DEFAULT_OUTGOING_BITRATE_BPS
 }
 
 /// Read push-to-talk settings from disk without going through the QObject.
@@ -3090,6 +3173,13 @@ fn dispatch_event(
             .to_string();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 bridge.as_mut().file_failed(QString::from(json.as_str()));
+            });
+        }
+        ConnectionEvent::ConnectionStats { json, .. } => {
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                bridge
+                    .as_mut()
+                    .connection_stats(QString::from(json.as_str()));
             });
         }
         _ => {}

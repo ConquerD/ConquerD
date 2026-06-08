@@ -38,6 +38,7 @@ use crate::relay::QUICRelayServer;
 use crate::sfu::SFURoomManager;
 use crate::signaling::{SignalingHandler, SignalingServer};
 use crate::ticket::RelayTicket;
+use conquerd_features::wellknown;
 use conquerd_features::FeatureRegistry;
 use conquerd_features::{NativeModuleLoader, TrustedKeyStore};
 
@@ -152,76 +153,21 @@ fn build_feature_registry(config: &Config) -> FeatureRegistry {
         }
     }
 
+    // QUIC relay fan-out classifies inner channel tags and enforces quotas
+    // against these descriptors even when the manifest omitted them.
+    for cap in [
+        wellknown::core_audio_opus(),
+        wellknown::core_chat_v1(),
+        wellknown::core_file_v1(),
+        wellknown::game_relay_v1(),
+        wellknown::room_audio_sfu(),
+        wellknown::room_chat_v1(),
+        wellknown::room_file_v1(),
+    ] {
+        let _ = registry.upsert(cap);
+    }
+
     registry
-}
-
-#[cfg(test)]
-mod build_feature_registry_tests {
-    use super::*;
-
-    fn cfg(data_dir: std::path::PathBuf) -> Config {
-        Config {
-            signaling_port: 0,
-            relay_port: 0,
-            web_port: None,
-            chat_enabled: true,
-            files_enabled: true,
-            sfu_enabled: true,
-            updates_enabled: false,
-            auto_restart: false,
-            invite_ttl_seconds: -1,
-            web_title: String::new(),
-            access_mode: crate::config::AccessMode::Open,
-            access_code: String::new(),
-            ad_duration: 0,
-            tos_text: String::new(),
-            ad_content: String::new(),
-            demo_links: false,
-            external_host: None,
-            data_dir,
-            web_localhost_only: false,
-        }
-    }
-
-    fn tempdir() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "conquerd-build-registry-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    #[test]
-    fn falls_back_to_legacy_config_when_no_manifest() {
-        let dir = tempdir();
-        let registry = build_feature_registry(&cfg(dir));
-        let ids: Vec<String> = registry.snapshot().iter().map(|c| c.id.clone()).collect();
-        // Legacy config has all toggles on => chat+files+sfu present.
-        assert!(ids.iter().any(|i| i == "core.chat.v1"));
-        assert!(ids.iter().any(|i| i == "core.file.v1"));
-        assert!(ids.iter().any(|i| i == "room.audio.sfu"));
-    }
-
-    #[test]
-    fn manifest_file_overrides_legacy_toggles() {
-        let dir = tempdir();
-        std::fs::write(
-            dir.join("supernode.toml"),
-            "schema_version = 1\n\
-             [[feature]]\n\
-             id = \"core.chat.v1\"\n",
-        )
-        .unwrap();
-        let registry = build_feature_registry(&cfg(dir));
-        let ids: Vec<String> = registry.snapshot().iter().map(|c| c.id.clone()).collect();
-        // Only the one capability declared in the manifest.
-        assert_eq!(ids, vec!["core.chat.v1".to_string()]);
-    }
 }
 
 /// Core supernode state shared across tasks.
@@ -242,7 +188,7 @@ struct SupernodeState {
     /// Pending hole-punch registrations: (peer_a, peer_b) canonical key → PunchRegistration
     pending_punches: RwLock<HashMap<(String, String), PunchRegistration>>,
     /// Capabilities advertised in `SUPERNODE_INFO`.
-    features: FeatureRegistry,
+    features: Arc<FeatureRegistry>,
     /// Browser-transport bridge. Always allocated, but only handed to a
     /// listener task when `web.host.h3.v1` is enabled in the manifest.
     web_bridge: BrowserBridge,
@@ -828,6 +774,47 @@ impl SupernodeState {
     }
 }
 
+/// Decode the Opus payload size from a native `SfuAudio` signaling message.
+fn sfu_audio_opus_byte_count(msg: &SignalingMessage) -> usize {
+    use base64::Engine;
+    msg.payload
+        .get("audio")
+        .and_then(|v| v.as_str())
+        .and_then(|b64| base64::engine::general_purpose::URL_SAFE.decode(b64).ok())
+        .map(|v| v.len())
+        .unwrap_or(0)
+}
+
+/// Payload byte count for `SfuChat` inbound quota accounting.
+fn sfu_chat_byte_count(msg: &SignalingMessage) -> usize {
+    msg.payload
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(str::len)
+        .unwrap_or(0)
+}
+
+/// Payload byte count for `SfuFile*` inbound quota accounting.
+fn sfu_file_inbound_byte_count(msg: &SignalingMessage, mt: MessageType) -> usize {
+    match mt {
+        MessageType::SfuFileChunk => msg
+            .payload
+            .get("data")
+            .and_then(|v| v.as_str())
+            .map(str::len)
+            .unwrap_or(0),
+        MessageType::SfuFileOffer => msg
+            .payload
+            .get("size")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0)
+            .max(64),
+        MessageType::SfuFileComplete => 64,
+        _ => 0,
+    }
+}
+
 /// Implements SignalingHandler for the supernode.
 struct SupernodeHandler {
     state: Arc<SupernodeState>,
@@ -862,7 +849,7 @@ impl SignalingHandler for SupernodeHandler {
                 self.handle_sfu_chat_broadcast(&msg, raw);
             }
             MessageType::SfuAudio => {
-                self.handle_sfu_broadcast(&msg, raw, MessageType::SfuAudio);
+                self.handle_sfu_audio_broadcast(&msg, raw);
             }
             MessageType::SfuFileOffer
             | MessageType::SfuFileChunk
@@ -1021,6 +1008,17 @@ impl SignalingHandler for SupernodeHandler {
             json!({"version": APP_VERSION}),
         );
 
+        // Also attest our build for reproducible build verification by clients.
+        self.state.send_signed(
+            identity_pub,
+            MessageType::BuildAttestation,
+            json!({
+                "build_id": env!("CONQUERD_BUILD_ID"),
+                "source_hash": env!("CONQUERD_SOURCE_HASH"),
+                "version": APP_VERSION,
+            }),
+        );
+
         // Send SFU room list
         if let Some(ref sfu) = self.state.sfu {
             let rooms = sfu.read().get_rooms_for_peer(identity_pub);
@@ -1033,6 +1031,9 @@ impl SignalingHandler for SupernodeHandler {
     }
 
     fn on_peer_disconnected(&self, identity_pub: &str) {
+        self.state.features.clear_peer_quotas(identity_pub);
+        self.state.features.clear_peer_outbound_quotas(identity_pub);
+
         // Remove from SFU rooms
         if let Some(ref sfu) = self.state.sfu {
             let left_rooms = sfu.write().remove_peer_from_all(identity_pub);
@@ -1136,6 +1137,17 @@ impl SupernodeHandler {
                     &joiner_pub,
                     MessageType::VersionAnnounce,
                     json!({"version": APP_VERSION}),
+                );
+
+                // Attest build ID to the newly trusted peer as well.
+                self.state.send_signed(
+                    &joiner_pub,
+                    MessageType::BuildAttestation,
+                    json!({
+                        "build_id": env!("CONQUERD_BUILD_ID"),
+                        "source_hash": env!("CONQUERD_SOURCE_HASH"),
+                        "version": APP_VERSION,
+                    }),
                 );
 
                 // Send SFU room list so rooms appear immediately
@@ -1267,43 +1279,127 @@ impl SupernodeHandler {
         );
     }
 
+    /// Relay native WebSocket `SfuFile*` with symmetric `room.file.v1` quotas.
     fn handle_sfu_broadcast(&self, msg: &SignalingMessage, raw: &str, mt: MessageType) {
         let Some(ref sfu) = self.state.sfu else {
             return;
         };
-        let room_id = msg
-            .payload
-            .get("room_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(sfu::DEFAULT_ROOM_ID);
-        let recipients = if matches!(
-            mt,
-            MessageType::SfuFileOffer | MessageType::SfuFileChunk | MessageType::SfuFileComplete
-        ) {
-            sfu.read().get_chat_recipients(room_id)
-        } else {
-            sfu.read().get_room_members(room_id)
-        };
-        for peer in &recipients {
-            if peer != &msg.sender {
-                self.state.signaling.send_to_peer(peer, raw);
-            }
-        }
-    }
-
-    /// Broadcast SFU_CHAT to voice participants AND text-chat subscribers.
-    fn handle_sfu_chat_broadcast(&self, msg: &SignalingMessage, raw: &str) {
-        let Some(ref sfu) = self.state.sfu else {
+        let payload_bytes = sfu_file_inbound_byte_count(msg, mt);
+        if payload_bytes == 0 {
             return;
-        };
+        }
+        if !self
+            .state
+            .features
+            .gate_inbound_through_feature("room.file.v1", &msg.sender, payload_bytes)
+        {
+            tracing::debug!(
+                "[room.file.v1] inbound quota exceeded for {}; dropping relay",
+                &msg.sender[..12.min(msg.sender.len())]
+            );
+            return;
+        }
+
         let room_id = msg
             .payload
             .get("room_id")
             .and_then(|v| v.as_str())
             .unwrap_or(sfu::DEFAULT_ROOM_ID);
         let recipients = sfu.read().get_chat_recipients(room_id);
+        let wire_bytes = raw.len();
         for peer in &recipients {
-            if peer != &msg.sender {
+            if peer == &msg.sender {
+                continue;
+            }
+            if self
+                .state
+                .features
+                .gate_through_feature("room.file.v1", peer, wire_bytes)
+            {
+                self.state.signaling.send_to_peer(peer, raw);
+            }
+        }
+    }
+
+    /// Relay native WebSocket `SfuAudio` with symmetric `room.audio.sfu` quotas.
+    fn handle_sfu_audio_broadcast(&self, msg: &SignalingMessage, raw: &str) {
+        let Some(ref sfu) = self.state.sfu else {
+            return;
+        };
+        let opus_bytes = sfu_audio_opus_byte_count(msg);
+        if opus_bytes == 0 {
+            return;
+        }
+        if !self.state.features.gate_inbound_through_feature(
+            "room.audio.sfu",
+            &msg.sender,
+            opus_bytes,
+        ) {
+            tracing::debug!(
+                "[room.audio.sfu] inbound quota exceeded for {}; dropping relay",
+                &msg.sender[..12.min(msg.sender.len())]
+            );
+            return;
+        }
+
+        let room_id = msg
+            .payload
+            .get("room_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(sfu::DEFAULT_ROOM_ID);
+        let recipients = sfu.read().get_room_members(room_id);
+        let wire_bytes = raw.len();
+        for peer in &recipients {
+            if peer == &msg.sender {
+                continue;
+            }
+            if self
+                .state
+                .features
+                .gate_through_feature("room.audio.sfu", peer, wire_bytes)
+            {
+                self.state.signaling.send_to_peer(peer, raw);
+            }
+        }
+    }
+
+    /// Relay native WebSocket `SfuChat` with symmetric `room.chat.v1` quotas.
+    fn handle_sfu_chat_broadcast(&self, msg: &SignalingMessage, raw: &str) {
+        let Some(ref sfu) = self.state.sfu else {
+            return;
+        };
+        let body_bytes = sfu_chat_byte_count(msg);
+        if body_bytes == 0 {
+            return;
+        }
+        if !self.state.features.gate_inbound_through_feature(
+            "room.chat.v1",
+            &msg.sender,
+            body_bytes,
+        ) {
+            tracing::debug!(
+                "[room.chat.v1] inbound quota exceeded for {}; dropping relay",
+                &msg.sender[..12.min(msg.sender.len())]
+            );
+            return;
+        }
+
+        let room_id = msg
+            .payload
+            .get("room_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(sfu::DEFAULT_ROOM_ID);
+        let recipients = sfu.read().get_chat_recipients(room_id);
+        let wire_bytes = raw.len();
+        for peer in &recipients {
+            if peer == &msg.sender {
+                continue;
+            }
+            if self
+                .state
+                .features
+                .gate_through_feature("room.chat.v1", peer, wire_bytes)
+            {
                 self.state.signaling.send_to_peer(peer, raw);
             }
         }
@@ -1559,9 +1655,11 @@ async fn main() -> anyhow::Result<()> {
         )]);
     }
 
+    let features = Arc::new(build_feature_registry(&config));
+
     // QUIC relay server
     let relay = {
-        let relay = QUICRelayServer::new(identity.public_id());
+        let relay = QUICRelayServer::new(identity.public_id(), Arc::clone(&features));
         let bind = SocketAddr::from(([0, 0, 0, 0], config.relay_port));
         let port = relay.start(bind).await?;
         info!("QUIC relay on port {}", port);
@@ -1616,7 +1714,7 @@ async fn main() -> anyhow::Result<()> {
             ticket_expiry: RwLock::new(HashMap::new()),
             endpoint_mailbox: RwLock::new(endpoint_mailbox),
             pending_punches: RwLock::new(HashMap::new()),
-            features: build_feature_registry(&config),
+            features: Arc::clone(&features),
             web_bridge: BrowserBridge::new(),
             web_cert_fingerprint,
         });
@@ -1689,8 +1787,11 @@ async fn main() -> anyhow::Result<()> {
                 let state_for_hook = std::sync::Arc::downgrade(&state);
                 std::sync::Arc::new(move |source, feature_id, payload| {
                     if let Some(s) = state_for_hook.upgrade() {
-                        s.features
-                            .dispatch_message(feature_id, source.to_string(), payload);
+                        // Inbound quota is enforced in BrowserBridge::on_inbound;
+                        // invoke the bound module directly to avoid double-charging.
+                        if let Some(module) = s.features.module(feature_id) {
+                            module.on_message(source.to_string(), payload);
+                        }
                     }
                 })
             };
@@ -1698,6 +1799,8 @@ async fn main() -> anyhow::Result<()> {
                 webtransport::ModuleNativeDispatcher::new(native_hook),
             ));
         }
+
+        bridge.set_features(Arc::clone(&state.features));
 
         tokio::spawn(async move {
             webtransport::run_listener(bridge, data_dir, port).await;
@@ -2027,4 +2130,85 @@ fn ensure_web_cert(data_dir: &std::path::Path) -> Option<String> {
         &fingerprint[..16.min(fingerprint.len())]
     );
     Some(fingerprint)
+}
+
+#[cfg(test)]
+mod build_feature_registry_tests {
+    use super::*;
+
+    fn cfg(data_dir: std::path::PathBuf) -> Config {
+        Config {
+            signaling_port: 0,
+            relay_port: 0,
+            web_port: None,
+            chat_enabled: true,
+            files_enabled: true,
+            sfu_enabled: true,
+            updates_enabled: false,
+            auto_restart: false,
+            invite_ttl_seconds: -1,
+            web_title: String::new(),
+            access_mode: crate::config::AccessMode::Open,
+            access_code: String::new(),
+            ad_duration: 0,
+            tos_text: String::new(),
+            ad_content: String::new(),
+            demo_links: false,
+            external_host: None,
+            data_dir,
+            web_localhost_only: false,
+        }
+    }
+
+    fn tempdir() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "conquerd-build-registry-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn falls_back_to_legacy_config_when_no_manifest() {
+        let dir = tempdir();
+        let registry = build_feature_registry(&cfg(dir));
+        let ids: Vec<String> = registry.snapshot().iter().map(|c| c.id.clone()).collect();
+        // Legacy config has all toggles on => chat+files+sfu present.
+        assert!(ids.iter().any(|i| i == "core.chat.v1"));
+        assert!(ids.iter().any(|i| i == "core.file.v1"));
+        assert!(ids.iter().any(|i| i == "room.audio.sfu"));
+    }
+
+    #[test]
+    fn manifest_file_overrides_legacy_toggles() {
+        let dir = tempdir();
+        std::fs::write(
+            dir.join("supernode.toml"),
+            "schema_version = 1\n\
+             [[feature]]\n\
+             id = \"core.chat.v1\"\n",
+        )
+        .unwrap();
+        let registry = build_feature_registry(&cfg(dir));
+        let mut ids: Vec<String> = registry.snapshot().iter().map(|c| c.id.clone()).collect();
+        ids.sort();
+        // Manifest declares chat only; relay + room quota descriptors are always upserted.
+        assert_eq!(
+            ids,
+            vec![
+                "core.audio.opus".to_string(),
+                "core.chat.v1".to_string(),
+                "core.file.v1".to_string(),
+                "game.relay.v1".to_string(),
+                "room.audio.sfu".to_string(),
+                "room.chat.v1".to_string(),
+                "room.file.v1".to_string(),
+            ]
+        );
+    }
 }

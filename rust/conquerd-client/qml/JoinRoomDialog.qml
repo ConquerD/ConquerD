@@ -3,14 +3,14 @@
 import QtQuick
 import QtQuick.Controls.Material
 import QtQuick.Layouts
+import ConquerD.Client 1.0
 
-Rectangle {
+Item {
     id: root
     visible: false
-    color: "#2F3136"
-    radius: 0
-    width: 380
-    height: 210
+    focus: visible
+    width: 400
+    height: 260
 
     signal joinRequested(string supernodeId, string roomId)
 
@@ -26,81 +26,100 @@ Rectangle {
         root.visible = false
     }
 
-    // Keyboard: Escape to cancel
     Keys.onEscapePressed: root.dismiss()
 
-    ColumnLayout {
+    Rectangle {
         anchors.fill: parent
-        anchors.margins: 20
-        spacing: 12
+        color: Theme.overlayScrim
+        opacity: 0.72
+    }
 
-        Label {
-            text: "Join Voice Room"
-            font.pixelSize: 15
-            font.bold: true
-            color: "#FFFFFF"
-        }
+    Rectangle {
+        anchors.centerIn: parent
+        width: 380
+        height: cardColumn.implicitHeight + Theme.spacingXl * 2
+        color: Theme.bg2
+        radius: Theme.radiusMd
+        border.color: Theme.border
+        border.width: 1
 
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 8
+        ColumnLayout {
+            id: cardColumn
+            anchors {
+                fill: parent
+                margins: Theme.spacingXl
+            }
+            spacing: Theme.spacingMd
+
             Label {
-                text: "Supernode:"
-                color: "#B9BBBE"
-                Layout.preferredWidth: 90
+                text: "Join Voice Room"
+                font.pixelSize: Theme.fontSizeTitle
+                font.bold: true
+                color: Theme.text
             }
-            TextField {
-                id: supernodeField
-                Layout.fillWidth: true
-                placeholderText: "supernode_id or host:port"
-                color: "#DCDDDE"
-                background: Rectangle { color: "#383A40"; radius: 0 }
-                Keys.onReturnPressed: roomField.forceActiveFocus()
-            }
-        }
 
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 8
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingSm
+
+                Label {
+                    text: "Supernode"
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeBody
+                    Layout.preferredWidth: 90
+                }
+                StyledTextField {
+                    id: supernodeField
+                    Layout.fillWidth: true
+                    placeholderText: "supernode_id or host:port"
+                    Keys.onReturnPressed: roomField.forceActiveFocus()
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingSm
+
+                Label {
+                    text: "Room"
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeBody
+                    Layout.preferredWidth: 90
+                }
+                StyledTextField {
+                    id: roomField
+                    Layout.fillWidth: true
+                    placeholderText: "room name or ID"
+                    Keys.onReturnPressed: doJoin()
+                }
+            }
+
             Label {
-                text: "Room:"
-                color: "#B9BBBE"
-                Layout.preferredWidth: 90
-            }
-            TextField {
-                id: roomField
+                id: errorLabel
+                text: ""
+                color: Theme.danger
+                font.pixelSize: Theme.fontSizeCaption
+                visible: text.length > 0
+                wrapMode: Text.WordWrap
                 Layout.fillWidth: true
-                placeholderText: "room name or ID"
-                color: "#DCDDDE"
-                background: Rectangle { color: "#383A40"; radius: 0 }
-                Keys.onReturnPressed: doJoin()
-            }
-        }
-
-        Label {
-            id: errorLabel
-            text: ""
-            color: "#ED4245"
-            font.pixelSize: 11
-            visible: text.length > 0
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 8
-
-            Button {
-                Layout.fillWidth: true
-                text: "Cancel"
-                flat: true
-                onClicked: root.dismiss()
             }
 
-            Button {
+            RowLayout {
                 Layout.fillWidth: true
-                text: "Join Room"
-                Material.background: Material.Blue
-                onClicked: doJoin()
+                spacing: Theme.spacingSm
+
+                StyledButton {
+                    Layout.fillWidth: true
+                    text: "Cancel"
+                    onClicked: root.dismiss()
+                }
+
+                StyledButton {
+                    Layout.fillWidth: true
+                    text: "Join Room"
+                    primary: true
+                    onClicked: doJoin()
+                }
             }
         }
     }

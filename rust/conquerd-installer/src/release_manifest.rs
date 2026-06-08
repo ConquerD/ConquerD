@@ -3,9 +3,22 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 
 /// Hex-encoded Ed25519 public key of the ConquerD release signer.
-/// Replace with the actual publisher key before shipping.
-const RELEASE_SIGNER_PUBKEY_HEX: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+/// This is the public half of the key generated for manifest signing
+/// (see keys/release-signer-public.pem; private key is kept out-of-repo).
+///
+/// The corresponding private key must be used (via a secure process or
+/// the `sign-release-manifest` binary) to produce the `signature` field in
+/// releases_manifest.json.
+///
+/// Usage (from repo root):
+///   cargo run -p conquerd-installer --bin sign-release-manifest -- \
+///     -i path/to/unsigned.json -o releases_manifest.json \
+///     --private-key /secure/release-signer-private.pem
+///
+/// The --pubkey argument defaults to this constant; pass --pubkey explicitly
+/// if/when rotating keys in the future (must match the const used by verifiers).
+pub const RELEASE_SIGNER_PUBKEY_HEX: &str =
+    "d31f43fcfba1fae04313d384d7fba026bd52796550c57def6cf47b069c18043f";
 
 /// One entry in the release manifest.
 #[derive(Debug, Deserialize)]
@@ -13,7 +26,12 @@ const RELEASE_SIGNER_PUBKEY_HEX: &str =
 pub struct ManifestEntry {
     pub version: String,
     pub platform: String,
+    /// Hash of the distributed archive (e.g. the .7z). Verified by installer.
     pub build_hash: String,
+    /// Optional reproducible build identifier embedded in the binaries
+    /// (e.g. "release-1.0.0-18eae80" or git sha). Used for P2P build attestation.
+    #[serde(default)]
+    pub build_id: String,
     #[serde(default)]
     pub published_at: f64,
 }
@@ -37,16 +55,15 @@ impl ReleaseManifest {
     ///
     /// Returns an error if:
     ///  - JSON is malformed
-    ///  - The Ed25519 signature is invalid (unless the embedded key is all-zero,
-    ///    in which case verification is skipped for development builds)
+    ///  - The Ed25519 signature is invalid for the configured RELEASE_SIGNER_PUBKEY_HEX
     pub fn parse_and_verify(raw_json: &str) -> Result<Self> {
         let manifest: ReleaseManifest =
             serde_json::from_str(raw_json).context("Failed to parse releases_manifest.json")?;
 
         if RELEASE_SIGNER_PUBKEY_HEX == "0".repeat(64) {
             anyhow::bail!(
-                "RELEASE_SIGNER_PUBKEY_HEX is the all-zero placeholder — \
-                set a real Ed25519 public key before releasing"
+                "RELEASE_SIGNER_PUBKEY_HEX is still the all-zero placeholder — \
+                this must be replaced with the real release signer public key"
             );
         }
 
@@ -198,6 +215,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 platform: "win64".to_string(),
                 build_hash: "DEADBEEF".to_string(),
+                build_id: "release-1.0.0-abc123".to_string(),
                 published_at: 0.0,
             }],
             signed_at: 0.0,
@@ -214,6 +232,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 platform: "linux".to_string(),
                 build_hash: "DEADBEEF".to_string(),
+                build_id: "release-1.0.0-abc123".to_string(),
                 published_at: 0.0,
             }],
             signed_at: 0.0,
@@ -237,6 +256,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 platform: "win64".to_string(),
                 build_hash: "DEADBEEF".to_string(),
+                build_id: "release-1.0.0-abc123".to_string(),
                 published_at: 0.0,
             }],
             signed_at: 0.0,
@@ -254,6 +274,7 @@ mod tests {
                 version: "2.0.0".to_string(),
                 platform: "macos".to_string(),
                 build_hash: "CAFEBABE".to_string(),
+                build_id: String::new(),
                 published_at: 0.0,
             }],
             signed_at: 0.0,
@@ -279,15 +300,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn parse_and_verify_rejects_placeholder_signing_key() {
-        // The codebase ships with the all-zero placeholder; verify it always errors.
-        let raw = r#"{"releases":[],"signed_at":0.0,"signer_pubkey":"","signature":""}"#;
+    fn parse_and_verify_rejects_invalid_signature() {
+        // A manifest with a signature that does not verify against the configured
+        // RELEASE_SIGNER_PUBKEY_HEX must be rejected.
+        let raw = r#"{"releases":[],"signed_at":0.0,"signer_pubkey":"","signature":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
         let result = ReleaseManifest::parse_and_verify(raw);
-        assert!(result.is_err(), "placeholder key must be rejected");
+        assert!(result.is_err(), "invalid signature must be rejected");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("placeholder") || msg.contains("real Ed25519"),
-            "error should mention placeholder key; got: {msg}"
+            msg.contains("signature") || msg.contains("verification"),
+            "error should mention signature verification failure; got: {msg}"
         );
     }
 

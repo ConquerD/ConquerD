@@ -1,119 +1,164 @@
 ---
-name: ConquerD Dark (Dracula/Discord-dark)
-colors:
-  accent:  "#5865F2"
-  danger:  "#FF2B40"
-  online:  "#3BA55D"
-  warn:    "#FAA61A"
-  bg0:     "#111214"
-  bg1:     "#1E1F22"
-  bg2:     "#2B2D31"
-  bg3:     "#383A40"
-  text:    "#DCDDDE"
-  muted:   "#72767D"
-rounded:
-  sm: 4px
-  md: 8px
-  lg: 12px
+name: ConquerD Design System
+version: 1.0.0
+theme: ConquerD Dark (Dracula/Discord-inspired)
+primary_palette: Dark (with full light mode support)
+framework: Qt 6 + QML + PySide6
+status: Active
+last_updated: 2026-06-06
 ---
 
-# Design System
+# ConquerD Design System
 
 ## Overview
-ConquerD uses a Dracula/Discord-dark palette rendered in Qt 6 / QML via Material.Dark.
-The design favours high information density, a angular layered dark background stack, and minimal chrome. 
-A dark/light toggle is supported via `Theme.isDark`; dark is the default and primary design target.
-Source of truth: `rust/conquerd-client/qml/Theme.qml`.
+ConquerD is a high-information-density, privacy-focused P2P application. The UI emphasizes clarity, speed, and minimal distraction through:
 
-## Colors
+- A layered dark-first aesthetic with subtle depth (no heavy shadows).
+- Discord/Dracula-inspired color language.
+- Strong typography hierarchy and consistent spacing.
+- Fluid micro-animations on state changes.
+- Full light mode support via `Theme.isDark`.
 
-### Background layers (dark)
-Four layers of background create visual depth without elevation shadows.
+**Source of truth**: `rust/conquerd-client/qml/Theme.qml` + this document.
+All new QML must consume tokens from `Theme.*` — never hardcode colors, sizes, or radii.
 
-| Token | Hex | Role |
-|---|---|---|
-| `Theme.bg0` | `#111214` | Window chrome, title bar |
-| `Theme.bg1` | `#1E1F22` | Sidebar / panel backgrounds |
-| `Theme.bg2` | `#2B2D31` | Section headers, input backgrounds, call overlay |
-| `Theme.bg3` | `#383A40` | Hover states, dividers, chips |
+**Design Principles**:
+- **Density over whitespace** — maximize useful content.
+- **Clarity first** — semantic colors and clear visual hierarchy.
+- **Motion with purpose** — short, meaningful animations (≤ 300ms).
+- **Consistency** — every component follows the token system.
+- **Performance** — lightweight delegates, lazy loading, minimal JS.
 
-### Background layers (light)
-`bg0 #F2F3F5` → `bg1 #FFFFFF` → `bg2 #E9EAEC` → `bg3 #D8D9DD`.
-All semantic and accent colours are identical in both modes.
+## Tokens
 
-### Text
-| Token | Hex | Role |
-|---|---|---|
-| `Theme.text` | `#DCDDDE` | Primary body text |
-| `Theme.muted` | `#72767D` | Section labels, placeholders, secondary info |
-| `Theme.textInv` | `#FFFFFF` | Text on coloured backgrounds |
+### Colors
 
-### Semantic / accent
-| Token | Hex | Role |
-|---|---|---|
-| `Theme.accent` | `#5865F2` | Active states, selection highlight, border focus, call overlay border |
-| `Theme.online` | `#3BA55D` | Direct peer connection, online presence dot |
-| `Theme.danger` | `#FF2B40` | Error state, destructive action, brand logo colour |
-| `Theme.warn` | `#FAA61A` | Relay connection, warning state |
+#### Background Stack (creates depth)
+Use layers strictly in order for visual hierarchy.
 
-The ConquerD logo ("D" chevron SVG) uses `#FF2B40`, making danger the brand identity colour.
+**Dark Mode (default)**
+| Token       | Hex       | Role                              |
+|-------------|-----------|-----------------------------------|
+| `bg0`       | `#111214` | Window chrome, title bar          |
+| `bg1`       | `#1E1F22` | Primary panels, sidebars          |
+| `bg2`       | `#2B2D31` | Cards, inputs, section headers    |
+| `bg3`       | `#383A40` | Hover, dividers, subtle surfaces  |
 
-## Typography
-Inherits the system default font via Qt Material.Dark (no custom font family imposed).
+**Light Mode**
+`bg0 #F2F3F5` → `bg1 #FFFFFF` → `bg2 #E9EAEC` → `bg3 #D8D9DD`
 
-| Token | Size | Role |
-|---|---|---|
-| `Theme.fontSizeTitle` | 15 px | Panel titles, peer name |
-| `Theme.fontSizeBody` | 13 px | Chat messages, body text |
-| `Theme.fontSizeCaption` | 11 px | Section headers, badges, timestamps |
+#### Text
+| Token       | Hex       | Role                                      |
+|-------------|-----------|-------------------------------------------|
+| `text`      | `#DCDDDE` | Primary body / labels                     |
+| `muted`     | `#72767D` | Secondary, captions, placeholders         |
+| `textInv`   | `#FFFFFF` | Text on accent / semantic colored bg      |
 
-Section headers are all-caps with `letterSpacing: 1.2` (e.g. "PEERS (3)", "ONLINE", "OFFLINE").
+#### Semantic
+| Token       | Hex       | Role                                      |
+|-------------|-----------|-------------------------------------------|
+| `accent`    | `#5865F2` | Focus, selection, active states           |
+| `online`    | `#3BA55D` | Live connections, success                 |
+| `warn`      | `#FAA61A` | Relay / non-ideal states                  |
+| `danger`    | `#FF2B40` | Errors, destructive actions, **brand**    |
 
-## Spacing & Radius
-| Token | Value | Use |
-|---|---|---|
-| `Theme.spacingXs` | 4 px | Tight icon gaps |
-| `Theme.spacingSm` | 8 px | Inner padding, icon-to-label |
-| `Theme.spacingMd` | 12 px | Standard item padding |
-| `Theme.spacingLg` | 16 px | Panel margins |
-| `Theme.spacingXl` | 24 px | Section gaps |
-| `Theme.radiusSm` | 4 px | Input fields, chips, accent pill |
-| `Theme.radiusMd` | 8 px | Buttons, dialogs |
-| `Theme.radiusLg` | 12 px | Floating overlays (call panel) |
+### Typography
+Uses system font (via `Material.Dark` / `SystemDefault`). No custom font loading unless decided later.
+
+| Token              | Size   | Weight     | Role                          |
+|--------------------|--------|------------|-------------------------------|
+| `fontSizeTitle`    | 15px   | Medium     | Panel titles, peer names      |
+| `fontSizeBody`     | 13px   | Regular    | Messages, main content        |
+| `fontSizeCaption`  | 11px   | Regular    | Timestamps, badges, labels    |
+
+**Rules**:
+- Section headers: `uppercase`, `letterSpacing: 1.2`, `muted` color.
+- Use `font.pixelSize` + `Theme.*` tokens.
+
+### Spacing & Radius
+| Token         | Value   | Usage                              |
+|---------------|---------|------------------------------------|
+| `spacingXs`   | 4px     | Icon gaps, tight elements          |
+| `spacingSm`   | 8px     | Inner padding, icon+label          |
+| `spacingMd`   | 12px    | Standard item padding              |
+| `spacingLg`   | 16px    | Panel margins                      |
+| `spacingXl`   | 24px    | Major section gaps                 |
+| `radiusSm`    | 0px     | Angular inputs, chips, pills       |
+| `radiusMd`    | 0px     | Angular buttons, cards, dialogs    |
+| `radiusLg`    | 0px     | Angular panels / overlays          |
 
 ## Components
 
-### TitleBar
-Custom frameless bar (44 px tall). Background is `Theme.bg0`. Contains the ConquerD logo SVG, an invite/peer-ID text field (`Theme.bg3` background, `Theme.accent` border on focus), and window controls (min/max/close). Supports drag-to-move via `DragHandler` + `startSystemMove()` and double-click-to-maximize. Aero Snap is preserved via `Qt.CustomizeWindowHint` (not `Qt.FramelessWindowHint`).
+### Core Components (Document each with)
+- Visual description + screenshot (add images here when possible)
+- Key properties & states
+- Usage example / code snippet
 
-### SessionBanner
-Compact status strip beneath the title bar. Background is `Theme.bg1` tinted with a 6 % overlay:
-- Direct → green tint (`Theme.online`), 3 px left accent bar
-- Relay → amber tint (`Theme.warn`)
-- Error → red tint (`Theme.danger`)
-- Offline → no tint, muted dot
+**TitleBar** — 44px frameless custom bar (`bg0`)
+**SessionBanner** — Status strip with animated tint + accent bar
+**PeerList / SidebarItem** — Navigation rail with sections and context menus
+**ChatPanel** — Message list, bubbles, typing indicator, file transfers, Ollama streaming
+**CallPanel** — Compact floating overlay
+**Avatar** — Deterministic SVG identicons via Rust backend
 
-All colour transitions animate with `ColorAnimation { duration: 300 }`.
+*(Expand each with real code patterns as the app grows)*
 
-### PeerList (navigation rail)
-`Theme.bg1` background. Header row is `Theme.bg2`. Peers are section-grouped into **Online** / **Offline** with `Theme.muted` all-caps section labels (10 px, `letterSpacing: 0.8`). Right-click context menu includes block/unblock toggle.
+## States & Interactions
 
-### SidebarItem
-Height 44 px. Selected state: `Theme.accent` at 15 % alpha fill + 3 px left accent pill (radius 2). Hover state: `Theme.bg2` fill. Label colour: `Theme.text` (selected) or `Theme.muted` (inactive). Uses emoji/SVG icon in the left slot.
+- **Hover**: `bg3` fill or slight brightness shift.
+- **Selected / Active**: `accent` 15% fill + 3px left accent bar with angular ends.
+- **Focus**: `accent` border.
+- **Disabled**: 50% opacity + `muted` text.
+- **Transitions**: Use `ColorAnimation { duration: 250 }` or `NumberAnimation` for all state changes.
+- **Right-click**: Consistent context menus with Qt `Menu`.
 
-### ChatPanel
-Full-height flex column. Chat bubble colours follow sender identity. Typing indicator fades after 4 s idle. Supports inline file transfer progress, YouTube preview toggle, and local Ollama AI streaming (streamed chunks appended to `aiResponse`).
+## Icons & Assets
+- Prefer **Material Icons** (via `MaterialIcon` or SVG) for consistency.
+- Custom SVGs only for brand (logo, avatars).
+- All icons: 20–24px, use `Theme.text` or semantic colors.
+- Avatars: Generated server-side via `backend.avatarSvg(...)`.
 
-### CallPanel (floating overlay)
-240 × 80 px floating rectangle, `radius: 12`, `Theme.bg2` fill, `Theme.accent` 1 px border. Status dot: green (`#57F287`) for in-call, amber (`#FEE75C`) for connecting, red (`#ED4245`) for error. Mic mute toggle icon turns red when muted.
+## Theming & Modes
+- Toggle: `Theme.isDark` (reactive property).
+- All colors defined as properties in `Theme.qml`.
+- Light mode is fully supported but secondary — test both regularly.
 
-### Avatars
-Deterministic SVG identicons generated by `AvatarConfig` (Rust). Rendered via `backend.avatarSvg(peerId, configJson)` → `data:image/svg+xml;base64,...` in `Avatar.qml`.
+## Do's and Don'ts (Rules)
 
-## Do's and Don'ts
-- Use `Theme.*` tokens — never hardcode hex values in new QML (existing inline literals in `CallPanel.qml` are the exception, not the pattern).
-- Use the 4-layer background stack in order: bg0 (outermost chrome) → bg1 → bg2 → bg3 (innermost surface).
-- Accent (`#5865F2`) is for selection and focus only — not for general informational colour.
-- Keep danger (`#FF2B40`) reserved for destructive actions and error state; it is also the brand colour, so overuse dilutes identity.
-- All-caps section labels must use `Theme.muted`, not `Theme.text`.
-- Animate colour transitions on state-change UI (banners, dots) with `ColorAnimation { duration: 300 }`.
+**Do**:
+- Always use `Theme.*` tokens.
+- Follow the background layer order (`bg0` → `bg1` → `bg2` → `bg3`).
+- Keep animations short and purposeful.
+- Use Layouts + anchors for responsiveness.
+- Test on multiple DPIs / window sizes.
+
+**Don't**:
+- Hardcode hex values, pixel sizes, or colors.
+- Use `danger` for non-destructive elements (it's the brand color).
+- Overuse `accent` — reserve for focus/selection.
+- Put heavy logic inside UI components (keep in Python/Rust models).
+
+## Accessibility
+- Minimum contrast ratios (WCAG AA).
+- Keyboard navigation support.
+- Screen reader friendly labels (`Accessible` role).
+- Scalable fonts and touch targets (min 44px).
+
+## Screenshots / Visual Inventory
+*(Add gallery here as components mature)*
+
+## Changelog
+- 2026-06-06: Initial design system document v1.0
+
+---
+
+### Additional Recommendations
+
+1. **Make it visual** — Add screenshots or exported QML renders next to each component section.
+2. **Component Gallery** — Create a `ComponentGallery.qml` file that showcases every component in one window for quick testing.
+3. **Figma / Design Studio sync** — If you bring in a designer later, this doc becomes the spec.
+4. **Token generation** — Consider generating parts of `Theme.qml` from this markdown (or vice versa) with a script later.
+5. **Qt-specific additions**:
+   - Style: `Material.Dark` + custom palette overrides.
+   - Use `QtQuick.Controls` + custom components.
+   - Performance notes (e.g., `Layer` usage, delegate recycling).

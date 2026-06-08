@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls.Material
 import QtQuick.Layouts
+import ConquerD.Client 1.0
 
 Item {
     id: root
@@ -44,7 +45,7 @@ Item {
         text = text.replace(/~~([^~\n]+)~~/g, "<s>$1</s>")
         text = text.replace(/\n/g, "<br>")
         text = text.replace(/(https?:\/\/[^\s<>"]+)/g,
-            '<a href="$1" style="color:' + (root.mine ? "#DCE0FF" : "#8EA7FF") + '">$1</a>')
+            '<a href="$1" style="color:' + Theme.toHex(root.mine ? Theme.linkMine : Theme.linkPeer) + '">$1</a>')
         return text
     }
 
@@ -131,7 +132,7 @@ Item {
             visible: root.isRoom && !root.mine && root.sender !== ""
             text: root.sender
             color: Theme.muted
-            font.pixelSize: 10
+            font.pixelSize: Theme.fontSizeCaption
             elide: Text.ElideRight
             width: parent.width
         }
@@ -139,17 +140,17 @@ Item {
         Rectangle {
             id: bubble
             width: parent.width
-            implicitHeight: bodyText.implicitHeight + 14
-            radius: 0
+            implicitHeight: bodyText.implicitHeight + Theme.spacingMd
+            radius: Theme.radiusMd
             color: root.mine ? Theme.accent : Theme.bg2
 
             Text {
                 id: bodyText
-                anchors { fill: parent; margins: 7 }
+                anchors { fill: parent; margins: Theme.spacingSm }
                 text: root.richText(root.body)
                 textFormat: Text.RichText
-                color: Theme.text
-                font.pixelSize: 13
+                color: root.mine ? Theme.textInv : Theme.text
+                font.pixelSize: Theme.fontSizeBody
                 wrapMode: Text.Wrap
                 onLinkActivated: (link) => Qt.openUrlExternally(link)
             }
@@ -174,7 +175,7 @@ Item {
             height: visible ? (inline ? 185 : previewRow.implicitHeight + 14) : 0
             radius: 0
             color: Theme.bg1
-            border.color: kindName === "youtube" ? "#FF0000" : Theme.bg3
+            border.color: kindName === "youtube" ? Theme.danger : Theme.bg3
             border.width: 1
             clip: true
 
@@ -209,13 +210,13 @@ Item {
                     Label {
                         text: root.previewTitle()
                         color: Theme.text
-                        font.pixelSize: 11
+                        font.pixelSize: Theme.fontSizeCaption
                         font.bold: true
                     }
                     Label {
                         text: root.previewUrl()
                         color: Theme.muted
-                        font.pixelSize: 10
+                        font.pixelSize: Theme.fontSizeCaption
                         elide: Text.ElideRight
                         Layout.fillWidth: true
                     }
@@ -280,14 +281,14 @@ Item {
                     ? Qt.formatTime(new Date(root.timestamp * 1000), "hh:mm")
                     : ""
                 color: Theme.muted
-                font.pixelSize: 10
+                font.pixelSize: Theme.fontSizeCaption
             }
 
             Text {
                 visible: root.mine
                 text: root.statusText()
                 color: root.status === "failed" ? Theme.danger : Theme.muted
-                font.pixelSize: 10
+                font.pixelSize: Theme.fontSizeCaption
             }
 
             ToolButton {
@@ -336,7 +337,7 @@ Item {
             wrapMode: Text.Wrap
             text: "Inline previews load the linked video provider directly in an off-the-record browser view. No data is sent to ConquerD servers."
             color: Theme.text
-            font.pixelSize: 12
+            font.pixelSize: Theme.fontSizeBody
         }
 
         onAccepted: {

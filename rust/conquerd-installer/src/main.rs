@@ -403,9 +403,7 @@ fn run_update_and_relaunch(
                             log!("Release manifest verified for v{}.", release.version);
                         }
                         Err(e) => {
-                            log!(
-                                "WARNING: manifest verification failed: {e:#}. Proceeding anyway."
-                            );
+                            bail!("Release manifest verification failed: {e:#}");
                         }
                     }
                 }

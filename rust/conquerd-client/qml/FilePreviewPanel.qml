@@ -28,7 +28,10 @@ Item {
     /// Absolute path to the file to preview. Changing this reloads the view.
     property string filePath: ""
 
-    // ── Extension → render mode mapping ──────────────────────────────────
+    readonly property string _fileName: root.filePath.length > 0
+        ? root.filePath.replace(/\\/g, "/").split("/").pop()
+        : ""
+
     readonly property var _imageExts:
         [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico"]
     readonly property var _webExts:
@@ -50,31 +53,32 @@ Item {
                _audioExts.indexOf(e) >= 0
     }
 
-    // ── Background ────────────────────────────────────────────────────────
     Rectangle {
         anchors.fill: parent
         color: Theme.bg0
         radius: 0
         clip: true
 
-        // ── Header bar ────────────────────────────────────────────────────
         Rectangle {
             id: headerBar
             anchors { top: parent.top; left: parent.left; right: parent.right }
-            height: 36
+            height: Theme.touchTarget
             color: Theme.bg1
 
             RowLayout {
-                anchors { fill: parent; leftMargin: 10; rightMargin: 6 }
-                spacing: 6
+                anchors {
+                    fill: parent
+                    leftMargin: Theme.spacingMd
+                    rightMargin: Theme.spacingSm
+                }
+                spacing: Theme.spacingSm
 
                 Label {
                     Layout.fillWidth: true
-                    text: root.filePath.length > 0
-                          ? root.filePath.replace(/\\/g, "/").split("/").pop()
-                          : "File Preview"
+                    text: root._fileName || "File Preview"
                     color: Theme.text
-                    font.pixelSize: 11
+                    font.pixelSize: Theme.fontSizeCaption
+                    font.bold: true
                     elide: Text.ElideMiddle
                 }
 
@@ -84,8 +88,8 @@ Item {
                     icon.height: 14
                     icon.color: Theme.accent
                     flat: true
-                    implicitWidth: 32
-                    implicitHeight: 24
+                    implicitWidth: Theme.controlHeight
+                    implicitHeight: Theme.controlHeight
                     ToolTip.text: "Open in system application"
                     ToolTip.visible: hovered
                     onClicked: Qt.openUrlExternally("file:///" + root.filePath.replace(/\\/g, "/"))
@@ -97,8 +101,8 @@ Item {
                     icon.height: 12
                     icon.color: Theme.muted
                     flat: true
-                    implicitHeight: 24
-                    implicitWidth: 28
+                    implicitHeight: Theme.controlHeight
+                    implicitWidth: Theme.controlHeight
                     ToolTip.text: "Close preview"
                     ToolTip.visible: hovered
                     onClicked: root.closeRequested()
@@ -106,73 +110,48 @@ Item {
             }
         }
 
-        // ── Preview area ──────────────────────────────────────────────────
         Item {
             anchors {
                 top: headerBar.bottom
                 left: parent.left; right: parent.right; bottom: parent.bottom
             }
 
-            // ConquerdWebView for previewable types
             ConquerdWebView {
                 id: _webView
                 anchors.fill: parent
-
-                // No outbound network: only file:// and data: permitted
                 allowAll: false
-                allowedDomains: []  // empty → local content only
-
+                allowedDomains: []
                 visible: root._canPreview(root.filePath)
             }
 
-            // "Cannot preview" fallback
             ColumnLayout {
                 anchors.centerIn: parent
                 visible: !root._canPreview(root.filePath) && root.filePath !== ""
-                spacing: 12
+                spacing: Theme.spacingMd
 
-                Image {
+                EmptyState {
                     Layout.alignment: Qt.AlignHCenter
-                    source: "qrc:/qt/qml/ConquerD/Client/icons/attach.svg"
-                    sourceSize.width: 32
-                    sourceSize.height: 32
-                    Layout.preferredWidth: 32
-                    Layout.preferredHeight: 32
-                    fillMode: Image.PreserveAspectFit
+                    iconSource: "qrc:/qt/qml/ConquerD/Client/icons/attach.svg"
+                    iconSize: 32
+                    title: "No preview available"
+                    subtitle: root._fileName
                 }
-                Label {
-                    Layout.alignment: Qt.AlignHCenter
-                    text: "No preview available"
-                    color: Theme.muted
-                    font.pixelSize: 13
-                }
-                Label {
-                    Layout.alignment: Qt.AlignHCenter
-                    text: root.filePath.replace(/\\/g, "/").split("/").pop()
-                    color: Theme.muted
-                    font.pixelSize: 10
-                }
-                Button {
+
+                StyledButton {
                     Layout.alignment: Qt.AlignHCenter
                     text: "Open in system application"
-                    flat: true
-                    Material.foreground: Theme.accent
+                    primary: true
                     onClicked: Qt.openUrlExternally("file:///" + root.filePath.replace(/\\/g, "/"))
                 }
             }
         }
     }
 
-    // ── Reload when filePath changes ──────────────────────────────────────
     onFilePathChanged: {
         if (filePath === "" || !_canPreview(filePath)) return
         var e = _ext(filePath)
-        var encoded = encodeURIComponent(filePath.replace(/\\/g, "/"))
 
         if (_videoExts.indexOf(e) >= 0) {
-            // Inject HTML5 <video> — avoids file:// cross-origin restrictions
-            // on some platforms by using a data: URI with the source attribute
-            // pointing to the local path via file://.
             _webView.navigate("data:text/html;charset=utf-8," + encodeURIComponent(
                 "<!DOCTYPE html><html><body style='margin:0;background:#000;display:flex;" +
                 "align-items:center;justify-content:center;height:100vh'>" +
@@ -189,7 +168,6 @@ Item {
                 "</audio></body></html>"
             ))
         } else {
-            // Images, PDF, HTML, text, code — load directly via file:// URL
             _webView.navigate("file:///" + filePath.replace(/\\/g, "/"))
         }
     }

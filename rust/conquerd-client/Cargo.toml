@@ -98,6 +98,8 @@ cxx-qt-build = { version = "0.8", optional = false }
 winresource = "0.1"
 # C++ compilation for the scheme handler shim (webengine feature).
 cc = "1"
+# For computing a content hash of source files for stronger build attestation.
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util", "macros"] }

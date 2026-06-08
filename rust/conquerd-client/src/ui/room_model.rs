@@ -33,6 +33,9 @@ pub mod ffi {
 
         include!("cxx-qt-lib/qhash.h");
         type QHash_i32_QByteArray = cxx_qt_lib::QHash<cxx_qt_lib::QHashPair_i32_QByteArray>;
+
+        include!("cxx-qt-lib/qlist.h");
+        type QList_i32 = cxx_qt_lib::QList<i32>;
     }
 
     unsafe extern "RustQt" {
@@ -80,6 +83,18 @@ pub mod ffi {
         #[inherit]
         #[rust_name = "end_reset_model"]
         fn endResetModel(self: Pin<&mut Self>);
+
+        #[inherit]
+        #[rust_name = "data_changed"]
+        fn dataChanged(
+            self: Pin<&mut Self>,
+            top_left: &QModelIndex,
+            bottom_right: &QModelIndex,
+            roles: &QList_i32,
+        );
+
+        #[inherit]
+        fn index(&self, row: i32, column: i32, parent: &QModelIndex) -> QModelIndex;
     }
 }
 
@@ -179,18 +194,20 @@ impl ffi::RoomModel {
             .iter()
             .position(|p| p.peer_id == id)
         {
-            self.as_mut().begin_reset_model();
             let p = &mut self.as_mut().rust_mut().participants[idx];
+            let mut roles = vec![room_roles::SPEAKING, room_roles::MUTED];
             p.speaking = speaking;
             p.muted = muted;
             // Derive a synthetic audio level from speaking state when no VAD value
             // is available; real VAD values arrive via setParticipants JSON.
             if speaking && p.audio_level < 0.1 {
                 p.audio_level = 0.7;
+                roles.push(room_roles::AUDIO_LEVEL);
             } else if !speaking {
                 p.audio_level = 0.0;
+                roles.push(room_roles::AUDIO_LEVEL);
             }
-            self.as_mut().end_reset_model();
+            emit_row_changed(self.as_mut(), idx as i32, &roles);
         }
     }
 
@@ -202,9 +219,23 @@ impl ffi::RoomModel {
             .iter()
             .position(|p| p.peer_id == id)
         {
-            self.as_mut().begin_reset_model();
-            self.as_mut().rust_mut().participants[idx].audio_level = level.clamp(0.0, 1.0);
-            self.as_mut().end_reset_model();
+            let next = level.clamp(0.0, 1.0);
+            if (self.rust().participants[idx].audio_level - next).abs() < 0.005 {
+                return;
+            }
+            self.as_mut().rust_mut().participants[idx].audio_level = next;
+            emit_row_changed(self.as_mut(), idx as i32, &[room_roles::AUDIO_LEVEL]);
         }
     }
+}
+
+fn emit_row_changed(model: Pin<&mut ffi::RoomModel>, row: i32, changed_roles: &[i32]) {
+    let parent = QModelIndex::default();
+    let tl = model.as_ref().index(row, 0, &parent);
+    let br = tl.clone();
+    let mut roles = cxx_qt_lib::QList::<i32>::default();
+    for role in changed_roles {
+        roles.append(*role);
+    }
+    model.data_changed(&tl, &br, &roles);
 }

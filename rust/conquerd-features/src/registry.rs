@@ -261,6 +261,30 @@ impl FeatureRegistry {
         self.quotas.clear_peer(peer_id);
     }
 
+    /// Gate an inbound receive through the local feature descriptor's quota
+    /// **without** invoking the bound module's `on_message` callback.
+    ///
+    /// Use on real-time hot paths (audio datagrams, SFU relay fan-out) where
+    /// the transport layer handles the payload after the quota check.
+    ///
+    /// Returns `true` when allowed (or when no local descriptor is registered).
+    pub fn gate_inbound_through_feature(
+        &self,
+        feature_id: &str,
+        peer_id: &str,
+        byte_count: usize,
+    ) -> bool {
+        let quota_params = {
+            let g = self.inner.read();
+            match g.get(feature_id) {
+                Some(e) => Self::quota_params_for(&e.descriptor),
+                None => return true,
+            }
+        };
+        self.quotas
+            .try_consume(feature_id, peer_id, byte_count, quota_params)
+    }
+
     // -- Outbound gating ------------------------------------------------
 
     /// Gate an outbound send through the local feature descriptor's quota.
@@ -430,7 +454,7 @@ mod tests {
             .expect("invoke_datagram should succeed");
 
         // Tag must be in the dynamic range.
-        assert!(tag >= 0x10 && tag <= 0xEF);
+        assert!((0x10..=0xEF).contains(&tag));
         // The tag should be bound in the registry.
         assert_eq!(tags.tag_for("core.audio.opus"), Some(tag));
         // The module must have been invoked once.
@@ -712,6 +736,30 @@ mod tests {
             r.gate_through_feature("room.audio.sfu", "room-peer-2", 100),
             "other room peer should still have quota"
         );
+    }
+
+    #[test]
+    fn room_audio_sfu_inbound_quota_exhaustion() {
+        let r = FeatureRegistry::new();
+        r.register(wellknown::room_audio_sfu()).unwrap();
+
+        for _ in 0..200 {
+            assert!(r.gate_inbound_through_feature("room.audio.sfu", "room-peer-1", 1));
+        }
+        assert!(
+            !r.gate_inbound_through_feature("room.audio.sfu", "room-peer-1", 1),
+            "room.audio.sfu inbound should be exhausted after burst"
+        );
+        assert!(
+            r.gate_inbound_through_feature("room.audio.sfu", "room-peer-2", 100),
+            "inbound quota is per-peer"
+        );
+    }
+
+    #[test]
+    fn gate_inbound_returns_true_for_unknown_feature() {
+        let r = FeatureRegistry::new();
+        assert!(r.gate_inbound_through_feature("unknown.feature.v1", "peer-a", 99_999));
     }
 
     #[test]

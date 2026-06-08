@@ -32,6 +32,7 @@ pub mod ffi {
         #[qproperty(i32, jitter_buffer_depth)]
         #[qproperty(i32, input_volume)]
         #[qproperty(i32, output_volume)]
+        #[qproperty(QString, voice_bitrate)]
         #[qproperty(QString, ptt_key)]
         #[qproperty(QString, audio_input_device)]
         #[qproperty(QString, audio_output_device)]
@@ -106,6 +107,8 @@ struct SettingsSnapshot {
     input_volume: i32,
     #[serde(default = "default_100")]
     output_volume: i32,
+    #[serde(default = "default_voice_bitrate")]
+    voice_bitrate: String,
     #[serde(default = "default_ptt_key")]
     ptt_key: String,
     #[serde(default)]
@@ -178,6 +181,9 @@ fn default_ptt_key() -> String {
 fn default_noise_strength() -> String {
     "moderate".to_string()
 }
+fn default_voice_bitrate() -> String {
+    "ultra".to_string()
+}
 fn default_theme() -> String {
     "system".to_string()
 }
@@ -197,6 +203,7 @@ impl Default for SettingsSnapshot {
             jitter_buffer_depth: 3,
             input_volume: 100,
             output_volume: 100,
+            voice_bitrate: default_voice_bitrate(),
             ptt_key: "space".to_string(),
             audio_input_device: String::new(),
             audio_output_device: String::new(),
@@ -238,6 +245,7 @@ pub struct SettingsModelRust {
     jitter_buffer_depth: i32,
     input_volume: i32,
     output_volume: i32,
+    voice_bitrate: QString,
     ptt_key: QString,
     audio_input_device: QString,
     audio_output_device: QString,
@@ -276,6 +284,7 @@ impl Default for SettingsModelRust {
             jitter_buffer_depth: s.jitter_buffer_depth,
             input_volume: s.input_volume,
             output_volume: s.output_volume,
+            voice_bitrate: QString::from(s.voice_bitrate.as_str()),
             ptt_key: QString::from(s.ptt_key.as_str()),
             audio_input_device: QString::default(),
             audio_output_device: QString::default(),
@@ -337,6 +346,7 @@ impl ffi::SettingsModel {
             jitter_buffer_depth: r.jitter_buffer_depth,
             input_volume: r.input_volume,
             output_volume: r.output_volume,
+            voice_bitrate: r.voice_bitrate.to_string(),
             ptt_key: r.ptt_key.to_string(),
             audio_input_device: r.audio_input_device.to_string(),
             audio_output_device: r.audio_output_device.to_string(),
@@ -405,6 +415,8 @@ impl ffi::SettingsModel {
             .set_jitter_buffer_depth(snap.jitter_buffer_depth);
         self.as_mut().set_input_volume(snap.input_volume);
         self.as_mut().set_output_volume(snap.output_volume);
+        self.as_mut()
+            .set_voice_bitrate(QString::from(snap.voice_bitrate.as_str()));
         self.as_mut()
             .set_ptt_key(QString::from(snap.ptt_key.as_str()));
         self.as_mut()

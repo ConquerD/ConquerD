@@ -14,7 +14,7 @@ Item {
     id: root
 
     // Height consumed by the title bar (taller to host topbar widgets)
-    implicitHeight: 44
+    implicitHeight: Theme.titleBarHeight
 
     // Parent window reference (set by parent ApplicationWindow)
     property var appWindow: null
@@ -63,9 +63,9 @@ Item {
             id: contentSlot
             Layout.fillWidth: true
             Layout.fillHeight: true
-            Layout.leftMargin: 8
-            Layout.rightMargin: 8
-            spacing: 8
+            Layout.leftMargin: Theme.spacingSm
+            Layout.rightMargin: Theme.spacingSm
+            spacing: Theme.spacingSm
         }
 
         // ── Window control buttons ─────────────────────────────────────────

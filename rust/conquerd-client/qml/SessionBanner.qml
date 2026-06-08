@@ -14,33 +14,10 @@ Rectangle {
     property string bannerText: ""
     property string connectionMode: "offline"  // "direct" | "relay" | "offline" | "error"
 
-    // Derive visual state from connectionMode
-    readonly property color _dotColor: {
-        switch (root.connectionMode) {
-            case "direct":  return Theme.online
-            case "relay":   return Theme.warn
-            case "error":   return Theme.danger
-            default:        return Theme.muted      // offline
-        }
-    }
-    readonly property string _modeLabel: {
-        switch (root.connectionMode) {
-            case "direct":  return "Direct"
-            case "relay":   return "Relay"
-            case "error":   return "Error"
-            default:        return "Offline"
-        }
-    }
-    readonly property color _tintColor: {
-        switch (root.connectionMode) {
-            case "direct":  return Qt.rgba(0.23, 0.65, 0.36, 0.06)  // green tint
-            case "relay":   return Qt.rgba(0.98, 0.65, 0.10, 0.06)  // yellow tint
-            case "error":   return Qt.rgba(1.00, 0.17, 0.25, 0.06)  // red tint
-            default:        return Qt.rgba(0,    0,    0,    0)
-        }
-    }
+    readonly property color _dotColor: Theme.connectionModeColor(root.connectionMode)
+    readonly property string _modeLabel: Theme.connectionModeLabel(root.connectionMode)
 
-    color: Qt.tint(Theme.bg1, root._tintColor)
+    color: Qt.tint(Theme.bg1, Theme.connectionModeTint(root.connectionMode))
 
     // 3px left accent bar
     Rectangle {
@@ -48,16 +25,16 @@ Rectangle {
         anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
         width: 3
         color: root._dotColor
-        Behavior on color { ColorAnimation { duration: 300 } }
+        Behavior on color { ColorAnimation { duration: Theme.animSlow } }
     }
 
     RowLayout {
         anchors {
-            left: accentBar.right; leftMargin: 8
-            right: parent.right; rightMargin: 8
+            left: accentBar.right; leftMargin: Theme.spacingSm
+            right: parent.right; rightMargin: Theme.spacingSm
             top: parent.top; bottom: parent.bottom
         }
-        spacing: 6
+        spacing: Theme.spacingXs
 
         // Status dot
         Rectangle {
@@ -70,28 +47,26 @@ Rectangle {
         Text {
             text: root._modeLabel
             color: root._dotColor
-            font.pixelSize: 11
+            font.pixelSize: Theme.fontSizeCaption
             font.bold: true
-            Behavior on color { ColorAnimation { duration: 300 } }
+            Behavior on color { ColorAnimation { duration: Theme.animSlow } }
         }
 
-        // Separator dot
         Text {
             text: "\u00B7"
             color: Theme.muted
-            font.pixelSize: 11
+            font.pixelSize: Theme.fontSizeCaption
             visible: root.bannerText !== ""
         }
 
-        // Banner text (scrolling elide)
         Text {
             Layout.fillWidth: true
             text: root.bannerText
             color: Theme.muted
-            font.pixelSize: 11
+            font.pixelSize: Theme.fontSizeCaption
             elide: Text.ElideRight
         }
     }
 
-    Behavior on color { ColorAnimation { duration: 300 } }
+    Behavior on color { ColorAnimation { duration: Theme.animSlow } }
 }

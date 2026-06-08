@@ -4,9 +4,8 @@
 //! verify+enumerate+forward pipeline that previously lived as an
 //! ad-hoc closure in `main.rs`. The WebTransport bridge dispatches
 //! room.* payloads to [`crate::webtransport::ModuleNativeDispatcher`],
-//! which calls a single hook that resolves to
-//! `state.features.dispatch_message(feature_id, source, payload)` —
-//! turning the per-message hot path into a proper framework dispatch.
+//! which calls a single hook that invokes the bound `FeatureModule` after
+//! inbound quota is enforced in [`crate::webtransport::BrowserBridge::on_inbound`].
 //!
 //! The module holds a `Weak<SupernodeState>` so the registry → module
 //! chain does not pin the state Arc.
@@ -97,6 +96,7 @@ impl FeatureModule for SfuRoomModule {
             MembersKind::Audio => sfu.read().get_room_members(&room_id),
             MembersKind::Chat => sfu.read().get_chat_recipients(&room_id),
         };
+        let wire_bytes = payload.len();
         for native in members {
             // Browser source ids are base64url Ed25519 pubkeys; native
             // ids share the same space, so skip the source itself in
@@ -104,7 +104,12 @@ impl FeatureModule for SfuRoomModule {
             if native == source {
                 continue;
             }
-            state.signaling.send_to_peer(&native, raw);
+            if state
+                .features
+                .gate_through_feature(self.feature_id, &native, wire_bytes)
+            {
+                state.signaling.send_to_peer(&native, raw);
+            }
         }
     }
 }
