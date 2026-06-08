@@ -38,6 +38,9 @@ jobs:
       - name: Verify version metadata stays in sync
         run: pwsh scripts/check_version_sync.ps1
 
+      - name: Fetch Opus DNN model weights
+        run: bash scripts/fetch_opus_weights.sh
+
       # --- Lint (fail fast) -------------------------------------------------
       - name: Check formatting (rust/ workspace)
         run: cargo fmt --all -- --check
