@@ -217,7 +217,7 @@ impl fmt::Display for MessageType {
         let s = serde_json::to_value(self)
             .ok()
             .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| format!("{:?}", self));
+            .unwrap_or_else(|| format!("{self:?}"));
         f.write_str(&s)
     }
 }

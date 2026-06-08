@@ -967,7 +967,7 @@ fn run_repair(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) -> anyhow::
             }
             ctx.request_repaint();
         } else {
-            eprintln!("Repair: cannot find {} in archive — skipping", rel_path);
+            eprintln!("Repair: cannot find {rel_path} in archive — skipping");
         }
     }
 

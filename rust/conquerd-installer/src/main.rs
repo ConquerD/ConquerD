@@ -61,7 +61,7 @@ fn chrono_stamp() -> String {
     let s = secs % 60;
     let m = (secs / 60) % 60;
     let h = (secs / 3600) % 24;
-    format!("{:02}:{:02}:{:02} UTC", h, m, s)
+    format!("{h:02}:{m:02}:{s:02} UTC")
 }
 
 /// On Windows, re-attach to the parent process console so that

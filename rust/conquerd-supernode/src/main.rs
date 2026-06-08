@@ -723,7 +723,7 @@ impl SupernodeState {
             Some(h) if !h.is_empty() && h != "0.0.0.0" => h.to_owned(),
             _ => "localhost".to_owned(),
         };
-        let url = format!("https://{}:{}", host, port);
+        let url = format!("https://{host}:{port}");
         // Include the cert fingerprint alongside the URL so the SDK can use
         // serverCertificateHashes even when it reaches us via the /api/wt-url
         // fallback (i.e. before SUPERNODE_INFO has been delivered via the

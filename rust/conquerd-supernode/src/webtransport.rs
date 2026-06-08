@@ -730,7 +730,7 @@ async fn run_identity_handshake(
     use rand::RngCore;
 
     let pubkey = crate::crypto::b64url_decode(peer_id_b64)
-        .map_err(|e| anyhow::anyhow!("peer id is not valid base64url: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("peer id is not valid base64url: {e}"))?;
     if pubkey.len() != 32 {
         anyhow::bail!(
             "peer id is not a 32-byte Ed25519 public key (got {} bytes)",

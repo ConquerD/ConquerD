@@ -90,7 +90,7 @@ fn main() -> Result<()> {
     if args.generate_unsigned {
         let skeleton = generate_unsigned_skeleton(&args.pubkey);
         if args.output == "-" {
-            println!("{}", skeleton);
+            println!("{skeleton}");
         } else {
             fs::write(&args.output, &skeleton)
                 .with_context(|| format!("Failed to write unsigned skeleton: {}", args.output))?;
@@ -140,7 +140,7 @@ fn main() -> Result<()> {
     let seed = load_private_seed(&private_key)?;
     let signed = sign_manifest(&unsigned, &seed, &args.pubkey)?;
     if args.output == "-" {
-        println!("{}", signed);
+        println!("{signed}");
     } else {
         fs::write(&args.output, &signed)
             .with_context(|| format!("Failed to write signed manifest: {}", args.output))?;
@@ -377,7 +377,7 @@ fn generate_unsigned_skeleton(pubkey_hex: &str) -> String {
     // Sample clean build_id (what a `git checkout v1.0.0 && cargo build` (no env override) or
     // the CI "release-${{ github.ref_name }}-${{ github.sha }}" (short) produces).
     // Peers will see/attest this exact string for official release binaries.
-    let sample_build_id = format!("release-{}-18eae80", version);
+    let sample_build_id = format!("release-{version}-18eae80");
 
     // published_at 0 in the template; signer will populate a real signed_at.
     let skeleton = format!(
@@ -409,9 +409,6 @@ fn generate_unsigned_skeleton(pubkey_hex: &str) -> String {
   "signed_at": 0.0,
   "signer_pubkey": "{pubkey_hex}"
 }}"#,
-        version = version,
-        sample_build_id = sample_build_id,
-        pubkey_hex = pubkey_hex
     );
 
     // Re-parse + pretty-print (consistent with sign path + validates JSON).
@@ -432,7 +429,7 @@ fn do_verify(input: &str) -> Result<()> {
         buf
     } else {
         fs::read_to_string(input)
-            .with_context(|| format!("Failed to read manifest for verification: {}", input))?
+            .with_context(|| format!("Failed to read manifest for verification: {input}"))?
     };
 
     use base64::Engine;
@@ -499,6 +496,6 @@ fn do_verify(input: &str) -> Result<()> {
     )?;
 
     eprintln!("OK: releases_manifest.json signature verifies against the project release key.");
-    eprintln!("    signer_pubkey: {}", RELEASE_SIGNER_PUBKEY_HEX);
+    eprintln!("    signer_pubkey: {RELEASE_SIGNER_PUBKEY_HEX}");
     Ok(())
 }

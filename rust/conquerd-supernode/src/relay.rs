@@ -727,7 +727,7 @@ fn extract_peer_id(conn: &quinn::Connection) -> anyhow::Result<String> {
     let cn_hex = x509_parser_lite(cert.as_ref())?;
     // Convert hex CN to base64url peer_id (matching Identity.public_id format)
     let pub_bytes =
-        hex::decode(&cn_hex).map_err(|e| anyhow::anyhow!("invalid hex CN '{}': {}", cn_hex, e))?;
+        hex::decode(&cn_hex).map_err(|e| anyhow::anyhow!("invalid hex CN '{cn_hex}': {e}"))?;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     Ok(URL_SAFE_NO_PAD.encode(&pub_bytes))
