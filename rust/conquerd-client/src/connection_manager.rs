@@ -3583,9 +3583,7 @@ async fn run_quic_peer_session(
             } else {
                 0.0
             };
-            let jitter_ms = prev_rtt_ms
-                .map(|prev| (rtt_ms - prev).abs())
-                .unwrap_or(0.0);
+            let jitter_ms = prev_rtt_ms.map(|prev| (rtt_ms - prev).abs()).unwrap_or(0.0);
             prev_rtt_ms = Some(rtt_ms);
             let bytes = s.udp_tx.bytes;
             let bandwidth_kbps = if prev_bytes > 0 && bytes >= prev_bytes {
@@ -3594,14 +3592,13 @@ async fn run_quic_peer_session(
                 0.0
             };
             prev_bytes = bytes;
-            let _ = stats_tx
-                .try_send(InternalEvent::QuicStats {
-                    peer_id: stats_peer.clone(),
-                    rtt_ms,
+            let _ = stats_tx.try_send(InternalEvent::QuicStats {
+                peer_id: stats_peer.clone(),
+                rtt_ms,
                     packet_loss_pct,
                     jitter_ms,
                     bandwidth_kbps,
-                });
+            });
         }
     });
 
