@@ -1965,11 +1965,7 @@ impl ffi::AppBridge {
         QString::from(avatar_tint_hex(&id, &config).as_str())
     }
 
-    fn avatar_image_smooth(
-        self: Pin<&mut Self>,
-        peer_id: &QString,
-        config_json: &QString,
-    ) -> bool {
+    fn avatar_image_smooth(self: Pin<&mut Self>, peer_id: &QString, config_json: &QString) -> bool {
         let (_, config) = resolve_avatar_config(self.rust(), peer_id, config_json);
         !config.svg_crisp
     }
