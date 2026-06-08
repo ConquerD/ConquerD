@@ -109,6 +109,10 @@ jobs:
         shell: pwsh
         run: pwsh scripts/check_version_sync.ps1
 
+      - name: Fetch Opus DNN model weights
+        shell: pwsh
+        run: pwsh scripts/fetch_opus_weights.ps1
+
       - name: Check formatting (rust/ workspace)
         shell: pwsh
         run: cargo fmt --all -- --check
