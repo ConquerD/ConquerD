@@ -133,17 +133,11 @@ features = ["qt_gui", "qt_qml"]
 
 # ── Workspace (client is its own workspace so cxx-qt patch is isolated here) ──
 # This keeps the server-side workspace (rust/Cargo.toml) free of Qt/cxx-qt,
-# allowing conquerd-supernode to be built on Linux without the Windows-local
-# cxx-qt path being resolved.
+# allowing conquerd-supernode to be built on Linux without Qt.
 [workspace]
 
-# Local patch for cxx-qt: fixes include!(<...>) in signal_boilerplate()
-# which triggers "non-foreign item macro in foreign item position" on Rust 1.83+.
-# Path is Windows-only; adjust or remove if building the client on Linux/macOS.
-[patch.crates-io]
-cxx-qt       = { path = "C:/Users/AWOL/cxx-qt-patched/crates/cxx-qt" }
-cxx-qt-lib   = { path = "C:/Users/AWOL/cxx-qt-patched/crates/cxx-qt-lib" }
-cxx-qt-build = { path = "C:/Users/AWOL/cxx-qt-patched/crates/cxx-qt-build" }
-cxx-qt-gen   = { path = "C:/Users/AWOL/cxx-qt-patched/crates/cxx-qt-gen" }
-cxx-qt-macro = { path = "C:/Users/AWOL/cxx-qt-patched/crates/cxx-qt-macro" }
-qt-build-utils = { path = "C:/Users/AWOL/cxx-qt-patched/crates/qt-build-utils" }
+# NOTE: If your local Rust toolchain triggers cxx-qt macro errors (e.g. the
+# "non-foreign item macro in foreign item position" issue on Rust ≥ 1.83),
+# apply a [patch.crates-io] override pointing at your patched cxx-qt source in
+# a *non-committed* local Cargo.toml layer.  The patch is intentionally NOT
+# committed here because the absolute Windows paths break CI and Linux builds.
