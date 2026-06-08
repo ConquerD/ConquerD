@@ -228,7 +228,7 @@ pub fn set_taskbar_badge(count: u32) {
                 "--type=method_call",
                 "/com/canonical/unity/launcherentry/1",
                 "com.canonical.Unity.LauncherEntry.Update",
-                &format!("string:application://conquerd.desktop"),
+                "string:application://conquerd.desktop",
                 &format!("variant:{{'count': <int64:{}>}}", count as i64),
             ])
             .spawn();
