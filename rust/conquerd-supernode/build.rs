@@ -72,7 +72,7 @@ fn compute_source_hash() -> String {
     }
 
     let digest = hasher.finalize();
-    format!("{:x}", digest)[..12].to_string()
+    format!("{digest:x}")[..12].to_string()
 }
 
 fn main() {
@@ -125,12 +125,12 @@ fn main() {
                 .unwrap_or(false);
 
             if is_dirty {
-                format!("{}-dirty", base)
+                format!("{base}-dirty")
             } else {
                 base
             }
         });
-        println!("cargo:rustc-env=CONQUERD_BUILD_ID={}", build_id);
+        println!("cargo:rustc-env=CONQUERD_BUILD_ID={build_id}");
         println!(
             "cargo:rustc-env=CONQUERD_VERSION={}",
             env!("CARGO_PKG_VERSION")
@@ -143,6 +143,6 @@ fn main() {
         }
 
         let source_hash = compute_source_hash();
-        println!("cargo:rustc-env=CONQUERD_SOURCE_HASH={}", source_hash);
+        println!("cargo:rustc-env=CONQUERD_SOURCE_HASH={source_hash}");
     }
 }
