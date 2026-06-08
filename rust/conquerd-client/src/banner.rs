@@ -105,14 +105,14 @@ pub fn resolve_room_voice_status(
         "ws-relay"
     };
     let voice_part = if state == "connected" {
-        format!("connected/{}", transport)
+        format!("connected/{transport}")
     } else {
         state.to_string()
     };
 
     let mut secondary: Vec<SecondaryLine> = Vec::new();
     if !supernode_label.is_empty() {
-        secondary.push((format!("SN: {}", supernode_label), Some(COLOR_BLUE)));
+        secondary.push((format!("SN: {supernode_label}"), Some(COLOR_BLUE)));
     }
     if !transport_note.is_empty() {
         secondary.push((transport_note.to_string(), Some(COLOR_RED)));
@@ -133,7 +133,7 @@ pub fn resolve_room_voice_status(
 pub fn resolve_direct_voice_status(voice_state: &str, voice_quality: &str) -> VoiceStatus {
     let (voice_part, color) = if voice_state == "connected" {
         (
-            format!("connected/{}", voice_quality),
+            format!("connected/{voice_quality}"),
             color_for_voice("connected", voice_quality),
         )
     } else if matches!(voice_state, "connecting" | "new" | "checking") {

@@ -365,11 +365,7 @@ pub fn build_avatar_svg(peer_id: &str, config: &AvatarConfig) -> String {
     let mut svg = String::with_capacity(cap);
 
     svg.push_str(&format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{g}" height="{g}" viewBox="0 0 {g} {g}" shape-rendering="{sr}"><defs><clipPath id="ac"><rect width="{g}" height="{g}" rx="{r:.2}" ry="{r:.2}"/></clipPath></defs><g clip-path="url(#ac)"><rect width="{g}" height="{g}" fill="{bg}"/>"#,
-        g = grid,
-        sr = sr,
-        r = corner_r,
-        bg = bg_fill,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{grid}" height="{grid}" viewBox="0 0 {grid} {grid}" shape-rendering="{sr}"><defs><clipPath id="ac"><rect width="{grid}" height="{grid}" rx="{corner_r:.2}" ry="{corner_r:.2}"/></clipPath></defs><g clip-path="url(#ac)"><rect width="{grid}" height="{grid}" fill="{bg_fill}"/>"#,
     ));
 
     for row in 0..grid {
@@ -428,12 +424,7 @@ pub fn build_avatar_svg(peer_id: &str, config: &AvatarConfig) -> String {
 
             let fill = hsl_str(hue, sat_used, lig);
             svg.push_str(&format!(
-                r#"<rect x="{x}" y="{y}" width="{w:.2}" height="{w:.2}" rx="{rx}" ry="{rx}" fill="{fill}"/>"#,
-                x = col,
-                y = row,
-                w = cell_w,
-                rx = rx_cell,
-                fill = fill,
+                r#"<rect x="{col}" y="{row}" width="{cell_w:.2}" height="{cell_w:.2}" rx="{rx_cell}" ry="{rx_cell}" fill="{fill}"/>"#,
             ));
         }
     }
@@ -449,7 +440,7 @@ pub fn build_avatar_svg(peer_id: &str, config: &AvatarConfig) -> String {
 fn hsl_str(hue: f32, sat: f32, lig: f32) -> String {
     // Standard HSL → RGB algorithm.
     let (r, g, b) = hsl_to_rgb(hue, sat, lig);
-    format!("#{:02x}{:02x}{:02x}", r, g, b)
+    format!("#{r:02x}{g:02x}{b:02x}")
 }
 
 /// Return the identity-derived background tint hex colour for `peer_id`.

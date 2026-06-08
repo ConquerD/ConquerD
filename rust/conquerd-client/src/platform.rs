@@ -98,7 +98,7 @@ pub fn should_exit_as_duplicate_instance() -> bool {
                         // otherwise the user intentionally double-launched
                         // and should still get a normal window.
                         let argv_has_uri =
-                            std::env::args().any(|a| a.starts_with(&format!("{}://", URI_SCHEME)));
+                            std::env::args().any(|a| a.starts_with(&format!("{URI_SCHEME}://")));
                         if argv_has_uri {
                             info!(
                                 "[single-instance] another ConquerD is running; \
@@ -126,7 +126,7 @@ pub fn should_exit_as_duplicate_instance() -> bool {
 ///
 /// Expected format: `conquerd://action/payload`
 pub fn parse_uri(uri: &str) -> Option<(String, String)> {
-    let stripped = uri.strip_prefix(&format!("{}://", URI_SCHEME))?;
+    let stripped = uri.strip_prefix(&format!("{URI_SCHEME}://"))?;
     let (action, payload) = stripped.split_once('/').unwrap_or((stripped, ""));
     Some((action.to_string(), payload.to_string()))
 }
@@ -160,7 +160,7 @@ fn register_uri_scheme_windows() -> bool {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    let base = format!("HKCU\\Software\\Classes\\{}", URI_SCHEME);
+    let base = format!("HKCU\\Software\\Classes\\{URI_SCHEME}");
     let ok = Command::new("reg")
         .args(["add", &base, "/ve", "/d", "URL:ConquerD Protocol", "/f"])
         .creation_flags(CREATE_NO_WINDOW)
@@ -168,14 +168,14 @@ fn register_uri_scheme_windows() -> bool {
         .map(|s| s.success())
         .unwrap_or(false);
     if ok {
-        let cmd_key = format!("{}\\shell\\open\\command", base);
+        let cmd_key = format!("{base}\\shell\\open\\command");
         Command::new("reg")
             .args([
                 "add",
                 &cmd_key,
                 "/ve",
                 "/d",
-                &format!("\"{}\" \"%1\"", exe),
+                &format!("\"{exe}\" \"%1\""),
                 "/f",
             ])
             .creation_flags(CREATE_NO_WINDOW)
