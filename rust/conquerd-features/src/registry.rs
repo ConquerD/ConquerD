@@ -137,7 +137,7 @@ impl FeatureRegistry {
     pub fn dispatch_invoke(&self, id: &str, ctx: InvocationContext) -> ModuleResult<()> {
         let module = self
             .module(id)
-            .ok_or_else(|| ModuleError::Internal(format!("no module bound to '{}'", id)))?;
+            .ok_or_else(|| ModuleError::Internal(format!("no module bound to '{id}'")))?;
         module.on_invoke(ctx)
     }
 

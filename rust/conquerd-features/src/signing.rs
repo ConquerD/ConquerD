@@ -345,7 +345,7 @@ impl TrustedKeyStore {
             .create(true)
             .append(true)
             .open(path)?;
-        writeln!(f, "{}", pubkey_b64)
+        writeln!(f, "{pubkey_b64}")
     }
 }
 
