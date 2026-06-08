@@ -1200,8 +1200,7 @@ mod tests {
         // This is the key expansion of the P0 smoke: we now drive actual
         // room membership and a room-broadcast datagram over a *real* QUIC
         // connection (not just in-memory state objects).
-        let (_conn_b, peer_b, _ep_b) =
-            connect_second_test_peer(&srv, port, &server_id).await;
+        let (_conn_b, peer_b, _ep_b) = connect_second_test_peer(&srv, port, &server_id).await;
         srv.join_room(&client_peer_id, "p0-smoke-room");
         srv.join_room(&peer_b, "p0-smoke-room");
 

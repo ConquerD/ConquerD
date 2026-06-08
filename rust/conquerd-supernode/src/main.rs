@@ -1288,11 +1288,11 @@ impl SupernodeHandler {
         if payload_bytes == 0 {
             return;
         }
-        if !self
-            .state
-            .features
-            .gate_inbound_through_feature("room.file.v1", &msg.sender, payload_bytes)
-        {
+        if !self.state.features.gate_inbound_through_feature(
+            "room.file.v1",
+            &msg.sender,
+            payload_bytes,
+        ) {
             tracing::debug!(
                 "[room.file.v1] inbound quota exceeded for {}; dropping relay",
                 &msg.sender[..12.min(msg.sender.len())]
