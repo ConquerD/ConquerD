@@ -336,7 +336,7 @@ jobs:
           CONQUERD_RELEASE: "1"
           CONQUERD_SIGN_ID: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           CONQUERD_BUILD_ID: ${{ steps.meta.outputs.build_id }}
-        run: ./build_macos.sh
+        run: bash build_macos.sh
 
       - name: Rename DMG to include platform suffix
         run: |
@@ -432,7 +432,7 @@ jobs:
         env:
           CONQUERD_RELEASE: "1"
           CONQUERD_BUILD_ID: ${{ steps.meta.outputs.build_id }}
-        run: ./build_linux.sh
+        run: bash build_linux.sh
 
       - name: Verify artifacts
         run: |
