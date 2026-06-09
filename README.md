@@ -8,8 +8,6 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 
 ---
 
----
-
 ## Features
 
 ### Chat-First P2P
@@ -86,7 +84,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Peer block/unblock toggle in the right-click context menu; blocked peers show a visual indicator in the peer list.
 - Privacy & Data controls in Settings: trim message history by age (days) or count (keep newest N), purge all chat history, and lock identity & quit (removes the OS-keyring AES key so the next launch requires a passphrase).
 - Optional AI chat assistant via the `x.ollama.v1` plugin (Ollama backend required); enable in Settings.
-- **Identity-derived avatars**: every peer has a deterministic, horizontally-symmetric identicon generated from their Ed25519 public key — no image uploads, no servers. Visual complexity signals trust tier: untrusted peers (no completed handshake) get a simple 8×8 flat-hue icon; trusted peers render a full 16×16 multi-shade avatar. Trusted peers can share a custom `AvatarConfig` after the handshake so all clients render an identical SVG. Customise your own avatar in **Settings → Avatar** with a live preview.
+- **Identity-derived avatars**: every peer has a deterministic, horizontally-symmetric identicon generated from their Ed25519 public key — no image uploads, no servers. Visual complexity signals trust tier: untrusted peers (no completed handshake) get a simple 8×8 flat-hue icon; trusted peers render a full 16×16 multi-shade avatar. Trusted peers can share a custom `AvatarConfig` after the handshake so all clients render an identical SVG. Customise your own avatar in **Settings → Identity → Avatar** with a live preview.
 
 ### Updates
 - Update notifications via the GitHub Releases API; the bundled `conquerd-installer` binary downloads and applies signed releases.
@@ -270,6 +268,8 @@ User types → ChatManager.send_message()
 
 Conquerd is structured as a **modular peer-connectivity framework**: chat, voice, files, rooms, and games are not hard-coded behaviors but **features** advertised and negotiated between peers and supernodes. The spine is the `conquerd-features` crate.
 
+For the precise runtime contract (auth tier enforcement order, quota symmetry across inbound/outbound and all transport paths, dispatch rules, negative-path requirements, and channel tag allocation), see `agents.md` → "Using the Modular Framework (Agent Contract)" and "Feature Module Reference (Agent Contract)". The material below is the human-oriented view suitable for operators and module authors.
+
 ### Concepts
 
 - **Capability descriptor** — a self-describing record advertised after handshake. Fields: `id` (reverse-DNS, e.g. `core.chat.v1`), `version` (semver, negotiated by major), `kind` (`datagram` | `stream` | `request`), `params` (free-form), `auth` (`public` | `room-member` | `trusted-peer`), `experimental`.
@@ -283,10 +283,10 @@ Conquerd is structured as a **modular peer-connectivity framework**: chat, voice
 
 | ID | Kind | Auth | Provided by |
 |---|---|---|---|
-| `transport.quic.audio.v1` | datagram | trusted-peer | `conquerd-quic` |
-| `transport.quic.relay.v1` | datagram | room-member | `conquerd-quic` (relay client) |
-| `transport.quic.stream.v1` | stream | trusted-peer | `conquerd-quic` |
-| `transport.quic.feature_datagram.v1` | datagram | trusted-peer | `conquerd-quic` |
+| `transport.quic.audio.v1` | datagram | trusted-peer | `conquerd-client` QUIC layer |
+| `transport.quic.relay.v1` | datagram | room-member | `conquerd-client` (`QuicRelayClient`) |
+| `transport.quic.stream.v1` | stream | trusted-peer | `conquerd-client` QUIC layer |
+| `transport.quic.feature_datagram.v1` | datagram | trusted-peer | `conquerd-client` QUIC layer |
 | `core.chat.v1` | stream | trusted-peer | desktop client |
 | `core.audio.opus` | datagram | trusted-peer | `conquerd-client` (via `conquerd-opus`) |
 | `core.file.v1` | stream | trusted-peer | desktop client |
@@ -595,7 +595,9 @@ All configuration is via environment variables set before launching.
 | `supernode_invite_ttl` | `-1` | Invite expiry in minutes. `-1` = never expires |
 | `CONQUERD_HOME` | `~/.conquerd` | Data directory for identity, settings, files |
 
-#### Feature Toggles
+#### Feature Toggles (legacy)
+
+Prefer `supernode.toml` for feature enablement (see [Enabling Features on a Supernode](#enabling-features-on-a-supernode)). The variables below are retained for backward compatibility when no manifest is present:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -874,7 +876,7 @@ cd conquerd-client
 cargo test
 ```
 
-The outer workspace currently runs **366 unit tests** (116 `conquerd-features` + 195 `conquerd-supernode` + 55 `conquerd-installer`) covering: capability negotiation/invocation, quota enforcement (inbound and outbound), channel-tag allocation, feature module loader, supernode manifest parsing, access control gates, handshake signing/verification, relay ticket lifecycle, WebTransport cert lifecycle, and installer signature verification. `conquerd-client` adds a further **120 unit tests** (crypto, identity, chat store, room/SFU state, call controller, peer store, plugin manager, network monitor, and more) for a combined total of **486** across all four crates.
+See `agents.md` (Roadmap & Status) for the current authoritative test counts, coverage areas, and P0–P2 delivery status. The test suite emphasises capability negotiation, quota symmetry (inbound/outbound), replay protection, relay/SFU/room flows, and installer manifest verification.
 
 ### Two-Client Local Testing
 
@@ -942,7 +944,7 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 ```
 ├── rust/
 │   ├── Cargo.toml                 # Outer workspace: features + supernode + installer
-│   ├── conquerd-client/           # Native desktop binary (own workspace; Qt 6 / QML via CXX-Qt)
+│   ├── conquerd-client/           # Native desktop binary (own workspace; Qt 6 / QML via CXX-Qt; 125 tests)
 │   │   ├── Cargo.toml             # features: qt-ui, webengine, console
 │   │   ├── build.rs               # CXX-Qt codegen + windres icon embedding
 │   │   ├── assets.qrc / icons.qrc # Qt resource bundles (QML + icons)
@@ -969,8 +971,8 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 │   │       ├── github_updater.rs  # GitHub Releases API poll + installer spawn
 │   │       ├── ringtone.rs / taskbar_badge.rs / upnp.rs / uri_scheme.rs / web_app_client.rs
 │   │       └── ui/                # AppBridge QObject + QML models (Peer/Chat/Call/Room/Settings/FileTransfer)
-│   ├── conquerd-features/         # rlib: capability registry, FeatureModule trait, quota enforcement (79 tests)
-│   ├── conquerd-supernode/        # Standalone binary: QUIC relay, SFU, WS signaling, WebTransport + QUIC-stream portal (187 tests)
+│   ├── conquerd-features/         # rlib: capability registry, FeatureModule trait, quota enforcement (113 tests)
+│   ├── conquerd-supernode/        # Standalone binary: QUIC relay, SFU, WS signaling, WebTransport + QUIC-stream portal (195 tests)
 │   └── conquerd-installer/        # Standalone binary: signed-release download + apply (55 tests)
 ├── web-sdk/conquerd.mjs           # Browser SDK (WebTransport client matching the native channel fabric)
 ├── games/                         # Example browser games served over `web.host.h3.v1`
