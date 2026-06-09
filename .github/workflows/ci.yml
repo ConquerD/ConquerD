@@ -1,3 +1,4 @@
+# Local mirror: scripts/ci_local.ps1 (Windows) / scripts/ci_local.sh (Linux/macOS)
 name: CI
 
 on:
