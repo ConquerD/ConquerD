@@ -16,7 +16,10 @@ format = "human"
 # A list of advisory IDs to ignore.
 # e.g. "RUSTSEC-0000-0000"
 [advisories]
-ignore = []
+ignore = [
+    # Transitive macOS-only: wgpu-hal → metal → paste. Installer uses eframe/glow.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained only; not on our glow code path" },
+]
 
 [licenses]
 # The confidence threshold for detecting a license from the license text.

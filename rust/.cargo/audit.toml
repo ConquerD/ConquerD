@@ -1,0 +1,9 @@
+# cargo-audit config for the rust/ workspace (features, supernode, installer, opus).
+# Picked up automatically when `cargo audit` runs with working-directory: rust.
+#
+# paste (RUSTSEC-2024-0436): transitive macOS-only via wgpu-hal → metal. The
+# installer GUI uses eframe with the glow backend, not wgpu/Metal. Unmaintained
+# status only — not a security vulnerability. Revisit when metal-rs drops paste.
+
+[advisories]
+ignore = ["RUSTSEC-2024-0436"]

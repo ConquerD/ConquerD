@@ -40,6 +40,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: rust
+          ignore: RUSTSEC-2024-0436
 
       - name: Security audit (client workspace)
         uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2 (pinned)
