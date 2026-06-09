@@ -83,3 +83,4 @@ ruff_audit.json
 /rust/conquerd-client/target-check
 /rust/conquerd-client/target
 /terminals
+/agent-tools
