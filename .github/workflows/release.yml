@@ -131,6 +131,7 @@ jobs:
           # For scheduled nightlies, force checkout of develop (schedule runs on default branch).
           # For push to develop or tags, use the event ref.
           ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
@@ -145,6 +146,10 @@ jobs:
             ~/.cargo/git
             rust/target
           key: windows-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Fetch Opus DNN model weights
+        shell: pwsh
+        run: pwsh scripts/fetch_opus_weights.ps1
 
       - name: Install Qt 6
         shell: pwsh
@@ -273,6 +278,7 @@ jobs:
           # For scheduled nightlies, force checkout of develop (schedule runs on default branch).
           # For push to develop or tags, use the event ref.
           ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
@@ -287,6 +293,9 @@ jobs:
             ~/.cargo/git
             rust/target
           key: macos-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Fetch Opus DNN model weights
+        run: bash scripts/fetch_opus_weights.sh
 
       - name: Install system deps
         run: brew install cmake create-dmg
@@ -368,6 +377,7 @@ jobs:
           # For scheduled nightlies, force checkout of develop (schedule runs on default branch).
           # For push to develop or tags, use the event ref.
           ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
@@ -382,6 +392,9 @@ jobs:
             ~/.cargo/git
             rust/target
           key: linux-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Fetch Opus DNN model weights
+        run: bash scripts/fetch_opus_weights.sh
 
       - name: Install system deps
         run: |
