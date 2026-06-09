@@ -796,13 +796,15 @@ All Conquerd data is stored under `CONQUERD_HOME` (default `~/.conquerd/`):
 
 | File | Purpose |
 |------|---------|
-| `identity.json` | Your Ed25519 keypair — **back this up** |
-| `settings.ini` | All preferences |
-| `peer_store.json` | Trusted peers list |
-| `chat_history.db` | Chat messages (SQLite) |
-| `my_rooms.json` | Saved room invites |
-| `received_files/` | Downloaded files from file transfers |
-| `conquerd-client.log` | Application log (Rust `tracing` output) |
+| `identity.dat` | Your Ed25519 keypair (v2, encrypted at rest) — **back this up** |
+| `identity.json` | Legacy v1 plaintext identity (read-only after migration, if present) |
+| `peers.dat` | Trusted peers list (encrypted) |
+| `chat_history.db` | Chat messages (SQLite; message bodies encrypted at rest) |
+| `settings.json` | All preferences |
+| `my_rooms.dat` | Saved room invites (encrypted) |
+| `installer.log` | Installer/updater activity (when `conquerd-installer` runs) |
+
+Received files are saved to your OS **Downloads** folder on completion (not under `CONQUERD_HOME`). The desktop client logs to **stderr** via `tracing` (`RUST_LOG`); there is no persistent client log file by default. An optional OS keyring entry (`conquerd` service) caches your unlock key locally.
 
 Supernodes additionally store:
 
@@ -811,7 +813,7 @@ Supernodes additionally store:
 | `supernode_invite.json` | Persistent invite link |
 | `supernode_endpoints.json` | Endpoint mailbox for peer reconnection (24h TTL) |
 
-> **What to back up**: At minimum, back up `identity.json`. Losing it means peers will see you as a new, untrusted identity.
+> **What to back up**: At minimum, back up `identity.dat` (and your passphrase). Losing it means peers will see you as a new, untrusted identity.
 
 ---
 
@@ -1082,15 +1084,18 @@ See [PRIVACY.md](PRIVACY.md) for the full privacy policy.
 
 ConquerD is a local-first application. All peer-to-peer communication (voice, chat, file transfer) travels directly between clients or through volunteer supernodes chosen by the user, and is end-to-end encrypted. ConquerD does not operate servers that store your identity, messages, or call data.
 
-The following network contacts occur automatically or on user action:
+The following network contacts occur automatically or on user action (see [PRIVACY.md](PRIVACY.md) for full detail):
 
 | Feature | External service contacted | When | How to disable |
 |---|---|---|---|
-| **STUN / public IP discovery** | Google (`stun.l.google.com`, `stun1.l.google.com`) and Cloudflare (`stun.cloudflare.com`) | On startup when *Network mode* is set to `public` | Set *Network mode* to `local` in Settings |
-| **GitHub update check** | GitHub Releases API (`api.github.com`) | Periodically in the background | Uncheck *Check for updates* in Settings |
-| **YouTube link preview** | YouTube / Google CDN (via yt-dlp) | Only when you click to expand a YouTube link shared in chat | No action required — this is opt-in per link |
+| **UPnP port mapping** | Your local router only (LAN multicast) | On startup when *Enable UPnP port mapping* is on (default) | Uncheck UPnP in Settings (`upnp_enabled` in `settings.json`) |
+| **GitHub update check** | GitHub Releases API (`api.github.com/repos/vbawol/ConquerD/releases/latest`) | Once per client launch | Block `api.github.com`, or avoid running the client on restricted networks. The *Check for updates* toggle is saved in `settings.json` but not yet enforced in 1.0.0 |
+| **YouTube / Vimeo inline preview** | Video host CDNs (e.g. `youtube.com`, `googlevideo.com`, `vimeo.com`) | Only when you expand an inline player or open a preview link — Qt WebEngine embed, not yt-dlp | Uncheck *Show YouTube preview cards in chat* in Settings |
+| **Ollama assistant** (optional) | Your configured Ollama URL (default `http://localhost:11434`) | When the AI plugin is enabled and you use it | Turn off *Enable AI assistant* in Settings |
+| **Supernode portal / gated relay** | The supernode operator you chose | When you open their portal or complete an access gate | Do not connect to that supernode |
+| **Installer download** | GitHub release assets + `releases_manifest.json` | When you apply an in-app update | Do not apply updates |
 
-No account credentials, message content, contact lists, or unique identifiers are transmitted to any of the above services.
+No account credentials, message content, or contact lists are transmitted to ConquerD-operated servers (there are none). Build-attestation metadata (version / build id) may be exchanged directly between peers you connect to.
 
 ## Release Notes
 
@@ -1103,7 +1108,7 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 - **Voice calls** — low-latency Opus over QUIC, push-to-talk and voice activation, spectral-gate noise suppression, jitter buffer with de-click.
 - **Rooms (multi-peer voice)** — SFU hosting on volunteer supernodes over QUIC relay, with chat/voice/file parity and peer room invites.
 - **Game relay & in-app portal**: `game.relay.v1` opaque datagram relay over WebTransport; three bundled browser game demos (cursor relay, brick breaker, shared drawing) served from `<data_dir>/games/` and accessible from the native client's Nodes tab at `conquerd://<supernode_id>/games/<slug>/`. Self-signed TLS cert with `serverAuth` EKU auto-generated and rotated every 7 days; fingerprint delivered via `SUPERNODE_INFO` trust chain.
-- **NAT traversal** — STUN public-IP discovery, UPnP port mapping, QUIC relay fallback, relay-coordinated hole punching.
+- **NAT traversal** — UPnP port mapping, QUIC/WebSocket direct connect, supernode relay fallback, relay-coordinated hole punching.
 - **Security** — signed, transcript-bound, replay-resistant signaling; peer revocation with propagation; release-signed P2P updates with Ed25519 + threshold validation; crash/installer logging.
 - **Desktop application** — DPI-aware dark theme, first-run onboarding wizard (display name, identity fingerprint + QR, supernode setup), `conquerd://` URI scheme for one-click invites, system tray with badges, collapsible event log, save-to-PNG invite QR codes.
 
