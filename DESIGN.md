@@ -151,14 +151,3 @@ Uses system font (via `Material.Dark` / `SystemDefault`). No custom font loading
 - 2026-06-06: Initial design system document v1.0
 
 ---
-
-### Additional Recommendations
-
-1. **Make it visual** — Add screenshots or exported QML renders next to each component section.
-2. **Component Gallery** — Create a `ComponentGallery.qml` file that showcases every component in one window for quick testing.
-3. **Figma / Design Studio sync** — If you bring in a designer later, this doc becomes the spec.
-4. **Token generation** — Consider generating parts of `Theme.qml` from this markdown (or vice versa) with a script later.
-5. **Qt-specific additions**:
-   - Style: `Material.Dark` + custom palette overrides.
-   - Use `QtQuick.Controls` + custom components.
-   - Performance notes (e.g., `Layer` usage, delegate recycling).
