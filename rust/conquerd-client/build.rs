@@ -332,41 +332,127 @@ fn build_qt_ui() {
     compile_qml_startup_cpp();
 }
 
+#[cfg(feature = "qt-ui")]
+fn resolve_qt_prefix() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    if let Ok(q) = std::env::var("QMAKE") {
+        let qmake = PathBuf::from(q);
+        if let Some(prefix) = qmake.parent().and_then(|p| p.parent()) {
+            return Some(prefix.to_path_buf());
+        }
+    }
+    if let Ok(qt_dir) = std::env::var("QT_DIR") {
+        let path = PathBuf::from(qt_dir);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    if let Ok(prefix) = std::env::var("CMAKE_PREFIX_PATH") {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let first = prefix.split(sep).next().unwrap_or(prefix.as_str()).trim();
+        if !first.is_empty() {
+            return Some(PathBuf::from(first));
+        }
+    }
+    None
+}
+
+#[cfg(feature = "qt-ui")]
+fn qt_install_headers(qt_prefix: &std::path::Path) -> std::path::PathBuf {
+    use std::process::Command;
+
+    let qmake_name = if cfg!(windows) { "qmake6.exe" } else { "qmake" };
+    let qmake = qt_prefix.join("bin").join(qmake_name);
+    if qmake.exists() {
+        if let Ok(out) = Command::new(&qmake)
+            .arg("-query")
+            .arg("QT_INSTALL_HEADERS")
+            .output()
+        {
+            if out.status.success() {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return std::path::PathBuf::from(path);
+                }
+            }
+        }
+    }
+    qt_prefix.join("include")
+}
+
+#[cfg(feature = "qt-ui")]
+fn qt_module_header_dirs(qt_prefix: &std::path::Path, modules: &[&str]) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let headers = qt_install_headers(qt_prefix);
+    if headers.is_dir() {
+        dirs.push(headers.clone());
+    }
+    for module in modules {
+        let sub = headers.join(module);
+        if sub.is_dir() {
+            dirs.push(sub);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let fw = qt_prefix
+                .join("lib")
+                .join(format!("{module}.framework"))
+                .join("Headers");
+            if fw.is_dir() {
+                dirs.push(fw);
+            }
+        }
+    }
+    dirs
+}
+
+#[cfg(feature = "qt-ui")]
+fn qt_header_exists(qt_prefix: &std::path::Path, module: &str, header: &str) -> bool {
+    let headers = qt_install_headers(qt_prefix);
+    if headers.join(module).join(header).exists() {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let fw = qt_prefix
+            .join("lib")
+            .join(format!("{module}.framework"))
+            .join("Headers")
+            .join(header);
+        if fw.exists() {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(all(feature = "qt-ui", target_os = "windows"))]
 fn compile_app_icon_cpp() {
     use std::path::PathBuf;
 
     println!("cargo:rerun-if-changed=src/ui/app_icon.cpp");
 
-    let qt_prefix = if let Ok(q) = std::env::var("QMAKE") {
-        PathBuf::from(q)
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .expect("QMAKE path should have at least two components")
-    } else if let Ok(prefix) = std::env::var("CMAKE_PREFIX_PATH") {
-        PathBuf::from(prefix.split(';').next().unwrap_or(&prefix).trim())
-    } else {
+    let Some(qt_prefix) = resolve_qt_prefix() else {
         eprintln!(
-            "cargo:warning=app_icon.cpp: cannot find Qt prefix; set QMAKE or CMAKE_PREFIX_PATH"
+            "cargo:warning=app_icon.cpp: cannot find Qt prefix; set QMAKE, QT_DIR, or CMAKE_PREFIX_PATH"
         );
         return;
     };
 
-    let include_root = qt_prefix.join("include");
-    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-
-    cc::Build::new()
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let mut build = cc::Build::new();
+    build
         .cpp(true)
         .std("c++17")
         .file("src/ui/app_icon.cpp")
-        .include(&include_root)
-        .include(include_root.join("QtCore"))
-        .include(include_root.join("QtGui"))
         .flag("/EHsc")
         .flag("/Zc:__cplusplus")
-        .flag("/permissive-")
-        .compile("conquerd_app_icon");
+        .flag("/permissive-");
+    for dir in qt_module_header_dirs(&qt_prefix, &["QtCore", "QtGui"]) {
+        build.include(dir);
+    }
+    build.compile("conquerd_app_icon");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=conquerd_app_icon");
@@ -378,34 +464,19 @@ fn compile_qml_startup_cpp() {
 
     println!("cargo:rerun-if-changed=src/ui/qml_startup.cpp");
 
-    let qt_prefix = if let Ok(q) = std::env::var("QMAKE") {
-        PathBuf::from(q)
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .expect("QMAKE path should have at least two components")
-    } else if let Ok(prefix) = std::env::var("CMAKE_PREFIX_PATH") {
-        PathBuf::from(prefix.split(';').next().unwrap_or(&prefix).trim())
-    } else {
+    let Some(qt_prefix) = resolve_qt_prefix() else {
         eprintln!(
-            "cargo:warning=qml_startup.cpp: cannot find Qt prefix; set QMAKE or CMAKE_PREFIX_PATH"
+            "cargo:warning=qml_startup.cpp: cannot find Qt prefix; set QMAKE, QT_DIR, or CMAKE_PREFIX_PATH"
         );
         return;
     };
 
-    let include_root = qt_prefix.join("include");
-    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .std("c++17")
-        .file("src/ui/qml_startup.cpp")
-        .include(&include_root)
-        .include(include_root.join("QtCore"))
-        .include(include_root.join("QtGui"))
-        .include(include_root.join("QtQml"))
-        .include(include_root.join("QtQuick"));
+    build.cpp(true).std("c++17").file("src/ui/qml_startup.cpp");
+    for dir in qt_module_header_dirs(&qt_prefix, &["QtCore", "QtGui", "QtQml", "QtQuick"]) {
+        build.include(dir);
+    }
 
     #[cfg(windows)]
     build
@@ -426,19 +497,9 @@ fn compile_scheme_cpp() {
     use std::path::PathBuf;
     use std::process::Command;
 
-    // ── Locate Qt via the same env vars cxx-qt-build uses ────────────────
-    let qt_prefix = if let Ok(q) = std::env::var("QMAKE") {
-        // QMAKE=/path/to/qmake6.exe → /path/to/../..
-        PathBuf::from(q)
-            .parent() // bin/
-            .and_then(|p| p.parent()) // Qt root
-            .map(|p| p.to_path_buf())
-            .expect("QMAKE path should have at least two components")
-    } else if let Ok(prefix) = std::env::var("CMAKE_PREFIX_PATH") {
-        PathBuf::from(prefix.split(';').next().unwrap_or(&prefix))
-    } else {
+    let Some(qt_prefix) = resolve_qt_prefix() else {
         eprintln!(
-            "cargo:warning=scheme.cpp: cannot find Qt prefix; set QMAKE or CMAKE_PREFIX_PATH"
+            "cargo:warning=scheme.cpp: cannot find Qt prefix; set QMAKE, QT_DIR, or CMAKE_PREFIX_PATH"
         );
         return;
     };
@@ -446,11 +507,7 @@ fn compile_scheme_cpp() {
     // ── Probe for Qt WebEngine headers ───────────────────────────────────────
     // Qt WebEngine is a separate component in the Qt installer.
     // If it is missing, emit a clear error rather than a cryptic C1083.
-    let we_probe = qt_prefix
-        .join("include")
-        .join("QtWebEngineCore")
-        .join("QWebEngineProfile.h");
-    if !we_probe.exists() {
+    if !qt_header_exists(&qt_prefix, "QtWebEngineCore", "QWebEngineProfile.h") {
         panic!(
             "\n\n\
              ╔══════════════════════════════════════════════════════════════╗\n\
@@ -495,7 +552,6 @@ fn compile_scheme_cpp() {
     }
 
     // Compile scheme.cpp.
-    let include_root = qt_prefix.join("include");
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -503,11 +559,13 @@ fn compile_scheme_cpp() {
         .file(src_dir.join("scheme.cpp"))
         // The generated .moc file is #include-d by scheme.cpp (via `#include "scheme.moc"`)
         // so the OUT_DIR must be on the include path.
-        .include(&out_dir)
-        .include(&include_root)
-        .include(include_root.join("QtCore"))
-        .include(include_root.join("QtWebEngineCore"))
-        .include(include_root.join("QtWebEngineQuick"));
+        .include(&out_dir);
+    for dir in qt_module_header_dirs(
+        &qt_prefix,
+        &["QtCore", "QtWebEngineCore", "QtWebEngineQuick"],
+    ) {
+        build.include(dir);
+    }
 
     #[cfg(windows)]
     build
