@@ -76,12 +76,18 @@ jobs:
         working-directory: rust/conquerd-client
 
       # --- Security ---------------------------------------------------------
-      - name: Security audit (cargo-audit)
-        # Uses the official rustsec action for better reporting and caching.
-        # Non-blocking while we gain experience with the signal.
+      # Lockfiles live under rust/ (two separate Cargo workspaces, not repo root).
+      - name: Security audit (rust workspace)
         uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2 (pinned)
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: rust
+
+      - name: Security audit (client workspace)
+        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2 (pinned)
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: rust/conquerd-client
 
   test-windows:
     name: Rust tests (Windows, non-Qt)
