@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # ============================================================================
 # build_linux.sh — Build ConquerD for Linux (Rust + Qt, AppImage)
 # ============================================================================
@@ -28,6 +28,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$ROOT/rust"
+CLIENT_DIR="$RUST_DIR/conquerd-client"
 
 # ── Auto-detect Qt 6 ─────────────────────────────────────────────────────────
 if [ -z "${QT_DIR:-}" ]; then
@@ -63,10 +64,15 @@ if [ "${CONQUERD_RELEASE:-0}" = "1" ]; then
 fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
+# conquerd-client is its own workspace root (see rust/conquerd-client/Cargo.toml).
 echo ""
-echo "==> cargo build -p conquerd-client --features qt-ui $CARGO_FLAGS"
+echo "==> cargo build --features qt-ui $CARGO_FLAGS  (conquerd-client workspace)"
+cd "$CLIENT_DIR"
+cargo build --features qt-ui $CARGO_FLAGS
+
+echo ""
+echo "==> cargo build -p conquerd-installer $CARGO_FLAGS"
 cd "$RUST_DIR"
-cargo build -p conquerd-client --features qt-ui $CARGO_FLAGS
 cargo build -p conquerd-installer $CARGO_FLAGS
 
 BINARY="$RUST_DIR/target/$PROFILE/conquerd-client"
