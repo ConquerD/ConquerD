@@ -408,7 +408,7 @@ jobs:
       - name: Install Qt 6
         run: |
           pip install aqtinstall
-          aqt install-qt linux desktop 6.8.3 gcc_64 -O /opt/Qt
+          aqt install-qt linux desktop 6.8.3 linux_gcc_64 -O /opt/Qt
           echo "QT_DIR=/opt/Qt/6.8.3/gcc_64" >> "$GITHUB_ENV"
 
       - name: Download appimagetool
