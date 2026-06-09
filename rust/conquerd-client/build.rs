@@ -382,29 +382,38 @@ fn qt_install_headers(qt_prefix: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[cfg(feature = "qt-ui")]
-fn qt_module_header_dirs(qt_prefix: &std::path::Path, modules: &[&str]) -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
+fn configure_qt_cpp_build(build: &mut cc::Build, qt_prefix: &std::path::Path, modules: &[&str]) {
     let headers = qt_install_headers(qt_prefix);
     if headers.is_dir() {
-        dirs.push(headers.clone());
+        build.include(&headers);
     }
     for module in modules {
         let sub = headers.join(module);
         if sub.is_dir() {
-            dirs.push(sub);
+            build.include(sub);
         }
         #[cfg(target_os = "macos")]
         {
-            let fw = qt_prefix
+            // Short includes like <QGuiApplication> live in the framework Headers dir.
+            let fw_headers = qt_prefix
                 .join("lib")
                 .join(format!("{module}.framework"))
                 .join("Headers");
-            if fw.is_dir() {
-                dirs.push(fw);
+            if fw_headers.is_dir() {
+                build.include(fw_headers);
             }
         }
     }
-    dirs
+
+    #[cfg(target_os = "macos")]
+    {
+        // Framework-style includes like <QtGui/qtguiglobal.h> resolve via -F, not -I.
+        // See https://forum.qt.io/topic/141436
+        let fw_lib = qt_prefix.join("lib");
+        if fw_lib.is_dir() {
+            build.flag(format!("-F{}", fw_lib.display()));
+        }
+    }
 }
 
 #[cfg(feature = "qt-ui")]
@@ -449,9 +458,7 @@ fn compile_app_icon_cpp() {
         .flag("/EHsc")
         .flag("/Zc:__cplusplus")
         .flag("/permissive-");
-    for dir in qt_module_header_dirs(&qt_prefix, &["QtCore", "QtGui"]) {
-        build.include(dir);
-    }
+    configure_qt_cpp_build(&mut build, &qt_prefix, &["QtCore", "QtGui"]);
     build.compile("conquerd_app_icon");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
@@ -474,9 +481,11 @@ fn compile_qml_startup_cpp() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let mut build = cc::Build::new();
     build.cpp(true).std("c++17").file("src/ui/qml_startup.cpp");
-    for dir in qt_module_header_dirs(&qt_prefix, &["QtCore", "QtGui", "QtQml", "QtQuick"]) {
-        build.include(dir);
-    }
+    configure_qt_cpp_build(
+        &mut build,
+        &qt_prefix,
+        &["QtCore", "QtGui", "QtQml", "QtQuick"],
+    );
 
     #[cfg(windows)]
     build
@@ -560,12 +569,11 @@ fn compile_scheme_cpp() {
         // The generated .moc file is #include-d by scheme.cpp (via `#include "scheme.moc"`)
         // so the OUT_DIR must be on the include path.
         .include(&out_dir);
-    for dir in qt_module_header_dirs(
+    configure_qt_cpp_build(
+        &mut build,
         &qt_prefix,
         &["QtCore", "QtWebEngineCore", "QtWebEngineQuick"],
-    ) {
-        build.include(dir);
-    }
+    );
 
     #[cfg(windows)]
     build
