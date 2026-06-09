@@ -23,7 +23,6 @@ futures-util = "0.3"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rcgen = "0.13"
-rustls-pemfile = "2"
 
 # Crypto (mirrors what conquerd-crypto uses internally)
 ed25519-dalek = { version = "2", features = ["rand_core", "pem", "serde"] }
