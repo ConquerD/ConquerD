@@ -46,6 +46,7 @@ fi
 echo "==> Using Qt: $QT_DIR"
 export PATH="$QT_DIR/bin:$PATH"
 export CMAKE_PREFIX_PATH="$QT_DIR"
+export QMAKE="$QT_DIR/bin/qmake"
 
 # ── Read version ─────────────────────────────────────────────────────────────
 VERSION=$(grep -m1 '^version' "$RUST_DIR/conquerd-client/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
