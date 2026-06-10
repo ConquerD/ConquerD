@@ -4,7 +4,7 @@
 # ============================================================================
 # Produces:
 #   dist/ConquerD.app
-#   dist/ConquerD-X.X.X.dmg  (requires create-dmg or hdiutil)
+#   dist/ConquerD-X.X.X-macos-<arch>.dmg  (create-dmg or hdiutil)
 #   dist/ConquerD-X.X.X.dmg.sha256
 #
 # Prerequisites:
@@ -146,27 +146,50 @@ else
 fi
 
 # ── Create DMG ────────────────────────────────────────────────────────────────
-DMG="$DIST/ConquerD-${VERSION}.dmg"
-echo ""
-if command -v create-dmg &>/dev/null; then
-    echo "==> Creating DMG with create-dmg..."
-    create-dmg \
-        --volname "ConquerD $VERSION" \
-        --background "$ROOT/assets/dmg_background.png" 2>/dev/null || true \
-        --window-pos 200 120 \
-        --window-size 600 400 \
-        --icon-size 100 \
-        --icon "ConquerD.app" 175 190 \
-        --hide-extension "ConquerD.app" \
-        --app-drop-link 425 190 \
-        "$DMG" \
-        "$DIST"
-else
-    echo "==> create-dmg not found; using hdiutil..."
+ARCH="$(uname -m)"
+case "$ARCH" in
+    arm64)  PLATFORM_SUFFIX="macos-arm64" ;;
+    x86_64) PLATFORM_SUFFIX="macos-x86_64" ;;
+    *)      PLATFORM_SUFFIX="macos-${ARCH}" ;;
+esac
+DMG="$DIST/ConquerD-${VERSION}-${PLATFORM_SUFFIX}.dmg"
+
+create_dmg_with_hdiutil() {
+    echo "==> Creating DMG with hdiutil..."
     hdiutil create -volname "ConquerD $VERSION" \
         -srcfolder "$APP_BUNDLE" \
         -ov -format UDZO \
         "$DMG"
+}
+
+echo ""
+if command -v create-dmg &>/dev/null; then
+    echo "==> Creating DMG with create-dmg..."
+    CREATE_DMG_ARGS=(
+        --volname "ConquerD $VERSION"
+        --window-pos 200 120
+        --window-size 600 400
+        --icon-size 100
+        --icon "ConquerD.app" 175 190
+        --hide-extension "ConquerD.app"
+        --app-drop-link 425 190
+    )
+    if [ -f "$ROOT/assets/dmg_background.png" ]; then
+        CREATE_DMG_ARGS+=(--background "$ROOT/assets/dmg_background.png")
+    else
+        echo "    (no assets/dmg_background.png — using default window)"
+    fi
+    if ! create-dmg "${CREATE_DMG_ARGS[@]}" "$DMG" "$DIST"; then
+        echo "==> create-dmg failed; falling back to hdiutil..."
+        create_dmg_with_hdiutil
+    fi
+else
+    create_dmg_with_hdiutil
+fi
+
+if [ ! -f "$DMG" ]; then
+    echo "ERROR: DMG was not created at $DMG"
+    exit 1
 fi
 
 # ── Notarization (optional) ────────────────────────────────────────────────────
