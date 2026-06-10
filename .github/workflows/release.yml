@@ -338,11 +338,6 @@ jobs:
           CONQUERD_BUILD_ID: ${{ steps.meta.outputs.build_id }}
         run: bash build_macos.sh
 
-      - name: Rename DMG to include platform suffix
-        run: |
-          VERSION=$(grep -m1 '^version' rust/conquerd-client/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          mv "dist/ConquerD-${VERSION}.dmg" "dist/ConquerD-${VERSION}-macos-arm64.dmg"
-
       - name: Notarize DMG
         if: env.APPLE_NOTARY_KEY != '' && env.APPLE_NOTARY_KEY_ID != '' && env.APPLE_NOTARY_ISSUER != ''
         run: |
