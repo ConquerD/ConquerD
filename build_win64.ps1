@@ -14,7 +14,7 @@
       * Rust + cargo on PATH (msvc toolchain, x86_64-pc-windows-msvc)
       * Qt 6.x MSVC install — auto-detected or set QT_DIR
       * signtool.exe in PATH for code signing (optional)
-      * 7z.exe for archiving (falls back to Python py7zr if absent)
+      * 7z.exe for archiving (required — install via winget/choco if absent)
 
     Environment variables (all optional):
       QT_DIR                  — override Qt MSVC root, e.g. C:\Qt\6.8.3\msvc2022_64
@@ -219,6 +219,17 @@ $ErrorActionPreference = $_prevPref3
 if ($_wdqtExit -ne 0) { Write-Error "windeployqt6 failed (exit code $_wdqtExit)" }
 Write-Host "    Qt runtime deployed"
 
+if ($_features -like "*webengine*") {
+    $qtWebEngineResources = Join-Path $QT_ROOT "resources"
+    $bundleWebEngineResources = Join-Path $BUNDLE "resources"
+    if (Test-Path (Join-Path $qtWebEngineResources "qtwebengine_resources.pak")) {
+        Copy-Item $qtWebEngineResources $bundleWebEngineResources -Recurse -Force
+        Write-Host "    Qt WebEngine resources deployed"
+    } else {
+        Write-Warning "Qt WebEngine resources not found under $qtWebEngineResources"
+    }
+}
+
 # ── Code-sign binaries (optional) ─────────────────────────────────────────────
 #
 #   CONQUERD_SIGN_THUMBPRINT  -- SHA-1 thumbprint of a cert in the Windows Store
@@ -290,28 +301,17 @@ if (-not $sevenZip) {
         }
     }
 }
-if ($sevenZip) {
-    Write-Host "`n==> Creating 7z archive with 7-Zip..."
-    & $sevenZip.Source a -t7z -mx=9 $archivePath "$BUNDLE\*" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Error "7z failed to create archive" }
-} else {
-    Write-Host "`n==> 7z.exe not found — trying Python py7zr fallback..."
-    $py = Get-Command "python" -ErrorAction SilentlyContinue
-    if ($py) {
-        & python -m pip install --quiet py7zr
-        python -c "
-import py7zr
-src = r'$BUNDLE'
-dst = r'$archivePath'
-with py7zr.SevenZipFile(dst, 'w') as z:
-    z.writeall(src, 'ConquerD')
-print('Archive created via py7zr')
-" 
-        if ($LASTEXITCODE -ne 0) { Write-Warning "py7zr archive creation may have failed" }
-    } else {
-        Write-Warning "Neither 7z.exe nor python found. No .7z will be produced. Install 7-Zip for full release packaging."
-    }
+if (-not $sevenZip) {
+    Write-Error @"
+7z.exe not found. Install 7-Zip before building release archives:
+  winget install --id 7zip.7zip
+  choco install 7zip -y
+Release archives must be non-solid (-ms=off) so the installer's embedded sevenz-rust decoder can extract every file.
+"@
 }
+Write-Host "`n==> Creating 7z archive with 7-Zip (non-solid, installer-compatible)..."
+& $sevenZip.Source a -t7z -mx=9 -ms=off $archivePath "$BUNDLE\*" | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Error "7z failed to create archive" }
 
 if (Test-Path $archivePath) {
     Write-Host "    Archive ready: $archivePath"

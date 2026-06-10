@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::path::Path;
 
 /// Create shortcuts that point to the installer exe as the launcher.
-/// The shortcut target is `<installer_exe> --launch` so it always
-/// launches the latest installed version without needing shortcut updates.
+/// The shortcut target is `<installer_exe> --launch` so it checks for
+/// updates and launches the latest installed version without shortcut rewrites.
 #[cfg(windows)]
 pub fn create_shortcuts_for_launcher(installer_exe: &Path) -> Result<()> {
     if !installer_exe.exists() {

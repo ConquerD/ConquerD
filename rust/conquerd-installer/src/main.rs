@@ -105,7 +105,7 @@ struct Cli {
     #[arg(long, default_value = "vbawol/ConquerD")]
     repo: String,
 
-    /// Launch the latest installed version directly (runner mode)
+    /// Check for updates, then launch the latest installed version (runner mode)
     #[arg(long)]
     launch: bool,
 
@@ -199,6 +199,7 @@ fn launch_app(version_dir: &std::path::Path) -> anyhow::Result<()> {
     let exe = state::find_exe(version_dir).ok_or_else(|| {
         anyhow::anyhow!("No ConquerD executable found in {}", version_dir.display())
     })?;
+    let working_dir = exe.parent().unwrap_or(version_dir);
 
     // Re-hash the binary immediately before exec and compare against the
     // manifest written at install time.  This prevents a race where a
@@ -231,14 +232,14 @@ fn launch_app(version_dir: &std::path::Path) -> anyhow::Result<()> {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x00000008;
         std::process::Command::new(&exe)
-            .current_dir(version_dir)
+            .current_dir(working_dir)
             .creation_flags(DETACHED_PROCESS)
             .spawn()?;
     }
     #[cfg(not(windows))]
     {
         std::process::Command::new(&exe)
-            .current_dir(version_dir)
+            .current_dir(working_dir)
             .spawn()?;
     }
     Ok(())
@@ -260,9 +261,9 @@ fn main() -> anyhow::Result<()> {
         return run_uninstall(&base_dir);
     }
 
-    // ── Launch mode: run latest installed version immediately ────────────
+    // ── Launch mode: check for updates, then run latest installed version ─
     if cli.launch {
-        return run_launch(&base_dir);
+        return run_launch(&base_dir, &cli.repo);
     }
 
     // ── Update-and-relaunch mode (called by the running app) ────────────
@@ -318,14 +319,26 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
-/// --launch: find the latest installed version and run it.
-fn run_launch(base_dir: &std::path::Path) -> anyhow::Result<()> {
+fn launchable_current_dir(st: &state::InstallState) -> Option<&std::path::Path> {
+    st.current_path()
+        .filter(|dir| state::find_exe(dir).is_some())
+}
+
+/// --launch: check for updates, then run the latest installed version.
+fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
     let st = state::read_state(base_dir)?;
-    if let Some(dir) = st.current_path() {
-        if state::find_exe(dir).is_some() {
-            launch_app(dir)?;
-            return Ok(());
+    if launchable_current_dir(&st).is_some() {
+        if let Err(e) = run_update_and_relaunch(base_dir, repo, false, true) {
+            log!("Update check/launch failed: {e:#}");
+            let fallback_state = state::read_state(base_dir).unwrap_or(st);
+            if let Some(dir) = launchable_current_dir(&fallback_state) {
+                log!("Launching installed version after update failure.");
+                launch_app(dir)?;
+                return Ok(());
+            }
+            return Err(e);
         }
+        return Ok(());
     }
     // No valid install — fall through to GUI installer
     log!("No installed version found. Starting installer…");
@@ -607,4 +620,25 @@ fn detect_version_from_archive(archive: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launchable_current_dir_requires_current_executable() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let ver_dir = tmp.path().join("conquerd_1.0.0");
+        std::fs::create_dir_all(&ver_dir).expect("version dir");
+
+        let mut st = state::InstallState::empty();
+        st.add_version("1.0.0", &ver_dir);
+
+        assert!(launchable_current_dir(&st).is_none());
+
+        std::fs::write(ver_dir.join("ConquerD.exe"), b"test").expect("exe marker");
+
+        assert_eq!(launchable_current_dir(&st), Some(ver_dir.as_path()));
+    }
 }

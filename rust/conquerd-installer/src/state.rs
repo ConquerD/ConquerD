@@ -116,9 +116,14 @@ pub fn version_dir(base_dir: &Path, version: &str) -> PathBuf {
 
 /// Find the ConquerD executable inside a versioned install directory.
 pub fn find_exe(version_dir: &Path) -> Option<PathBuf> {
-    let candidates = ["ConquerD.exe", "conquerd.exe"];
-    for name in &candidates {
-        let p = version_dir.join(name);
+    let candidates = [
+        "ConquerD.exe",
+        "conquerd.exe",
+        "ConquerD/ConquerD.exe",
+        "ConquerD/conquerd.exe",
+    ];
+    for rel in &candidates {
+        let p = version_dir.join(rel);
         if p.exists() {
             return Some(p);
         }
@@ -276,6 +281,26 @@ mod tests {
         let base = Path::new("/install");
         let sp = state_path(base);
         assert_eq!(sp, PathBuf::from("/install/current_version.json"));
+    }
+
+    #[test]
+    fn find_exe_finds_direct_executable() {
+        let dir = tmp_dir();
+        let exe = dir.path().join("ConquerD.exe");
+        fs::write(&exe, b"test").expect("write exe marker");
+
+        assert_eq!(find_exe(dir.path()), Some(exe));
+    }
+
+    #[test]
+    fn find_exe_finds_nested_packaged_executable() {
+        let dir = tmp_dir();
+        let app_dir = dir.path().join("ConquerD");
+        fs::create_dir_all(&app_dir).expect("app dir");
+        let exe = app_dir.join("ConquerD.exe");
+        fs::write(&exe, b"test").expect("write exe marker");
+
+        assert_eq!(find_exe(dir.path()), Some(exe));
     }
 
     // ── disk I/O (read_state / write_state) ────────────────────────────────

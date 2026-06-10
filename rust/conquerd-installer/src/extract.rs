@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use sevenz_rust::decompress_file;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Extract a .7z archive into `dest_dir`.
 /// Returns a map of relative paths → SHA-256 hex digests for all extracted files.
@@ -11,13 +11,78 @@ pub fn extract_7z(archive: &Path, dest_dir: &Path) -> Result<HashMap<String, Str
     fs::create_dir_all(dest_dir)
         .with_context(|| format!("Failed to create directory: {}", dest_dir.display()))?;
 
-    decompress_file(archive, dest_dir)
+    decompress_archive(archive, dest_dir)
         .with_context(|| format!("Failed to extract archive: {}", archive.display()))?;
 
     // Walk the destination and hash every file
     let mut files = HashMap::new();
     collect_files(dest_dir, dest_dir, &mut files)?;
     Ok(files)
+}
+
+/// Decompress a .7z archive with the embedded `sevenz-rust` decoder.
+///
+/// Release archives must be built non-solid (`7z a -ms=off`); solid archives
+/// are not fully supported by `sevenz-rust`.
+fn decompress_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
+    fs::create_dir_all(dest_dir)?;
+
+    decompress_file(archive, dest_dir)
+        .with_context(|| format!("Failed to extract archive: {}", archive.display()))?;
+    validate_bundle_layout(dest_dir)?;
+    Ok(())
+}
+
+/// Return the directory that contains `ConquerD.exe` inside an install tree.
+fn bundle_root(install_dir: &Path) -> PathBuf {
+    let nested = install_dir.join("ConquerD");
+    if nested.join("ConquerD.exe").is_file() {
+        nested
+    } else {
+        install_dir.to_path_buf()
+    }
+}
+
+/// Ensure the extracted bundle contains the Qt runtime folders ConquerD needs.
+fn validate_bundle_layout(install_dir: &Path) -> Result<()> {
+    let root = bundle_root(install_dir);
+    if !root.join("ConquerD.exe").is_file() {
+        bail!(
+            "Extraction incomplete: ConquerD.exe not found under {}",
+            install_dir.display()
+        );
+    }
+
+    let required = [
+        "platforms",
+        "qml",
+        "imageformats",
+        "generic",
+        "iconengines",
+        "networkinformation",
+        "position",
+        "qmltooling",
+        "styles",
+        "tls",
+        "translations",
+    ];
+    let missing: Vec<_> = required
+        .iter()
+        .filter(|folder| !root.join(**folder).is_dir())
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "Extraction incomplete: missing bundle folders: {}",
+            missing.join(", ")
+        );
+    }
+
+    if root.join("Qt6WebEngineCore.dll").is_file() && !root.join("resources").is_dir() {
+        bail!("Extraction incomplete: missing resources/ (required for Qt WebEngine)");
+    }
+
+    Ok(())
 }
 
 fn collect_files(base: &Path, dir: &Path, files: &mut HashMap<String, String>) -> Result<()> {
@@ -73,7 +138,7 @@ where
     // sevenz-rust doesn't have per-file callbacks, so we extract all at once
     // then walk and hash with progress
     fs::create_dir_all(dest_dir)?;
-    decompress_file(archive, dest_dir)
+    decompress_archive(archive, dest_dir)
         .with_context(|| format!("Failed to extract: {}", archive.display()))?;
 
     // Pre-count so the UI can show a determinate progress bar
@@ -364,5 +429,110 @@ mod tests {
         .unwrap();
         assert_eq!(call_count.get(), 2);
         assert_eq!(last_total.get(), 2);
+    }
+
+    // ── bundle layout helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn bundle_root_prefers_nested_conquerd_folder() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("ConquerD");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("ConquerD.exe"), b"x").unwrap();
+        assert_eq!(bundle_root(tmp.path()), nested);
+    }
+
+    #[test]
+    fn bundle_root_falls_back_to_install_dir() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("ConquerD.exe"), b"x").unwrap();
+        assert_eq!(bundle_root(tmp.path()), tmp.path());
+    }
+
+    #[test]
+    fn validate_bundle_layout_requires_qt_runtime_folders() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("ConquerD");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ConquerD.exe"), b"x").unwrap();
+        fs::create_dir_all(root.join("platforms")).unwrap();
+        fs::create_dir_all(root.join("qml")).unwrap();
+        assert!(validate_bundle_layout(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn validate_bundle_layout_accepts_complete_flat_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("ConquerD.exe"), b"x").unwrap();
+        for folder in [
+            "platforms",
+            "qml",
+            "imageformats",
+            "generic",
+            "iconengines",
+            "networkinformation",
+            "position",
+            "qmltooling",
+            "styles",
+            "tls",
+            "translations",
+        ] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        validate_bundle_layout(tmp.path()).expect("complete bundle should validate");
+    }
+
+    #[test]
+    fn extract_7z_round_trips_non_solid_bundle() {
+        use sevenz_rust::SevenZWriter;
+        use std::fs::File;
+        use std::io::BufWriter;
+
+        let src = TempDir::new().unwrap();
+        let bundle = src.path().join("ConquerD");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("ConquerD.exe"), b"stub").unwrap();
+        for folder in [
+            "platforms",
+            "qml",
+            "imageformats",
+            "generic",
+            "iconengines",
+            "networkinformation",
+            "position",
+            "qmltooling",
+            "styles",
+            "tls",
+            "translations",
+        ] {
+            let dir = bundle.join(folder);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("placeholder.txt"), b"x").unwrap();
+        }
+
+        let archive = src.path().join("bundle.7z");
+        let file = File::create(&archive).unwrap();
+        let mut writer = SevenZWriter::new(BufWriter::new(file)).unwrap();
+        writer
+            .push_source_path_non_solid(&bundle, |_| true)
+            .unwrap();
+        writer.finish().unwrap();
+
+        let dest = TempDir::new().unwrap();
+        let hashes = extract_7z(&archive, dest.path()).expect("non-solid archive should extract");
+        assert!(
+            hashes.keys().any(|path| path.ends_with("ConquerD.exe")),
+            "expected ConquerD.exe in extracted hashes, got: {:?}",
+            hashes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            hashes
+                .keys()
+                .any(|path| path.contains("platforms/") && path.ends_with("placeholder.txt")),
+            "expected platforms/placeholder.txt in extracted hashes, got: {:?}",
+            hashes.keys().collect::<Vec<_>>()
+        );
+        validate_bundle_layout(dest.path()).expect("extracted bundle should be complete");
     }
 }
