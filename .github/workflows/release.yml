@@ -620,25 +620,57 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Rename nightly artifacts to use "nightly" in the name
+      - name: Prepare nightly artifacts for upload
         run: |
-          cd artifacts
-          # Windows 7z and sha
-          for f in ConquerD-*-win64.7z; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-win64.7z"; done
-          for f in ConquerD-*-win64.7z.sha256; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-win64.7z.sha256"; done
-          # Standalone installer
-          [ -f "conquerd-installer.exe" ] && mv "conquerd-installer.exe" "conquerd-installer-nightly.exe"
-          # macOS
-          for f in ConquerD-*-macos-arm64.dmg; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-macos-arm64.dmg"; done
-          for f in ConquerD-*-macos-arm64.dmg.sha256; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-macos-arm64.dmg.sha256"; done
-          # Linux
-          for f in ConquerD-*-x86_64.AppImage; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-x86_64.AppImage"; done
-          for f in ConquerD-*-x86_64.AppImage.sha256; do [ -f "$f" ] && mv "$f" "ConquerD-nightly-x86_64.AppImage.sha256"; done
-          echo "Renamed artifacts:"
-          find . -type f | sort
+          set -euo pipefail
 
-      - name: List nightly artifacts (after renaming)
-        run: find artifacts -type f | sort
+          # upload-artifact preserves the dist/ directory from each build job,
+          # so files land under artifacts/dist/ rather than artifacts/.
+          echo "==> Downloaded artifact tree:"
+          find artifacts -type f | sort
+
+          mkdir -p artifacts/_staging
+          find artifacts -type f \
+            \( -name 'ConquerD-*' -o -name 'conquerd-installer*.exe' \) \
+            -exec cp -f {} artifacts/_staging/ \;
+          rm -rf artifacts/dist
+          for f in artifacts/_staging/*; do
+            mv -f "$f" artifacts/
+          done
+          rmdir artifacts/_staging
+
+          cd artifacts
+          shopt -s nullglob
+          for f in ConquerD-*-win64.7z; do mv "$f" "ConquerD-nightly-win64.7z"; done
+          for f in ConquerD-*-win64.7z.sha256; do mv "$f" "ConquerD-nightly-win64.7z.sha256"; done
+          [ -f "conquerd-installer.exe" ] && mv "conquerd-installer.exe" "conquerd-installer-nightly.exe"
+          for f in ConquerD-*-macos-arm64.dmg; do mv "$f" "ConquerD-nightly-macos-arm64.dmg"; done
+          for f in ConquerD-*-macos-arm64.dmg.sha256; do mv "$f" "ConquerD-nightly-macos-arm64.dmg.sha256"; done
+          for f in ConquerD-*-x86_64.AppImage; do mv "$f" "ConquerD-nightly-x86_64.AppImage"; done
+          for f in ConquerD-*-x86_64.AppImage.sha256; do mv "$f" "ConquerD-nightly-x86_64.AppImage.sha256"; done
+
+          echo "==> Nightly assets ready:"
+          find . -maxdepth 1 -type f | sort
+
+          REQUIRED=(
+            ConquerD-nightly-win64.7z
+            ConquerD-nightly-win64.7z.sha256
+            conquerd-installer-nightly.exe
+            ConquerD-nightly-macos-arm64.dmg
+            ConquerD-nightly-macos-arm64.dmg.sha256
+            ConquerD-nightly-x86_64.AppImage
+            ConquerD-nightly-x86_64.AppImage.sha256
+          )
+          missing=0
+          for f in "${REQUIRED[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: missing nightly asset: $f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Checkout source (for manifest generator)
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -700,6 +732,7 @@ jobs:
           name: "Nightly Build ${{ github.sha }}"
           prerelease: true
           draft: false
+          fail_on_unmatched_files: true
           generate_release_notes: false
           body: |
             **Development nightly build** from the `develop` branch.
