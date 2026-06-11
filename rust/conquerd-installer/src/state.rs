@@ -5,6 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATE_FILE: &str = "current_version.json";
 
+pub const CHANNEL_STABLE: &str = "stable";
+pub const CHANNEL_NIGHTLY: &str = "nightly";
+
 /// Tracks all installed versions and which one is current.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallState {
@@ -12,6 +15,12 @@ pub struct InstallState {
     pub current_version: String,
     /// All installed versions, newest first.
     pub versions: Vec<InstalledVersion>,
+    /// Update channel: `stable` or `nightly`.
+    #[serde(default)]
+    pub channel: String,
+    /// SHA-256 of the last installed archive (used for nightly update checks).
+    #[serde(default)]
+    pub archive_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,7 +38,21 @@ impl InstallState {
         Self {
             current_version: String::new(),
             versions: Vec::new(),
+            channel: CHANNEL_STABLE.to_string(),
+            archive_sha256: String::new(),
         }
+    }
+
+    pub fn is_nightly_channel(&self) -> bool {
+        self.channel == CHANNEL_NIGHTLY
+    }
+
+    pub fn set_channel(&mut self, nightly: bool) {
+        self.channel = if nightly {
+            CHANNEL_NIGHTLY.to_string()
+        } else {
+            CHANNEL_STABLE.to_string()
+        };
     }
 
     /// Register a newly installed version and mark it current.
@@ -156,10 +179,24 @@ pub fn kill_running_instances() {
         .status();
 }
 
+/// Installed launcher filename for the given update channel.
+pub fn installer_exe_name(nightly: bool) -> &'static str {
+    if nightly {
+        "conquerd-installer-nightly.exe"
+    } else {
+        "conquerd-installer.exe"
+    }
+}
+
+/// Path to the installed launcher for the given update channel.
+pub fn installer_path(base_dir: &Path, nightly: bool) -> PathBuf {
+    base_dir.join(installer_exe_name(nightly))
+}
+
 /// Copy the running installer exe into base_dir if it isn't already there.
-pub fn self_copy(base_dir: &Path) -> Result<()> {
+pub fn self_copy(base_dir: &Path, nightly: bool) -> Result<()> {
     let self_exe = std::env::current_exe().context("Cannot determine own exe path")?;
-    let dest = base_dir.join("conquerd-installer.exe");
+    let dest = installer_path(base_dir, nightly);
 
     // Don't copy over ourselves
     if let (Ok(a), Ok(b)) = (

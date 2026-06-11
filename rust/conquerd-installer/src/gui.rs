@@ -51,6 +51,7 @@ struct AppState {
     archive: Option<PathBuf>,
     no_shortcuts: bool,
     repo: String,
+    nightly: bool,
     kill: bool,
     progress_text: String,
     files_extracted: usize,
@@ -110,6 +111,7 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
     };
 
     let installed_version = config.install_state.current_version.clone();
+    let nightly = github::is_nightly_installer() || config.install_state.is_nightly_channel();
 
     let state = Arc::new(Mutex::new(AppState {
         page: start_page,
@@ -117,6 +119,7 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
         archive: config.archive,
         no_shortcuts: config.no_shortcuts,
         repo: config.repo,
+        nightly,
         kill: config.kill,
         progress_text: String::new(),
         files_extracted: 0,
@@ -625,13 +628,13 @@ impl InstallerApp {
 // ── Background: check for updates then launch or show update UI ─────────
 
 fn check_and_maybe_launch(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) {
-    let (repo, installed_ver) = {
+    let (repo, nightly, install_state) = {
         let st = app_state.lock().unwrap();
-        (st.repo.clone(), st.installed_version.clone())
+        (st.repo.clone(), st.nightly, st.install_state.clone())
     };
 
     // Try to check GitHub; if it fails, just launch what we have
-    let release = match github::fetch_latest_release(&repo) {
+    let release = match github::fetch_release(&repo, nightly) {
         Ok(r) => r,
         Err(_) => {
             // Network error — launch existing version
@@ -640,8 +643,13 @@ fn check_and_maybe_launch(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context)
         }
     };
 
-    let needs_update =
-        installed_ver.is_empty() || state::is_newer(&release.version, &installed_ver);
+    let needs_update = match github::needs_release_update(&release, &install_state, nightly) {
+        Ok(v) => v,
+        Err(_) => {
+            launch_current_and_close(app_state, ctx);
+            return;
+        }
+    };
 
     if !needs_update {
         // Up to date — launch immediately
@@ -672,13 +680,13 @@ fn run_download_and_install(
     app_state: &Arc<Mutex<AppState>>,
     ctx: &egui::Context,
 ) -> anyhow::Result<()> {
-    let (repo, kill) = {
+    let (repo, kill, nightly) = {
         let st = app_state.lock().unwrap();
-        (st.repo.clone(), st.kill)
+        (st.repo.clone(), st.kill, st.nightly)
     };
 
     // 1. Fetch latest release info
-    let release = github::fetch_latest_release(&repo)?;
+    let release = github::fetch_release(&repo, nightly)?;
 
     {
         let mut st = app_state.lock().unwrap();
@@ -703,6 +711,7 @@ fn run_download_and_install(
     })?;
 
     // 3. Verify SHA-256
+    let mut archive_sha256 = String::new();
     if !release.sha256_url.is_empty() {
         {
             let mut st = app_state.lock().unwrap();
@@ -712,9 +721,10 @@ fn run_download_and_install(
 
         let expected = github::fetch_sha256(&release.sha256_url)?;
         github::verify_download(&dest, &expected)?;
+        archive_sha256 = expected;
     }
 
-    // 3b. Cross-check against the signed release manifest when available.
+    // 3b. Cross-check against the release manifest when available.
     if !release.manifest_url.is_empty() {
         {
             let mut st = app_state.lock().unwrap();
@@ -723,15 +733,16 @@ fn run_download_and_install(
         ctx.request_repaint();
 
         let raw_json = github::fetch_release_manifest(&release.manifest_url)?;
-        let mf = release_manifest::ReleaseManifest::parse_and_verify(&raw_json)?;
         let archive_hash = extract::hash_file(&dest)?;
-        if !mf.contains(&release.version, &archive_hash) {
-            anyhow::bail!(
-                "Archive hash {} not found in release manifest for v{}",
-                &archive_hash[..archive_hash.len().min(12)],
-                release.version
-            );
-        }
+        release_manifest::verify_archive_hash(
+            &raw_json,
+            nightly,
+            &release.version,
+            github::current_platform_id(),
+            &archive_hash,
+        )?;
+    } else if nightly {
+        anyhow::bail!("Nightly install requires releases_manifest.json");
     }
 
     // 4. Kill running instances if requested
@@ -791,8 +802,10 @@ fn run_download_and_install(
     }
 
     ist.add_version(&release.version, &ver_dir);
+    ist.set_channel(nightly);
+    ist.archive_sha256 = archive_sha256;
     state::write_state(&base_dir, &ist)?;
-    state::self_copy(&base_dir)?;
+    state::self_copy(&base_dir, nightly)?;
 
     // 8. Shortcuts
     if !no_shortcuts {
@@ -801,7 +814,7 @@ fn run_download_and_install(
         drop(st);
         ctx.request_repaint();
 
-        let installer_exe = base_dir.join("conquerd-installer.exe");
+        let installer_exe = state::installer_path(&base_dir, nightly);
         shortcuts::create_shortcuts_for_launcher(&installer_exe)?;
     }
 
@@ -896,11 +909,11 @@ fn run_repair(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) -> anyhow::
         arc
     } else {
         // Try downloading the matching version from GitHub
-        let repo = {
+        let (repo, nightly) = {
             let st = app_state.lock().unwrap();
-            st.repo.clone()
+            (st.repo.clone(), st.nightly)
         };
-        let release = github::fetch_latest_release(&repo)?;
+        let release = github::fetch_release(&repo, nightly)?;
         let temp = std::env::temp_dir().join(&release.archive_name);
 
         {
@@ -1054,9 +1067,15 @@ fn run_local_install(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) -> a
         ist.remove_version(&old.version);
     }
 
+    let nightly = {
+        let st = app_state.lock().unwrap();
+        st.nightly
+    };
+
     ist.add_version(&version, &ver_dir);
+    ist.set_channel(nightly);
     state::write_state(&base_dir, &ist)?;
-    state::self_copy(&base_dir)?;
+    state::self_copy(&base_dir, nightly)?;
 
     // Shortcuts
     if !no_shortcuts {
@@ -1065,7 +1084,7 @@ fn run_local_install(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) -> a
         drop(st);
         ctx.request_repaint();
 
-        let installer_exe = base_dir.join("conquerd-installer.exe");
+        let installer_exe = state::installer_path(&base_dir, nightly);
         shortcuts::create_shortcuts_for_launcher(&installer_exe)?;
     }
 

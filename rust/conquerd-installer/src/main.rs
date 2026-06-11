@@ -8,7 +8,7 @@ mod release_manifest;
 mod shortcuts;
 mod state;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -102,7 +102,7 @@ struct Cli {
     uninstall: bool,
 
     /// GitHub repo for downloading releases
-    #[arg(long, default_value = "vbawol/ConquerD")]
+    #[arg(long, default_value = "ConquerD/ConquerD")]
     repo: String,
 
     /// Check for updates, then launch the latest installed version (runner mode)
@@ -347,7 +347,7 @@ fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
         archive: None,
         base_dir: base_dir.to_path_buf(),
         no_shortcuts: false,
-        repo: "vbawol/ConquerD".to_string(),
+        repo: "ConquerD/ConquerD".to_string(),
         kill: false,
         install_state,
         repair: false,
@@ -363,8 +363,14 @@ fn run_update_and_relaunch(
 ) -> anyhow::Result<()> {
     let mut st = state::read_state(base_dir)?;
 
-    log!("Checking for updates from {repo}…");
-    let release = match github::fetch_latest_release(repo) {
+    let nightly = github::resolve_nightly_channel(base_dir);
+    let source = if nightly {
+        format!("nightly channel ({})", github::nightly_archive_name())
+    } else {
+        format!("{repo} latest release")
+    };
+    log!("Checking for updates from {source}…");
+    let release = match github::fetch_release(repo, nightly) {
         Ok(r) => r,
         Err(e) => {
             log!("Update check failed: {e:#}");
@@ -376,8 +382,16 @@ fn run_update_and_relaunch(
         }
     };
 
-    let needs_update =
-        st.current_version.is_empty() || state::is_newer(&release.version, &st.current_version);
+    let needs_update = match github::needs_release_update(&release, &st, nightly) {
+        Ok(v) => v,
+        Err(e) => {
+            log!("Update check failed: {e:#}");
+            if let Some(dir) = st.current_path() {
+                launch_app(dir)?;
+            }
+            return Ok(());
+        }
+    };
 
     if !needs_update {
         log!("Already up to date (v{}).", st.current_version);
@@ -394,38 +408,36 @@ fn run_update_and_relaunch(
         let temp = std::env::temp_dir().join(&release.archive_name);
         github::download_file(&release.archive_url, &temp, |_, _| {})?;
 
-        if !release.sha256_url.is_empty() {
+        let archive_sha256 = if !release.sha256_url.is_empty() {
             let expected = github::fetch_sha256(&release.sha256_url)?;
             github::verify_download(&temp, &expected)?;
-        }
+            expected
+        } else {
+            String::new()
+        };
 
-        // Cross-check against the signed release manifest when available.
+        // Cross-check against the release manifest when available.
         if !release.manifest_url.is_empty() {
-            match github::fetch_release_manifest(&release.manifest_url) {
-                Ok(raw_json) => {
-                    match release_manifest::ReleaseManifest::parse_and_verify(&raw_json) {
-                        Ok(mf) => {
-                            let archive_hash = extract::hash_file(&temp).unwrap_or_default();
-                            if !mf.contains(&release.version, &archive_hash) {
-                                bail!(
-                                    "Archive hash {} not found in release manifest for v{} — aborting",
-                                    &archive_hash[..12],
-                                    release.version
-                                );
-                            }
-                            log!("Release manifest verified for v{}.", release.version);
-                        }
-                        Err(e) => {
-                            bail!("Release manifest verification failed: {e:#}");
-                        }
-                    }
+            let raw_json = github::fetch_release_manifest(&release.manifest_url)
+                .with_context(|| format!("Failed to fetch {}", release.manifest_url))?;
+            let archive_hash = extract::hash_file(&temp)?;
+            release_manifest::verify_archive_hash(
+                &raw_json,
+                nightly,
+                &release.version,
+                github::current_platform_id(),
+                &archive_hash,
+            )?;
+            log!(
+                "Release manifest verified for {}.",
+                if nightly {
+                    format!("nightly ({})", github::current_platform_id())
+                } else {
+                    format!("v{}", release.version)
                 }
-                Err(e) => {
-                    log!(
-                        "WARNING: could not fetch release manifest: {e:#}. Skipping verification."
-                    );
-                }
-            }
+            );
+        } else if nightly {
+            bail!("Nightly install requires releases_manifest.json");
         }
 
         let ver_dir = state::version_dir(base_dir, &release.version);
@@ -440,11 +452,13 @@ fn run_update_and_relaunch(
         }
 
         st.add_version(&release.version, &ver_dir);
+        st.set_channel(nightly);
+        st.archive_sha256 = archive_sha256;
         state::write_state(base_dir, &st)?;
-        state::self_copy(base_dir)?;
+        state::self_copy(base_dir, nightly)?;
 
         if !no_shortcuts {
-            let installer_in_base = base_dir.join("conquerd-installer.exe");
+            let installer_in_base = state::installer_path(base_dir, nightly);
             shortcuts::create_shortcuts_for_launcher(&installer_in_base)?;
         }
 
@@ -499,12 +513,14 @@ fn run_silent(
         st.remove_version(&old_ver.version);
     }
 
+    let nightly = github::resolve_nightly_channel(base_dir);
     st.add_version(&version, &ver_dir);
+    st.set_channel(nightly);
     state::write_state(base_dir, &st)?;
-    state::self_copy(base_dir)?;
+    state::self_copy(base_dir, nightly)?;
 
     if !cli.no_shortcuts {
-        let installer_in_base = base_dir.join("conquerd-installer.exe");
+        let installer_in_base = state::installer_path(base_dir, nightly);
         shortcuts::create_shortcuts_for_launcher(&installer_in_base)?;
         log!("Shortcuts created");
     }

@@ -78,12 +78,79 @@ impl ReleaseManifest {
         Ok(manifest)
     }
 
+    /// Parse an unsigned manifest (nightly builds). JSON structure is validated;
+    /// Ed25519 signature verification is skipped.
+    pub fn parse_unsigned(raw_json: &str) -> Result<Self> {
+        let manifest: ReleaseManifest =
+            serde_json::from_str(raw_json).context("Failed to parse releases_manifest.json")?;
+
+        if manifest.releases.is_empty() {
+            anyhow::bail!("Release manifest contains no release entries");
+        }
+
+        Ok(manifest)
+    }
+
+    /// Parse and verify using the channel-appropriate trust model.
+    pub fn parse_for_channel(raw_json: &str, nightly: bool) -> Result<Self> {
+        if nightly {
+            Self::parse_unsigned(raw_json)
+        } else {
+            Self::parse_and_verify(raw_json)
+        }
+    }
+
     /// Return true if *(version, build_hash)* appears for any platform.
     pub fn contains(&self, version: &str, build_hash: &str) -> bool {
         self.releases.iter().any(|e| {
             e.version == version && e.build_hash.to_lowercase() == build_hash.to_lowercase()
         })
     }
+
+    /// Return true if *build_hash* appears for the given platform.
+    pub fn contains_for_platform(&self, platform: &str, build_hash: &str) -> bool {
+        self.releases.iter().any(|e| {
+            e.platform == platform && e.build_hash.to_lowercase() == build_hash.to_lowercase()
+        })
+    }
+
+    /// Return the published archive hash for a platform, if present.
+    pub fn build_hash_for_platform(&self, platform: &str) -> Option<String> {
+        self.releases
+            .iter()
+            .find(|e| e.platform == platform)
+            .map(|e| e.build_hash.to_lowercase())
+    }
+}
+
+/// Cross-check a downloaded archive hash against the release manifest.
+pub fn verify_archive_hash(
+    raw_json: &str,
+    nightly: bool,
+    release_version: &str,
+    platform: &str,
+    archive_hash: &str,
+) -> Result<()> {
+    let mf = ReleaseManifest::parse_for_channel(raw_json, nightly)?;
+    let ok = if nightly {
+        mf.contains_for_platform(platform, archive_hash)
+    } else {
+        mf.contains(release_version, archive_hash)
+    };
+
+    if !ok {
+        let target = if nightly {
+            format!("platform {platform}")
+        } else {
+            format!("v{release_version}")
+        };
+        anyhow::bail!(
+            "Archive hash {} not found in release manifest for {target}",
+            &archive_hash[..archive_hash.len().min(12)]
+        );
+    }
+
+    Ok(())
 }
 
 /// Rebuild the canonical form: same as the raw JSON but with the `signature`
@@ -293,6 +360,74 @@ mod tests {
             signature: String::new(),
         };
         assert!(!manifest.contains("1.0.0", "any"));
+    }
+
+    #[test]
+    fn contains_for_platform_matches_platform_and_hash() {
+        let manifest = ReleaseManifest {
+            releases: vec![ManifestEntry {
+                version: "nightly-20260609".to_string(),
+                platform: "win64".to_string(),
+                build_hash: "abc123".to_string(),
+                build_id: "nightly-deadbeef-42".to_string(),
+                published_at: 0.0,
+            }],
+            signed_at: 0.0,
+            signer_pubkey: String::new(),
+            signature: String::new(),
+        };
+        assert!(manifest.contains_for_platform("win64", "abc123"));
+        assert!(!manifest.contains_for_platform("macos-arm64", "abc123"));
+    }
+
+    #[test]
+    fn build_hash_for_platform_returns_lowercase_hash() {
+        let manifest = ReleaseManifest {
+            releases: vec![ManifestEntry {
+                version: "nightly-20260609".to_string(),
+                platform: "win64".to_string(),
+                build_hash: "ABC123".to_string(),
+                build_id: String::new(),
+                published_at: 0.0,
+            }],
+            signed_at: 0.0,
+            signer_pubkey: String::new(),
+            signature: String::new(),
+        };
+        assert_eq!(
+            manifest.build_hash_for_platform("win64").as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn parse_unsigned_rejects_empty_releases() {
+        let raw = r#"{"releases":[],"signed_at":0.0}"#;
+        assert!(ReleaseManifest::parse_unsigned(raw).is_err());
+    }
+
+    #[test]
+    fn parse_unsigned_accepts_nightly_shape_without_signature() {
+        let raw = r#"{
+            "comment": "Development nightly build",
+            "releases": [
+                {"version":"nightly-20260609","platform":"win64","build_hash":"abc","build_id":"nightly-1","published_at":0.0}
+            ],
+            "signed_at":0.0
+        }"#;
+        let mf = ReleaseManifest::parse_unsigned(raw).expect("nightly manifest");
+        assert_eq!(mf.releases.len(), 1);
+    }
+
+    #[test]
+    fn verify_archive_hash_accepts_nightly_platform_entry() {
+        let raw = r#"{
+            "releases": [
+                {"version":"nightly-20260609","platform":"win64","build_hash":"abc123","build_id":"nightly-1","published_at":0.0}
+            ],
+            "signed_at":0.0
+        }"#;
+        verify_archive_hash(raw, true, "nightly", "win64", "abc123").expect("verify");
     }
 
     // -----------------------------------------------------------------------

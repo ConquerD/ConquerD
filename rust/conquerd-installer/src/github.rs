@@ -1,3 +1,5 @@
+use crate::release_manifest;
+use crate::state::{self, InstallState, CHANNEL_NIGHTLY};
 use anyhow::{bail, Context};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -6,6 +8,9 @@ use std::path::{Path, PathBuf};
 
 const GITHUB_API: &str = "https://api.github.com";
 const USER_AGENT: &str = concat!("ConquerD-Installer/", env!("CARGO_PKG_VERSION"));
+const NIGHTLY_TAG: &str = "nightly";
+const NIGHTLY_DOWNLOAD_BASE: &str =
+    "https://github.com/ConquerD/ConquerD/releases/download/nightly";
 
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
@@ -31,7 +36,141 @@ struct GhAsset {
     browser_download_url: String,
 }
 
-/// Fetch the latest release from a GitHub repo (e.g. "vbawol/ConquerD").
+/// True when the running executable is the nightly installer build.
+pub fn is_nightly_installer() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+        .map(|name| name.contains("nightly"))
+        .unwrap_or(false)
+}
+
+/// Resolve whether this install session should use the nightly channel.
+pub fn resolve_nightly_channel(base_dir: &Path) -> bool {
+    if is_nightly_installer() {
+        return true;
+    }
+    state::read_state(base_dir)
+        .map(|st| st.channel == CHANNEL_NIGHTLY)
+        .unwrap_or(false)
+}
+
+/// Platform id used in releases_manifest.json entries.
+pub fn current_platform_id() -> &'static str {
+    #[cfg(windows)]
+    {
+        "win64"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "macos-arm64"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "linux-x86_64"
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        "unknown"
+    }
+}
+
+/// Platform-specific nightly archive published on the `nightly` GitHub release.
+pub fn nightly_archive_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "ConquerD-nightly-win64.7z"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "ConquerD-nightly-macos-arm64.dmg"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "ConquerD-nightly-x86_64.AppImage"
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        "ConquerD-nightly.7z"
+    }
+}
+
+/// Fetch the rolling nightly release via direct asset URLs (no GitHub API).
+pub fn fetch_nightly_release() -> anyhow::Result<ReleaseInfo> {
+    let archive_name = nightly_archive_name();
+    let archive_url = format!("{NIGHTLY_DOWNLOAD_BASE}/{archive_name}");
+    let sha256_url = format!("{archive_url}.sha256");
+
+    Ok(ReleaseInfo {
+        tag: NIGHTLY_TAG.to_string(),
+        version: NIGHTLY_TAG.to_string(),
+        archive_url,
+        archive_name: archive_name.to_string(),
+        sha256_url,
+        manifest_url: format!("{NIGHTLY_DOWNLOAD_BASE}/releases_manifest.json"),
+    })
+}
+
+/// Fetch and parse the nightly manifest, returning the archive hash for this platform.
+pub fn nightly_remote_hash(release: &ReleaseInfo) -> anyhow::Result<String> {
+    if release.manifest_url.is_empty() {
+        bail!("Nightly release is missing releases_manifest.json URL");
+    }
+
+    let raw_json = fetch_release_manifest(&release.manifest_url)?;
+    let mf = release_manifest::ReleaseManifest::parse_unsigned(&raw_json)?;
+    mf.build_hash_for_platform(current_platform_id()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No nightly manifest entry for platform {}",
+            current_platform_id()
+        )
+    })
+}
+
+/// Fetch either the rolling nightly build or the latest stable GitHub release.
+pub fn fetch_release(repo: &str, nightly: bool) -> anyhow::Result<ReleaseInfo> {
+    if nightly {
+        fetch_nightly_release()
+    } else {
+        fetch_latest_release(repo)
+    }
+}
+
+/// Decide whether a remote release should be installed over the current one.
+pub fn needs_release_update(
+    release: &ReleaseInfo,
+    st: &InstallState,
+    nightly: bool,
+) -> anyhow::Result<bool> {
+    if st.current_version.is_empty() {
+        return Ok(true);
+    }
+
+    if nightly {
+        if !release.manifest_url.is_empty() {
+            if let Ok(remote_hash) = nightly_remote_hash(release) {
+                return Ok(nightly_update_available(&remote_hash, st));
+            }
+        }
+        if !release.sha256_url.is_empty() {
+            let remote_sha = fetch_sha256(&release.sha256_url)?;
+            return Ok(nightly_update_available(&remote_sha, st));
+        }
+        return Ok(true);
+    }
+
+    Ok(state::is_newer(&release.version, &st.current_version))
+}
+
+/// Returns true when a nightly build should replace the installed copy.
+pub fn nightly_update_available(remote_sha: &str, st: &InstallState) -> bool {
+    if st.archive_sha256.is_empty() {
+        return true;
+    }
+    remote_sha != st.archive_sha256
+}
+
+/// Fetch the latest release from a GitHub repo (e.g. "ConquerD/ConquerD").
 pub fn fetch_latest_release(repo: &str) -> anyhow::Result<ReleaseInfo> {
     let url = format!("{GITHUB_API}/repos/{repo}/releases/latest");
 
@@ -159,4 +298,51 @@ pub fn verify_download(path: &Path, expected: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_nightly_release_uses_direct_github_download_urls() {
+        let release = fetch_nightly_release().expect("nightly release info");
+        let archive_name = nightly_archive_name();
+
+        assert_eq!(release.tag, "nightly");
+        assert_eq!(release.version, "nightly");
+        assert_eq!(release.archive_name, archive_name);
+        assert_eq!(
+            release.archive_url,
+            format!("{NIGHTLY_DOWNLOAD_BASE}/{archive_name}")
+        );
+        assert_eq!(
+            release.sha256_url,
+            format!("{NIGHTLY_DOWNLOAD_BASE}/{archive_name}.sha256")
+        );
+        assert_eq!(
+            release.manifest_url,
+            format!("{NIGHTLY_DOWNLOAD_BASE}/releases_manifest.json")
+        );
+    }
+
+    #[test]
+    fn nightly_update_available_when_hashes_differ() {
+        let mut st = InstallState::empty();
+        st.archive_sha256 = "abc".to_string();
+        assert!(nightly_update_available("def", &st));
+    }
+
+    #[test]
+    fn nightly_update_available_when_hashes_match() {
+        let mut st = InstallState::empty();
+        st.archive_sha256 = "abc".to_string();
+        assert!(!nightly_update_available("abc", &st));
+    }
+
+    #[test]
+    fn nightly_update_available_when_local_hash_missing() {
+        let st = InstallState::empty();
+        assert!(nightly_update_available("abc", &st));
+    }
 }
