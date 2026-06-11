@@ -119,12 +119,13 @@ pub fn nightly_remote_hash(release: &ReleaseInfo) -> anyhow::Result<String> {
 
     let raw_json = fetch_release_manifest(&release.manifest_url)?;
     let mf = release_manifest::ReleaseManifest::parse_unsigned(&raw_json)?;
-    mf.build_hash_for_platform(current_platform_id()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No nightly manifest entry for platform {}",
-            current_platform_id()
-        )
-    })
+    mf.build_hash_for_platform(current_platform_id())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No nightly manifest entry for platform {}",
+                current_platform_id()
+            )
+        })
 }
 
 /// Fetch either the rolling nightly build or the latest stable GitHub release.
