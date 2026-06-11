@@ -155,11 +155,12 @@ jobs:
         shell: pwsh
         run: choco install 7zip -y --no-progress
 
-      - name: Install Qt 6
+      - name: Install Qt 6 (base + WebEngine for in-app supernode portal)
         shell: pwsh
         run: |
           pip install aqtinstall
-          aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt
+          aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt `
+            --modules qtwebengine qtwebchannel
 
       - name: Set build metadata
         id: meta
@@ -203,6 +204,13 @@ jobs:
           }
           if (-not (Test-Path "dist\conquerd-installer.exe")) {
             throw "conquerd-installer.exe not found in dist/"
+          }
+          $bundle = "dist\ConquerD"
+          if (-not (Test-Path "$bundle\Qt6WebEngineCore.dll")) {
+            throw "Qt6WebEngineCore.dll missing from $bundle — nightly portal will not load"
+          }
+          if (-not (Test-Path "$bundle\resources\qtwebengine_resources.pak")) {
+            throw "WebEngine resources missing from $bundle — portal pages will fail to render"
           }
 
       - name: Upload unsigned artifacts
