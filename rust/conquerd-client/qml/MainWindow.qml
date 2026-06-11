@@ -622,27 +622,30 @@ ApplicationWindow {
             TabBar {
                 id: sidebarTabBar
                 Layout.fillWidth: true
-                implicitHeight: 36
+                Layout.preferredHeight: sidebarTabHeight
+                implicitHeight: sidebarTabHeight
                 visible: navIndex !== 2
                 Material.accent: Material.Blue
+
+                readonly property int sidebarTabHeight: Theme.controlHeight + 4
 
                 TabButton {
                     text: "Peers"
                     font.pixelSize: Theme.fontSizeCaption
                     font.bold: sidebarTabBar.currentIndex === 0
-                    implicitHeight: Theme.touchTarget
+                    implicitHeight: sidebarTabBar.sidebarTabHeight
                 }
                 TabButton {
                     text: "Rooms"
                     font.pixelSize: Theme.fontSizeCaption
                     font.bold: sidebarTabBar.currentIndex === 1
-                    implicitHeight: Theme.touchTarget
+                    implicitHeight: sidebarTabBar.sidebarTabHeight
                 }
                 TabButton {
                     text: "Nodes"
                     font.pixelSize: Theme.fontSizeCaption
                     font.bold: sidebarTabBar.currentIndex === 2
-                    implicitHeight: Theme.touchTarget
+                    implicitHeight: sidebarTabBar.sidebarTabHeight
                 }
             }
 
