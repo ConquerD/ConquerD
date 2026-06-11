@@ -53,6 +53,7 @@ fn validate_bundle_layout(install_dir: &Path) -> Result<()> {
         );
     }
 
+    // Match windeployqt6 output from build_win64.ps1 (--no-translations; no Qt Positioning).
     let required = [
         "platforms",
         "qml",
@@ -60,11 +61,9 @@ fn validate_bundle_layout(install_dir: &Path) -> Result<()> {
         "generic",
         "iconengines",
         "networkinformation",
-        "position",
         "qmltooling",
         "styles",
         "tls",
-        "translations",
     ];
     let missing: Vec<_> = required
         .iter()
@@ -472,11 +471,9 @@ mod tests {
             "generic",
             "iconengines",
             "networkinformation",
-            "position",
             "qmltooling",
             "styles",
             "tls",
-            "translations",
         ] {
             fs::create_dir_all(root.join(folder)).unwrap();
         }
@@ -500,11 +497,9 @@ mod tests {
             "generic",
             "iconengines",
             "networkinformation",
-            "position",
             "qmltooling",
             "styles",
             "tls",
-            "translations",
         ] {
             let dir = bundle.join(folder);
             fs::create_dir_all(&dir).unwrap();
