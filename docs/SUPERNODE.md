@@ -14,6 +14,21 @@ cargo build -p conquerd-supernode --release
 ./target/release/conquerd-supernode
 ```
 
+### Pre-built Linux ARM64 binary
+
+Official and nightly releases include a standalone `conquerd-supernode-*-linux-aarch64.tar.gz` asset (GitHub Releases). This is the easiest path for ARM64 VPS hosts, Raspberry Pi, and other `aarch64` Linux servers.
+
+```bash
+# Example: install from a tagged release asset
+tar -xzf conquerd-supernode-1.0.0-linux-aarch64.tar.gz
+sudo install -m 755 conquerd-supernode-1.0.0-linux-aarch64/conquerd-supernode /usr/local/bin/
+
+# Or build/package locally on any supported host:
+CONQUERD_RELEASE=1 ./scripts/build_supernode.sh
+```
+
+Nightly builds publish `conquerd-supernode-nightly-linux-aarch64.tar.gz` on the rolling `nightly` release.
+
 Configuration is read from `<data_dir>/supernode.toml` (see below). Legacy environment variables are supported for backward compatibility but are deprecated.
 
 ## Configuration (supernode.toml)

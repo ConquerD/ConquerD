@@ -455,6 +455,59 @@ jobs:
             dist/ConquerD-*-x86_64.AppImage
             dist/ConquerD-*-x86_64.AppImage.sha256
 
+  build-supernode-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: supernode-linux-arm64-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Set build metadata
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            SHORT_SHA="${GITHUB_SHA:0:12}"
+            echo "build_id=release-${VERSION}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            SHORT_SHA="${GITHUB_SHA:0:12}"
+            echo "build_id=nightly-${SHORT_SHA}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and package supernode (linux-aarch64)
+        env:
+          CONQUERD_RELEASE: "1"
+          CONQUERD_BUILD_ID: ${{ steps.meta.outputs.build_id }}
+        run: bash scripts/build_supernode.sh
+
+      - name: Verify artifacts
+        run: |
+          ls dist/conquerd-supernode-*-linux-aarch64.tar.gz
+          ls dist/conquerd-supernode-*-linux-aarch64.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: supernode-linux-arm64-release
+          path: |
+            dist/conquerd-supernode-*-linux-aarch64.tar.gz
+            dist/conquerd-supernode-*-linux-aarch64.tar.gz.sha256
+
   attest:
     needs: [build-macos, build-linux, sign-windows, windows-unsigned-fallback]
     # Only run artifact attestations for official tagged releases.
@@ -478,7 +531,7 @@ jobs:
             artifacts/ConquerD-*-x86_64.AppImage
 
   publish-release:
-    needs: [attest]
+    needs: [attest, build-supernode-linux-arm64]
     runs-on: ubuntu-22.04
     # Only for official tagged releases (v*). Nightly/dev builds on develop use publish-nightly instead.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -497,6 +550,13 @@ jobs:
           pattern: "*-release"
           path: artifacts
           merge-multiple: true
+
+      - name: Flatten supernode artifacts into release bundle
+        run: |
+          set -euo pipefail
+          find artifacts -type f \( -name 'conquerd-supernode-*-linux-aarch64.tar.gz*' \) \
+            -exec cp -f {} artifacts/ \;
+          find artifacts -type d -empty -delete 2>/dev/null || true
 
       - name: List artifacts
         run: find artifacts -type f | sort
@@ -606,13 +666,15 @@ jobs:
             artifacts/ConquerD-*-macos-arm64.dmg.sha256
             artifacts/ConquerD-*-x86_64.AppImage
             artifacts/ConquerD-*-x86_64.AppImage.sha256
+            artifacts/conquerd-supernode-*-linux-aarch64.tar.gz
+            artifacts/conquerd-supernode-*-linux-aarch64.tar.gz.sha256
             releases_manifest.json
 
   publish-nightly:
     # Run for pushes to develop and scheduled nightlies.
     # Does not require the protected "release" environment or signing secrets.
     if: github.ref == 'refs/heads/develop' || github.event_name == 'schedule'
-    needs: [build-windows, build-macos, build-linux]
+    needs: [build-windows, build-macos, build-linux, build-supernode-linux-arm64]
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout source (for manifest generator)
@@ -639,6 +701,12 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "supernode-linux-arm64-release"
+          path: artifacts
+          merge-multiple: true
+
       - name: Prepare nightly artifacts for upload
         run: |
           set -euo pipefail
@@ -650,7 +718,7 @@ jobs:
 
           mkdir -p artifacts/_staging
           find artifacts -type f \
-            \( -name 'ConquerD-*' -o -name 'conquerd-installer*.exe' \) \
+            \( -name 'ConquerD-*' -o -name 'conquerd-installer*.exe' -o -name 'conquerd-supernode-*' \) \
             -exec cp -f {} artifacts/_staging/ \;
           rm -rf artifacts/dist
           for f in artifacts/_staging/*; do
@@ -667,6 +735,8 @@ jobs:
           for f in ConquerD-*-macos-arm64.dmg.sha256; do mv "$f" "ConquerD-nightly-macos-arm64.dmg.sha256"; done
           for f in ConquerD-*-x86_64.AppImage; do mv "$f" "ConquerD-nightly-x86_64.AppImage"; done
           for f in ConquerD-*-x86_64.AppImage.sha256; do mv "$f" "ConquerD-nightly-x86_64.AppImage.sha256"; done
+          for f in conquerd-supernode-*-linux-aarch64.tar.gz; do mv "$f" "conquerd-supernode-nightly-linux-aarch64.tar.gz"; done
+          for f in conquerd-supernode-*-linux-aarch64.tar.gz.sha256; do mv "$f" "conquerd-supernode-nightly-linux-aarch64.tar.gz.sha256"; done
 
           echo "==> Nightly assets ready:"
           find . -maxdepth 1 -type f | sort
@@ -679,6 +749,8 @@ jobs:
             ConquerD-nightly-macos-arm64.dmg.sha256
             ConquerD-nightly-x86_64.AppImage
             ConquerD-nightly-x86_64.AppImage.sha256
+            conquerd-supernode-nightly-linux-aarch64.tar.gz
+            conquerd-supernode-nightly-linux-aarch64.tar.gz.sha256
           )
           missing=0
           for f in "${REQUIRED[@]}"; do
@@ -761,6 +833,7 @@ jobs:
             - Windows portable 7z + standalone installer
             - macOS dmg
             - Linux AppImage
+            - Linux ARM64 supernode tarball
 
             The `releases_manifest.json` is unsigned and provided for reference.
           files: |
@@ -771,4 +844,6 @@ jobs:
             artifacts/ConquerD-nightly-macos-arm64.dmg.sha256
             artifacts/ConquerD-nightly-x86_64.AppImage
             artifacts/ConquerD-nightly-x86_64.AppImage.sha256
+            artifacts/conquerd-supernode-nightly-linux-aarch64.tar.gz
+            artifacts/conquerd-supernode-nightly-linux-aarch64.tar.gz.sha256
             releases_manifest.json
