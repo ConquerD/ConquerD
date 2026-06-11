@@ -102,6 +102,13 @@ if ($env:CONQUERD_NO_WEBENGINE -ne "1" -and (Test-Path $_weProbe)) {
 } else {
     Write-Host "    [web] Qt WebEngine NOT found — portal disabled" -ForegroundColor Yellow
     Write-Host "         Install via Qt Maintenance Tool: Qt 6.x > Additional Libraries > Qt WebEngine" -ForegroundColor Yellow
+    if ($env:CONQUERD_BUILD_ID) {
+        Write-Error @"
+CI/release builds require Qt WebEngine for the in-app supernode portal.
+Install the module, e.g.:
+  aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt --modules qtwebengine qtwebchannel
+"@
+    }
 }
 
 # ── Build conquerd-client (Qt UI) ─────────────────────────────────────────────
@@ -227,6 +234,19 @@ if ($_features -like "*webengine*") {
         Write-Host "    Qt WebEngine resources deployed"
     } else {
         Write-Warning "Qt WebEngine resources not found under $qtWebEngineResources"
+    }
+    $qtLocales = Join-Path $QT_ROOT "translations\qtwebengine_locales"
+    $bundleLocales = Join-Path $BUNDLE "locales"
+    if (Test-Path $qtLocales) {
+        Copy-Item $qtLocales $bundleLocales -Recurse -Force
+        Write-Host "    Qt WebEngine locales deployed"
+    } else {
+        # aqt installs Chromium locale packs under resources/ on some Qt builds.
+        $altLocales = Join-Path $QT_ROOT "resources\locales"
+        if (Test-Path $altLocales) {
+            Copy-Item $altLocales $bundleLocales -Recurse -Force
+            Write-Host "    Qt WebEngine locales deployed (from resources/locales)"
+        }
     }
 }
 
