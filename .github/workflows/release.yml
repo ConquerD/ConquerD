@@ -159,8 +159,9 @@ jobs:
         shell: pwsh
         run: |
           pip install aqtinstall
+          # WebEngine pulls in WebChannel + Positioning; windeployqt fails if they are missing.
           aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt `
-            --modules qtwebengine qtwebchannel
+            --modules qtwebengine qtwebchannel qtpositioning
 
       - name: Set build metadata
         id: meta
