@@ -236,8 +236,22 @@ ApplicationWindow {
         }
 
         backend.peersUpdated.connect(peerModel.setPeers)
-        backend.chatMessageReceived.connect(chatModel.appendMessage)
-        backend.chatHistoryLoaded.connect(chatModel.setMessages)
+        backend.chatMessageReceived.connect(function(msgJson) {
+            try {
+                var msg = JSON.parse(msgJson)
+                if (!msg.peer_id || msg.peer_id === chatPanel.selectedPeerId)
+                    chatModel.appendMessage(msgJson)
+            } catch (e) {
+                chatModel.appendMessage(msgJson)
+            }
+        })
+        backend.chatHistoryLoaded.connect(function(json) {
+            chatModel.setMessages(json)
+            chatPanel._historyPage = 0
+            chatPanel._hasMoreHistory = true
+            chatPanel._loadingHistory = false
+        })
+        backend.chatHistoryPrepended.connect(chatPanel.onHistoryPrepended)
         backend.messageStatusChanged.connect(chatModel.updateMessageStatus)
         backend.participantsUpdated.connect(roomModel.setParticipants)
         backend.localSpeakingChanged.connect(function(speaking) {
@@ -667,8 +681,6 @@ ApplicationWindow {
                         chatPanel.selectedPeerName = handle
                         backend.selectPeer(peerId)
                         navIndex = 0
-                        backend.clearUnread()
-                        // Clear the badge on the peer row immediately
                         peerModel.setPeerUnread(peerId, 0)
                     }
                     onStartCallRequested: (peerId) => backend.startCall(peerId)

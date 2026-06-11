@@ -108,12 +108,15 @@ Item {
 
     function statusText() {
         var s = root.status || "delivered"
-        if (s === "sending") return "sending"
-        if (s === "read") return "read"
-        if (s === "failed") return "failed"
-        if (s === "sent") return "sent"
-        return "delivered"
+        if (s === "sending") return "Sending…"
+        if (s === "sent") return "Sent"
+        if (s === "delivered") return "Delivered"
+        if (s === "read") return "Read"
+        if (s === "failed") return "Failed"
+        return s
     }
+
+    property string dateSeparator: ""
 
     Column {
         id: column
@@ -127,6 +130,18 @@ Item {
         }
         width: Math.min(root.width * 0.75, 500)
         spacing: 4
+
+        Text {
+            visible: root.dateSeparator !== ""
+            text: root.dateSeparator
+            color: Theme.muted
+            font.pixelSize: Theme.fontSizeCaption
+            font.bold: true
+            horizontalAlignment: Text.AlignHCenter
+            width: parent.width
+            topPadding: 4
+            bottomPadding: 2
+        }
 
         Text {
             visible: root.isRoom && !root.mine && root.sender !== ""

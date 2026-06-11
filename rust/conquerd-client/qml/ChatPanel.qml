@@ -27,6 +27,17 @@ Item {
     property int _aiSeq: 0
     property string _currentAiRequestId: ""
     property bool _statsPanelOpen: false
+    property int _historyPage: 0
+    property bool _loadingHistory: false
+    property bool _hasMoreHistory: true
+    property bool _pinnedToLatest: true
+
+    onPeerIsTypingChanged: {
+        if (root.peerIsTyping)
+            typingClearTimer.restart()
+        else
+            typingClearTimer.stop()
+    }
 
     Connections {
         target: backend
@@ -63,6 +74,10 @@ Item {
     }
 
     onSelectedPeerIdChanged: {
+        root._historyPage = 0
+        root._loadingHistory = false
+        root._hasMoreHistory = true
+        root._pinnedToLatest = true
         root._statsPanelOpen = false
         connStatsPanel.applyStats(JSON.stringify({
             peer_id: root.selectedPeerId,
@@ -205,6 +220,17 @@ Item {
                     }
                 }
 
+                Text {
+                    visible: root._searchText !== "" && root.chatModel
+                    text: {
+                        if (!root.chatModel) return ""
+                        var n = root.chatModel.matchCount(root._searchText)
+                        return n === 1 ? "1 match" : (n + " matches")
+                    }
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeCaption
+                }
+
                 ToolButton {
                     icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
                     icon.width: 12
@@ -241,7 +267,19 @@ Item {
             model: root.chatModel
             verticalLayoutDirection: ListView.BottomToTop
             spacing: 2
-            onCountChanged: Qt.callLater(function() { msgList.positionViewAtBeginning() })
+
+            onContentYChanged: {
+                root._pinnedToLatest = contentY <= 24
+                if (root._loadingHistory || !root._hasMoreHistory || root.selectedPeerId === "")
+                    return
+                if (contentHeight > height && contentY >= contentHeight - height - 48)
+                    root.loadOlderHistory()
+            }
+
+            onCountChanged: {
+                if (root._pinnedToLatest)
+                    Qt.callLater(function() { msgList.positionViewAtBeginning() })
+            }
 
             ColumnLayout {
                 anchors.centerIn: parent
@@ -287,6 +325,11 @@ Item {
             delegate: ChatRichMessageDelegate {
                 property bool searchMatch: root._searchText === "" ||
                     (model.body || "").toLowerCase().indexOf(root._searchText) !== -1
+                property string dateSeparator: {
+                    if (!searchMatch || (model.timestamp || 0) <= 0)
+                        return ""
+                    return root.dateSeparatorForIndex(index, model.timestamp)
+                }
                 visible: searchMatch
                 height: searchMatch ? implicitHeight : 0
                 clip: true
@@ -543,5 +586,60 @@ Item {
                 if (root.selectedPeerId !== "") backend.sendTyping(root.selectedPeerId, false)
             }
         }
+    }
+
+    function sameCalendarDay(a, b) {
+        return a.getFullYear() === b.getFullYear()
+            && a.getMonth() === b.getMonth()
+            && a.getDate() === b.getDate()
+    }
+
+    function formatDateLabel(d) {
+        var today = new Date()
+        var yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1)
+        if (root.sameCalendarDay(d, today))
+            return "Today"
+        if (root.sameCalendarDay(d, yesterday))
+            return "Yesterday"
+        return Qt.formatDate(d, "MMM d, yyyy")
+    }
+
+    function dateSeparatorForIndex(idx, ts) {
+        var d = new Date(ts * 1000)
+        if (!root.chatModel)
+            return root.formatDateLabel(d)
+        var olderTs = root.chatModel.timestampAt(idx + 1)
+        if (olderTs <= 0)
+            return root.formatDateLabel(d)
+        var older = new Date(olderTs * 1000)
+        if (root.sameCalendarDay(d, older))
+            return ""
+        return root.formatDateLabel(d)
+    }
+
+    function loadOlderHistory() {
+        if (root._loadingHistory || !root._hasMoreHistory || root.selectedPeerId === "")
+            return
+        root._loadingHistory = true
+        root._historyPage += 1
+        backend.loadMoreHistory(root.selectedPeerId, root._historyPage)
+    }
+
+    function onHistoryPrepended(json) {
+        var rows = []
+        try { rows = JSON.parse(json) } catch (e) { rows = [] }
+        if (!rows.length) {
+            root._hasMoreHistory = false
+            root._loadingHistory = false
+            return
+        }
+        var oldHeight = msgList.contentHeight
+        if (root.chatModel)
+            root.chatModel.prependMessages(json)
+        root._hasMoreHistory = rows.length >= 50
+        root._loadingHistory = false
+        Qt.callLater(function() {
+            msgList.contentY += msgList.contentHeight - oldHeight
+        })
     }
 }

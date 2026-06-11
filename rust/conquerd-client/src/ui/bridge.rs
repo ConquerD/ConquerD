@@ -301,6 +301,18 @@ pub mod ffi {
         #[rust_name = "select_peer"]
         fn selectPeer(self: Pin<&mut AppBridge>, peer_id: &QString);
 
+        /// Load an older page of chat history for the selected peer.
+        /// Emits `chatHistoryPrepended` with a JSON array (oldest-first within the page).
+        #[qinvokable]
+        #[rust_name = "load_more_history"]
+        fn loadMoreHistory(self: Pin<&mut AppBridge>, peer_id: &QString, page: i32);
+
+        /// Emitted when an older history page is loaded. `msgs_json` is a JSON array
+        /// of message objects to prepend to the active conversation.
+        #[qsignal]
+        #[rust_name = "chat_history_prepended"]
+        fn chatHistoryPrepended(self: Pin<&mut AppBridge>, msgs_json: QString);
+
         /// Send a typing indicator to a peer.
         #[qinvokable]
         #[rust_name = "send_typing"]
@@ -1333,6 +1345,7 @@ impl ffi::AppBridge {
         // Local echo: emit immediately so the sender sees their own message.
         let echo_json = serde_json::json!({
             "msg_id": message_id,
+            "peer_id": pid,
             "sender": handle,
             "body": body,
             "timestamp": now_ts as i64,
@@ -1341,9 +1354,11 @@ impl ffi::AppBridge {
             "status": initial_status.as_str(),
         })
         .to_string();
-        let _ = self
-            .as_mut()
-            .chat_message_received(QString::from(echo_json.as_str()));
+        if self.rust().selected_peer_id == pid {
+            let _ = self
+                .as_mut()
+                .chat_message_received(QString::from(echo_json.as_str()));
+        }
     }
 
     fn start_call(mut self: Pin<&mut Self>, peer_id: &QString) {
@@ -1943,8 +1958,18 @@ impl ffi::AppBridge {
     }
 
     fn clear_unread(mut self: Pin<&mut Self>) {
-        self.as_mut().rust_mut().unread_chat = 0;
-        crate::platform::clear_taskbar_badge();
+        let global = self
+            .rust()
+            .chat_store
+            .as_ref()
+            .and_then(|cs| cs.total_unread_count().ok())
+            .unwrap_or(0);
+        self.as_mut().rust_mut().unread_chat = global as u32;
+        if global == 0 {
+            crate::platform::clear_taskbar_badge();
+        } else {
+            crate::platform::set_taskbar_badge(global as u32);
+        }
     }
 
     fn avatar_svg(self: Pin<&mut Self>, peer_id: &QString, config_json: &QString) -> QString {
@@ -2087,6 +2112,21 @@ impl ffi::AppBridge {
         let cs_opt: Option<Arc<crate::chat_store::ChatStore>> =
             self.rust().chat_store.as_ref().map(Arc::clone);
 
+        if let Some(ref cs) = cs_opt {
+            if let Err(e) = cs.mark_peer_read(&pid) {
+                warn!("chat_store mark_peer_read error: {e}");
+            }
+            let global = cs.total_unread_count().unwrap_or(0);
+            self.as_mut().rust_mut().unread_chat = global as u32;
+            if global == 0 {
+                crate::platform::clear_taskbar_badge();
+            } else {
+                crate::platform::set_taskbar_badge(global as u32);
+            }
+            self.as_mut()
+                .unread_changed(QString::from(pid.as_str()), 0);
+        }
+
         // Build the full history JSON array then emit a single chatHistoryLoaded
         // signal. The QML side wires this to chatModel.setMessages() which does
         // an atomic beginResetModel/clear/endResetModel, preventing stale messages
@@ -2095,23 +2135,31 @@ impl ffi::AppBridge {
             .and_then(|cs| cs.get_history(&pid, 0).ok())
             .unwrap_or_default()
             .iter()
-            .map(|msg| {
-                serde_json::json!({
-                    "msg_id": msg.id,
-                    "sender": msg.sender_handle,
-                    "body": msg.body,
-                    "timestamp": msg.timestamp,
-                    "kind": msg.kind.as_str(),
-                    "mine": msg.is_self,
-                    "status": msg.status.as_str(),
-                })
-            })
+            .map(chat_message_to_json)
             .collect();
 
         let array_json = serde_json::Value::Array(msgs).to_string();
         let _ = self
             .as_mut()
             .chat_history_loaded(QString::from(array_json.as_str()));
+    }
+
+    fn load_more_history(mut self: Pin<&mut Self>, peer_id: &QString, page: i32) {
+        let pid = peer_id.to_string();
+        let page = page.max(0) as usize;
+        let msgs: Vec<serde_json::Value> = self
+            .rust()
+            .chat_store
+            .as_ref()
+            .and_then(|cs| cs.get_history(&pid, page).ok())
+            .unwrap_or_default()
+            .iter()
+            .map(chat_message_to_json)
+            .collect();
+        let array_json = serde_json::Value::Array(msgs).to_string();
+        let _ = self
+            .as_mut()
+            .chat_history_prepended(QString::from(array_json.as_str()));
     }
 
     fn send_typing(self: Pin<&mut Self>, peer_id: &QString, is_typing: bool) {
@@ -2538,6 +2586,19 @@ fn save_received_file(rel_path: &str, data: &[u8]) -> Option<String> {
     }
 }
 
+fn chat_message_to_json(msg: &crate::chat_store::ChatMessage) -> serde_json::Value {
+    serde_json::json!({
+        "msg_id": msg.id,
+        "peer_id": msg.peer_id,
+        "sender": msg.sender_handle,
+        "body": msg.body,
+        "timestamp": msg.timestamp,
+        "kind": msg.kind.as_str(),
+        "mine": msg.is_self,
+        "status": msg.status.as_str(),
+    })
+}
+
 fn dispatch_event(
     qt_thread: &cxx_qt::CxxQtThread<ffi::AppBridge>,
     ev: ConnectionEvent,
@@ -2617,29 +2678,49 @@ fn dispatch_event(
 
             let peer_id_clone = peer_id.clone();
             let preview_clone = preview.clone();
-            let json = serde_json::json!({
-                "msg_id": message_id,
-                "sender": sender_handle,
-                "body": body,
-                "timestamp": timestamp,
-                "kind": "text",
-                "mine": false,
-                "status": "delivered",
-            })
-            .to_string();
+            let message_id_clone = message_id.clone();
+            let sender_handle_clone = sender_handle.clone();
+            let body_clone = body.clone();
+            let chat_store_for_read = Arc::clone(chat_store);
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                // Increment unread + taskbar badge
-                let count = bridge.rust().unread_chat + 1;
-                bridge.as_mut().rust_mut().unread_chat = count;
-                crate::platform::set_taskbar_badge(count);
+                let is_viewing = bridge.rust().selected_peer_id == peer_id_clone;
+                if is_viewing {
+                    if let Err(e) = chat_store_for_read.mark_peer_read(&peer_id_clone) {
+                        warn!("chat_store mark_peer_read (live) error: {e}");
+                    }
+                }
+
+                let peer_unread = chat_store_for_read
+                    .unread_count(&peer_id_clone)
+                    .unwrap_or(0) as i32;
+                let global = chat_store_for_read.total_unread_count().unwrap_or(0) as u32;
+                bridge.as_mut().rust_mut().unread_chat = global;
+                if global == 0 {
+                    crate::platform::clear_taskbar_badge();
+                } else {
+                    crate::platform::set_taskbar_badge(global);
+                }
+
+                if is_viewing {
+                    let json = serde_json::json!({
+                        "msg_id": message_id_clone,
+                        "peer_id": peer_id_clone,
+                        "sender": sender_handle_clone,
+                        "body": body_clone,
+                        "timestamp": timestamp,
+                        "kind": "text",
+                        "mine": false,
+                        "status": "read",
+                    })
+                    .to_string();
+                    bridge
+                        .as_mut()
+                        .chat_message_received(QString::from(json.as_str()));
+                }
+
                 bridge
                     .as_mut()
-                    .chat_message_received(QString::from(json.as_str()));
-                // Emit unread count + preview for the sender peer
-                bridge
-                    .as_mut()
-                    .unread_changed(QString::from(peer_id_clone.as_str()), count as i32);
-                // Use truncated body as preview (max 60 chars)
+                    .unread_changed(QString::from(peer_id_clone.as_str()), peer_unread);
                 let preview_text = if preview_clone.len() > 60 {
                     format!("{}\u{2026}", &preview_clone[..59])
                 } else {

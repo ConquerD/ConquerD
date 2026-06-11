@@ -82,6 +82,21 @@ pub mod ffi {
         #[rust_name = "clear_messages"]
         fn clearMessages(self: Pin<&mut Self>);
 
+        /// Prepend older messages (JSON array) to the top of the conversation.
+        #[qinvokable]
+        #[rust_name = "prepend_messages"]
+        fn prependMessages(self: Pin<&mut Self>, messages_json: &QString);
+
+        /// Return the timestamp of the message at `row`, or 0.0 when out of range.
+        #[qinvokable]
+        #[rust_name = "timestamp_at"]
+        fn timestampAt(self: Pin<&mut Self>, row: i32) -> f64;
+
+        /// Count messages whose body contains `needle` (case-insensitive).
+        #[qinvokable]
+        #[rust_name = "match_count"]
+        fn matchCount(self: Pin<&mut Self>, needle: &QString) -> i32;
+
         #[inherit]
         #[rust_name = "begin_reset_model"]
         fn beginResetModel(self: Pin<&mut Self>);
@@ -221,6 +236,42 @@ impl ffi::ChatModel {
         self.as_mut().begin_reset_model();
         self.as_mut().rust_mut().messages.clear();
         self.as_mut().end_reset_model();
+    }
+
+    fn prepend_messages(mut self: Pin<&mut Self>, json: &QString) {
+        if let Ok(entries) = parse_chat_entries(&json.to_string()) {
+            if entries.is_empty() {
+                return;
+            }
+            let count = entries.len() as i32;
+            let parent = QModelIndex::default();
+            self.as_mut().begin_insert_rows(&parent, 0, count - 1);
+            let mut msgs = std::mem::take(&mut self.as_mut().rust_mut().messages);
+            let mut combined = entries;
+            combined.append(&mut msgs);
+            self.as_mut().rust_mut().messages = combined;
+            self.as_mut().end_insert_rows();
+        }
+    }
+
+    fn timestamp_at(self: Pin<&mut Self>, row: i32) -> f64 {
+        self.rust()
+            .messages
+            .get(row as usize)
+            .map(|m| m.timestamp)
+            .unwrap_or(0.0)
+    }
+
+    fn match_count(self: Pin<&mut Self>, needle: &QString) -> i32 {
+        let needle = needle.to_string().to_lowercase();
+        if needle.is_empty() {
+            return 0;
+        }
+        self.rust()
+            .messages
+            .iter()
+            .filter(|m| m.body.to_lowercase().contains(&needle))
+            .count() as i32
     }
 }
 

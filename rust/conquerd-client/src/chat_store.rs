@@ -74,7 +74,8 @@ impl MessageStatus {
 
     fn from_str(s: &str) -> Self {
         match s {
-            "sending" | "sent" => Self::Sending,
+            "sending" => Self::Sending,
+            "sent" => Self::Sent,
             "delivered" => Self::Delivered,
             "read" => Self::Read,
             "failed" => Self::Failed,
@@ -413,7 +414,7 @@ impl ChatStore {
         ))
     }
 
-    /// Count unread messages (delivered, not read, not self) for a peer.
+    /// Count unread messages (inbound, not yet read) for a peer.
     pub fn unread_count(&self, peer_id: &str) -> Result<usize> {
         let conn = self.conn.lock();
         let count: i64 = conn.query_row(
@@ -422,6 +423,27 @@ impl ChatStore {
             |r| r.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    /// Count unread inbound messages across all peers.
+    pub fn total_unread_count(&self) -> Result<usize> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE is_self=0 AND status!='read'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Mark all inbound messages for a peer as read. Returns rows updated.
+    pub fn mark_peer_read(&self, peer_id: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE messages SET status='read' WHERE peer_id=?1 AND is_self=0 AND status!='read'",
+            params![peer_id],
+        )?;
+        Ok(n)
     }
 
     /// Delete a single message by its ID.
@@ -577,6 +599,34 @@ mod tests {
             .unwrap();
         let loaded = store.get_by_id(&id_str).unwrap().unwrap();
         assert_eq!(loaded.status, MessageStatus::Delivered);
+    }
+
+    #[test]
+    fn status_from_str_sent_is_distinct_from_sending() {
+        assert_eq!(MessageStatus::from_str("sent"), MessageStatus::Sent);
+        assert_eq!(MessageStatus::from_str("sending"), MessageStatus::Sending);
+    }
+
+    #[test]
+    fn mark_peer_read_and_unread_counts() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let store = ChatStore::open(&id, Some(&dir.path().join(CHAT_DB_FILENAME))).unwrap();
+
+        let inbound = make_msg("peer1", "hello", false);
+        store.insert(&inbound).unwrap();
+        let outbound = make_msg("peer1", "reply", true);
+        store.insert(&outbound).unwrap();
+
+        assert_eq!(store.unread_count("peer1").unwrap(), 1);
+        assert_eq!(store.total_unread_count().unwrap(), 1);
+
+        store.mark_peer_read("peer1").unwrap();
+        assert_eq!(store.unread_count("peer1").unwrap(), 0);
+        assert_eq!(store.total_unread_count().unwrap(), 0);
+
+        let loaded = store.get_by_id(&inbound.id).unwrap().unwrap();
+        assert_eq!(loaded.status, MessageStatus::Read);
     }
 
     #[test]

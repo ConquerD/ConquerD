@@ -2142,6 +2142,13 @@ impl ConnectionManager {
         self.replay_guard.check_and_record(&msg.sender, &sig_bytes)
     }
 
+    fn is_blocked_sender(peer_store: &Arc<RwLock<PeerStore>>, sender: &str) -> bool {
+        peer_store
+            .read()
+            .get(sender)
+            .is_some_and(|rec| rec.blocked)
+    }
+
     async fn handle_inbound(&mut self, msg: SignalingMessage) {
         // Enforce signed-transcript model: every inbound signaling message
         // MUST carry a valid Ed25519 signature over its canonical bytes,
@@ -2165,6 +2172,22 @@ impl ConnectionManager {
         if msg.msg_type != MessageType::SfuAudio && !self.check_replay(&msg) {
             warn!(
                 "[signaling] dropping {:?} from {} — replayed message",
+                msg.msg_type,
+                &msg.sender[..8.min(msg.sender.len())],
+            );
+            return;
+        }
+        if Self::is_blocked_sender(&self.peer_store, &msg.sender)
+            && matches!(
+                msg.msg_type,
+                MessageType::ChatMessage
+                    | MessageType::ChatAck
+                    | MessageType::ChatTyping
+                    | MessageType::CallRequest
+            )
+        {
+            debug!(
+                "[signaling] dropping {:?} from blocked peer {}",
                 msg.msg_type,
                 &msg.sender[..8.min(msg.sender.len())],
             );
