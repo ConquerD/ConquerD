@@ -7,6 +7,10 @@
     job: version sync, Opus weights, fmt, clippy, release-manifest self-test,
     release-mode tests, and cargo-audit (both Cargo workspaces).
 
+    Supernode packaging (linux-x86_64, linux-aarch64, win64) is validated in
+    separate CI jobs — run scripts/build_supernode.sh or build_supernode.ps1 locally
+    after a successful ci_local pass when touching supernode release paths.
+
     Run from the repository root:
 
         powershell -ExecutionPolicy Bypass -File scripts/ci_local.ps1

@@ -198,3 +198,78 @@ jobs:
       - name: Package supernode (linux-aarch64)
         run: CONQUERD_RELEASE=1 bash scripts/build_supernode.sh
 
+  test-supernode-linux-x86_64:
+    name: Supernode build (Linux x86_64)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: linux-x86_64-supernode-ci-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Clippy (conquerd-supernode, deny warnings)
+        run: cargo clippy -p conquerd-supernode -- -D warnings
+        working-directory: rust
+
+      - name: Run conquerd-supernode tests
+        run: cargo test -p conquerd-supernode --release
+        working-directory: rust
+
+      - name: Package supernode (linux-x86_64)
+        run: CONQUERD_RELEASE=1 bash scripts/build_supernode.sh
+
+  test-supernode-windows:
+    name: Supernode build (Windows)
+    runs-on: windows-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: windows-supernode-ci-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Clippy (conquerd-supernode, deny warnings)
+        shell: pwsh
+        run: cargo clippy -p conquerd-supernode -- -D warnings
+        working-directory: rust
+
+      - name: Run conquerd-supernode tests
+        shell: pwsh
+        run: cargo test -p conquerd-supernode --release
+        working-directory: rust
+
+      - name: Package supernode (win64)
+        shell: pwsh
+        env:
+          CONQUERD_RELEASE: "1"
+        run: pwsh scripts/build_supernode.ps1
+

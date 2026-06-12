@@ -8,6 +8,7 @@
 #
 # Supported platform suffixes:
 #   linux-x86_64, linux-aarch64, macos-arm64, macos-x86_64
+# Windows x86_64: use scripts/build_supernode.ps1 (produces .zip)
 #
 # Prerequisites:
 #   Rust toolchain (cargo) on PATH.

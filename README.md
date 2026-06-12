@@ -38,7 +38,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Up to 32 participants per room.
 
 ### In-App Supernode Portal & Browser Games
-- Supernodes with `web_port` configured serve an in-app portal over a QUIC bidi-stream channel (`web.host.app.v1`). The native client browses `conquerd://` pages using an embedded Chromium view inside the **Nodes** tab — no external browser, no CA needed.
+- Supernodes with `web_port` configured serve an in-app portal over a QUIC bidi-stream channel (`web.host.app.v1`). The native client browses `conquerd://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no CA needed.
 - A WebTransport listener (`web.host.h3.v1`) on the same port lets browser-side game clients join the exact same channel fabric as native peers using the `web-sdk/conquerd.mjs` JavaScript SDK. Ed25519 identity handshake is performed; the supernode verifies signed envelopes before any fan-out.
 - **`game.relay.v1`** — opaque datagram relay: the supernode fans raw datagrams to all WebTransport peers in the same room without reading or modifying the payload. Three demo games are bundled: **cursor relay** (multi-cursor canvas), **brick breaker** (multiplayer paddle game), **shared drawing** (collaborative canvas).
 - Game pages are served from `<data_dir>/games/<slug>/` and reachable at `conquerd://<supernode_id>/games/<slug>/`. The `window.conquerd` JS bridge is injected automatically; games call `window.conquerd.ready` to obtain the WebTransport URL and cert fingerprint via the ConquerD trust chain — no HTTPS CA required.
@@ -79,7 +79,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - System tray with badge notifications for unread messages and missed calls.
 - Collapsible event log panel (toggle with `Ctrl+B`); `Ctrl+K` creates a new invite, `Ctrl+,` opens Settings.
 - Audio input/output device selector in Settings.
-- Dedicated Nodes tab for managing supernodes with right-click context menu; gated supernodes open the operator portal inside the Nodes tab (Qt WebEngine).
+- **Rooms** sidebar lists supernodes (avatar per node) with grouped SFU rooms; avatar left-click opens the operator portal, right-click offers portal / copy node ID (Qt WebEngine when `webengine` feature is enabled).
 - Handles / display names broadcast to all peers and shown everywhere (chat, calls, event log).
 - Peer block/unblock toggle in the right-click context menu; blocked peers show a visual indicator in the peer list.
 - Privacy & Data controls in Settings: trim message history by age (days) or count (keep newest N), purge all chat history, and lock identity & quit (removes the OS-keyring AES key so the next launch requires a passphrase).
@@ -407,7 +407,7 @@ Three bundled game demos are deployed to `<data_dir>/games/` on first supernode 
 | `/games/brick-breaker/` | Brick breaker — multiplayer paddle game |
 | `/games/shared-drawing/` | Shared drawing — collaborative canvas with stroke broadcast |
 
-All three use the same `game.relay.v1` opaque datagram relay and can be opened via `conquerd://<supernode_id>/games/<slug>/` in the Nodes tab or directly at `https://<host>:<web_port>/games/<slug>/` from a browser (with `?host=<host>&port=<port>` query params when not in portal context).
+All three use the same `game.relay.v1` opaque datagram relay and can be opened via `conquerd://<supernode_id>/games/<slug>/` from the in-app portal (supernode avatar in the Rooms sidebar) or directly at `https://<host>:<web_port>/games/<slug>/` from a browser (with `?host=<host>&port=<port>` query params when not in portal context).
 
 The SDK also exports `ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, and `featureForFixedTag` for games that interoperate with first-party `core.*` channels.
 
@@ -525,7 +525,7 @@ Each supernode operator decides how peers gain relay access:
 | **Access Code** | A web page asks for a code provided by the operator (e.g. shared in a group chat). |
 | **Timer** | A countdown page is shown; access is granted after the timer expires. |
 
-When a gated supernode requires portal access, Conquerd opens the supernode's web page in the **Nodes** tab. Complete the required step and relay access is granted automatically.
+When a gated supernode requires portal access, Conquerd opens the supernode's web page in the in-app portal view. Complete the required step and relay access is granted automatically.
 
 Operators can also write custom access controllers that integrate any verification or payment system — Stripe, PayPal, Lightning, Patreon, OAuth, or anything else reachable from a web page. No wallet or payment infrastructure is built into the Conquerd client itself.
 
@@ -535,13 +535,36 @@ Operators can also write custom access controllers that integrate any verificati
 
 Running a supernode is **optional**. Peers who can connect directly to each other do not need one at all.
 
-### Basic Setup
+### Pre-built binaries
+
+GitHub Releases (tagged + `nightly`) include standalone supernode packages with SHA-256 sidecars:
+
+| Platform | Release asset |
+|---|---|
+| Linux x86_64 | `conquerd-supernode-<version>-linux-x86_64.tar.gz` |
+| Linux ARM64 | `conquerd-supernode-<version>-linux-aarch64.tar.gz` |
+| Windows x86_64 | `conquerd-supernode-<version>-win64.zip` |
+
+See [`docs/SUPERNODE.md`](docs/SUPERNODE.md) for install examples. Nightly builds use the `conquerd-supernode-nightly-<platform>.*` naming on the rolling `nightly` release.
+
+### Basic Setup (build from source)
 
 Build the Rust supernode binary (one time):
 
 ```bash
 cd rust/conquerd-supernode
 cargo build --release
+```
+
+Or package a redistributable archive locally:
+
+```bash
+# Linux / macOS
+CONQUERD_RELEASE=1 ./scripts/build_supernode.sh
+
+# Windows
+$env:CONQUERD_RELEASE = '1'
+.\scripts\build_supernode.ps1
 ```
 
 #### Windows
@@ -650,9 +673,17 @@ sudo mkdir -p /opt/conquerd/.conquerd
 sudo chown conquerd: /opt/conquerd/.conquerd
 ```
 
-#### Option A — Rust binary (recommended)
+#### Option A — Pre-built or Rust binary (recommended)
 
-Build the binary once:
+Install from a GitHub Release tarball (no Rust toolchain on the server):
+
+```bash
+# x86_64 VPS example
+tar -xzf conquerd-supernode-1.0.0-linux-x86_64.tar.gz
+sudo install -m 755 conquerd-supernode-1.0.0-linux-x86_64/conquerd-supernode /usr/local/bin/
+```
+
+Or build from source once:
 
 ```bash
 . "$HOME/.cargo/env"
@@ -880,6 +911,25 @@ cargo test
 
 See `agents.md` (Roadmap & Status) for the current authoritative test counts, coverage areas, and P0–P2 delivery status. The test suite emphasises capability negotiation, quota symmetry (inbound/outbound), replay protection, relay/SFU/room flows, and installer manifest verification.
 
+### Local CI
+
+Mirror the GitHub Actions `CI` workflow before pushing:
+
+```powershell
+# Windows (full: fmt, clippy, tests, audit)
+.\scripts\ci_local.ps1
+
+# Faster lint-only pass
+.\scripts\ci_local.ps1 -SkipTests -SkipAudit
+```
+
+```bash
+# Linux / macOS
+bash scripts/ci_local.sh
+```
+
+CI also runs dedicated supernode packaging jobs on **Linux x86_64**, **Linux ARM64**, and **Windows** (`test-supernode-linux-x86_64`, `test-linux-arm64`, `test-supernode-windows` in `.github/workflows/ci.yml`).
+
 ### Two-Client Local Testing
 
 The profile directories `.clientA/` and `.clientB/` (at the repo root) are populated by overriding `USERPROFILE` (Windows) or `HOME` (Linux/macOS) before launching the binary. There is no longer a separate launcher per profile — use `run_client.bat` after pointing the home directory at the desired profile:
@@ -897,15 +947,26 @@ $env:USERPROFILE = "$PWD\.clientB"
 ### Portable Build
 
 ```powershell
-# Windows: produces dist\ConquerD\ (portable) + dist\ConquerD-<version>-win64.7z
+# Windows client: dist\ConquerD\ + dist\ConquerD-<version>-win64.7z
 .\build_win64.ps1
 
-# Linux
+# Linux client AppImage
 ./build_linux.sh
 
-# macOS
+# macOS client DMG
 ./build_macos.sh
+
+# Supernode (standalone relay binary — no Qt)
+$env:CONQUERD_RELEASE = '1'
+.\scripts\build_supernode.ps1    # dist\conquerd-supernode-<version>-win64.zip
 ```
+
+```bash
+# Supernode on Linux / macOS
+CONQUERD_RELEASE=1 ./scripts/build_supernode.sh   # dist/conquerd-supernode-<version>-<platform>.tar.gz
+```
+
+Release CI builds client artifacts plus supernode packages for **linux-x86_64**, **linux-aarch64**, and **win64** (see `.github/workflows/release.yml`).
 
 `build_win64.ps1` runs `cargo build --release --features qt-ui[,webengine]` for `conquerd-client`, `cargo build --release -p conquerd-installer`, then invokes `windeployqt6` to gather the Qt runtime DLLs into `dist\ConquerD\`. Set `QT_DIR` if Qt is not in one of the auto-detected default locations. Set `CONQUERD_DEBUG=1` for a debug build, or `CONQUERD_DEBUG_CONSOLE=1` to keep a console window attached.
 
@@ -980,6 +1041,9 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 ├── games/                         # Example browser games served over `web.host.h3.v1`
 ├── packaging/                     # Linux .desktop file, macOS Info.plist template, AppRun
 ├── scripts/check_version_sync.ps1 # Verify Cargo.toml versions stay aligned (PowerShell)
+├── scripts/build_supernode.sh     # Package conquerd-supernode (.tar.gz; Linux/macOS hosts)
+├── scripts/build_supernode.ps1    # Package conquerd-supernode (.zip; Windows hosts)
+├── scripts/ci_local.ps1 / ci_local.sh  # Local mirror of .github/workflows/ci.yml
 ├── build_win64.ps1                # Portable Windows build (cargo + windeployqt6 + optional sign + 7z)
 ├── build_linux.sh / build_macos.sh
 ├── run_client.bat / run_client.sh # Debug-build launchers
@@ -1107,7 +1171,8 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 - **Chat-first UX** — text is the primary interaction after connecting; voice is opt-in per conversation. Per-conversation scroll persistence, typing indicators, unread badges on taskbar + tray.
 - **Voice calls** — low-latency Opus over QUIC, push-to-talk and voice activation, spectral-gate noise suppression, jitter buffer with de-click.
 - **Rooms (multi-peer voice)** — SFU hosting on volunteer supernodes over QUIC relay, with chat/voice/file parity and peer room invites.
-- **Game relay & in-app portal**: `game.relay.v1` opaque datagram relay over WebTransport; three bundled browser game demos (cursor relay, brick breaker, shared drawing) served from `<data_dir>/games/` and accessible from the native client's Nodes tab at `conquerd://<supernode_id>/games/<slug>/`. Self-signed TLS cert with `serverAuth` EKU auto-generated and rotated every 7 days; fingerprint delivered via `SUPERNODE_INFO` trust chain.
+- **Game relay & in-app portal**: `game.relay.v1` opaque datagram relay over WebTransport; three bundled browser game demos (cursor relay, brick breaker, shared drawing) served from `<data_dir>/games/` and accessible from the in-app portal at `conquerd://<supernode_id>/games/<slug>/`. Self-signed TLS cert with `serverAuth` EKU auto-generated and rotated every 7 days; fingerprint delivered via `SUPERNODE_INFO` trust chain.
+- **Supernode release binaries**: pre-built packages for Linux x86_64, Linux ARM64, and Windows x86_64 on GitHub Releases and nightlies (`scripts/build_supernode.sh` / `scripts/build_supernode.ps1`).
 - **NAT traversal** — UPnP port mapping, QUIC/WebSocket direct connect, supernode relay fallback, relay-coordinated hole punching.
 - **Security** — signed, transcript-bound, replay-resistant signaling; peer revocation with propagation; release-signed P2P updates with Ed25519 + threshold validation; crash/installer logging.
 - **Desktop application** — DPI-aware dark theme, first-run onboarding wizard (display name, identity fingerprint + QR, supernode setup), `conquerd://` URI scheme for one-click invites, system tray with badges, collapsible event log, save-to-PNG invite QR codes.

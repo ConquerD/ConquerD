@@ -2,7 +2,9 @@
 # Run the same checks as .github/workflows/ci.yml before pushing.
 #
 # Mirrors the Linux "Rust tests" job (fmt, clippy, tests, cargo-audit for both
-# Cargo workspaces). Run from the repository root:
+# Cargo workspaces). Supernode packaging jobs (linux-x86_64 / aarch64 / win64)
+# run separately in CI — use scripts/build_supernode.sh locally when needed.
+# Run from the repository root:
 #
 #   bash scripts/ci_local.sh
 #

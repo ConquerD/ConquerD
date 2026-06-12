@@ -90,6 +90,7 @@ Working style:
 ### 6. DevOps/Infra Agent (Transport + Feature Hosting)
 Responsibilities:
 - Maintain QUIC relay, SFU, and WebTransport + QUIC-stream deployment guidance and scripts.
+- Maintain supernode packaging (`scripts/build_supernode.sh` for Linux/macOS `.tar.gz`, `scripts/build_supernode.ps1` for Windows `win64` `.zip`) and release/CI jobs for **linux-x86_64**, **linux-aarch64**, and **win64**.
 - Maintain the supernode feature manifest (`supernode.toml`-style typed capability list replacing ad-hoc env-var toggles).
 - Support hot-reload of feature modules and bespoke `x.<vendor>.*` plug-ins.
 - Keep infra docs aligned with no-backend policy: supernodes assist transport and host feature modules; they are never identity authorities.
@@ -342,7 +343,7 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 | Cross-platform CI | Windows runner (non-Qt tests + client clippy) added. |
 | Platform TODOs | macOS dock badge, Linux D-Bus badge, UPnP all implemented. |
 | Supply-chain | Weekly `supply-chain.yml` (cargo-deny + audit-check) + `deny.toml`. |
-| Operator runbook | `docs/SUPERNODE.md` with full guidance + example `supernode.toml`. |
+| Operator runbook | `docs/SUPERNODE.md` with full guidance + example `supernode.toml`; pre-built supernode packages for linux-x86_64, linux-aarch64, and win64 on GitHub Releases / nightlies. |
 | Threat model | `docs/THREAT_MODEL.md`. |
 | Version automation | `scripts/check_version_sync.ps1 -BumpTo X.Y.Z` bumps all crates + prints git/tag commands. |
 | Metrics export | `/api/metrics` via `web.host.app.v1`. |

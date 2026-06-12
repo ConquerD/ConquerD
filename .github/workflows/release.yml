@@ -508,6 +508,119 @@ jobs:
             dist/conquerd-supernode-*-linux-aarch64.tar.gz
             dist/conquerd-supernode-*-linux-aarch64.tar.gz.sha256
 
+  build-supernode-linux-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: supernode-linux-x86_64-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Set build metadata
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            SHORT_SHA="${GITHUB_SHA:0:12}"
+            echo "build_id=release-${VERSION}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            SHORT_SHA="${GITHUB_SHA:0:12}"
+            echo "build_id=nightly-${SHORT_SHA}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and package supernode (linux-x86_64)
+        env:
+          CONQUERD_RELEASE: "1"
+          CONQUERD_BUILD_ID: ${{ steps.meta.outputs.build_id }}
+        run: bash scripts/build_supernode.sh
+
+      - name: Verify artifacts
+        run: |
+          ls dist/conquerd-supernode-*-linux-x86_64.tar.gz
+          ls dist/conquerd-supernode-*-linux-x86_64.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: supernode-linux-x86_64-release
+          path: |
+            dist/conquerd-supernode-*-linux-x86_64.tar.gz
+            dist/conquerd-supernode-*-linux-x86_64.tar.gz.sha256
+
+  build-supernode-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: supernode-win64-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Set build metadata
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}".StartsWith("refs/tags/")) {
+            $ver = "${{ github.ref_name }}" -replace '^v',''
+            $sha = "${{ github.sha }}".Substring(0, 12)
+            "build_id=release-${ver}-${sha}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            $sha = "${{ github.sha }}".Substring(0, 12)
+            "build_id=nightly-${sha}-${{ github.run_number }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Build and package supernode (win64)
+        shell: pwsh
+        env:
+          CONQUERD_RELEASE: "1"
+          CONQUERD_BUILD_ID: ${{ steps.meta.outputs.build_id }}
+        run: pwsh scripts/build_supernode.ps1
+
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          if (-not (Get-ChildItem "dist\conquerd-supernode-*-win64.zip" -ErrorAction SilentlyContinue)) {
+            throw "Supernode zip not found in dist/"
+          }
+          if (-not (Get-ChildItem "dist\conquerd-supernode-*-win64.zip.sha256" -ErrorAction SilentlyContinue)) {
+            throw "Supernode zip checksum not found in dist/"
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: supernode-win64-release
+          path: |
+            dist/conquerd-supernode-*-win64.zip
+            dist/conquerd-supernode-*-win64.zip.sha256
+
   attest:
     needs: [build-macos, build-linux, sign-windows, windows-unsigned-fallback]
     # Only run artifact attestations for official tagged releases.
@@ -531,7 +644,7 @@ jobs:
             artifacts/ConquerD-*-x86_64.AppImage
 
   publish-release:
-    needs: [attest, build-supernode-linux-arm64]
+    needs: [attest, build-supernode-linux-arm64, build-supernode-linux-x86_64, build-supernode-windows]
     runs-on: ubuntu-22.04
     # Only for official tagged releases (v*). Nightly/dev builds on develop use publish-nightly instead.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -554,8 +667,11 @@ jobs:
       - name: Flatten supernode artifacts into release bundle
         run: |
           set -euo pipefail
-          find artifacts -type f \( -name 'conquerd-supernode-*-linux-aarch64.tar.gz*' \) \
-            -exec cp -f {} artifacts/ \;
+          find artifacts -type f \( \
+            -name 'conquerd-supernode-*-linux-aarch64.tar.gz*' -o \
+            -name 'conquerd-supernode-*-linux-x86_64.tar.gz*' -o \
+            -name 'conquerd-supernode-*-win64.zip*' \
+            \) -exec cp -f {} artifacts/ \;
           find artifacts -type d -empty -delete 2>/dev/null || true
 
       - name: List artifacts
@@ -668,13 +784,17 @@ jobs:
             artifacts/ConquerD-*-x86_64.AppImage.sha256
             artifacts/conquerd-supernode-*-linux-aarch64.tar.gz
             artifacts/conquerd-supernode-*-linux-aarch64.tar.gz.sha256
+            artifacts/conquerd-supernode-*-linux-x86_64.tar.gz
+            artifacts/conquerd-supernode-*-linux-x86_64.tar.gz.sha256
+            artifacts/conquerd-supernode-*-win64.zip
+            artifacts/conquerd-supernode-*-win64.zip.sha256
             releases_manifest.json
 
   publish-nightly:
     # Run for pushes to develop and scheduled nightlies.
     # Does not require the protected "release" environment or signing secrets.
     if: github.ref == 'refs/heads/develop' || github.event_name == 'schedule'
-    needs: [build-windows, build-macos, build-linux, build-supernode-linux-arm64]
+    needs: [build-windows, build-macos, build-linux, build-supernode-linux-arm64, build-supernode-linux-x86_64, build-supernode-windows]
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout source (for manifest generator)
@@ -704,6 +824,18 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "supernode-linux-arm64-release"
+          path: artifacts
+          merge-multiple: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "supernode-linux-x86_64-release"
+          path: artifacts
+          merge-multiple: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "supernode-win64-release"
           path: artifacts
           merge-multiple: true
 
@@ -737,6 +869,10 @@ jobs:
           for f in ConquerD-*-x86_64.AppImage.sha256; do mv "$f" "ConquerD-nightly-x86_64.AppImage.sha256"; done
           for f in conquerd-supernode-*-linux-aarch64.tar.gz; do mv "$f" "conquerd-supernode-nightly-linux-aarch64.tar.gz"; done
           for f in conquerd-supernode-*-linux-aarch64.tar.gz.sha256; do mv "$f" "conquerd-supernode-nightly-linux-aarch64.tar.gz.sha256"; done
+          for f in conquerd-supernode-*-linux-x86_64.tar.gz; do mv "$f" "conquerd-supernode-nightly-linux-x86_64.tar.gz"; done
+          for f in conquerd-supernode-*-linux-x86_64.tar.gz.sha256; do mv "$f" "conquerd-supernode-nightly-linux-x86_64.tar.gz.sha256"; done
+          for f in conquerd-supernode-*-win64.zip; do mv "$f" "conquerd-supernode-nightly-win64.zip"; done
+          for f in conquerd-supernode-*-win64.zip.sha256; do mv "$f" "conquerd-supernode-nightly-win64.zip.sha256"; done
 
           echo "==> Nightly assets ready:"
           find . -maxdepth 1 -type f | sort
@@ -751,6 +887,10 @@ jobs:
             ConquerD-nightly-x86_64.AppImage.sha256
             conquerd-supernode-nightly-linux-aarch64.tar.gz
             conquerd-supernode-nightly-linux-aarch64.tar.gz.sha256
+            conquerd-supernode-nightly-linux-x86_64.tar.gz
+            conquerd-supernode-nightly-linux-x86_64.tar.gz.sha256
+            conquerd-supernode-nightly-win64.zip
+            conquerd-supernode-nightly-win64.zip.sha256
           )
           missing=0
           for f in "${REQUIRED[@]}"; do
@@ -833,7 +973,8 @@ jobs:
             - Windows portable 7z + standalone installer
             - macOS dmg
             - Linux AppImage
-            - Linux ARM64 supernode tarball
+            - Linux ARM64 / x86_64 supernode tarballs
+            - Windows x86_64 supernode zip
 
             The `releases_manifest.json` is unsigned and provided for reference.
           files: |
@@ -846,4 +987,8 @@ jobs:
             artifacts/ConquerD-nightly-x86_64.AppImage.sha256
             artifacts/conquerd-supernode-nightly-linux-aarch64.tar.gz
             artifacts/conquerd-supernode-nightly-linux-aarch64.tar.gz.sha256
+            artifacts/conquerd-supernode-nightly-linux-x86_64.tar.gz
+            artifacts/conquerd-supernode-nightly-linux-x86_64.tar.gz.sha256
+            artifacts/conquerd-supernode-nightly-win64.zip
+            artifacts/conquerd-supernode-nightly-win64.zip.sha256
             releases_manifest.json

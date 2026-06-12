@@ -14,20 +14,57 @@ cargo build -p conquerd-supernode --release
 ./target/release/conquerd-supernode
 ```
 
-### Pre-built Linux ARM64 binary
+### Pre-built binaries (GitHub Releases)
 
-Official and nightly releases include a standalone `conquerd-supernode-*-linux-aarch64.tar.gz` asset (GitHub Releases). This is the easiest path for ARM64 VPS hosts, Raspberry Pi, and other `aarch64` Linux servers.
+Official tagged releases and the rolling `nightly` prerelease ship standalone supernode packages (each with a `.sha256` sidecar). These are the easiest path for VPS and bare-metal hosts — no Rust toolchain required on the server.
+
+| Platform | Tagged release asset | Nightly asset |
+|---|---|---|
+| Linux x86_64 | `conquerd-supernode-<version>-linux-x86_64.tar.gz` | `conquerd-supernode-nightly-linux-x86_64.tar.gz` |
+| Linux ARM64 (`aarch64`) | `conquerd-supernode-<version>-linux-aarch64.tar.gz` | `conquerd-supernode-nightly-linux-aarch64.tar.gz` |
+| Windows x86_64 | `conquerd-supernode-<version>-win64.zip` | `conquerd-supernode-nightly-win64.zip` |
+
+**Linux x86_64** (typical VPS / cloud VM):
 
 ```bash
-# Example: install from a tagged release asset
-tar -xzf conquerd-supernode-1.0.0-linux-aarch64.tar.gz
-sudo install -m 755 conquerd-supernode-1.0.0-linux-aarch64/conquerd-supernode /usr/local/bin/
-
-# Or build/package locally on any supported host:
-CONQUERD_RELEASE=1 ./scripts/build_supernode.sh
+tar -xzf conquerd-supernode-1.0.0-linux-x86_64.tar.gz
+sudo install -m 755 conquerd-supernode-1.0.0-linux-x86_64/conquerd-supernode /usr/local/bin/
 ```
 
-Nightly builds publish `conquerd-supernode-nightly-linux-aarch64.tar.gz` on the rolling `nightly` release.
+**Linux ARM64** (Raspberry Pi, ARM VPS):
+
+```bash
+tar -xzf conquerd-supernode-1.0.0-linux-aarch64.tar.gz
+sudo install -m 755 conquerd-supernode-1.0.0-linux-aarch64/conquerd-supernode /usr/local/bin/
+```
+
+**Windows x86_64**:
+
+```powershell
+Expand-Archive conquerd-supernode-1.0.0-win64.zip -DestinationPath .
+# Run: .\conquerd-supernode-1.0.0-win64\conquerd-supernode.exe
+```
+
+### Build and package locally
+
+On Linux or macOS, `scripts/build_supernode.sh` detects the host platform and emits a `.tar.gz` under `dist/`:
+
+```bash
+CONQUERD_RELEASE=1 ./scripts/build_supernode.sh
+# e.g. dist/conquerd-supernode-1.0.0-linux-x86_64.tar.gz
+```
+
+On Windows, use the companion script (`.zip` output):
+
+```powershell
+$env:CONQUERD_RELEASE = '1'
+.\scripts\build_supernode.ps1
+# e.g. dist\conquerd-supernode-1.0.0-win64.zip
+```
+
+Supported local package suffixes: `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64` (shell script), and `win64` (PowerShell script).
+
+CI validates packaging on all three release targets (`test-supernode-linux-x86_64`, `test-linux-arm64`, `test-supernode-windows` in `.github/workflows/ci.yml`).
 
 Configuration is read from `<data_dir>/supernode.toml` (see below). Legacy environment variables are supported for backward compatibility but are deprecated.
 
@@ -190,4 +227,4 @@ Improvements to the supernode (especially better observability, hot-reload for p
 
 ---
 
-*Maintained as part of the ConquerD project. Last major update aligned with P1 #7 (2026).*
+*Maintained as part of the ConquerD project. Last updated for multi-platform release binaries (linux-x86_64, linux-aarch64, win64).*
