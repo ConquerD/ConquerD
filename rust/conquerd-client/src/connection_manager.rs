@@ -2143,10 +2143,7 @@ impl ConnectionManager {
     }
 
     fn is_blocked_sender(peer_store: &Arc<RwLock<PeerStore>>, sender: &str) -> bool {
-        peer_store
-            .read()
-            .get(sender)
-            .is_some_and(|rec| rec.blocked)
+        peer_store.read().get(sender).is_some_and(|rec| rec.blocked)
     }
 
     async fn handle_inbound(&mut self, msg: SignalingMessage) {
