@@ -36,6 +36,40 @@ ApplicationWindow {
         Material.theme = useDark ? Material.Dark : Material.Light
     }
 
+    function upsertSfuRoomGroup(supernodeId, rooms) {
+        var nodeIdx = -1
+        for (var j = 0; j < nodeListModel.count; j++) {
+            if (nodeListModel.get(j).node_id === supernodeId) {
+                nodeIdx = j
+                break
+            }
+        }
+
+        var normalized = []
+        for (var i = 0; i < rooms.length; i++) {
+            var r = rooms[i]
+            normalized.push({
+                room_id: r.room_id || "",
+                name: r.name || r.room_id || "Room",
+                kind: r.kind || r.room_type || "voice",
+                count: r.count || r.member_count || 0
+            })
+        }
+
+        var roomsJson = JSON.stringify(normalized)
+        if (nodeIdx >= 0) {
+            nodeListModel.setProperty(nodeIdx, "rooms_json", roomsJson)
+        } else if (normalized.length > 0) {
+            nodeListModel.append({
+                node_id: supernodeId,
+                connected: false,
+                homepage_url: "",
+                title: "",
+                rooms_json: roomsJson
+            })
+        }
+    }
+
     // ── Custom frameless title bar with embedded logo + invite controls ─────
     TitleBar {
         id: customTitleBar
@@ -202,10 +236,7 @@ ApplicationWindow {
     RoomModel         { id: roomModel }
     FileTransferModel { id: fileTransferModel }
 
-    // Sidebar: available SFU rooms (updated by sfuRoomsUpdated signal)
-    ListModel { id: sfuRoomListModel }
-
-    // Sidebar: connected supernodes (updated by nodesUpdated signal)
+    // Sidebar: supernodes with grouped SFU rooms (nodesUpdated + sfuRoomsUpdated)
     ListModel { id: nodeListModel }
 
     Component.onCompleted: {
@@ -295,22 +326,11 @@ ApplicationWindow {
             updateBanner.visible = true
         })
 
-        // Wire room list updates into sfuRoomListModel
+        // Merge room list updates per supernode into grouped sidebar model.
         backend.sfuRoomsUpdated.connect(function(json) {
             try {
                 var obj = JSON.parse(json)
-                var rooms = obj.rooms || []
-                sfuRoomListModel.clear()
-                for (var i = 0; i < rooms.length; i++) {
-                    var r = rooms[i]
-                    sfuRoomListModel.append({
-                        room_id:      r.room_id      || "",
-                        name:         r.name         || r.room_id || "Room",
-                        kind:         r.kind         || r.room_type || "voice",
-                        count:        r.count        || r.member_count || 0,
-                        supernode_id: obj.supernode_id || ""
-                    })
-                }
+                root.upsertSfuRoomGroup(obj.supernode_id || "", obj.rooms || [])
             } catch(e) { console.warn("sfuRoomsUpdated parse error:", e) }
         })
 
@@ -338,7 +358,8 @@ ApplicationWindow {
                             node_id:      p.node_id,
                             connected:    p.connected || false,
                             homepage_url: p.homepage_url || "",
-                            title:        p.title || ""
+                            title:        p.title || "",
+                            rooms_json:   "[]"
                         })
                     }
                 }
@@ -623,7 +644,7 @@ ApplicationWindow {
         }
         spacing: 0
 
-        // ── Left sidebar: Peers | Rooms | Nodes tabs ─────────────────────────
+        // ── Left sidebar: Peers | Rooms tabs ─────────────────────────────────
         ColumnLayout {
             Layout.preferredWidth: Theme.sidebarWidth
             Layout.minimumWidth: Theme.sidebarWidth
@@ -653,12 +674,6 @@ ApplicationWindow {
                     text: "Rooms"
                     font.pixelSize: Theme.fontSizeCaption
                     font.bold: sidebarTabBar.currentIndex === 1
-                    implicitHeight: sidebarTabBar.sidebarTabHeight
-                }
-                TabButton {
-                    text: "Nodes"
-                    font.pixelSize: Theme.fontSizeCaption
-                    font.bold: sidebarTabBar.currentIndex === 2
                     implicitHeight: sidebarTabBar.sidebarTabHeight
                 }
             }
@@ -693,105 +708,253 @@ ApplicationWindow {
                     }
                 }
 
-                // ── Tab 1: Rooms ──────────────────────────────────────────
+                // ── Tab 1: Rooms (supernodes + grouped rooms) ─────────────
                 ColumnLayout {
                     spacing: 0
 
-                    // Rooms list
+                    Menu {
+                        id: roomContextMenu
+                        property string targetSupernodeId: ""
+                        property string targetRoomId: ""
+                        property string targetRoomName: ""
+                        MenuItem {
+                            text: qsTr("Join Voice Room")
+                            onTriggered: {
+                                roomPanel.switchToRoom(
+                                    roomContextMenu.targetRoomName,
+                                    roomContextMenu.targetRoomId)
+                                backend.joinRoomWithVoice(
+                                    roomContextMenu.targetSupernodeId,
+                                    roomContextMenu.targetRoomId)
+                                root.voiceRoomName = roomContextMenu.targetRoomName
+                                navIndex = 1
+                            }
+                        }
+                    }
+
+                    Menu {
+                        id: nodeContextMenu
+                        property string targetNodeId: ""
+                        MenuItem {
+                            text: qsTr("Open Portal")
+                            onTriggered: {
+                                console.log("[portal] context menu node_id=" + nodeContextMenu.targetNodeId)
+                                backend.openNodePortal(nodeContextMenu.targetNodeId)
+                            }
+                        }
+                        MenuItem {
+                            text: qsTr("Copy Node ID")
+                            onTriggered: backend.copyToClipboard(nodeContextMenu.targetNodeId)
+                        }
+                    }
+
                     ListView {
                         id: roomsListView
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        model: sfuRoomListModel
+                        model: nodeListModel
                         clip: true
+                        spacing: Theme.spacingXs
 
                         EmptyState {
                             anchors.centerIn: parent
-                            visible: sfuRoomListModel.count === 0
+                            visible: nodeListModel.count === 0
                             width: Math.min(parent.width - Theme.spacingXl, 170)
-                            iconSource: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg"
+                            iconSource: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
                             iconSize: 30
-                            title: "No rooms visible"
-                            subtitle: "Connect to a supernode to browse rooms."
+                            title: "No supernodes"
+                            subtitle: "Connect to a supernode to browse rooms and portals."
                         }
 
-                        delegate: ItemDelegate {
-                            id: roomDelegate
+                        delegate: Item {
+                            id: roomGroup
+                            required property string node_id
+                            required property bool connected
+                            required property string rooms_json
+
+                            readonly property var rooms: {
+                                try {
+                                    return JSON.parse(roomGroup.rooms_json || "[]")
+                                } catch (e) {
+                                    return []
+                                }
+                            }
+
                             width: roomsListView.width
-                            height: 48
-                            readonly property bool roomSelected: roomPanel.roomId !== ""
-                                && roomPanel.roomId === model.room_id
+                            height: Math.max(48, roomGroup.rooms.length * 48)
+                                + Theme.spacingSm
 
-                            background: Rectangle {
-                                color: roomDelegate.roomSelected
-                                    ? Theme.selectedFill()
-                                    : (roomDelegate.hovered ? Theme.bg3 : "transparent")
-                                Behavior on color { ColorAnimation { duration: Theme.animNormal } }
-
-                                Rectangle {
-                                    visible: roomDelegate.roomSelected
-                                    width: 3
-                                    anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
-                                    color: Theme.accent
-                                }
-                            }
-                            // Single click: subscribe to room chat (no voice join, no voice disruption)
-                            onClicked: {
-                                roomPanel.switchToRoom(model.name || model.room_id, model.room_id)
-                                backend.subscribeRoomChat(model.supernode_id, model.room_id)
-                                navIndex = 1
-                            }
-                            // Double click or right-click "Join Voice": join room with voice
-                            onDoubleClicked: {
-                                roomPanel.switchToRoom(model.name || model.room_id, model.room_id)
-                                backend.joinRoomWithVoice(model.supernode_id, model.room_id)
-                                root.voiceRoomName = model.name || model.room_id
-                                navIndex = 1
-                            }
-
-                            // Right-click context menu
-                            MouseArea {
+                            RowLayout {
                                 anchors.fill: parent
-                                acceptedButtons: Qt.RightButton
-                                onClicked: (mouse) => {
-                                    if (mouse.button === Qt.RightButton)
-                                        roomContextMenu.popup()
-                                }
-                            }
+                                anchors.leftMargin: Theme.spacingMd
+                                anchors.rightMargin: Theme.spacingSm
+                                anchors.topMargin: Theme.spacingXs
+                                anchors.bottomMargin: Theme.spacingXs
+                                spacing: Theme.spacingSm
 
-                            Menu {
-                                id: roomContextMenu
-                                MenuItem {
-                                    text: qsTr("Join Voice Room")
-                                    onTriggered: {
-                                        roomPanel.switchToRoom(model.name || model.room_id, model.room_id)
-                                        backend.joinRoomWithVoice(model.supernode_id, model.room_id)
-                                        root.voiceRoomName = model.name || model.room_id
-                                        navIndex = 1
+                                Item {
+                                    Layout.alignment: Qt.AlignTop
+                                    Layout.topMargin: 4
+                                    width: 44
+                                    height: 44
+
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        radius: Theme.radiusSm
+                                        color: groupSnHover.hovered ? Theme.bg3 : "transparent"
+                                        Behavior on color {
+                                            ColorAnimation { duration: Theme.animNormal }
+                                        }
+                                    }
+
+                                    Avatar {
+                                        id: groupAvatar
+                                        anchors.centerIn: parent
+                                        peerId: roomGroup.node_id
+                                        size: 36
+                                        showRing: true
+                                        ringColor: roomGroup.connected
+                                            ? Theme.online
+                                            : groupAvatar.tintColor
+                                    }
+
+                                    HoverHandler { id: groupSnHover }
+
+                                    ToolTip {
+                                        visible: groupSnHover.hovered
+                                        text: roomGroup.node_id
+                                        delay: 300
+                                        timeout: 5000
+                                    }
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: (mouse) => {
+                                            if (mouse.button === Qt.RightButton) {
+                                                nodeContextMenu.targetNodeId = roomGroup.node_id
+                                                nodeContextMenu.popup()
+                                            } else {
+                                                console.log("[portal] node avatar clicked node_id=" + roomGroup.node_id)
+                                                backend.openNodePortal(roomGroup.node_id)
+                                            }
+                                        }
                                     }
                                 }
-                            }
 
-                            ColumnLayout {
-                                anchors.verticalCenter: parent.verticalCenter
-                                anchors.left: parent.left
-                                anchors.leftMargin: Theme.spacingMd
-                                anchors.right: parent.right
-                                anchors.rightMargin: Theme.spacingSm
-                                spacing: Theme.spacingXs
-
-                                Label {
+                                Column {
+                                    id: roomColumn
                                     Layout.fillWidth: true
-                                    text: model.name
-                                    color: Theme.text
-                                    font.pixelSize: Theme.fontSizeBody
-                                    font.bold: roomDelegate.roomSelected
-                                    elide: Text.ElideRight
-                                }
-                                Label {
-                                    text: model.kind + (model.count > 0 ? " \u00B7 " + model.count : "")
-                                    color: Theme.muted
-                                    font.pixelSize: Theme.fontSizeCaption
+                                    spacing: 0
+
+                                    Label {
+                                        visible: roomGroup.rooms.length === 0
+                                        width: roomColumn.width
+                                        height: 48
+                                        verticalAlignment: Text.AlignVCenter
+                                        text: "No rooms"
+                                        color: Theme.muted
+                                        font.pixelSize: Theme.fontSizeCaption
+                                        leftPadding: Theme.spacingXs
+                                    }
+
+                                    Repeater {
+                                        model: roomGroup.rooms
+
+                                        delegate: ItemDelegate {
+                                            id: roomDelegate
+                                            required property string room_id
+                                            required property string name
+                                            required property string kind
+                                            required property int count
+
+                                            width: roomColumn.width
+                                            height: 48
+
+                                            readonly property bool roomSelected:
+                                                roomPanel.roomId !== ""
+                                                && roomPanel.roomId === roomDelegate.room_id
+
+                                            background: Rectangle {
+                                                color: roomDelegate.roomSelected
+                                                    ? Theme.selectedFill()
+                                                    : (roomDelegate.hovered ? Theme.bg3 : "transparent")
+                                                Behavior on color {
+                                                    ColorAnimation { duration: Theme.animNormal }
+                                                }
+
+                                                Rectangle {
+                                                    visible: roomDelegate.roomSelected
+                                                    width: 3
+                                                    anchors {
+                                                        left: parent.left
+                                                        top: parent.top
+                                                        bottom: parent.bottom
+                                                    }
+                                                    color: Theme.accent
+                                                }
+                                            }
+
+                                            onClicked: {
+                                                roomPanel.switchToRoom(
+                                                    roomDelegate.name || roomDelegate.room_id,
+                                                    roomDelegate.room_id)
+                                                backend.subscribeRoomChat(
+                                                    roomGroup.node_id,
+                                                    roomDelegate.room_id)
+                                                navIndex = 1
+                                            }
+                                            onDoubleClicked: {
+                                                roomPanel.switchToRoom(
+                                                    roomDelegate.name || roomDelegate.room_id,
+                                                    roomDelegate.room_id)
+                                                backend.joinRoomWithVoice(
+                                                    roomGroup.node_id,
+                                                    roomDelegate.room_id)
+                                                root.voiceRoomName = roomDelegate.name || roomDelegate.room_id
+                                                navIndex = 1
+                                            }
+
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                acceptedButtons: Qt.RightButton
+                                                onClicked: (mouse) => {
+                                                    if (mouse.button === Qt.RightButton) {
+                                                        roomContextMenu.targetSupernodeId = roomGroup.node_id
+                                                        roomContextMenu.targetRoomId = roomDelegate.room_id
+                                                        roomContextMenu.targetRoomName =
+                                                            roomDelegate.name || roomDelegate.room_id
+                                                        roomContextMenu.popup()
+                                                    }
+                                                }
+                                            }
+
+                                            ColumnLayout {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                anchors.left: parent.left
+                                                anchors.right: parent.right
+                                                spacing: Theme.spacingXs
+
+                                                Label {
+                                                    Layout.fillWidth: true
+                                                    text: roomDelegate.name
+                                                    color: Theme.text
+                                                    font.pixelSize: Theme.fontSizeBody
+                                                    font.bold: roomDelegate.roomSelected
+                                                    elide: Text.ElideRight
+                                                }
+                                                Label {
+                                                    text: roomDelegate.kind
+                                                        + (roomDelegate.count > 0
+                                                           ? " \u00B7 " + roomDelegate.count
+                                                           : "")
+                                                    color: Theme.muted
+                                                    font.pixelSize: Theme.fontSizeCaption
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -811,125 +974,10 @@ ApplicationWindow {
                         }
                     }
                 }
-
-                // ── Tab 2: Nodes ──────────────────────────────────────────
-                ColumnLayout {
-                    spacing: 0
-
-                    ListView {
-                        id: nodesListView
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        model: nodeListModel
-                        clip: true
-
-                        EmptyState {
-                            anchors.centerIn: parent
-                            visible: nodeListModel.count === 0
-                            width: Math.min(parent.width - Theme.spacingXl, 170)
-                            iconSource: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
-                            iconSize: 30
-                            title: "No supernodes"
-                            subtitle: "Connected nodes and portals appear here."
-                        }
-
-                        delegate: ItemDelegate {
-                            id: nodeDelegate
-                            width: nodesListView.width
-                            height: model.homepage_url ? 60 : 48
-
-                            RowLayout {
-                                anchors.verticalCenter: parent.verticalCenter
-                                anchors.left: parent.left
-                                anchors.leftMargin: Theme.spacingMd
-                                anchors.right: parent.right
-                                anchors.rightMargin: Theme.spacingSm
-                                spacing: Theme.spacingSm
-
-                                Rectangle {
-                                    width: 8; height: 8; radius: 4
-                                    color: model.connected ? Theme.online : Theme.muted
-                                }
-
-                                ColumnLayout {
-                                    Layout.fillWidth: true
-                                    spacing: Theme.spacingXs
-
-                                    Label {
-                                        Layout.fillWidth: true
-                                        text: model.title ||
-                                              (model.node_id.length > 16
-                                               ? model.node_id.substring(0, 16) + "\u2026"
-                                               : model.node_id)
-                                        color: model.connected ? Theme.text : Theme.muted
-                                        font.pixelSize: Theme.fontSizeCaption
-                                        elide: Text.ElideRight
-                                        ToolTip.text: model.node_id
-                                        ToolTip.visible: hovered
-                                    }
-                                    Label {
-                                        visible: !!model.homepage_url
-                                        Layout.fillWidth: true
-                                        text: model.homepage_url
-                                        color: Theme.muted
-                                        font.pixelSize: Theme.fontSizeMicro
-                                        elide: Text.ElideRight
-                                    }
-                                }
-
-                                // Open Portal button — always visible so you can
-                                // click it even before the relay connects (the
-                                // backend queues the request and shows a spinner).
-                                ToolButton {
-                                    icon.source: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
-                                    icon.width: 16
-                                    icon.height: 16
-                                    icon.color: model.connected ? Theme.accent : Theme.muted
-                                    implicitWidth: 32
-                                    implicitHeight: 32
-                                    ToolTip.text: qsTr("Open supernode portal")
-                                    ToolTip.visible: hovered
-                                    onClicked: {
-                                        console.log("[portal] Portal button clicked node_id=" + model.node_id)
-                                        backend.openNodePortal(model.node_id)
-                                    }
-                                }
-                            }
-
-                            // Right-click context menu
-                            MouseArea {
-                                anchors.fill: parent
-                                acceptedButtons: Qt.RightButton
-                                onClicked: (mouse) => {
-                                    if (mouse.button === Qt.RightButton) {
-                                        nodeContextMenu.targetNodeId = model.node_id
-                                        nodeContextMenu.popup()
-                                    }
-                                }
-                            }
-
-                            Menu {
-                                id: nodeContextMenu
-                                property string targetNodeId: ""
-                                MenuItem {
-                                    text: qsTr("Open Portal")
-                                    onTriggered: {
-                                        console.log("[portal] context menu node_id=" + nodeContextMenu.targetNodeId)
-                                        backend.openNodePortal(nodeContextMenu.targetNodeId)
-                                    }
-                                }
-                                MenuItem {
-                                    text: qsTr("Copy Node ID")
-                                    onTriggered: backend.copyToClipboard(nodeContextMenu.targetNodeId)
-                                }
-                            }
-                        }
-                    }
-                }                // end Nodes ColumnLayout
             }                    // end sidebar StackLayout
 
             // ── Settings section navigation ──────────────────────────────────
-            // Replaces the peer/room/nodes area when Settings is the active nav.
+            // Replaces the peer/rooms area when Settings is the active nav.
             SettingsSidebar {
                 visible: navIndex === 2
                 Layout.fillWidth: true

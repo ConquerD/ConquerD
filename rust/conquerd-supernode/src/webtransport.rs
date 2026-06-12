@@ -648,7 +648,9 @@ async fn handle_session(
         .iter()
         .enumerate()
         .filter_map(|(i, fid)| {
-            let tag = DYNAMIC_TAG_START.checked_add(i as u8)?;
+            // u8::try_from (not `as u8`) so indices ≥ 256 are dropped
+            // instead of wrapping back into the dynamic range.
+            let tag = DYNAMIC_TAG_START.checked_add(u8::try_from(i).ok()?)?;
             (tag <= DYNAMIC_TAG_END).then(|| (tag, fid.clone()))
         })
         .collect();

@@ -189,6 +189,10 @@ impl QUICRelayServer {
             peer.connection.close(0u32.into(), b"revoked");
         }
         state.remove_peer(normalized);
+        drop(state);
+        // Quota symmetry: clear per-(feature, peer) buckets on removal.
+        self.features.clear_peer_quotas(normalized);
+        self.features.clear_peer_outbound_quotas(normalized);
     }
 
     /// Join a peer into a relay room for broadcast routing.
@@ -323,12 +327,13 @@ impl QUICRelayServer {
         // Cleanup task
         let state_cleanup = self.state.clone();
         let shutdown_cleanup = self.shutdown.clone();
+        let features_cleanup = self.features.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_S));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        cleanup_stale_peers(&state_cleanup);
+                        cleanup_stale_peers(&state_cleanup, &features_cleanup);
                     }
                     _ = shutdown_cleanup.notified() => break,
                 }
@@ -382,9 +387,15 @@ async fn handle_connection(
             connection.close(0u32.into(), b"full");
             return Ok(());
         }
-        // Remove old connection if peer reconnects
-        if st.peers.contains_key(&peer_id) {
+        // Remove old connection if peer reconnects: close the stale
+        // connection (its exit path is skipped via the stable_id guard
+        // in the disconnect cleanup) and reset quota buckets so the new
+        // session starts fresh rather than inheriting consumed tokens.
+        if let Some(old) = st.peers.get(&peer_id) {
+            old.connection.close(0u32.into(), b"reconnected");
             st.remove_peer(&peer_id);
+            features.clear_peer_quotas(&peer_id);
+            features.clear_peer_outbound_quotas(&peer_id);
         }
         let idx = st
             .allocate_index()
@@ -470,20 +481,33 @@ async fn handle_connection(
         }
     }
 
-    // Cleanup on disconnect
+    // Cleanup on disconnect. Guard on stable_id: if this peer_id has
+    // reconnected, the registered entry belongs to the *new* connection
+    // and must not be torn down by this (old) connection's exit path.
     info!(
         "Relay peer disconnected: {} index={}",
         &peer_id[..12.min(peer_id.len())],
         peer_index
     );
-    let room_id = {
+    let registered = {
         let st = state.read();
-        st.peers.get(&peer_id).and_then(|p| p.room_id.clone())
+        st.peers
+            .get(&peer_id)
+            .is_some_and(|p| p.connection.stable_id() == connection.stable_id())
     };
-    state.write().remove_peer(&peer_id);
-    // Notify remaining room members
-    if let Some(room_id) = room_id {
-        notify_room_peer_left(&state, &peer_id, &room_id);
+    if registered {
+        let room_id = {
+            let st = state.read();
+            st.peers.get(&peer_id).and_then(|p| p.room_id.clone())
+        };
+        state.write().remove_peer(&peer_id);
+        // Quota symmetry: clear per-(feature, peer) buckets on disconnect.
+        features.clear_peer_quotas(&peer_id);
+        features.clear_peer_outbound_quotas(&peer_id);
+        // Notify remaining room members
+        if let Some(room_id) = room_id {
+            notify_room_peer_left(&state, &peer_id, &room_id);
+        }
     }
 
     Ok(())
@@ -696,7 +720,7 @@ fn notify_room_peer_left(state: &Arc<RwLock<RelayState>>, peer_id: &str, room_id
 }
 
 /// Remove disconnected peers.
-fn cleanup_stale_peers(state: &Arc<RwLock<RelayState>>) {
+fn cleanup_stale_peers(state: &Arc<RwLock<RelayState>>, features: &FeatureRegistry) {
     let mut st = state.write();
     let stale: Vec<String> = st
         .peers
@@ -707,6 +731,9 @@ fn cleanup_stale_peers(state: &Arc<RwLock<RelayState>>) {
     for id in stale {
         debug!("Cleaning up stale relay peer: {}", &id[..12.min(id.len())]);
         st.remove_peer(&id);
+        // Quota symmetry: clear per-(feature, peer) buckets on removal.
+        features.clear_peer_quotas(&id);
+        features.clear_peer_outbound_quotas(&id);
     }
 }
 
@@ -983,6 +1010,22 @@ mod tests {
         srv.allow_peer("peer-padded==");
         assert!(srv.state.read().allowed.contains("peer-padded"));
         assert!(!srv.state.read().allowed.contains("peer-padded=="));
+    }
+
+    #[test]
+    fn revoke_peer_clears_quota_buckets() {
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
+        let features = srv.features.clone();
+        srv.allow_peer("peer-x");
+        // Exhaust peer-x's chat budget in both directions (32 KB/s).
+        assert!(features.gate_through_feature("core.chat.v1", "peer-x", 32_768));
+        assert!(!features.gate_through_feature("core.chat.v1", "peer-x", 32_768));
+        assert!(features.gate_inbound_through_feature("core.chat.v1", "peer-x", 32_768));
+        assert!(!features.gate_inbound_through_feature("core.chat.v1", "peer-x", 32_768));
+        // Revoking must reset both directions so a future session starts fresh.
+        srv.revoke_peer("peer-x");
+        assert!(features.gate_through_feature("core.chat.v1", "peer-x", 32_768));
+        assert!(features.gate_inbound_through_feature("core.chat.v1", "peer-x", 32_768));
     }
 
     #[test]

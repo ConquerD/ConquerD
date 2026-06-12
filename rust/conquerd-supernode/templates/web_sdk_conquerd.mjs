@@ -213,10 +213,16 @@ export class RawConquerdClient {
         // Feature -> 1-byte channel tag, mirroring the supernode's
         // announce-order allocation in `handle_session`.
         this.tagFor = new Map();
-        caps.forEach((fid, i) => this.tagFor.set(fid, 0x10 + i));
         // Reverse for fast tag -> feature lookup in datagram path
         this.featureForTag = new Map();
-        caps.forEach((fid, i) => this.featureForTag.set(0x10 + i, fid));
+        caps.forEach((fid, i) => {
+            const tag = 0x10 + i;
+            // Mirror the supernode: features beyond the dynamic tag
+            // range (0x10-0xEF) get no tag instead of overflowing.
+            if (tag > 0xef) return;
+            this.tagFor.set(fid, tag);
+            this.featureForTag.set(tag, fid);
+        });
         this.onDatagram = null; // (tag, body, featureId|null) set by caller
         this._readerTask = this._readDatagrams();
     }

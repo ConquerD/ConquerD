@@ -324,11 +324,11 @@ No central feature registry, no mandatory features, no implicit cross-feature pr
 
 This section is the single source of truth for delivery status (condensed from the former `ROADMAP.md` / `IMPROVEMENT_PLAN.md` / `TODO.md`).
 
-**Last reviewed:** 2026-06-08 (doc accuracy pass: test-count sync, UI navigation, quota constant names, discovery/gossip status).
+**Last reviewed:** 2026-06-11 (bug-review pass: relay quota cleanup on disconnect/reconnect/revoke/stale-sweep, reconnect stable_id guard, dynamic-tag overflow fixes).
 
 ### Health summary
 
-ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (488 unit tests; 113 features + 195 supernode + 125 client + 55 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients.
+ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (489 unit tests; 113 features + 196 supernode + 125 client + 55 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients.
 
 ### P0–P2 — Complete ✅
 
@@ -337,7 +337,7 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 | CI hardening | `fmt --check` + `clippy -D warnings` (both workspaces) + headless client tests + `cargo-audit`; all SHA-pinned. |
 | Post-handshake replay protection | 5-minute timestamp freshness window (`MAX_MESSAGE_AGE_SECS` on client, `is_fresh(300.0)` on supernode WS path), **plus** a per-sender sliding-window dedup guard (`conquerd_features::ReplayGuard`) keyed on the message signature; `ReplayGuard` replay negative-path tests in `replay.rs` (explicit `is_fresh` stale/future unit tests still a client-path gap). |
 | Relay + SFU smoke tests | Real mTLS QUIC suite: 2-peer room broadcast, unauthorized rejection, leave/rejoin, ticket renewal. |
-| Quota symmetry | Inbound + outbound gating on direct P2P (`core.audio.opus`), client room audio (`room.audio.sfu`), supernode WS `SfuAudio`/`SfuChat`/`SfuFile*` relay, QUIC relay datagram fan-out, and WebTransport browser fan-out (`BrowserBridge::on_inbound` + `send` + `release_session` cleanup). |
+| Quota symmetry | Inbound + outbound gating on direct P2P (`core.audio.opus`), client room audio (`room.audio.sfu`), supernode WS `SfuAudio`/`SfuChat`/`SfuFile*` relay, QUIC relay datagram fan-out, and WebTransport browser fan-out (`BrowserBridge::on_inbound` + `send` + `release_session` cleanup). Bug-review pass (2026-06-11): QUIC relay now clears quota buckets on disconnect, reconnect-replacement, revoke, and stale-peer sweep (`relay.rs`); reconnect no longer lets the old connection's exit path tear down the new session (stable_id guard); dynamic-tag allocation hardened against >224-feature overflow in `webtransport.rs` and both web-SDK copies. |
 | Audio dispatch decision | Real-time Opus bypasses `dispatch_message` module callbacks but is explicitly gated at the transport layer via `check_audio_quota` / `check_room_audio_outbound_quota` / `check_inbound_feature_quota` so quota enforcement cannot be skipped accidentally. |
 | Cross-platform CI | Windows runner (non-Qt tests + client clippy) added. |
 | Platform TODOs | macOS dock badge, Linux D-Bus badge, UPnP all implemented. |
@@ -347,7 +347,7 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 | Version automation | `scripts/check_version_sync.ps1 -BumpTo X.Y.Z` bumps all crates + prints git/tag commands. |
 | Metrics export | `/api/metrics` via `web.host.app.v1`. |
 | Game relay end-to-end | `game.relay.v1` over WebTransport confirmed working: race condition in `/_conquerd/ctx.json` cache fixed (scheme-layer caches now populated on tokio thread in `connection_manager.rs` before any `FetchWebApp` can succeed); self-signed TLS cert now includes `serverAuth` EKU (Chrome WebTransport requirement); cert fingerprint always re-derived from on-disk DER (stale `.hex` cache bug fixed); old certs missing the EKU detected via OID byte-scan and auto-rotated on next supernode start; template SDK synced with source (`ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, `featureForFixedTag` exports added); SDK now fails fast with a clear error when portal context exists but no WebTransport URL is available; cursor relay demo fixed (`encodeCursorLeave` now carries color so peer tracking is stable). |
-| Test suite integrity | Full test run across all four crates: 488 unit tests all green (113 `conquerd-features` + 195 `conquerd-supernode` + 125 `conquerd-client` + 55 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
+| Test suite integrity | Full test run across all four crates: 489 unit tests all green (113 `conquerd-features` + 196 `conquerd-supernode` + 125 `conquerd-client` + 55 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
 
 ### P3 backlog (as capacity allows)
 

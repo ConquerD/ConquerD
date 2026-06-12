@@ -10,6 +10,7 @@
 //   • Off-the-record profile: no cookies, cache, or history persist.
 //   • conquerd:// portal mode (nodeMode: true): navigation is locked to the
 //     conquerd:// scheme only. External links open in the system browser.
+//     Portal mode hides the toolbar and off-the-record notice for a full-bleed view.
 //   • Peer identity, crypto material, and AppBridge state are never
 //     accessible from within the browser (no QWebChannel bridge in this panel).
 //
@@ -42,18 +43,20 @@ Item {
     /// Navigate to a URL from outside the panel.
     function navigateTo(url) {
         _webView.navigate(url)
-        _addressBar.text = url
+        if (!root.nodeMode)
+            _addressBar.text = url
     }
 
     onStartUrlChanged: {
         if (startUrl !== "") navigateTo(startUrl)
     }
 
-    // ── Toolbar ───────────────────────────────────────────────────────────
+    // ── Toolbar (omitted in supernode portal mode) ──────────────────────
     Rectangle {
         id: toolbar
         anchors { top: parent.top; left: parent.left; right: parent.right }
-        height: Theme.touchTarget
+        height: root.nodeMode ? 0 : Theme.touchTarget
+        visible: !root.nodeMode
         color: Theme.bg1
 
         RowLayout {
@@ -112,6 +115,7 @@ Item {
 
             StyledTextField {
                 id: _addressBar
+                visible: !root.nodeMode
                 Layout.fillWidth: true
                 placeholderText: "Enter URL or search…"
                 font.pixelSize: Theme.fontSizeCaption
@@ -156,13 +160,14 @@ Item {
     Connections {
         target: _webView
         function onCurrentUrlChanged() {
-            if (!_addressBar.activeFocus)
-                _addressBar.text = _webView.currentUrl === "about:blank"
-                                   ? "" : _webView.currentUrl
+            if (root.nodeMode || _addressBar.activeFocus)
+                return
+            _addressBar.text = _webView.currentUrl === "about:blank"
+                               ? "" : _webView.currentUrl
         }
     }
 
-    // ── Privacy notice bar (first use reminder) ───────────────────────────
+    // ── Privacy notice bar (general browser mode only) ────────────────────
     Rectangle {
         id: _privacyBar
         anchors { top: toolbar.bottom; left: parent.left; right: parent.right }
@@ -217,6 +222,8 @@ Item {
         startUrl: root.startUrl !== "" ? root.startUrl : "about:blank"
 
         onCurrentUrlChanged: {
+            if (root.nodeMode)
+                return
             if (_webView.currentUrl !== "about:blank" && _webView.currentUrl !== "")
                 _privacyBar.visible = true
         }
