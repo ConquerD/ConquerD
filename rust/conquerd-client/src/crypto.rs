@@ -11,7 +11,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use serde_json::json;
 use sha2::{Digest, Sha256};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::error::{ClientError, Result};
 
@@ -167,6 +169,64 @@ pub fn b64url_encode(data: &[u8]) -> String {
 
 pub fn b64url_encode_nopad(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
+}
+
+const INVITE_SESSION_KEY_INFO: &[u8] = b"conquerd-invite-session-v2";
+
+/// Ephemeral X25519 keypair for invite handshake (joiner side).
+pub struct EphemeralKeyPair {
+    pub secret: StaticSecret,
+    pub public: PublicKey,
+}
+
+pub fn generate_ephemeral_keypair() -> EphemeralKeyPair {
+    let secret = StaticSecret::random_from_rng(OsRng);
+    let public = PublicKey::from(&secret);
+    EphemeralKeyPair { secret, public }
+}
+
+pub fn x25519_exchange(secret: &StaticSecret, peer_public: &PublicKey) -> [u8; 32] {
+    secret.diffie_hellman(peer_public).to_bytes()
+}
+
+/// Derive the invite session key on the joiner side (matches supernode handshake).
+pub fn derive_invite_session_key(
+    joiner_secret: &StaticSecret,
+    inviter_ephemeral_pub_b64: &str,
+    invite_id: &str,
+    inviter_identity_pub: &str,
+    joiner_identity_pub: &str,
+    joiner_ephemeral_pub_b64: &str,
+) -> Result<([u8; 32], String)> {
+    let inv_eph_bytes = b64url_decode(inviter_ephemeral_pub_b64)?;
+    if inv_eph_bytes.len() != 32 {
+        return Err(ClientError::Crypto(
+            "inviter_ephemeral_pub must be 32 bytes".into(),
+        ));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&inv_eph_bytes);
+    let inviter_eph_pub = PublicKey::from(arr);
+    let shared_secret = x25519_exchange(joiner_secret, &inviter_eph_pub);
+
+    let transcript = serde_json::json!({
+        "invite_id": invite_id,
+        "inviter_ephemeral_pub": inviter_ephemeral_pub_b64,
+        "inviter_identity_pub": inviter_identity_pub,
+        "joiner_ephemeral_pub": joiner_ephemeral_pub_b64,
+        "joiner_identity_pub": joiner_identity_pub,
+    });
+    let transcript_bytes = serde_json::to_vec(&transcript)
+        .map_err(|e| ClientError::Crypto(format!("transcript serialize: {e}")))?;
+    let transcript_hash = sha256_hex(&transcript_bytes);
+
+    let mut ikm = Vec::new();
+    ikm.extend_from_slice(&(shared_secret.len() as u32).to_be_bytes());
+    ikm.extend_from_slice(&shared_secret);
+    ikm.extend_from_slice(&(transcript_bytes.len() as u32).to_be_bytes());
+    ikm.extend_from_slice(&transcript_bytes);
+    let session_key = hkdf_derive_key(&ikm, INVITE_SESSION_KEY_INFO)?;
+    Ok((session_key, transcript_hash))
 }
 
 pub fn b64url_decode(s: &str) -> Result<Vec<u8>> {
