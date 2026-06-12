@@ -2123,8 +2123,7 @@ impl ffi::AppBridge {
             } else {
                 crate::platform::set_taskbar_badge(global as u32);
             }
-            self.as_mut()
-                .unread_changed(QString::from(pid.as_str()), 0);
+            self.as_mut().unread_changed(QString::from(pid.as_str()), 0);
         }
 
         // Build the full history JSON array then emit a single chatHistoryLoaded
