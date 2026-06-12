@@ -3082,6 +3082,11 @@ impl ConnectionManager {
             .or_else(|| payload.get("lan_hint").and_then(Value::as_str))
             .map(|s| s.to_owned())
             .unwrap_or_default();
+        let inviter_ephemeral_pub = payload
+            .get("inviter_ephemeral_pub")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
 
         if invite_id.is_empty() {
             warn!("AcceptInvite: missing invite_id");
@@ -3120,6 +3125,28 @@ impl ConnectionManager {
         // channel (the message will be delivered once the WS connection is up).
         let sender = self.identity.public_id();
         let joiner_peer_id = self.identity.peer_id();
+        let joiner_eph = crate::crypto::generate_ephemeral_keypair();
+        let joiner_ephemeral_pub = crate::crypto::b64url_encode_nopad(joiner_eph.public.as_bytes());
+        if !inviter_ephemeral_pub.is_empty() {
+            if let Err(e) = crate::crypto::derive_invite_session_key(
+                &joiner_eph.secret,
+                &inviter_ephemeral_pub,
+                &invite_id,
+                &inviter_identity_pub,
+                &sender,
+                &joiner_ephemeral_pub,
+            ) {
+                warn!("AcceptInvite: session key derivation failed: {e}");
+            }
+        } else {
+            warn!("AcceptInvite: invite missing inviter_ephemeral_pub — using legacy handshake");
+        }
+        let joiner_quic_port = self
+            .quic_endpoint
+            .as_ref()
+            .and_then(|ep| ep.local_addr().ok())
+            .map(|addr| addr.port())
+            .unwrap_or(0);
         let mut msg = SignalingMessage::new(MessageType::InviteHandshakeInit, sender.clone());
         msg.target = Some(inviter_identity_pub.clone());
         msg.payload
@@ -3128,6 +3155,14 @@ impl ConnectionManager {
             .insert("joiner_identity_pub".into(), Value::String(sender.clone()));
         msg.payload
             .insert("joiner_peer_id".into(), Value::String(joiner_peer_id));
+        msg.payload.insert(
+            "joiner_ephemeral_pub".into(),
+            Value::String(joiner_ephemeral_pub),
+        );
+        msg.payload.insert(
+            "joiner_quic_port".into(),
+            Value::Number(joiner_quic_port.into()),
+        );
 
         if let Ok(canonical) = msg.canonical_bytes() {
             let sig = self.identity.sign(&canonical);
