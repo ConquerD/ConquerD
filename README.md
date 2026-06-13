@@ -18,7 +18,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Unread badges on taskbar and system tray notifications.
 - Chat history persisted to SQLite with delivery states (sending → sent → delivered).
 - Right-click message context menu: delete individual messages or clear full per-peer history.
-- Room chat history persisted per room ID across sessions.
+- Room chat history stored locally per `(supernode, room)` on each peer (not on the supernode).
 
 ### Voice Calls
 - Low-latency Opus audio over QUIC peer-to-peer transport (Rust [quinn](https://github.com/quinn-rs/quinn)).
@@ -31,9 +31,12 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Missed call counter badge shown in the peer list and tray; increments when a call ends unanswered.
 
 ### Rooms (Multi-Peer Voice)
-- SFU (Selective Forwarding Unit) room hosting on volunteer supernodes.
+- SFU (Selective Forwarding Unit) room hosting on volunteer supernodes — **ephemeral in memory only**; the supernode does not persist room definitions or chat history.
+- **Client-owned room definitions** — rooms you create, join, or subscribe to are saved in encrypted `my_rooms.dat` on your device, keyed by `(supernode, room_id)`. When you reconnect to a supernode, saved rooms are materialized automatically via `SfuRoomCreate` (without auto-joining voice).
+- Idle user-created rooms are removed on the supernode after ~15 minutes with no voice participants or chat subscribers; the built-in `default` room is always present.
 - QUIC relay transport for NAT-traversed room audio; WebSocket for room membership signaling only.
 - Room parity with direct-peer features: chat, voice, file transfer.
+- Create public or private rooms from the Rooms sidebar; right-click **Remove room** hides the room locally (does not delete server-side state — there is none to delete).
 - Peer room invites with accept/decline flow.
 - Up to 32 participants per room.
 
@@ -79,7 +82,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - System tray with badge notifications for unread messages and missed calls.
 - Collapsible event log panel (toggle with `Ctrl+B`); `Ctrl+K` creates a new invite, `Ctrl+,` opens Settings.
 - Audio input/output device selector in Settings.
-- **Rooms** sidebar lists supernodes (avatar per node) with grouped SFU rooms; avatar left-click opens the operator portal, right-click offers portal / copy node ID (Qt WebEngine when `webengine` feature is enabled).
+- **Rooms** sidebar lists supernodes (avatar per node) with grouped SFU rooms; avatar left-click opens the operator portal, right-click offers portal / create public or private room / copy node ID / remove supernode (Qt WebEngine when `webengine` feature is enabled). Room right-click can hide a room from the sidebar (local only).
 - Handles / display names broadcast to all peers and shown everywhere (chat, calls, event log).
 - Peer block/unblock toggle in the right-click context menu; blocked peers show a visual indicator in the peer list.
 - Privacy & Data controls in Settings: trim message history by age (days) or count (keep newest N), purge all chat history, and lock identity & quit (removes the OS-keyring AES key so the next launch requires a passphrase).
@@ -250,6 +253,15 @@ OpusEncoder
   → OpusDecoder (per sender) → playback
 
 Room membership (join/leave/state) flows over WebSocket only.
+```
+
+**Room lifecycle (definitions vs hosting)**
+```
+Peer creates/joins/subscribes → RoomStore (my_rooms.dat) saves definition
+Supernode connect            → client replays SfuRoomCreate (materialize only)
+Everyone leaves + 15 min idle → supernode drops in-memory room (default kept)
+Peer reconnects              → saved definition materializes room again
+Chat history                 → stays on each peer's device (ChatStore / session cache)
 ```
 
 **Chat message**
@@ -500,7 +512,7 @@ When uncoordinated hole punching fails due to timing mismatch, a trusted superno
 
 ## Supernode Relay
 
-A supernode is a volunteer peer that provides QUIC relay and SFU (group voice) hosting. Supernodes are **transport-only** — they never store identity, messages, or act as a central server.
+A supernode is a volunteer peer that provides QUIC relay and SFU (group voice) hosting. Supernodes are **transport-only** — they never store identity, messages, room definitions, or chat history, and do not act as a central server. SFU rooms are held in memory while active and dropped after ~15 minutes idle; clients rematerialize saved rooms from `my_rooms.dat` on reconnect.
 
 ### Connecting to a Supernode
 1. Get the supernode's invite link from the operator.
@@ -832,7 +844,7 @@ All Conquerd data is stored under `CONQUERD_HOME` (default `~/.conquerd/`):
 | `peers.dat` | Trusted peers list (encrypted) |
 | `chat_history.db` | Chat messages (SQLite; message bodies encrypted at rest) |
 | `settings.json` | All preferences |
-| `my_rooms.dat` | Saved room invites (encrypted) |
+| `my_rooms.dat` | Client-owned SFU room definitions per supernode (encrypted); used to rematerialize rooms on reconnect. Sidebar hide list is stored here too. |
 | `installer.log` | Installer/updater activity (when `conquerd-installer` runs) |
 
 Received files are saved to your OS **Downloads** folder on completion (not under `CONQUERD_HOME`). The desktop client logs to **stderr** via `tracing` (`RUST_LOG`); there is no persistent client log file by default. An optional OS keyring entry (`conquerd` service) caches your unlock key locally.
@@ -843,6 +855,9 @@ Supernodes additionally store:
 |------|---------|
 | `supernode_invite.json` | Persistent invite link |
 | `supernode_endpoints.json` | Endpoint mailbox for peer reconnection (24h TTL) |
+| `peers.json` | Trusted peer records for relay/SFU access control |
+
+SFU **room state is not persisted** on the supernode — rooms exist in memory while in use and are idle-GC'd after ~15 minutes empty. Room definitions and chat history live on clients.
 
 > **What to back up**: At minimum, back up `identity.dat` (and your passphrase). Losing it means peers will see you as a new, untrusted identity.
 
@@ -1007,7 +1022,7 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 ```
 ├── rust/
 │   ├── Cargo.toml                 # Outer workspace: features + supernode + installer
-│   ├── conquerd-client/           # Native desktop binary (own workspace; Qt 6 / QML via CXX-Qt; 125 tests)
+│   ├── conquerd-client/           # Native desktop binary (own workspace; Qt 6 / QML via CXX-Qt; 138 tests)
 │   │   ├── Cargo.toml             # features: qt-ui, webengine, console
 │   │   ├── build.rs               # CXX-Qt codegen + windres icon embedding
 │   │   ├── assets.qrc / icons.qrc # Qt resource bundles (QML + icons)
@@ -1023,7 +1038,7 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 │   │       ├── file_transfer.rs   # P2P file send/receive with chunking + progress
 │   │       ├── sfu_client.rs      # SFU membership (join/leave/member list)
 │   │       ├── room_manager.rs    # Per-participant room state
-│   │       ├── room_store.rs      # JSON persistence for user rooms
+│   │       ├── room_store.rs      # Encrypted client-owned room definitions (my_rooms.dat)
 │   │       ├── quic_relay_client.rs # QUIC relay client (room audio + signaling fallback)
 │   │       ├── quic_tls.rs        # rustls config for QUIC peer/relay sessions
 │   │       ├── metrics.rs / network_monitor.rs # Per-peer QUIC stats → ConnectionQuality
@@ -1035,7 +1050,7 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 │   │       ├── ringtone.rs / taskbar_badge.rs / upnp.rs / uri_scheme.rs / web_app_client.rs
 │   │       └── ui/                # AppBridge QObject + QML models (Peer/Chat/Call/Room/Settings/FileTransfer)
 │   ├── conquerd-features/         # rlib: capability registry, FeatureModule trait, quota enforcement (113 tests)
-│   ├── conquerd-supernode/        # Standalone binary: QUIC relay, SFU, WS signaling, WebTransport + QUIC-stream portal (195 tests)
+│   ├── conquerd-supernode/        # Standalone binary: QUIC relay, ephemeral SFU, WS signaling, WebTransport + QUIC-stream portal (198 tests)
 │   └── conquerd-installer/        # Standalone binary: signed-release download + apply (55 tests)
 ├── web-sdk/conquerd.mjs           # Browser SDK (WebTransport client matching the native channel fabric)
 ├── games/                         # Example browser games served over `web.host.h3.v1`
@@ -1170,7 +1185,7 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 - **Zero-trust P2P architecture** — direct peer-to-peer; no central server stores your data. Ed25519 identity with derived peer IDs, invite-only discovery via signed `conquerd://` links, forward-secret handshakes (ephemeral X25519 + HKDF + AES-GCM).
 - **Chat-first UX** — text is the primary interaction after connecting; voice is opt-in per conversation. Per-conversation scroll persistence, typing indicators, unread badges on taskbar + tray.
 - **Voice calls** — low-latency Opus over QUIC, push-to-talk and voice activation, spectral-gate noise suppression, jitter buffer with de-click.
-- **Rooms (multi-peer voice)** — SFU hosting on volunteer supernodes over QUIC relay, with chat/voice/file parity and peer room invites.
+- **Rooms (multi-peer voice)** — client-owned room definitions (`my_rooms.dat`); supernodes host SFU sessions ephemerally over QUIC relay with chat/voice/file parity, idle GC, and reconnect materialization.
 - **Game relay & in-app portal**: `game.relay.v1` opaque datagram relay over WebTransport; three bundled browser game demos (cursor relay, brick breaker, shared drawing) served from `<data_dir>/games/` and accessible from the in-app portal at `conquerd://<supernode_id>/games/<slug>/`. Self-signed TLS cert with `serverAuth` EKU auto-generated and rotated every 7 days; fingerprint delivered via `SUPERNODE_INFO` trust chain.
 - **Supernode release binaries**: pre-built packages for Linux x86_64, Linux ARM64, and Windows x86_64 on GitHub Releases and nightlies (`scripts/build_supernode.sh` / `scripts/build_supernode.ps1`).
 - **NAT traversal** — UPnP port mapping, QUIC/WebSocket direct connect, supernode relay fallback, relay-coordinated hole punching.

@@ -1462,39 +1462,41 @@ impl SupernodeHandler {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or(sfu::RoomType::Public);
         let room_id = msg.payload.get("room_id").and_then(|v| v.as_str());
+        let creator_id = msg
+            .payload
+            .get("creator_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&msg.sender);
 
         let mut sfu_lock = sfu.write();
-        if let Some(room) = sfu_lock.create_room(room_id, room_name, room_type, &msg.sender) {
-            let room_id_out = room.room_id.clone();
-            let room_name_out = room.room_name.clone();
-            let is_private = room_type == sfu::RoomType::Private;
-            drop(sfu_lock);
+        let Some((room, created_new)) =
+            sfu_lock.create_room(room_id, room_name, room_type, creator_id)
+        else {
+            return;
+        };
+        let room_id_out = room.room_id.clone();
+        let room_name_out = room.room_name.clone();
+        let is_private = room_type == sfu::RoomType::Private;
+        drop(sfu_lock);
 
-            let invite_token = if is_private {
-                sfu.write().generate_invite_token(&room_id_out, &msg.sender)
-            } else {
-                None
-            };
+        let invite_token = if created_new && is_private {
+            sfu.write().generate_invite_token(&room_id_out, creator_id)
+        } else {
+            None
+        };
 
-            self.state.send_signed(
-                &msg.sender,
-                MessageType::SfuRoomCreated,
-                json!({
-                    "room_id": room_id_out,
-                    "room_name": room_name_out,
-                    "room_type": room_type,
-                    "invite_token": invite_token,
-                }),
-            );
-
-            // If public, persist rooms immediately so they survive a SIGTERM restart,
-            // then broadcast updated room list to all connected trusted peers.
-            if !is_private {
-                let rooms_path = self.state.config.data_dir.join("sfu_rooms.json");
-                let _ = sfu.read().save_rooms(&rooms_path);
-                self.state.broadcast_room_list();
-            }
-        }
+        self.state.send_signed(
+            &msg.sender,
+            MessageType::SfuRoomCreated,
+            json!({
+                "room_id": room_id_out,
+                "room_name": room_name_out,
+                "room_type": room_type,
+                "invite_token": invite_token,
+            }),
+        );
+        self.state.broadcast_room_list();
     }
 
     fn handle_sfu_room_invite(&self, msg: &SignalingMessage) {
@@ -1672,13 +1674,8 @@ async fn main() -> anyhow::Result<()> {
 
     // SFU room manager
     let sfu = if config.sfu_enabled {
-        let mut mgr = SFURoomManager::new();
-        let rooms_path = config.data_dir.join("sfu_rooms.json");
-        let loaded = mgr.load_rooms(&rooms_path);
-        if loaded > 0 {
-            info!("Loaded {} persisted SFU rooms", loaded);
-        }
-        Some(RwLock::new(mgr))
+        info!("SFU enabled — rooms are ephemeral (peer-owned definitions, idle GC)");
+        Some(RwLock::new(SFURoomManager::new()))
     } else {
         None
     };
@@ -1840,6 +1837,27 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Idle SFU room GC — peer-materialized rooms are dropped after inactivity.
+    let state_gc = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let Some(ref sfu) = state_gc.sfu else {
+                continue;
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            let removed = sfu.write().gc_idle_rooms(now, sfu::IDLE_ROOM_GC_SECS);
+            if !removed.is_empty() {
+                info!("GC removed {} idle SFU room(s)", removed.len());
+                state_gc.broadcast_room_list();
+            }
+        }
+    });
+
     // Wait for shutdown signal (SIGINT or SIGTERM)
     info!("Supernode running. Press Ctrl+C to stop.");
     #[cfg(unix)]
@@ -1858,10 +1876,6 @@ async fn main() -> anyhow::Result<()> {
     // Cleanup
     if let Some(ref relay) = state.relay {
         relay.shutdown();
-    }
-    if let Some(ref sfu) = state.sfu {
-        let rooms_path = state.config.data_dir.join("sfu_rooms.json");
-        let _ = sfu.read().save_rooms(&rooms_path);
     }
     let _ = state.peer_store.read().save();
 

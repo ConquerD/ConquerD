@@ -605,6 +605,7 @@ async fn handle_event(
         | ConnectionEvent::CapabilityInvokePending { .. }
         | ConnectionEvent::EndpointUpdated { .. }
         | ConnectionEvent::RoomListReceived { .. }
+        | ConnectionEvent::RoomCreated { .. }
         | ConnectionEvent::PresenceUpdated { .. }
         | ConnectionEvent::InviteAccepted { .. }
         | ConnectionEvent::FileOffered { .. }

@@ -1,7 +1,7 @@
-// CreateRoomDialog.qml — Dialog to create or join an SFU audio room.
+// CreateRoomDialog.qml — Dialog to create a public or private SFU voice room.
 //
-// Accepts a room name + supernode selection and fires createRoom on the bridge.
-// Open via: createRoomDialog.open()
+// Open via createRoomDialog.openForNode(supernodeId, "public"|"private")
+// or createRoomDialog.open() to pick a supernode from the list.
 
 import QtQuick
 import QtQuick.Controls.Material
@@ -11,27 +11,44 @@ import ConquerD.Client 1.0
 Dialog {
     id: root
 
-    // The live node list model from MainWindow
+    // The live node list model from MainWindow (used when no supernode is preset).
     required property ListModel nodeListModel
 
-    title: "Create Room"
+    // When set, the supernode picker is hidden and this node is used on accept.
+    property string targetSupernodeId: ""
+    // "public" or "private" — drives title and the createRoom wire shape.
+    property string roomType: "public"
+
+    readonly property bool supernodePreset: targetSupernodeId !== ""
+
+    title: roomType === "private" ? qsTr("Create Private Room") : qsTr("Create Public Room")
     modal: true
     standardButtons: Dialog.Ok | Dialog.Cancel
     closePolicy: Dialog.CloseOnEscape
 
-    // Reset fields each time the dialog opens
+    function openForNode(supernodeId, type) {
+        targetSupernodeId = supernodeId || ""
+        roomType = (type === "private") ? "private" : "public"
+        open()
+    }
+
     onOpened: {
-        roomNameField.text  = ""
-        supernodeBox.currentIndex = 0
+        roomNameField.text = ""
+        if (!supernodePreset)
+            supernodeBox.currentIndex = 0
         roomNameField.forceActiveFocus()
     }
 
     onAccepted: {
         var name = roomNameField.text.trim()
-        if (name === "" || supernodeBox.currentIndex < 0) return
-        var snId = nodeListModel.get(supernodeBox.currentIndex).nodeId || ""
+        if (name === "") return
+        var snId = supernodePreset
+            ? targetSupernodeId
+            : (supernodeBox.currentIndex >= 0
+                ? (nodeListModel.get(supernodeBox.currentIndex).node_id || "")
+                : "")
         if (snId === "") return
-        backend.createRoom(snId, name)
+        backend.createRoom(snId, name, roomType)
     }
 
     background: Rectangle {
@@ -57,13 +74,21 @@ Dialog {
     contentItem: ColumnLayout {
         spacing: 16
 
-        // Room name
+        Text {
+            visible: roomType === "private"
+            text: qsTr("Private rooms require an invite token to join. You'll receive one after creation.")
+            color: Theme.muted
+            font.pixelSize: Theme.fontSizeCaption
+            wrapMode: Text.Wrap
+            Layout.fillWidth: true
+        }
+
         ColumnLayout {
             spacing: 4
             Layout.fillWidth: true
 
             Text {
-                text: "Room name"
+                text: qsTr("Room name")
                 color: Theme.muted
                 font.pixelSize: Theme.fontSizeCaption
             }
@@ -71,7 +96,7 @@ Dialog {
             TextField {
                 id: roomNameField
                 Layout.fillWidth: true
-                placeholderText: "e.g. Game Night"
+                placeholderText: qsTr("e.g. Game Night")
                 maximumLength: 64
                 background: Rectangle {
                     color: Theme.bg2
@@ -85,13 +110,13 @@ Dialog {
             }
         }
 
-        // Supernode selection
         ColumnLayout {
+            visible: !root.supernodePreset
             spacing: 4
             Layout.fillWidth: true
 
             Text {
-                text: "Host supernode"
+                text: qsTr("Host supernode")
                 color: Theme.muted
                 font.pixelSize: Theme.fontSizeCaption
             }
@@ -100,7 +125,7 @@ Dialog {
                 id: supernodeBox
                 Layout.fillWidth: true
                 model: root.nodeListModel
-                textRole: "displayName"
+                textRole: "title"
 
                 background: Rectangle {
                     color: Theme.bg2
@@ -111,7 +136,11 @@ Dialog {
 
                 contentItem: Text {
                     leftPadding: 8
-                    text: supernodeBox.displayText
+                    text: {
+                        if (supernodeBox.currentIndex < 0) return supernodeBox.displayText
+                        var row = nodeListModel.get(supernodeBox.currentIndex)
+                        return (row.title && row.title !== "") ? row.title : row.node_id
+                    }
                     color: Theme.text
                     font.pixelSize: Theme.fontSizeBody
                     verticalAlignment: Text.AlignVCenter
@@ -119,11 +148,11 @@ Dialog {
 
                 delegate: ItemDelegate {
                     required property int index
-                    required property string displayName
-                    required property string nodeId
+                    required property string title
+                    required property string node_id
                     width: supernodeBox.width
                     contentItem: Text {
-                        text: displayName || nodeId
+                        text: (title && title !== "") ? title : node_id
                         color: Theme.text
                         font.pixelSize: Theme.fontSizeBody
                     }
@@ -133,7 +162,6 @@ Dialog {
                     }
                 }
 
-                // Shown when no nodes are connected
                 popup: Popup {
                     y: supernodeBox.height + 2
                     width: supernodeBox.width
@@ -158,7 +186,7 @@ Dialog {
 
             Text {
                 visible: root.nodeListModel.count === 0
-                text: "No supernodes connected. Connect to a supernode first."
+                text: qsTr("No supernodes connected. Connect to a supernode first.")
                 color: Theme.danger
                 font.pixelSize: Theme.fontSizeCaption
                 wrapMode: Text.Wrap
@@ -167,7 +195,6 @@ Dialog {
         }
     }
 
-    // Override OK button to enforce validation
     footer: DialogButtonBox {
         standardButtons: root.standardButtons
         background: Rectangle {
@@ -175,13 +202,16 @@ Dialog {
             radius: 0
             Rectangle {
                 anchors { left: parent.left; right: parent.right; top: parent.top }
-                height: 10; color: Theme.bg0
+                height: 10
+                color: Theme.bg0
             }
         }
         delegate: Button {
             text: DialogButtonBox.buttonText(this)
             enabled: DialogButtonBox.buttonRole(this) !== DialogButtonBox.AcceptRole
-                  || (roomNameField.text.trim() !== "" && supernodeBox.currentIndex >= 0 && root.nodeListModel.count > 0)
+                  || (roomNameField.text.trim() !== ""
+                      && (root.supernodePreset
+                          || (supernodeBox.currentIndex >= 0 && root.nodeListModel.count > 0)))
         }
     }
 }

@@ -111,10 +111,15 @@ pub mod ffi {
         fn sfuRoomsUpdated(self: Pin<&mut AppBridge>, rooms_json: QString);
 
         /// Emitted when a supernode connects or disconnects. `nodes_json` is a
-        /// JSON array of `{node_id, connected, homepage_url, title}` patch objects.
+        /// JSON array of `{node_id, connected, homepage_url, title, sfu_enabled}` patch objects.
         #[qsignal]
         #[rust_name = "nodes_updated"]
         fn nodesUpdated(self: Pin<&mut AppBridge>, nodes_json: QString);
+
+        /// Emitted after a supernode is removed from the trusted peer store.
+        #[qsignal]
+        #[rust_name = "supernode_removed"]
+        fn supernodeRemoved(self: Pin<&mut AppBridge>, node_id: QString);
 
         /// Emitted when a supernode sends its homepage / portal info.
         /// Open `url` in the system browser to show the portal.
@@ -212,9 +217,37 @@ pub mod ffi {
         fn joinRoomWithVoice(self: Pin<&mut AppBridge>, supernode_id: &QString, room_id: &QString);
 
         /// Create and immediately join a new SFU voice room on a supernode.
+        /// `room_type` is `"public"` or `"private"` (supernode wire shape).
         #[qinvokable]
         #[rust_name = "create_room"]
-        fn createRoom(self: Pin<&mut AppBridge>, supernode_id: &QString, room_name: &QString);
+        fn createRoom(
+            self: Pin<&mut AppBridge>,
+            supernode_id: &QString,
+            room_name: &QString,
+            room_type: &QString,
+        );
+
+        /// Emitted when the supernode acknowledges a room we created.
+        #[qsignal]
+        #[rust_name = "room_created"]
+        fn roomCreated(
+            self: Pin<&mut AppBridge>,
+            supernode_id: QString,
+            room_id: QString,
+            room_name: QString,
+            room_type: QString,
+            invite_token: QString,
+        );
+
+        /// Hide an SFU room from the local Rooms sidebar (not deleted on the supernode).
+        #[qinvokable]
+        #[rust_name = "remove_room"]
+        fn removeRoom(self: Pin<&mut AppBridge>, supernode_id: &QString, room_id: &QString);
+
+        /// Emitted when a room is hidden from the local Rooms sidebar.
+        #[qsignal]
+        #[rust_name = "room_removed"]
+        fn roomRemoved(self: Pin<&mut AppBridge>, supernode_id: QString, room_id: QString);
 
         /// Register the conquerd:// URI scheme handler (Windows only, no-op elsewhere).
         #[qinvokable]
@@ -280,6 +313,11 @@ pub mod ffi {
         #[qinvokable]
         #[rust_name = "remove_peer"]
         fn removePeer(self: Pin<&mut AppBridge>, peer_id: &QString);
+
+        /// Remove a trusted supernode from the store and tear down its WS session.
+        #[qinvokable]
+        #[rust_name = "remove_supernode"]
+        fn removeSupernode(self: Pin<&mut AppBridge>, node_id: &QString);
 
         /// Block a peer — prevents further inbound messages.
         #[qinvokable]
@@ -793,6 +831,9 @@ pub struct AppBridgeRust {
     /// Chat store shared reference — used by selectPeer to load history.
     chat_store: Option<Arc<crate::chat_store::ChatStore>>,
 
+    /// Local room hide-list (sidebar removals do not touch the supernode).
+    room_store: Option<Arc<RwLock<crate::room_store::RoomStore>>>,
+
     /// Currently selected peer (for per-peer chat loading).
     selected_peer_id: String,
 
@@ -871,6 +912,7 @@ impl Default for AppBridgeRust {
             unread_chat: 0,
             peer_store: None,
             chat_store: None,
+            room_store: None,
             selected_peer_id: String::new(),
             current_supernode_id: String::new(),
             current_room_id: String::new(),
@@ -1069,6 +1111,13 @@ impl ffi::AppBridge {
             }
         };
         let chat_store = Arc::clone(&_chat_store_arc);
+        let room_store = match crate::room_store::RoomStore::open(&identity, None) {
+            Ok(s) => Arc::new(RwLock::new(s)),
+            Err(e) => {
+                error!("Room store error: {e}");
+                return;
+            }
+        };
 
         // ── Split subsystems ──────────────────────────────────────────────
         // Build a shared FeatureRegistry so plugin descriptors registered
@@ -1130,6 +1179,7 @@ impl ffi::AppBridge {
             r.identity = Some(Arc::clone(&identity));
             r.peer_store = Some(Arc::clone(&peer_store));
             r.chat_store = Some(Arc::clone(&chat_store));
+            r.room_store = Some(Arc::clone(&room_store));
             r.ollama_cmd_tx = maybe_ollama_cmd;
             r.ollama_available = ollama_is_available;
         }
@@ -1829,9 +1879,19 @@ impl ffi::AppBridge {
         }
         {
             let mut r = self.as_mut().rust_mut();
-            r.current_supernode_id = sid;
-            r.current_room_id = rid;
+            r.current_supernode_id = sid.clone();
+            r.current_room_id = rid.clone();
         }
+        remember_room_in_store(
+            &self.rust().room_store,
+            &sid,
+            &rid,
+            &rid,
+            "public",
+            "",
+            false,
+            "",
+        );
 
         // Immediately seed room_participant_ids with just the local peer so
         // that any stale RoomPeerLeft closures already queued to the Qt thread
@@ -1902,12 +1962,60 @@ impl ffi::AppBridge {
         // Point send_room_chat at the newly-selected chat room.
         {
             let mut r = self.as_mut().rust_mut();
-            r.current_supernode_id = sid;
-            r.current_room_id = rid;
+            r.current_supernode_id = sid.clone();
+            r.current_room_id = rid.clone();
         }
+        remember_room_in_store(
+            &self.rust().room_store,
+            &sid,
+            &rid,
+            &rid,
+            "public",
+            "",
+            false,
+            "",
+        );
     }
 
-    fn create_room(self: Pin<&mut Self>, supernode_id: &QString, room_name: &QString) {
+    fn remove_room(mut self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) {
+        let Some(sid) = self
+            .rust()
+            .resolve_supernode_node_id_str(&supernode_id.to_string())
+        else {
+            return;
+        };
+        let rid = room_id.to_string();
+        if sid.is_empty() || rid.is_empty() || rid == "default" {
+            return;
+        }
+        if let Some(ref rs) = self.rust().room_store {
+            if let Err(e) = rs.write().hide_from_sidebar(&sid, &rid) {
+                warn!("room_store hide_from_sidebar error: {e}");
+            }
+        }
+        let in_this_room =
+            self.rust().current_supernode_id == sid && self.rust().current_room_id == rid;
+        if in_this_room {
+            self.as_mut().leave_room();
+            {
+                let mut r = self.as_mut().rust_mut();
+                r.current_supernode_id.clear();
+                r.current_room_id.clear();
+            }
+            self.as_mut()
+                .set_session_banner(QString::from("Offline \u{00b7} Room hidden"));
+            self.as_mut().set_connection_mode(QString::from("offline"));
+        }
+        self.as_mut()
+            .room_removed(QString::from(sid.as_str()), QString::from(rid.as_str()));
+    }
+
+    fn create_room(
+        self: Pin<&mut Self>,
+        supernode_id: &QString,
+        room_name: &QString,
+        room_type: &QString,
+    ) {
         let Some(sid) = self
             .rust()
             .resolve_supernode_node_id_str(&supernode_id.to_string())
@@ -1915,10 +2023,21 @@ impl ffi::AppBridge {
             return;
         };
         let name = room_name.to_string();
+        let normalized = match room_type.to_string().trim().to_ascii_lowercase().as_str() {
+            "private" => "private",
+            _ => "public",
+        };
+        if name.trim().is_empty() {
+            return;
+        }
         if let Some(ref tx) = self.rust().conn_cmd_tx {
             let _ = tx.try_send(ConnectionCommand::CreateRoom {
                 supernode_id: sid,
                 room_name: name,
+                room_type: normalized.to_owned(),
+                room_id: None,
+                creator_id: None,
+                materialize_only: false,
             });
         }
     }
@@ -2114,7 +2233,10 @@ impl ffi::AppBridge {
         let pid = peer_id.to_string();
         // Remove from in-memory + persisted peer store
         if let Some(ref ps) = self.rust().peer_store {
-            ps.write().remove(&pid);
+            let mut store = ps.write();
+            if store.remove_by_any_id(&pid).is_some() {
+                let _ = store.save();
+            }
         }
         // Disconnect any active audio session
         if let Some(ref tx) = self.rust().call_cmd_tx {
@@ -2123,6 +2245,73 @@ impl ffi::AppBridge {
             });
         }
         info!("Peer removed: {pid}");
+    }
+
+    fn remove_supernode(mut self: Pin<&mut Self>, node_id: &QString) {
+        let id = node_id.to_string();
+        let Some(canon) = self.rust().resolve_supernode_node_id_str(&id) else {
+            warn!("remove_supernode: unknown node {id}");
+            return;
+        };
+
+        {
+            let ps = self.rust().peer_store.clone();
+            let Some(ps) = ps else {
+                warn!("remove_supernode: peer store unavailable");
+                return;
+            };
+            let mut store = ps.write();
+            if !store.is_supernode_id(&canon) {
+                warn!("remove_supernode: not a supernode {canon}");
+                return;
+            }
+            if store.remove_by_any_id(&canon).is_none() {
+                return;
+            }
+            if let Err(e) = store.save() {
+                warn!("remove_supernode: failed to persist peer store: {e}");
+            }
+        }
+
+        let on_removed_supernode = self.rust().current_supernode_id == canon;
+        if on_removed_supernode {
+            if let Some(ref tx) = self.rust().conn_cmd_tx {
+                let _ = tx.try_send(ConnectionCommand::LeaveRoom {
+                    supernode_id: canon.clone(),
+                });
+            }
+            if let Some(ref tx) = self.rust().sfu_cmd_tx {
+                let _ = tx.try_send(SfuCommand::Leave);
+            }
+            if let Some(ref tx) = self.rust().call_cmd_tx {
+                let _ = tx.try_send(CallCommand::ClearRoomMode);
+                let _ = tx.try_send(CallCommand::StopAudio);
+            }
+            let mut r = self.as_mut().rust_mut();
+            r.current_supernode_id.clear();
+            r.current_room_id.clear();
+            r.room_participant_ids.clear();
+            self.as_mut().set_in_room(false);
+            self.as_mut().set_voice_active(false);
+        }
+
+        {
+            let prefix = format!("{canon}:");
+            self.as_mut()
+                .rust_mut()
+                .room_chat_history
+                .retain(|k, _| !k.starts_with(&prefix));
+        }
+
+        if let Some(ref tx) = self.rust().conn_cmd_tx {
+            let _ = tx.try_send(ConnectionCommand::RemoveSupernode {
+                supernode_id: canon.clone(),
+            });
+        }
+
+        self.as_mut()
+            .supernode_removed(QString::from(canon.as_str()));
+        info!("Supernode removed: {canon}");
     }
 
     fn enable_ptt(mut self: Pin<&mut Self>, key: &QString) {
@@ -2692,6 +2881,137 @@ fn peer_row_json(record: &crate::peer_store::PeerRecord, online: bool) -> serde_
     })
 }
 
+fn remember_room_in_store(
+    room_store: &Option<Arc<RwLock<crate::room_store::RoomStore>>>,
+    supernode_id: &str,
+    room_id: &str,
+    room_name: &str,
+    room_type: &str,
+    creator_id: &str,
+    is_creator: bool,
+    invite_token: &str,
+) {
+    let Some(rs) = room_store else {
+        return;
+    };
+    if supernode_id.is_empty() || room_id.is_empty() || room_id == "default" {
+        return;
+    }
+    let entry = crate::room_store::RoomEntry::new(room_id, room_name)
+        .with_type(if room_type.is_empty() {
+            "public"
+        } else {
+            room_type
+        })
+        .with_supernode(supernode_id)
+        .with_creator(creator_id, is_creator)
+        .with_invite_token(invite_token);
+    if let Err(e) = rs.write().upsert(entry) {
+        warn!("room_store upsert error: {e}");
+    }
+}
+
+fn sync_saved_rooms_from_list(
+    room_store: &mut crate::room_store::RoomStore,
+    supernode_id: &str,
+    rooms: &serde_json::Value,
+) {
+    let Some(arr) = rooms.as_array() else {
+        return;
+    };
+    for room in arr {
+        let room_id = room
+            .get("room_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if room_id.is_empty() || !room_store.contains(supernode_id, room_id) {
+            continue;
+        }
+        let room_name = room
+            .get("name")
+            .or_else(|| room.get("room_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(room_id);
+        let room_type = room
+            .get("room_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("public");
+        let creator_id = room
+            .get("creator_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let existing = room_store.get(supernode_id, room_id);
+        let is_creator = existing.map(|e| e.is_creator).unwrap_or(false);
+        let invite_token = existing.map(|e| e.invite_token.as_str()).unwrap_or("");
+        let entry = crate::room_store::RoomEntry::new(room_id, room_name)
+            .with_type(room_type)
+            .with_supernode(supernode_id)
+            .with_creator(
+                if creator_id.is_empty() {
+                    existing.map(|e| e.creator_id.as_str()).unwrap_or("")
+                } else {
+                    creator_id
+                },
+                is_creator,
+            )
+            .with_invite_token(invite_token);
+        if let Err(e) = room_store.upsert(entry) {
+            warn!("room_store sync from list error: {e}");
+        }
+    }
+}
+
+fn replay_saved_rooms_on_supernode_connect(
+    room_store: &crate::room_store::RoomStore,
+    conn_cmd_tx: &mpsc::Sender<ConnectionCommand>,
+    supernode_id: &str,
+    my_public_id: &str,
+) {
+    for entry in room_store.list_for_supernode(supernode_id) {
+        if entry.room_id == "default" {
+            continue;
+        }
+        if room_store.is_hidden_from_sidebar(supernode_id, &entry.room_id) {
+            continue;
+        }
+        let creator_id = if entry.creator_id.is_empty() {
+            my_public_id.to_owned()
+        } else {
+            entry.creator_id.clone()
+        };
+        let _ = conn_cmd_tx.try_send(ConnectionCommand::CreateRoom {
+            supernode_id: supernode_id.to_owned(),
+            room_name: entry.room_name.clone(),
+            room_type: entry.room_type.clone(),
+            room_id: Some(entry.room_id.clone()),
+            creator_id: Some(creator_id),
+            materialize_only: true,
+        });
+    }
+}
+
+fn filter_sfu_rooms_for_sidebar(
+    room_store: &crate::room_store::RoomStore,
+    supernode_id: &str,
+    rooms: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(arr) = rooms.as_array() else {
+        return rooms.clone();
+    };
+    let filtered: Vec<serde_json::Value> = arr
+        .iter()
+        .filter(|r| {
+            let room_id = r
+                .get("room_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            !room_id.is_empty() && !room_store.is_hidden_from_sidebar(supernode_id, room_id)
+        })
+        .cloned()
+        .collect();
+    serde_json::Value::Array(filtered)
+}
+
 fn non_supernode_peers_json(store: &crate::peer_store::PeerStore, online: bool) -> String {
     serde_json::to_string(
         &store
@@ -2964,6 +3284,13 @@ fn dispatch_event(
                 bridge
                     .as_mut()
                     .nodes_updated(QString::from(node_json.as_str()));
+                let my_public_id = bridge.rust().my_public_id.clone();
+                if let (Some(rs), Some(tx)) = (
+                    bridge.rust().room_store.as_ref(),
+                    bridge.rust().conn_cmd_tx.as_ref(),
+                ) {
+                    replay_saved_rooms_on_supernode_connect(&rs.read(), tx, &canon, &my_public_id);
+                }
             });
         }
         ConnectionEvent::SupernodeDisconnected(id) => {
@@ -2988,6 +3315,7 @@ fn dispatch_event(
             title,
             wt_url,
             cert_fingerprint,
+            sfu_enabled,
         } => {
             // Cache the WebTransport base URL and cert fingerprint so
             // /_conquerd/ctx.json can expose them to game pages loaded via
@@ -3015,6 +3343,7 @@ fn dispatch_event(
                     "node_id": canon,
                     "homepage_url": homepage_url,
                     "title": title,
+                    "sfu_enabled": sfu_enabled,
                 }])
                 .to_string();
                 bridge
@@ -3024,6 +3353,47 @@ fn dispatch_event(
                     QString::from(canon.as_str()),
                     QString::from(url_q.as_str()),
                     QString::from(title_q.as_str()),
+                );
+            });
+        }
+        ConnectionEvent::RoomCreated {
+            supernode_id,
+            room_id,
+            room_name,
+            room_type,
+            invite_token,
+        } => {
+            let banner = format!("Room \u{00b7} {room_name}");
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
+                    return;
+                };
+                let my_public_id = bridge.rust().my_public_id.clone();
+                remember_room_in_store(
+                    &bridge.rust().room_store,
+                    &canon,
+                    &room_id,
+                    &room_name,
+                    &room_type,
+                    &my_public_id,
+                    true,
+                    &invite_token,
+                );
+                bridge
+                    .as_mut()
+                    .set_session_banner(QString::from(banner.as_str()));
+                bridge.as_mut().set_connection_mode(QString::from("room"));
+                {
+                    let mut r = bridge.as_mut().rust_mut();
+                    r.current_supernode_id = canon.clone();
+                    r.current_room_id = room_id.clone();
+                }
+                bridge.as_mut().room_created(
+                    QString::from(canon.as_str()),
+                    QString::from(room_id.as_str()),
+                    QString::from(room_name.as_str()),
+                    QString::from(room_type.as_str()),
+                    QString::from(invite_token.as_str()),
                 );
             });
         }
@@ -3279,10 +3649,18 @@ fn dispatch_event(
                 let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
                     return;
                 };
+                let rooms = serde_json::from_str::<serde_json::Value>(&rooms_json)
+                    .unwrap_or(serde_json::Value::Array(vec![]));
+                let rooms = if let Some(rs) = bridge.rust().room_store.as_ref() {
+                    let mut store = rs.write();
+                    sync_saved_rooms_from_list(&mut store, &canon, &rooms);
+                    filter_sfu_rooms_for_sidebar(&store, &canon, &rooms)
+                } else {
+                    rooms
+                };
                 let wrapped = serde_json::json!({
                     "supernode_id": canon,
-                    "rooms": serde_json::from_str::<serde_json::Value>(&rooms_json)
-                        .unwrap_or(serde_json::Value::Array(vec![])),
+                    "rooms": rooms,
                 })
                 .to_string();
                 bridge

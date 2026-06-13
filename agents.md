@@ -50,6 +50,7 @@ Responsibilities:
 - Maintain first-party feature modules: `core.chat.v1`, `core.audio.opus`, `core.file.v1`, `room.audio.sfu`, `room.chat.v1`, `room.file.v1`.
 - Maintain desktop UX consumers (chat panel, call overlay, session banner) on top of the feature modules.
 - Maintain relay ticket auto-renewal and endpoint mailbox for robust connectivity across restarts.
+- Keep SFU room hosting ephemeral on supernodes (`sfu.rs` idle GC, no disk persistence); client `RoomStore` owns definitions and replays `SfuRoomCreate` on connect.
 - Keep session status banner accurate across direct, relay, and room modes; preserve participant-state consistency.
 
 Working style:
@@ -94,7 +95,7 @@ Responsibilities:
 - Maintain the supernode feature manifest (`supernode.toml`-style typed capability list replacing ad-hoc env-var toggles).
 - Support hot-reload of feature modules and bespoke `x.<vendor>.*` plug-ins.
 - Keep infra docs aligned with no-backend policy: supernodes assist transport and host feature modules; they are never identity authorities.
-- Ensure endpoint mailbox (`supernode_endpoints.json`, 24h TTL) and ticket renewal (1h TTL, 10-min renewal window) persist across restarts.
+- Ensure endpoint mailbox (`supernode_endpoints.json`, 24h TTL) and ticket renewal (1h TTL, 10-min renewal window) persist across restarts. SFU room state must **not** be persisted — only peer trust (`peers.json`), identity, manifest, and endpoint mailbox belong on disk.
 - Document how to host static + WebTransport-enabled web games under `games/<slug>/`.
 
 Working style:
@@ -119,6 +120,7 @@ Responsibilities:
 - Keep the Privacy and Data `SettingCard` in `SettingsPage.qml` (Privacy tab) in sync with `ChatStore` methods and `keyring_delete_aes_key`.
 - Keep the peer block/unblock context menu toggle in `PeerList.qml` in sync with `ConnectionCommand::BlockPeer` / `UnblockPeer`.
 - Keep the **Peers vs Rooms** split: the Peers rail (`PeerList.qml` / `PeerListModel`) must list only `PeerStore::list_non_supernode_peers()`; the Rooms sidebar (`MainWindow.qml` `nodeListModel`, `RoomPanel.qml`) must list only trusted supernodes (`PeerStore::supernodes()`, `AppBridge::isKnownSupernode`). Never show supernodes in Peers or ordinary peers in Rooms.
+- Keep **room UX** aligned with client-owned definitions + ephemeral supernode hosting: `CreateRoomDialog.qml` / `create_room` for user-initiated create (auto-join); `RoomStore::hide_from_sidebar` for sidebar remove (local only — no `SfuRoomDelete`); `SupernodeConnected` replay via `CreateRoom { materialize_only: true }` must not auto-join; room list filtering uses `filter_sfu_rooms_for_sidebar` + composite `(supernodeId, roomId)` keys.
 - Keep the Avatar section on the Identity settings tab (`SettingsPage.qml`, `settingsTab = 1`) in sync with `AvatarConfig` fields in `avatar_config.rs`; the `settings.avatar_config_json` qproperty on `SettingsModel` bridges the two. Avatar SVGs are rendered via `backend.avatarSvg(peerId, configJson)` → `data:image/svg+xml;base64,...` in `Avatar.qml`.
 
 Working style:
@@ -144,6 +146,7 @@ This section captures implementation locations and invariants that agents must r
   - `src/peer_store.rs`: trusted-peer persistence (`is_supernode`, `supernode_from_invite`, `relay_hints`); `supernodes()` vs `list_non_supernode_peers()` split drives Rooms vs Peers (see supernode detection invariant below).
   - `src/avatar_config.rs`: compiled unconditionally (so `peer_store.rs` can hold `Option<AvatarConfig>` even without `qt-ui`); `settings.avatar_config_json` qproperty lives on `SettingsModel`.
   - `src/chat_store.rs`: per-peer `trim_by_age` / `trim_by_count` / `purge_all`; `keyring_delete_aes_key` for identity lock.
+  - `src/room_store.rs`: client-owned encrypted room definitions (`my_rooms.dat`), keyed by `(supernode_id, room_id)`; sidebar hide list; replay source for `SfuRoomCreate` on supernode connect. **Never** persist room definitions on the supernode.
   - `src/identity.rs`: Ed25519 + OS keyring integration.
   - `ConnectionManager`: direct QUIC + relay client paths; outbound `core.chat.v1` / `core.file.v1` must call `gate_through_feature`; audio datagrams must use the quota-checked send helpers.
 - `conquerd-features`: the spine. `FeatureRegistry`, `FeatureModule` trait, `dispatch_message` / `dispatch_invoke_datagram`, inbound/outbound quota enforcement (token-bucket per `(feature, peer)`), auth tiers, channel-tag registry. 113 unit tests. All transports (direct QUIC, relay, WS, WebTransport) must go through the registry for capability-gated paths; hot paths may call `gate_inbound_through_feature` directly but must still respect the same buckets.
@@ -163,6 +166,14 @@ This section captures implementation locations and invariants that agents must r
 - **Transport**: `ConnectionManager::connect_supernode_ws` and startup WS auto-reconnect (`PeerStore::supernodes()` in `run_inner`) run only for trusted supernode records.
 - **UI**: `PeerStore::list_non_supernode_peers()` → `peersUpdated` / Peers rail; `PeerStore::supernodes()` + `AppBridge::resolveSupernodeNodeId` / `isKnownSupernode` → Rooms sidebar (`nodesUpdated`, `sfuRoomsUpdated`). Room selection is scoped by `(supernodeId, roomId)` — never `room_id` alone.
 - **Migration-only repair** (`PeerStore::repair_all_supernode_flags` on `peers.dat` load): demote false positives whose ws hint matches another trusted supernode's signaling URL, or `is_supernode` rows with a non-zero direct `quic_port` and a non-operator handle; legacy-promote ws rows with operator/default titles only; grandfather unique-ws `is_supernode` rows to `supernode_from_invite`. Do not reintroduce broad ws-hint promotion for personal-handle peers. Negative-path tests live in `peer_store.rs`.
+
+**Room ownership invariant** (client definitions, supernode ephemeral only):
+- **Authoritative room definitions live on peers** — encrypted `my_rooms.dat` via `RoomStore`, keyed by `(supernode_id, room_id)`. Entries are written on user create (`RoomCreated`), join (`join_room`), or chat subscribe (`subscribe_room_chat`). Chat history stays in `ChatStore` / `room_chat_history` on each peer; the supernode does not store messages or room metadata to disk.
+- **Supernode rooms are in-memory only** — `SFURoomManager` in `rust/conquerd-supernode/src/sfu.rs`. Do **not** reintroduce `sfu_rooms.json` or other room persistence on the supernode. The built-in `default` room is always present; user-created rooms idle-GC after `IDLE_ROOM_GC_SECS` (900 s) with zero voice participants and zero chat subscribers.
+- **Materialize on connect** — when a trusted supernode WS session comes up, `AppBridge` replays non-hidden `RoomStore` entries with `ConnectionCommand::CreateRoom { materialize_only: true, room_id, creator_id, ... }`. `ConnectionManager::pending_materialize` suppresses auto-join on the matching `SfuRoomCreated`. User-initiated create (`materialize_only: false`) still auto-joins.
+- **Wire shape** — `SfuRoomCreate` payload may include `room_name`, `room_type`, optional `room_id`, optional `creator_id` (original creator when a non-creator peer replays a saved definition). Supernode `handle_sfu_room_create` uses `creator_id` from payload when present.
+- **Sidebar hide is local** — `RoomStore::hide_from_sidebar` + `remove_room` in `bridge.rs` / `MainWindow.qml`; does not delete on the supernode (ephemeral GC handles server-side cleanup). Hidden rooms are filtered from `sfuRoomsUpdated` and skipped on replay.
+- **Outbound routing** — room signaling must target the correct supernode WS session (`resolve_supernode_ws_target` in `dispatch_outbound`); never fan `SfuRoomCreate` to the first connected supernode when multiple nodes share a host.
 
 ### Build Gotchas (Agent-Relevant)
 - **`conquerd-opus` DNN data** (required for default `dnn` feature): run `scripts/fetch_opus_weights.ps1` (Windows) or `.sh` (Linux/macOS) before building. Extracts Xiph.Org C arrays into `rust/conquerd-opus/opus/dnn/`. Idempotent. Set `default-features = false` on the dep to build without DNN support.
@@ -304,8 +315,8 @@ Supernode-hosted modules (multi-party; require a connected supernode):
 
 | Capability ID | Kind | Auth | Notes |
 |---|---|---|---|
-| `room.audio.sfu` | datagram | room-member | SFU voice rooms; supernode `SfuRoomModule`. |
-| `room.chat.v1` | stream | room-member | Room text chat broadcast via supernode. |
+| `room.audio.sfu` | datagram | room-member | Ephemeral SFU voice in supernode memory (`sfu.rs`); idle-GC after 900 s empty; definitions owned by clients (`room_store.rs`). |
+| `room.chat.v1` | stream | room-member | Room text chat broadcast via supernode (content not persisted server-side). |
 | `room.file.v1` | stream | room-member | Signed room file broadcast via supernode; recipients verify chunks before saving. |
 | `web.host.app.v1` | stream | public | In-app `conquerd://` portal over QUIC bidi streams in embedded Chromium (4 MB/s). |
 | `web.host.h3.v1` | datagram | public | WebTransport (HTTP/3) bridge so browser clients join the same channel fabric. |
@@ -334,11 +345,11 @@ No central feature registry, no mandatory features, no implicit cross-feature pr
 
 This section is the single source of truth for delivery status (condensed from the former `ROADMAP.md` / `IMPROVEMENT_PLAN.md` / `TODO.md`).
 
-**Last reviewed:** 2026-06-11 (bug-review pass: relay quota cleanup on disconnect/reconnect/revoke/stale-sweep, reconnect stable_id guard, dynamic-tag overflow fixes).
+**Last reviewed:** 2026-06-13 (ephemeral SFU rooms: client `RoomStore` replay, supernode idle GC, docs realigned).
 
 ### Health summary
 
-ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (489 unit tests; 113 features + 196 supernode + 125 client + 55 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients.
+ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (504 unit tests; 113 features + 198 supernode + 138 client + 55 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only.
 
 ### P0–P2 — Complete ✅
 
@@ -357,7 +368,8 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 | Version automation | `scripts/check_version_sync.ps1 -BumpTo X.Y.Z` bumps all crates + prints git/tag commands. |
 | Metrics export | `/api/metrics` via `web.host.app.v1`. |
 | Game relay end-to-end | `game.relay.v1` over WebTransport confirmed working: race condition in `/_conquerd/ctx.json` cache fixed (scheme-layer caches now populated on tokio thread in `connection_manager.rs` before any `FetchWebApp` can succeed); self-signed TLS cert now includes `serverAuth` EKU (Chrome WebTransport requirement); cert fingerprint always re-derived from on-disk DER (stale `.hex` cache bug fixed); old certs missing the EKU detected via OID byte-scan and auto-rotated on next supernode start; template SDK synced with source (`ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, `featureForFixedTag` exports added); SDK now fails fast with a clear error when portal context exists but no WebTransport URL is available; cursor relay demo fixed (`encodeCursorLeave` now carries color so peer tracking is stable). |
-| Test suite integrity | Full test run across all four crates: 489 unit tests all green (113 `conquerd-features` + 196 `conquerd-supernode` + 125 `conquerd-client` + 55 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
+| Test suite integrity | Full test run across all four crates: 504 unit tests all green (113 `conquerd-features` + 198 `conquerd-supernode` + 138 `conquerd-client` + 55 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
+| Ephemeral SFU rooms | Supernode in-memory rooms only (`sfu.rs` idle GC, no `sfu_rooms.json`); client `RoomStore` replay on supernode connect; sidebar hide local-only. |
 
 ### P3 backlog (as capacity allows)
 

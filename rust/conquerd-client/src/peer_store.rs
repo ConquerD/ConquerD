@@ -239,6 +239,19 @@ impl PeerStore {
         self.records.remove(peer_id)
     }
 
+    /// Remove by hex `peer_id` or base64url `identity_pub`.
+    pub fn remove_by_any_id(&mut self, id: &str) -> Option<PeerRecord> {
+        if let Some(rec) = self.records.remove(id) {
+            return Some(rec);
+        }
+        let key = self
+            .records
+            .iter()
+            .find(|(_, r)| r.identity_pub == id)
+            .map(|(k, _)| k.clone());
+        key.and_then(|k| self.records.remove(&k))
+    }
+
     pub fn contains(&self, peer_id: &str) -> bool {
         self.records.contains_key(peer_id)
     }
@@ -614,6 +627,23 @@ mod tests {
             peers[0].identity_pub,
             "HQrq9wyKpjmsp0DvT0H3si_lgQ5nKoYpBjVxbDFkugQ="
         );
+    }
+
+    #[test]
+    fn remove_by_any_id_accepts_peer_id_or_identity_pub() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let mut store = PeerStore::open(&id, Some(&dir.path().join(PEER_STORE_FILE))).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "hex_peer".to_owned(),
+            identity_pub: "b64_identity".to_owned(),
+            is_supernode: true,
+            supernode_from_invite: true,
+            ..Default::default()
+        });
+
+        assert!(store.remove_by_any_id("b64_identity").is_some());
+        assert!(store.is_empty());
     }
 
     #[test]

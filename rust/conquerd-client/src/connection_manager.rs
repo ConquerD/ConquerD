@@ -159,6 +159,8 @@ pub enum ConnectionEvent {
         /// WebTransport TLS cert.  Passed to game pages so they can use
         /// `serverCertificateHashes` — no CA cert needed.
         cert_fingerprint: String,
+        /// True when the supernode advertises `room.audio.sfu` (SFU room hosting).
+        sfu_enabled: bool,
     },
     /// Supernode requires a portal visit before granting relay access.
     RelayPaymentRequired {
@@ -171,6 +173,15 @@ pub enum ConnectionEvent {
         /// Raw JSON array of room descriptors.
         rooms_json: String,
     },
+    /// Supernode acknowledged a room we created (`SfuRoomCreated`).
+    RoomCreated {
+        supernode_id: String,
+        room_id: String,
+        room_name: String,
+        room_type: String,
+        invite_token: String,
+    },
+
     /// A peer sent a presence update.
     PresenceUpdated { peer_id: String, status: String },
     /// Inbound SFU_AUDIO relayed from the supernode (Opus bytes from a room peer).
@@ -327,10 +338,22 @@ pub enum ConnectionCommand {
     CancelFile {
         transfer_id: String,
     },
-    /// Create (and immediately join) a new SFU room on a supernode.
+    /// Create a new SFU room on a supernode, or materialize a saved definition.
     CreateRoom {
         supernode_id: String,
         room_name: String,
+        /// `"public"` or `"private"` (supernode `RoomType` wire shape).
+        room_type: String,
+        /// When set, recreate this exact room id (client replay on reconnect).
+        room_id: Option<String>,
+        /// Original creator when a non-creator peer materializes a saved room.
+        creator_id: Option<String>,
+        /// When true, do not auto-join on `SfuRoomCreated` (replay only).
+        materialize_only: bool,
+    },
+    /// Tear down a trusted supernode session and stop WS auto-reconnect.
+    RemoveSupernode {
+        supernode_id: String,
     },
     /// Send an Opus audio frame to the current SFU room via the supernode.
     /// Used as a WebSocket fallback when direct QUIC is unavailable.
@@ -450,6 +473,8 @@ struct SupernodeSession {
     /// Channel to send messages into this supernode connection.
     send_tx: mpsc::Sender<WsMessage>,
     connected: bool,
+    /// Background WS task; aborted when the supernode is removed from trust.
+    ws_task: tokio::task::JoinHandle<()>,
 }
 
 /// Extract the bare host (no scheme, port, or path) from a URL-ish string
@@ -586,6 +611,9 @@ pub struct ConnectionManager {
     replay_guard: ReplayGuard,
     /// Latest QUIC transport stats keyed by peer id.
     transport_stats: HashMap<String, PeerTransportStats>,
+    /// `supernode_id:room_id` keys for in-flight materialize-only creates.
+    /// `SfuRoomCreated` must not auto-join these rooms.
+    pending_materialize: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -664,6 +692,7 @@ impl ConnectionManager {
             quic_relays: HashMap::new(),
             replay_guard: ReplayGuard::new(Self::MAX_MESSAGE_AGE_SECS),
             transport_stats: HashMap::new(),
+            pending_materialize: HashSet::new(),
         };
         (cmd_tx, event_rx, mgr.run_inner())
     }
@@ -752,6 +781,9 @@ impl ConnectionManager {
                             self.current_room_id.clear();
                             self.current_supernode_id.clear();
                             self.send_room_leave(&supernode_id).await;
+                        }
+                        ConnectionCommand::RemoveSupernode { supernode_id } => {
+                            self.remove_supernode(&supernode_id).await;
                         }
                         ConnectionCommand::SubscribeRoomChat { supernode_id, room_id } => {
                             self.send_room_subscribe(&supernode_id, &room_id).await;
@@ -863,21 +895,23 @@ impl ConnectionManager {
                                 self.send_avatar_config(&peer_id, &config_json).await;
                             }
                         }
-                        ConnectionCommand::CreateRoom { supernode_id, room_name } => {
-                            // Generate a room ID from the name (slug + random suffix).
-                            use std::time::{SystemTime, UNIX_EPOCH};
-                            let ts = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let slug: String = room_name
-                                .chars()
-                                .filter(|c| c.is_alphanumeric() || *c == '-')
-                                .map(|c| c.to_ascii_lowercase())
-                                .collect();
-                            let room_id = format!("{slug}-{ts}");
-                            info!("[cm] CreateRoom: supernode={supernode_id} room_id={room_id}");
-                            self.send_room_join(&supernode_id, &room_id).await;
+                        ConnectionCommand::CreateRoom {
+                            supernode_id,
+                            room_name,
+                            room_type,
+                            room_id,
+                            creator_id,
+                            materialize_only,
+                        } => {
+                            self.send_room_create(
+                                &supernode_id,
+                                &room_name,
+                                &room_type,
+                                room_id.as_deref(),
+                                creator_id.as_deref(),
+                                materialize_only,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -941,7 +975,7 @@ impl ConnectionManager {
         let ws_url_clone = ws_url.clone();
 
         // Spawn a dedicated task for this supernode connection
-        tokio::spawn(supernode_ws_task(
+        let ws_task = tokio::spawn(supernode_ws_task(
             identity,
             peer_id_clone,
             ws_url_clone,
@@ -956,7 +990,41 @@ impl ConnectionManager {
                 ws_url,
                 send_tx,
                 connected: false,
+                ws_task,
             },
+        );
+    }
+
+    /// Resolve a signaling `target` to a `supernodes` session key (`identity_pub`).
+    fn resolve_supernode_ws_target(&self, target: &str) -> Option<String> {
+        if self.supernodes.contains_key(target) {
+            return Some(target.to_owned());
+        }
+        let canon = self
+            .peer_store
+            .read()
+            .resolve_supernode_identity_pub(target)?;
+        if self.supernodes.contains_key(&canon) {
+            Some(canon)
+        } else {
+            None
+        }
+    }
+
+    async fn remove_supernode(&mut self, supernode_id: &str) {
+        if self.current_supernode_id == supernode_id {
+            self.current_room_id.clear();
+            self.current_supernode_id.clear();
+            self.send_room_leave(supernode_id).await;
+        }
+        if let Some(sn) = self.supernodes.remove(supernode_id) {
+            sn.ws_task.abort();
+            let _ = sn.send_tx.try_send(WsMessage::Close(None));
+        }
+        self.quic_relays.remove(supernode_id);
+        info!(
+            "Supernode removed from trust store: {}",
+            &supernode_id[..8.min(supernode_id.len())]
         );
     }
 
@@ -1124,7 +1192,37 @@ impl ConnectionManager {
             }
         }
 
-        // Fall back: send via first connected supernode WebSocket
+        // Route supernode-targeted signaling to that supernode's WS session.
+        // Without this, multi-supernode clients always hit the first connected
+        // session — room creates/lists from SN-B would land on SN-A instead.
+        if let Some(target) = msg.target.clone() {
+            if let Some(sn_id) = self.resolve_supernode_ws_target(&target) {
+                match self.supernodes.get(&sn_id) {
+                    Some(sn) if sn.connected => {
+                        let _ = sn.send_tx.try_send(WsMessage::Text(json.clone()));
+                        return;
+                    }
+                    _ => {
+                        warn!(
+                            "Supernode {} not connected; dropping {:?}",
+                            &sn_id[..8.min(sn_id.len())],
+                            msg_type
+                        );
+                        if let Some((peer_id, message_id)) = chat_attempt {
+                            let _ = self.event_tx.try_send(ConnectionEvent::ChatSendFailed {
+                                peer_id,
+                                message_id,
+                                reason: "supernode is offline".to_owned(),
+                            });
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fall back: send via first connected supernode WebSocket (legacy path
+        // for untargeted or peer-targeted messages that missed QUIC).
         for sn in self.supernodes.values() {
             if sn.connected {
                 let _ = sn.send_tx.try_send(WsMessage::Text(json.clone()));
@@ -1560,6 +1658,47 @@ impl ConnectionManager {
         msg.target = Some(supernode_id.to_owned());
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
+        self.dispatch_outbound(msg).await;
+    }
+
+    async fn send_room_create(
+        &mut self,
+        supernode_id: &str,
+        room_name: &str,
+        room_type: &str,
+        room_id: Option<&str>,
+        creator_id: Option<&str>,
+        materialize_only: bool,
+    ) {
+        let normalized = match room_type.trim().to_ascii_lowercase().as_str() {
+            "private" => "private",
+            _ => "public",
+        };
+        if materialize_only {
+            if let Some(rid) = room_id.filter(|s| !s.is_empty()) {
+                let key = format!("{supernode_id}:{rid}");
+                self.pending_materialize.insert(key);
+            }
+        }
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::SfuRoomCreate, sender.clone());
+        msg.target = Some(supernode_id.to_owned());
+        msg.payload
+            .insert("room_name".to_owned(), Value::String(room_name.to_owned()));
+        msg.payload
+            .insert("room_type".to_owned(), Value::String(normalized.to_owned()));
+        if let Some(rid) = room_id.filter(|s| !s.is_empty()) {
+            msg.payload
+                .insert("room_id".to_owned(), Value::String(rid.to_owned()));
+        }
+        if let Some(cid) = creator_id.filter(|s| !s.is_empty()) {
+            msg.payload
+                .insert("creator_id".to_owned(), Value::String(cid.to_owned()));
+        }
+        info!(
+            "[cm] SfuRoomCreate: supernode={} name={room_name} type={normalized} materialize_only={materialize_only}",
+            &supernode_id[..8.min(supernode_id.len())]
+        );
         self.dispatch_outbound(msg).await;
     }
 
@@ -2526,15 +2665,29 @@ impl ConnectionManager {
                 let homepage_url = msg
                     .payload
                     .get("homepage_url")
+                    .or_else(|| msg.payload.get("app_url"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
                 let title = msg
                     .payload
                     .get("title")
+                    .or_else(|| msg.payload.get("node_title"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                let sfu_enabled = msg
+                    .payload
+                    .get("capabilities")
+                    .and_then(Value::as_array)
+                    .map(|caps| {
+                        caps.iter().any(|c| {
+                            c.get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| id == "room.audio.sfu")
+                        })
+                    })
+                    .unwrap_or(false);
                 let mut wt_url = msg
                     .payload
                     .get("wt_url")
@@ -2592,6 +2745,7 @@ impl ConnectionManager {
                         title,
                         wt_url,
                         cert_fingerprint,
+                        sfu_enabled,
                     });
             }
             MessageType::RelayPaymentRequired => {
@@ -2625,6 +2779,57 @@ impl ConnectionManager {
                     supernode_id: msg.sender.clone(),
                     rooms_json,
                 });
+            }
+            MessageType::SfuRoomCreated => {
+                let room_id = msg
+                    .payload
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let room_name = msg
+                    .payload
+                    .get("room_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Room")
+                    .to_owned();
+                let room_type = msg
+                    .payload
+                    .get("room_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("public")
+                    .to_owned();
+                let invite_token = msg
+                    .payload
+                    .get("invite_token")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if room_id.is_empty() {
+                    warn!(
+                        "SfuRoomCreated missing room_id from {}",
+                        &msg.sender[..8.min(msg.sender.len())]
+                    );
+                    return;
+                }
+                let supernode_id = msg.sender.clone();
+                let materialize_key = format!("{supernode_id}:{room_id}");
+                let materialize_only = self.pending_materialize.remove(&materialize_key);
+                if materialize_only {
+                    self.send_room_list_request(&supernode_id).await;
+                } else {
+                    self.current_supernode_id = supernode_id.clone();
+                    self.current_room_id = room_id.clone();
+                    self.send_room_join(&supernode_id, &room_id).await;
+                    self.send_room_list_request(&supernode_id).await;
+                    let _ = self.event_tx.try_send(ConnectionEvent::RoomCreated {
+                        supernode_id,
+                        room_id,
+                        room_name,
+                        room_type,
+                        invite_token,
+                    });
+                }
             }
             MessageType::PresenceUpdate => {
                 let status = msg

@@ -61,6 +61,21 @@ ApplicationWindow {
         return -1
     }
 
+    // Union two room snapshots by room_id (used when deduping alias node rows).
+    function mergeRoomLists(a, b) {
+        var byId = {}
+        for (var i = 0; i < a.length; i++)
+            if (a[i].room_id) byId[a[i].room_id] = a[i]
+        for (var j = 0; j < b.length; j++)
+            if (b[j].room_id) byId[b[j].room_id] = b[j]
+        var out = []
+        for (var k in byId) {
+            if (byId.hasOwnProperty(k))
+                out.push(byId[k])
+        }
+        return out
+    }
+
     // Merge duplicate sidebar entries created when the same supernode was
     // keyed once by hex peer_id and once by base64url identity_pub.
     function dedupeNodeList() {
@@ -77,10 +92,14 @@ ApplicationWindow {
                 var dupRooms = []
                 try { keepRooms = JSON.parse(keepEntry.rooms_json || "[]") } catch (e) {}
                 try { dupRooms = JSON.parse(entry.rooms_json || "[]") } catch (e) {}
-                if (keepRooms.length === 0 && dupRooms.length > 0)
-                    nodeListModel.setProperty(keep, "rooms_json", entry.rooms_json)
+                if (dupRooms.length > 0) {
+                    var mergedRooms = root.mergeRoomLists(keepRooms, dupRooms)
+                    nodeListModel.setProperty(keep, "rooms_json", JSON.stringify(mergedRooms))
+                }
                 if (!keepEntry.connected && entry.connected)
                     nodeListModel.setProperty(keep, "connected", true)
+                if (!keepEntry.sfu_enabled && entry.sfu_enabled)
+                    nodeListModel.setProperty(keep, "sfu_enabled", true)
                 if (!keepEntry.title && entry.title)
                     nodeListModel.setProperty(keep, "title", entry.title)
                 if (!keepEntry.homepage_url && entry.homepage_url)
@@ -110,7 +129,9 @@ ApplicationWindow {
                 room_id: r.room_id || "",
                 name: r.name || r.room_name || r.room_id || "Room",
                 kind: r.kind || r.room_type || "voice",
-                count: r.count || r.member_count || 0
+                count: r.count || r.member_count || 0,
+                creator_id: r.creator_id || "",
+                is_default: r.is_default === true || r.room_id === "default"
             })
         }
 
@@ -125,6 +146,7 @@ ApplicationWindow {
                 connected: false,
                 homepage_url: "",
                 title: "",
+                sfu_enabled: false,
                 rooms_json: roomsJson
             })
         }
@@ -412,12 +434,15 @@ ApplicationWindow {
                             nodeListModel.setProperty(nodeIdx, "homepage_url", p.homepage_url)
                         if (p.title !== undefined)
                             nodeListModel.setProperty(nodeIdx, "title", p.title)
+                        if (p.sfu_enabled !== undefined && p.sfu_enabled !== null)
+                            nodeListModel.setProperty(nodeIdx, "sfu_enabled", p.sfu_enabled)
                     } else {
                         nodeListModel.append({
                             node_id:      canon,
                             connected:    p.connected || false,
                             homepage_url: p.homepage_url || "",
                             title:        p.title || "",
+                            sfu_enabled:  p.sfu_enabled || false,
                             rooms_json:   "[]"
                         })
                     }
@@ -521,6 +546,46 @@ ApplicationWindow {
             browserPanel.navigateTo(url)
             navIndex = 3
         }
+        function onSupernodeRemoved(nodeId) {
+            var canon = root.canonicalNodeId(nodeId)
+            if (canon === "") return
+            for (var j = nodeListModel.count - 1; j >= 0; j--) {
+                if (root.canonicalNodeId(nodeListModel.get(j).node_id) === canon)
+                    nodeListModel.remove(j)
+            }
+            if (root.canonicalNodeId(roomPanel.supernodeId) === canon)
+                roomPanel.switchToRoom("", "", "")
+        }
+        function onRoomRemoved(supernodeId, roomId) {
+            if (roomPanel.supernodeId === supernodeId && roomPanel.roomId === roomId)
+                roomPanel.switchToRoom("", "", "")
+            var nodeIdx = root.findNodeIndex(supernodeId)
+            if (nodeIdx < 0) return
+            var rooms = []
+            try { rooms = JSON.parse(nodeListModel.get(nodeIdx).rooms_json || "[]") } catch (e) {}
+            var filtered = []
+            for (var i = 0; i < rooms.length; i++) {
+                if (rooms[i].room_id !== roomId)
+                    filtered.push(rooms[i])
+            }
+            nodeListModel.setProperty(nodeIdx, "rooms_json", JSON.stringify(filtered))
+        }
+        function onRoomCreated(supernodeId, roomId, roomName, roomType, inviteToken) {
+            roomPanel.switchToRoom(roomName, roomId, supernodeId)
+            backend.joinRoomWithVoice(supernodeId, roomId)
+            root.voiceRoomName = roomName
+            navIndex = 1
+            if (roomType === "private" && inviteToken !== "") {
+                backend.copyToClipboard(inviteToken)
+                if (trayIcon.available) {
+                    trayIcon.showMessage(
+                        qsTr("Private room created"),
+                        qsTr("Invite token copied to clipboard."),
+                        Platform.SystemTrayIcon.Information,
+                        5000)
+                }
+            }
+        }
     }
 
     // ── Incoming call overlay ─────────────────────────────────────────────
@@ -542,6 +607,13 @@ ApplicationWindow {
             backend.joinRoom(supernodeId, roomId)
             navIndex = 1
         }
+    }
+
+    CreateRoomDialog {
+        id: createRoomDialog
+        anchors.centerIn: parent
+        z: 100
+        nodeListModel: nodeListModel
     }
 
     // ── Update available banner ───────────────────────────────────────────
@@ -780,6 +852,8 @@ ApplicationWindow {
                         property string targetSupernodeId: ""
                         property string targetRoomId: ""
                         property string targetRoomName: ""
+                        property bool targetCanRemove: false
+
                         MenuItem {
                             text: qsTr("Join Voice Room")
                             onTriggered: {
@@ -794,11 +868,37 @@ ApplicationWindow {
                                 navIndex = 1
                             }
                         }
+                        MenuSeparator {
+                            visible: roomContextMenu.targetCanRemove
+                        }
+                        MenuItem {
+                            text: qsTr("Hide Room")
+                            visible: roomContextMenu.targetCanRemove
+                            onTriggered: backend.removeRoom(
+                                roomContextMenu.targetSupernodeId,
+                                roomContextMenu.targetRoomId)
+                        }
                     }
 
                     Menu {
                         id: nodeContextMenu
                         property string targetNodeId: ""
+                        property bool targetConnected: false
+                        property bool targetSfuEnabled: false
+
+                        MenuItem {
+                            text: qsTr("Create Public Room…")
+                            enabled: nodeContextMenu.targetConnected && nodeContextMenu.targetSfuEnabled
+                            onTriggered: createRoomDialog.openForNode(
+                                nodeContextMenu.targetNodeId, "public")
+                        }
+                        MenuItem {
+                            text: qsTr("Create Private Room…")
+                            enabled: nodeContextMenu.targetConnected && nodeContextMenu.targetSfuEnabled
+                            onTriggered: createRoomDialog.openForNode(
+                                nodeContextMenu.targetNodeId, "private")
+                        }
+                        MenuSeparator {}
                         MenuItem {
                             text: qsTr("Open Portal")
                             onTriggered: {
@@ -809,6 +909,11 @@ ApplicationWindow {
                         MenuItem {
                             text: qsTr("Copy Node ID")
                             onTriggered: backend.copyToClipboard(nodeContextMenu.targetNodeId)
+                        }
+                        MenuSeparator {}
+                        MenuItem {
+                            text: qsTr("Remove Supernode")
+                            onTriggered: backend.removeSupernode(nodeContextMenu.targetNodeId)
                         }
                     }
 
@@ -834,6 +939,7 @@ ApplicationWindow {
                             id: roomGroup
                             required property string node_id
                             required property bool connected
+                            required property bool sfu_enabled
                             required property string rooms_json
 
                             readonly property var rooms: {
@@ -901,6 +1007,8 @@ ApplicationWindow {
                                         onClicked: (mouse) => {
                                             if (mouse.button === Qt.RightButton) {
                                                 nodeContextMenu.targetNodeId = roomGroup.node_id
+                                                nodeContextMenu.targetConnected = roomGroup.connected
+                                                nodeContextMenu.targetSfuEnabled = roomGroup.sfu_enabled
                                                 nodeContextMenu.popup()
                                             } else {
                                                 console.log("[portal] node avatar clicked node_id=" + roomGroup.node_id)
@@ -935,9 +1043,15 @@ ApplicationWindow {
                                             required property string name
                                             required property string kind
                                             required property int count
+                                            required property string creator_id
+                                            required property bool is_default
 
                                             width: roomColumn.width
                                             height: 48
+
+                                            readonly property bool canRemove:
+                                                !roomDelegate.is_default
+                                                && roomDelegate.room_id !== "default"
 
                                             readonly property bool roomSelected:
                                                 roomPanel.supernodeId !== ""
@@ -996,6 +1110,7 @@ ApplicationWindow {
                                                         roomContextMenu.targetRoomId = roomDelegate.room_id
                                                         roomContextMenu.targetRoomName =
                                                             roomDelegate.name || roomDelegate.room_id
+                                                        roomContextMenu.targetCanRemove = roomDelegate.canRemove
                                                         roomContextMenu.popup()
                                                     }
                                                 }

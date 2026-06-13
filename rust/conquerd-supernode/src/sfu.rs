@@ -13,6 +13,8 @@ use crate::crypto::generate_nonce_hex;
 pub const MAX_ROOM_SIZE: usize = 32;
 /// Default room ID (always-present "Public Voice" room).
 pub const DEFAULT_ROOM_ID: &str = "default";
+/// Remove user-created SFU rooms after this many seconds with no voice or chat subscribers.
+pub const IDLE_ROOM_GC_SECS: f64 = 900.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -38,6 +40,9 @@ pub struct SFURoom {
     invite_tokens: HashMap<String, InviteToken>,
     #[allow(dead_code)]
     pub created_at: f64,
+    /// When the room last had zero voice participants and zero chat subscribers.
+    /// `None` while the room is in use. Used for idle GC of peer-materialized rooms.
+    empty_since: Option<f64>,
     next_index: u8,
 }
 
@@ -64,7 +69,29 @@ impl SFURoom {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs_f64(),
+            empty_since: None,
             next_index: 1,
+        }
+    }
+
+    fn now_secs() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    }
+
+    pub fn is_unused(&self) -> bool {
+        self.participants.is_empty() && self.subscribers.is_empty()
+    }
+
+    pub(crate) fn mark_in_use(&mut self) {
+        self.empty_since = None;
+    }
+
+    pub(crate) fn mark_unused_if_empty(&mut self) {
+        if self.is_unused() {
+            self.empty_since.get_or_insert_with(Self::now_secs);
         }
     }
 
@@ -109,11 +136,16 @@ impl SFURoom {
         self.participants.insert(peer_id.to_string(), idx);
         // Promoted to full participant — remove from text-only subscribers.
         self.subscribers.remove(peer_id);
+        self.mark_in_use();
         true
     }
 
     pub fn remove_participant(&mut self, peer_id: &str) -> bool {
-        self.participants.remove(peer_id).is_some()
+        let removed = self.participants.remove(peer_id).is_some();
+        if removed {
+            self.mark_unused_if_empty();
+        }
+        removed
     }
 
     /// Subscribe a peer to text chat (without voice join).
@@ -121,19 +153,25 @@ impl SFURoom {
         // No-op if already a voice participant (they already receive chat).
         if !self.participants.contains_key(peer_id) {
             self.subscribers.insert(peer_id.to_string());
+            self.mark_in_use();
         }
     }
 
     /// Unsubscribe a peer from text chat.
     pub fn unsubscribe(&mut self, peer_id: &str) {
-        self.subscribers.remove(peer_id);
+        if self.subscribers.remove(peer_id) {
+            self.mark_unused_if_empty();
+        }
     }
 
     /// Remove a peer from both participants and subscribers.
     pub fn remove_peer_entirely(&mut self, peer_id: &str) -> bool {
         let was_participant = self.participants.remove(peer_id).is_some();
-        self.subscribers.remove(peer_id);
-        was_participant
+        let was_subscriber = self.subscribers.remove(peer_id);
+        if was_participant || was_subscriber {
+            self.mark_unused_if_empty();
+        }
+        was_participant || was_subscriber
     }
 
     /// All peers who should receive text chat: participants + subscribers.
@@ -143,10 +181,6 @@ impl SFURoom {
             ids.push(sub.clone());
         }
         ids
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.participants.is_empty()
     }
 
     pub fn generate_invite_token(&mut self, created_by: &str, max_uses: u32) -> String {
@@ -176,16 +210,6 @@ impl SFURoom {
         }
         true
     }
-
-    /// Serialize for persistence.
-    pub fn to_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "room_id": self.room_id,
-            "room_name": self.room_name,
-            "room_type": self.room_type,
-            "creator_id": self.creator_id,
-        })
-    }
 }
 
 /// Manages all SFU rooms.
@@ -198,32 +222,53 @@ impl SFURoomManager {
         let mut mgr = Self {
             rooms: HashMap::new(),
         };
-        // Create default "Public Voice" room
-        mgr.rooms.insert(
-            DEFAULT_ROOM_ID.to_string(),
-            SFURoom::new(DEFAULT_ROOM_ID, "Public Voice", RoomType::Public, ""),
-        );
+        // Create default "Public Voice" room (never idle-GC'd).
+        let mut default_room = SFURoom::new(DEFAULT_ROOM_ID, "Public Voice", RoomType::Public, "");
+        default_room.empty_since = None;
+        mgr.rooms.insert(DEFAULT_ROOM_ID.to_string(), default_room);
         mgr
     }
 
-    /// Create a new room. Returns the room if created, or None if exists.
+    /// Create or return an existing peer-materialized room.
+    /// Returns `(room, created_new)`.
     pub fn create_room(
         &mut self,
         room_id: Option<&str>,
         room_name: &str,
         room_type: RoomType,
         creator_id: &str,
-    ) -> Option<&SFURoom> {
+    ) -> Option<(&SFURoom, bool)> {
         let id = room_id
             .map(String::from)
             .unwrap_or_else(|| crate::crypto::derive_room_id(creator_id, room_name));
         if self.rooms.contains_key(&id) {
-            return self.rooms.get(&id);
+            return self.rooms.get(&id).map(|r| (r, false));
         }
-        let room = SFURoom::new(&id, room_name, room_type, creator_id);
-        info!("Created SFU room: {} ({})", room_name, &id);
+        let mut room = SFURoom::new(&id, room_name, room_type, creator_id);
+        room.mark_unused_if_empty();
+        info!("Materialized SFU room: {} ({})", room_name, &id);
         self.rooms.insert(id.clone(), room);
-        self.rooms.get(&id)
+        self.rooms.get(&id).map(|r| (r, true))
+    }
+
+    /// Drop user-created rooms that have been unused for at least `idle_secs`.
+    pub fn gc_idle_rooms(&mut self, now: f64, idle_secs: f64) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.rooms.retain(|room_id, room| {
+            if *room_id == DEFAULT_ROOM_ID || room.creator_id.is_empty() {
+                return true;
+            }
+            let Some(empty_since) = room.empty_since else {
+                return true;
+            };
+            if now - empty_since < idle_secs {
+                return true;
+            }
+            debug!("GC idle SFU room: {}", room_id);
+            removed.push(room_id.clone());
+            false
+        });
+        removed
     }
 
     /// Join a peer to a room. Returns (success, member_list).
@@ -245,9 +290,10 @@ impl SFURoomManager {
             return vec![];
         };
         room.remove_participant(peer_id);
+        room.mark_unused_if_empty();
         let members = room.participant_ids();
         // GC anonymous rooms (non-default, no creator) when empty
-        if room.is_empty() && room.creator_id.is_empty() && room_id != DEFAULT_ROOM_ID {
+        if room.is_unused() && room.creator_id.is_empty() && room_id != DEFAULT_ROOM_ID {
             debug!("GC-ing empty anonymous room: {}", room_id);
             self.rooms.remove(room_id);
         }
@@ -267,11 +313,12 @@ impl SFURoomManager {
             .collect();
         for room_id in room_ids {
             if let Some(room) = self.rooms.get_mut(&room_id) {
-                let was_participant = room.remove_peer_entirely(peer_id);
-                if was_participant {
+                let was_present = room.remove_peer_entirely(peer_id);
+                if was_present {
                     let members = room.participant_ids();
                     // GC anonymous rooms when empty
-                    if room.is_empty() && room.creator_id.is_empty() && room_id != DEFAULT_ROOM_ID {
+                    if room.is_unused() && room.creator_id.is_empty() && room_id != DEFAULT_ROOM_ID
+                    {
                         debug!("GC-ing empty anonymous room: {}", room_id);
                         self.rooms.remove(&room_id);
                     }
@@ -330,6 +377,8 @@ impl SFURoomManager {
                     "name": r.room_name,
                     "member_count": r.participant_count(),
                     "room_type": r.room_type,
+                    "creator_id": r.creator_id,
+                    "is_default": r.room_id == DEFAULT_ROOM_ID,
                 })
             })
             .collect()
@@ -348,45 +397,6 @@ impl SFURoomManager {
         self.rooms
             .get_mut(room_id)
             .map(|r| r.generate_invite_token(created_by, 1))
-    }
-
-    /// Save user-created rooms to JSON.
-    pub fn save_rooms(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let rooms: Vec<serde_json::Value> = self
-            .rooms
-            .values()
-            .filter(|r| !r.creator_id.is_empty())
-            .map(|r| r.to_value())
-            .collect();
-        let json = serde_json::to_string_pretty(&rooms).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
-    }
-
-    /// Load rooms from JSON. Returns count loaded.
-    pub fn load_rooms(&mut self, path: &std::path::Path) -> usize {
-        let Ok(data) = std::fs::read_to_string(path) else {
-            return 0;
-        };
-        let Ok(rooms) = serde_json::from_str::<Vec<serde_json::Value>>(&data) else {
-            return 0;
-        };
-        let mut count = 0;
-        for r in rooms {
-            let room_id = r.get("room_id").and_then(|v| v.as_str()).unwrap_or("");
-            let room_name = r.get("room_name").and_then(|v| v.as_str()).unwrap_or("");
-            let room_type: RoomType =
-                serde_json::from_value(r.get("room_type").cloned().unwrap_or_default())
-                    .unwrap_or(RoomType::Public);
-            let creator = r.get("creator_id").and_then(|v| v.as_str()).unwrap_or("");
-            if !room_id.is_empty() && !self.rooms.contains_key(room_id) {
-                self.rooms.insert(
-                    room_id.to_string(),
-                    SFURoom::new(room_id, room_name, room_type, creator),
-                );
-                count += 1;
-            }
-        }
-        count
     }
 
     /// Stats snapshot.
@@ -432,7 +442,8 @@ mod tests {
         let mut mgr = SFURoomManager::new();
         assert!(mgr.get_room(DEFAULT_ROOM_ID).is_some());
 
-        mgr.create_room(Some("test"), "Test Room", RoomType::Public, "creator1");
+        mgr.create_room(Some("test"), "Test Room", RoomType::Public, "creator1")
+            .expect("room");
         let (ok, members) = mgr.join_room("peer1", "test");
         assert!(ok);
         assert_eq!(members.len(), 1);
@@ -464,6 +475,17 @@ mod tests {
 
         let (ok, _) = mgr.join_room("friend", "priv");
         assert!(ok);
+    }
+
+    #[test]
+    fn gc_idle_user_room() {
+        let mut mgr = SFURoomManager::new();
+        let now = SFURoom::now_secs();
+        mgr.create_room(Some("idle"), "Idle", RoomType::Public, "creator");
+        let removed = mgr.gc_idle_rooms(now + IDLE_ROOM_GC_SECS + 1.0, IDLE_ROOM_GC_SECS);
+        assert_eq!(removed, vec!["idle".to_string()]);
+        assert!(mgr.get_room("idle").is_none());
+        assert!(mgr.get_room(DEFAULT_ROOM_ID).is_some());
     }
 
     #[test]
