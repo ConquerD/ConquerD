@@ -119,7 +119,7 @@ jobs:
             ~/.cargo/git
             rust/target
             rust/conquerd-client/target
-          key: windows-cargo-ci-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}-${{ hashFiles('rust/conquerd-client/Cargo.lock') }}
+          key: windows-cargo-ci-ninja-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}-${{ hashFiles('rust/conquerd-client/Cargo.lock') }}
 
       - name: Verify version metadata stays in sync
         shell: pwsh
