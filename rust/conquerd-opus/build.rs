@@ -123,11 +123,11 @@ fn main() {
 fn should_use_ninja_generator() -> bool {
     #[cfg(all(target_os = "windows", target_env = "msvc"))]
     {
-        return std::process::Command::new("ninja")
+        std::process::Command::new("ninja")
             .arg("--version")
             .status()
             .map(|s| s.success())
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
     #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
     {
