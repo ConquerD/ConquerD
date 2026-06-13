@@ -10,6 +10,7 @@ Item {
 
     property string roomName: "Room"
     property string roomId: ""
+    property string supernodeId: ""
     property int participantCount: 0
     property var roomModel: null
     property var fileTransferModel: null
@@ -43,16 +44,22 @@ Item {
         })
     }
 
-    function switchToRoom(name, roomId) {
+    function switchToRoom(name, roomId, supernodeId) {
         var newName = name || "Room"
-        if (root.roomName !== newName) {
+        var newSn = supernodeId || ""
+        var newRid = roomId || ""
+        var roomChanged = root.roomId !== newRid || root.supernodeId !== newSn
+        if (roomChanged) {
             roomChatModel.clear()
             root.roomName = newName
-            root.roomId = roomId || ""
-            if (roomId && roomId !== "" && backend) backend.loadRoomChatHistory(roomId)
+            root.roomId = newRid
+            root.supernodeId = newSn
+            if (newRid !== "" && newSn !== "" && backend)
+                backend.loadRoomChatHistory(newSn, newRid)
         } else {
             root.roomName = newName
-            root.roomId = roomId || root.roomId
+            root.roomId = newRid || root.roomId
+            root.supernodeId = newSn || root.supernodeId
         }
     }
 

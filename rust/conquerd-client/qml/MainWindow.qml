@@ -36,38 +36,99 @@ ApplicationWindow {
         Material.theme = useDark ? Material.Dark : Material.Light
     }
 
-    function upsertSfuRoomGroup(supernodeId, rooms) {
-        var nodeIdx = -1
+    function canonicalNodeId(nodeId) {
+        if (!nodeId || nodeId === "") return ""
+        if (!backend.isKnownSupernode(nodeId)) return ""
+        var resolved = backend.resolveSupernodeNodeId(nodeId)
+        return resolved !== "" ? resolved : nodeId
+    }
+
+    function pruneNonSupernodeEntries() {
+        for (var j = nodeListModel.count - 1; j >= 0; j--) {
+            if (!backend.isKnownSupernode(nodeListModel.get(j).node_id))
+                nodeListModel.remove(j)
+        }
+    }
+
+    function findNodeIndex(nodeId) {
+        var canon = canonicalNodeId(nodeId)
+        if (canon === "") return -1
         for (var j = 0; j < nodeListModel.count; j++) {
-            if (nodeListModel.get(j).node_id === supernodeId) {
-                nodeIdx = j
-                break
+            var existing = nodeListModel.get(j).node_id
+            if (existing === canon || canonicalNodeId(existing) === canon)
+                return j
+        }
+        return -1
+    }
+
+    // Merge duplicate sidebar entries created when the same supernode was
+    // keyed once by hex peer_id and once by base64url identity_pub.
+    function dedupeNodeList() {
+        var canonToIdx = {}
+        var toRemove = []
+        for (var j = 0; j < nodeListModel.count; j++) {
+            var entry = nodeListModel.get(j)
+            var canon = canonicalNodeId(entry.node_id)
+            if (canon === "") continue
+            if (canonToIdx.hasOwnProperty(canon)) {
+                var keep = canonToIdx[canon]
+                var keepEntry = nodeListModel.get(keep)
+                var keepRooms = []
+                var dupRooms = []
+                try { keepRooms = JSON.parse(keepEntry.rooms_json || "[]") } catch (e) {}
+                try { dupRooms = JSON.parse(entry.rooms_json || "[]") } catch (e) {}
+                if (keepRooms.length === 0 && dupRooms.length > 0)
+                    nodeListModel.setProperty(keep, "rooms_json", entry.rooms_json)
+                if (!keepEntry.connected && entry.connected)
+                    nodeListModel.setProperty(keep, "connected", true)
+                if (!keepEntry.title && entry.title)
+                    nodeListModel.setProperty(keep, "title", entry.title)
+                if (!keepEntry.homepage_url && entry.homepage_url)
+                    nodeListModel.setProperty(keep, "homepage_url", entry.homepage_url)
+                nodeListModel.setProperty(keep, "node_id", canon)
+                toRemove.push(j)
+            } else {
+                canonToIdx[canon] = j
+                if (entry.node_id !== canon)
+                    nodeListModel.setProperty(j, "node_id", canon)
             }
         }
+        toRemove.sort(function(a, b) { return b - a })
+        for (var k = 0; k < toRemove.length; k++)
+            nodeListModel.remove(toRemove[k])
+        pruneNonSupernodeEntries()
+    }
+
+    function upsertSfuRoomGroup(supernodeId, rooms) {
+        var canon = canonicalNodeId(supernodeId)
+        if (canon === "") return
 
         var normalized = []
         for (var i = 0; i < rooms.length; i++) {
             var r = rooms[i]
             normalized.push({
                 room_id: r.room_id || "",
-                name: r.name || r.room_id || "Room",
+                name: r.name || r.room_name || r.room_id || "Room",
                 kind: r.kind || r.room_type || "voice",
                 count: r.count || r.member_count || 0
             })
         }
 
         var roomsJson = JSON.stringify(normalized)
+        var nodeIdx = findNodeIndex(canon)
         if (nodeIdx >= 0) {
+            nodeListModel.setProperty(nodeIdx, "node_id", canon)
             nodeListModel.setProperty(nodeIdx, "rooms_json", roomsJson)
         } else if (normalized.length > 0) {
             nodeListModel.append({
-                node_id: supernodeId,
+                node_id: canon,
                 connected: false,
                 homepage_url: "",
                 title: "",
                 rooms_json: roomsJson
             })
         }
+        dedupeNodeList()
     }
 
     // ── Custom frameless title bar with embedded logo + invite controls ─────
@@ -340,22 +401,20 @@ ApplicationWindow {
                 var patches = JSON.parse(json)
                 for (var i = 0; i < patches.length; i++) {
                     var p = patches[i]
-                    var found = false
-                    for (var j = 0; j < nodeListModel.count; j++) {
-                        if (nodeListModel.get(j).node_id === p.node_id) {
-                            // Update only the fields present in the patch.
-                            if (p.connected !== undefined && p.connected !== null)
-                                nodeListModel.setProperty(j, "connected", p.connected)
-                            if (p.homepage_url !== undefined)
-                                nodeListModel.setProperty(j, "homepage_url", p.homepage_url)
-                            if (p.title !== undefined)
-                                nodeListModel.setProperty(j, "title", p.title)
-                            found = true; break
-                        }
-                    }
-                    if (!found) {
+                    var canon = root.canonicalNodeId(p.node_id || "")
+                    if (canon === "") continue
+                    var nodeIdx = root.findNodeIndex(canon)
+                    if (nodeIdx >= 0) {
+                        nodeListModel.setProperty(nodeIdx, "node_id", canon)
+                        if (p.connected !== undefined && p.connected !== null)
+                            nodeListModel.setProperty(nodeIdx, "connected", p.connected)
+                        if (p.homepage_url !== undefined)
+                            nodeListModel.setProperty(nodeIdx, "homepage_url", p.homepage_url)
+                        if (p.title !== undefined)
+                            nodeListModel.setProperty(nodeIdx, "title", p.title)
+                    } else {
                         nodeListModel.append({
-                            node_id:      p.node_id,
+                            node_id:      canon,
                             connected:    p.connected || false,
                             homepage_url: p.homepage_url || "",
                             title:        p.title || "",
@@ -363,6 +422,8 @@ ApplicationWindow {
                         })
                     }
                 }
+                root.dedupeNodeList()
+                root.pruneNonSupernodeEntries()
             } catch(e) { console.warn("nodesUpdated parse error:", e) }
         })
 
@@ -383,6 +444,8 @@ ApplicationWindow {
         })
 
         backend.initializeBackend()
+        // Drop any stale non-supernode rows left from older builds.
+        Qt.callLater(root.pruneNonSupernodeEntries)
     }
 
     // ── Passphrase dialog — shown when identity needs unlocking/creation ──
@@ -475,7 +538,7 @@ ApplicationWindow {
         anchors.centerIn: parent
         z: 100
         onJoinRequested: function(supernodeId, roomId) {
-            roomPanel.switchToRoom(roomId, roomId)
+            roomPanel.switchToRoom(roomId, roomId, supernodeId)
             backend.joinRoom(supernodeId, roomId)
             navIndex = 1
         }
@@ -722,7 +785,8 @@ ApplicationWindow {
                             onTriggered: {
                                 roomPanel.switchToRoom(
                                     roomContextMenu.targetRoomName,
-                                    roomContextMenu.targetRoomId)
+                                    roomContextMenu.targetRoomId,
+                                    roomContextMenu.targetSupernodeId)
                                 backend.joinRoomWithVoice(
                                     roomContextMenu.targetSupernodeId,
                                     roomContextMenu.targetRoomId)
@@ -780,9 +844,12 @@ ApplicationWindow {
                                 }
                             }
 
+                            readonly property real groupHeight:
+                                Math.max(48, roomGroup.rooms.length * 48) + Theme.spacingSm
+
+                            visible: backend.isKnownSupernode(roomGroup.node_id)
                             width: roomsListView.width
-                            height: Math.max(48, roomGroup.rooms.length * 48)
-                                + Theme.spacingSm
+                            height: visible ? groupHeight : 0
 
                             RowLayout {
                                 anchors.fill: parent
@@ -873,7 +940,9 @@ ApplicationWindow {
                                             height: 48
 
                                             readonly property bool roomSelected:
-                                                roomPanel.roomId !== ""
+                                                roomPanel.supernodeId !== ""
+                                                && roomPanel.supernodeId === roomGroup.node_id
+                                                && roomPanel.roomId !== ""
                                                 && roomPanel.roomId === roomDelegate.room_id
 
                                             background: Rectangle {
@@ -899,7 +968,8 @@ ApplicationWindow {
                                             onClicked: {
                                                 roomPanel.switchToRoom(
                                                     roomDelegate.name || roomDelegate.room_id,
-                                                    roomDelegate.room_id)
+                                                    roomDelegate.room_id,
+                                                    roomGroup.node_id)
                                                 backend.subscribeRoomChat(
                                                     roomGroup.node_id,
                                                     roomDelegate.room_id)
@@ -908,7 +978,8 @@ ApplicationWindow {
                                             onDoubleClicked: {
                                                 roomPanel.switchToRoom(
                                                     roomDelegate.name || roomDelegate.room_id,
-                                                    roomDelegate.room_id)
+                                                    roomDelegate.room_id,
+                                                    roomGroup.node_id)
                                                 backend.joinRoomWithVoice(
                                                     roomGroup.node_id,
                                                     roomDelegate.room_id)

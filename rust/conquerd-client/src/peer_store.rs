@@ -39,6 +39,9 @@ pub struct PeerRecord {
     pub auto_connect: bool,
     #[serde(default)]
     pub is_supernode: bool,
+    /// Set when the invite payload explicitly advertised `is_supernode`.
+    #[serde(default)]
+    pub supernode_from_invite: bool,
     #[serde(default)]
     pub transcript_hash: String,
     #[serde(default)]
@@ -160,6 +163,12 @@ impl PeerStore {
                 }
             }
         }
+        let repaired = Self::repair_all_supernode_flags(&mut self.records);
+        if repaired {
+            if let Err(e) = self.save() {
+                warn!("Failed to persist repaired supernode flags: {}", e);
+            }
+        }
     }
 
     /// Persist records to disk as an encrypted envelope.
@@ -189,6 +198,17 @@ impl PeerStore {
 
     pub fn list_peers(&self) -> Vec<&PeerRecord> {
         let mut v: Vec<&PeerRecord> = self.records.values().collect();
+        v.sort_by(|a, b| {
+            a.created_at
+                .partial_cmp(&b.created_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        v
+    }
+
+    /// Trusted peers for the navigation rail — excludes supernodes.
+    pub fn list_non_supernode_peers(&self) -> Vec<&PeerRecord> {
+        let mut v: Vec<&PeerRecord> = self.records.values().filter(|r| !r.is_supernode).collect();
         v.sort_by(|a, b| {
             a.created_at
                 .partial_cmp(&b.created_at)
@@ -238,11 +258,161 @@ impl PeerStore {
             .collect()
     }
 
+    /// Returns trusted supernode records eligible for WS auto-reconnect.
     pub fn supernodes(&self) -> Vec<&PeerRecord> {
         self.records
             .values()
-            .filter(|r| r.is_supernode && !r.blocked)
+            .filter(|r| !r.blocked && r.is_supernode)
             .collect()
+    }
+
+    /// True when `id` matches a trusted supernode (`peer_id` or `identity_pub`).
+    pub fn is_supernode_id(&self, id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        self.records
+            .values()
+            .any(|r| !r.blocked && r.is_supernode && (r.identity_pub == id || r.peer_id == id))
+    }
+
+    /// Resolve a supernode sidebar / signaling id to the canonical
+    /// `identity_pub` (base64url Ed25519 key). Returns `None` for ordinary peers.
+    pub fn resolve_supernode_identity_pub(&self, id: &str) -> Option<String> {
+        if id.is_empty() {
+            return None;
+        }
+        for record in self.records.values() {
+            if record.blocked || !record.is_supernode {
+                continue;
+            }
+            if record.identity_pub == id || record.peer_id == id {
+                return Some(record.identity_pub.clone());
+            }
+        }
+        None
+    }
+
+    fn has_supernode_signaling_hint(record: &PeerRecord) -> bool {
+        record.relay_hints.iter().any(|h| {
+            let h = h.trim();
+            h.starts_with("ws://") || h.starts_with("wss://")
+        })
+    }
+
+    /// Default / operator titles supernodes advertise during handshake.
+    fn looks_like_operator_handle(handle: &str) -> bool {
+        matches!(
+            handle,
+            "Relay Node" | "Supernode" | "My Relay Node" | "My Community Node"
+        ) || handle.ends_with(" Relay Node")
+    }
+
+    /// Supernodes eligible to own a ws signaling URL for demotion checks.
+    /// Excludes mis-tagged peers (`is_supernode` without invite proof or operator title).
+    fn is_trusted_supernode_record(record: &PeerRecord) -> bool {
+        record.is_supernode
+            && (record.supernode_from_invite
+                || record.handle.is_empty()
+                || Self::looks_like_operator_handle(&record.handle))
+    }
+
+    fn supernode_ws_hint_owners(records: &HashMap<String, PeerRecord>) -> HashMap<String, String> {
+        let mut owners = HashMap::new();
+        for record in records.values() {
+            if !Self::is_trusted_supernode_record(record) {
+                continue;
+            }
+            for hint in &record.relay_hints {
+                let h = hint.trim();
+                if h.starts_with("ws://") || h.starts_with("wss://") {
+                    owners
+                        .entry(h.to_owned())
+                        .or_insert_with(|| record.identity_pub.clone());
+                }
+            }
+        }
+        owners
+    }
+
+    /// True when a ws/wss relay hint belongs to a different trusted supernode.
+    fn relay_hint_targets_other_supernode(
+        record: &PeerRecord,
+        owners: &HashMap<String, String>,
+    ) -> bool {
+        for hint in &record.relay_hints {
+            let h = hint.trim();
+            if !h.starts_with("ws://") && !h.starts_with("wss://") {
+                continue;
+            }
+            if let Some(owner) = owners.get(h) {
+                if owner != &record.identity_pub {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Fix mis-tagged peers from the old ws-relay-hint heuristic and promote
+    /// legacy supernodes saved before `is_supernode` was persisted.
+    fn repair_all_supernode_flags(records: &mut HashMap<String, PeerRecord>) -> bool {
+        let mut changed = false;
+        let mut owners = Self::supernode_ws_hint_owners(records);
+
+        // Pass 1 — demote false positives (regular peers borrowing a supernode ws URL).
+        for record in records.values_mut() {
+            if record.supernode_from_invite {
+                continue;
+            }
+            if record.is_supernode && Self::relay_hint_targets_other_supernode(record, &owners) {
+                record.is_supernode = false;
+                changed = true;
+                continue;
+            }
+            if record.is_supernode
+                && record.quic_port > 0
+                && !Self::looks_like_operator_handle(&record.handle)
+            {
+                record.is_supernode = false;
+                changed = true;
+            }
+        }
+        if changed {
+            owners = Self::supernode_ws_hint_owners(records);
+        }
+
+        // Pass 2 — trust invite-flagged or unique-ws supernodes; restore invite-tagged rows.
+        for record in records.values_mut() {
+            if record.is_supernode
+                && !record.supernode_from_invite
+                && Self::has_supernode_signaling_hint(record)
+                && record.quic_port == 0
+                && !Self::relay_hint_targets_other_supernode(record, &owners)
+            {
+                record.supernode_from_invite = true;
+                changed = true;
+            }
+            if !record.is_supernode && record.supernode_from_invite {
+                record.is_supernode = true;
+                changed = true;
+            }
+        }
+
+        // Pass 3 — legacy promotion (operator/default title only).
+        for record in records.values_mut() {
+            if !record.is_supernode
+                && Self::has_supernode_signaling_hint(record)
+                && record.quic_port == 0
+                && (record.handle.is_empty() || Self::looks_like_operator_handle(&record.handle))
+            {
+                record.is_supernode = true;
+                record.supernode_from_invite = true;
+                changed = true;
+            }
+        }
+
+        changed
     }
 }
 
@@ -293,6 +463,181 @@ mod tests {
         let loaded = store2.get("abc123").unwrap();
         assert_eq!(loaded.handle, "Alice");
         assert!(loaded.auto_connect);
+    }
+
+    #[test]
+    fn resolve_supernode_identity_pub_accepts_peer_id_or_identity_pub() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let mut store = PeerStore::open(&id, Some(&dir.path().join(PEER_STORE_FILE))).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "hex_peer".to_owned(),
+            identity_pub: "b64_identity".to_owned(),
+            relay_hints: vec!["ws://relay:34935/ws".to_owned()],
+            is_supernode: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            store.resolve_supernode_identity_pub("hex_peer"),
+            Some("b64_identity".to_owned())
+        );
+        assert_eq!(
+            store.resolve_supernode_identity_pub("b64_identity"),
+            Some("b64_identity".to_owned())
+        );
+        assert!(store.resolve_supernode_identity_pub("unknown").is_none());
+    }
+
+    #[test]
+    fn legacy_supernode_promoted_on_load_from_ws_hint_and_operator_title() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PEER_STORE_FILE);
+        let id = make_identity();
+
+        let mut store = PeerStore::open(&id, Some(&path)).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "sn_hex".to_owned(),
+            identity_pub: "sn_b64".to_owned(),
+            relay_hints: vec!["ws://relay.example.com:34935/ws".to_owned()],
+            handle: "Relay Node".to_owned(),
+            ..Default::default()
+        });
+        store.save().unwrap();
+
+        let store2 = PeerStore::open(&id, Some(&path)).unwrap();
+        let sns = store2.supernodes();
+        assert_eq!(sns.len(), 1);
+        assert_eq!(sns[0].identity_pub, "sn_b64");
+        assert!(store2.is_supernode_id("sn_b64"));
+    }
+
+    #[test]
+    fn regular_peer_with_ws_relay_hint_and_quic_port_is_not_a_supernode() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let mut store = PeerStore::open(&id, Some(&dir.path().join(PEER_STORE_FILE))).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "peer_hex".to_owned(),
+            identity_pub: "peer_b64".to_owned(),
+            relay_hints: vec!["ws://relay.example.com:34935/ws".to_owned()],
+            handle: "Alice".to_owned(),
+            quic_port: 34934,
+            is_supernode: true,
+            ..Default::default()
+        });
+        store.save().unwrap();
+
+        let store2 = PeerStore::open(&id, Some(&dir.path().join(PEER_STORE_FILE))).unwrap();
+        assert!(store2.supernodes().is_empty());
+        assert!(!store2.is_supernode_id("peer_b64"));
+    }
+
+    #[test]
+    fn custom_titled_supernode_is_not_demoted_on_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PEER_STORE_FILE);
+        let id = make_identity();
+
+        let mut store = PeerStore::open(&id, Some(&path)).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "sn_hex".to_owned(),
+            identity_pub: "sn_b64".to_owned(),
+            relay_hints: vec!["ws://relay.example.com:34935/ws".to_owned()],
+            handle: "My Home Server".to_owned(),
+            is_supernode: true,
+            ..Default::default()
+        });
+        store.save().unwrap();
+
+        let store2 = PeerStore::open(&id, Some(&path)).unwrap();
+        assert_eq!(store2.supernodes().len(), 1);
+        assert!(store2.is_supernode_id("sn_b64"));
+    }
+
+    #[test]
+    fn invite_flagged_supernode_restored_on_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PEER_STORE_FILE);
+        let id = make_identity();
+
+        let mut store = PeerStore::open(&id, Some(&path)).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "sn_hex".to_owned(),
+            identity_pub: "sn_b64".to_owned(),
+            relay_hints: vec!["ws://relay.example.com:34935/ws".to_owned()],
+            handle: "My Home Server".to_owned(),
+            supernode_from_invite: true,
+            ..Default::default()
+        });
+        store.save().unwrap();
+
+        let store2 = PeerStore::open(&id, Some(&path)).unwrap();
+        assert_eq!(store2.supernodes().len(), 1);
+        assert!(store2.is_supernode_id("sn_b64"));
+    }
+
+    #[test]
+    fn regular_peer_sharing_supernode_ws_hint_is_demoted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PEER_STORE_FILE);
+        let id = make_identity();
+        let shared_hint = "ws://relay.example.com:34935/ws".to_owned();
+
+        let mut store = PeerStore::open(&id, Some(&path)).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "sn_hex".to_owned(),
+            identity_pub: "sn_b64".to_owned(),
+            relay_hints: vec![shared_hint.clone()],
+            handle: "Relay Node".to_owned(),
+            is_supernode: true,
+            supernode_from_invite: true,
+            ..Default::default()
+        });
+        store.upsert(PeerRecord {
+            peer_id: "peer_hex".to_owned(),
+            identity_pub: "HQrq9wyKpjmsp0DvT0H3si_lgQ5nKoYpBjVxbDFkugQ=".to_owned(),
+            relay_hints: vec![shared_hint],
+            handle: "Friend".to_owned(),
+            is_supernode: true,
+            ..Default::default()
+        });
+        store.save().unwrap();
+
+        let store2 = PeerStore::open(&id, Some(&path)).unwrap();
+        assert_eq!(store2.supernodes().len(), 1);
+        assert!(store2.is_supernode_id("sn_b64"));
+        assert!(!store2.is_supernode_id("HQrq9wyKpjmsp0DvT0H3si_lgQ5nKoYpBjVxbDFkugQ="));
+        let peers = store2.list_non_supernode_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].identity_pub,
+            "HQrq9wyKpjmsp0DvT0H3si_lgQ5nKoYpBjVxbDFkugQ="
+        );
+    }
+
+    #[test]
+    fn list_non_supernode_peers_excludes_supernodes() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let mut store = PeerStore::open(&id, Some(&dir.path().join(PEER_STORE_FILE))).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "peer_hex".to_owned(),
+            identity_pub: "peer_b64".to_owned(),
+            handle: "Alice".to_owned(),
+            ..Default::default()
+        });
+        store.upsert(PeerRecord {
+            peer_id: "sn_hex".to_owned(),
+            identity_pub: "sn_b64".to_owned(),
+            relay_hints: vec!["ws://relay:34935/ws".to_owned()],
+            is_supernode: true,
+            ..Default::default()
+        });
+
+        let peers = store.list_non_supernode_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].identity_pub, "peer_b64");
     }
 
     #[test]

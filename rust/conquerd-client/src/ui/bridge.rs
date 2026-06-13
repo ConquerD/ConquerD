@@ -651,7 +651,23 @@ pub mod ffi {
         /// History is session-scoped (not persisted to disk).
         #[qinvokable]
         #[rust_name = "load_room_chat_history"]
-        fn loadRoomChatHistory(self: Pin<&mut AppBridge>, room_id: &QString);
+        fn loadRoomChatHistory(
+            self: Pin<&mut AppBridge>,
+            supernode_id: &QString,
+            room_id: &QString,
+        );
+
+        /// Normalize a supernode sidebar id (hex `peer_id` or base64url
+        /// `identity_pub`) to the canonical `identity_pub` used on the wire.
+        /// Returns an empty string for ordinary peers.
+        #[qinvokable]
+        #[rust_name = "resolve_supernode_node_id"]
+        fn resolveSupernodeNodeId(self: Pin<&mut AppBridge>, node_id: &QString) -> QString;
+
+        /// True when `node_id` belongs to a trusted supernode in the peer store.
+        #[qinvokable]
+        #[rust_name = "is_known_supernode"]
+        fn isKnownSupernode(self: Pin<&mut AppBridge>, node_id: &QString) -> bool;
 
         /// Delete a single chat message from the store by ID.
         /// Emits `messageDeleted(msg_id)` on success.
@@ -872,6 +888,14 @@ impl Default for AppBridgeRust {
     }
 }
 
+impl AppBridgeRust {
+    fn resolve_supernode_node_id_str(&self, id: &str) -> Option<String> {
+        self.peer_store
+            .as_ref()
+            .and_then(|ps| ps.read().resolve_supernode_identity_pub(id))
+    }
+}
+
 impl Drop for AppBridgeRust {
     fn drop(&mut self) {
         // Signal the PTT polling thread to exit before channels close.
@@ -890,6 +914,10 @@ impl Drop for AppBridgeRust {
         drop(self.updater_cmd_tx.take());
         drop(self.ollama_cmd_tx.take());
     }
+}
+
+fn room_chat_history_key(supernode_id: &str, room_id: &str) -> String {
+    format!("{supernode_id}:{room_id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,24 +1184,31 @@ impl ffi::AppBridge {
         // ── Emit initial peer list from store ─────────────────────────────
         {
             let store = peer_store.read();
-            let peers_json = serde_json::to_string(
+            let peers_json = non_supernode_peers_json(&store, false);
+            self.as_mut()
+                .peers_updated(QString::from(peers_json.as_str()));
+
+            // Restore the Rooms sidebar from persisted supernode records so
+            // reconnect does not leave known nodes visible only in the Peers tab.
+            let nodes_json = serde_json::to_string(
                 &store
-                    .list_peers()
+                    .supernodes()
                     .iter()
                     .map(|p| {
                         serde_json::json!({
-                            "peer_id": p.peer_id,
-                            "handle":  p.handle,
-                            "online":  false,
-                            "in_call": false,
-                            "blocked": p.blocked,
+                            "node_id": p.identity_pub,
+                            "connected": false,
+                            "homepage_url": "",
+                            "title": p.handle,
                         })
                     })
                     .collect::<Vec<_>>(),
             )
             .unwrap_or_else(|_| "[]".to_owned());
-            self.as_mut()
-                .peers_updated(QString::from(peers_json.as_str()));
+            if nodes_json != "[]" {
+                self.as_mut()
+                    .nodes_updated(QString::from(nodes_json.as_str()));
+            }
         }
 
         let qt_thread = self.qt_thread();
@@ -1530,18 +1565,42 @@ impl ffi::AppBridge {
         QString::from(json.to_string().as_str())
     }
 
-    fn load_room_chat_history(mut self: Pin<&mut Self>, room_id: &QString) {
-        let room_id_str = room_id.to_string();
+    fn load_room_chat_history(mut self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) {
+        let Some(sn) = self
+            .rust()
+            .resolve_supernode_node_id_str(&supernode_id.to_string())
+        else {
+            return;
+        };
+        let rid = room_id.to_string();
+        let key = room_chat_history_key(&sn, &rid);
         let msgs: Vec<String> = self
             .rust()
             .room_chat_history
-            .get(&room_id_str)
+            .get(&key)
             .cloned()
             .unwrap_or_default();
         for msg in msgs {
             self.as_mut()
                 .room_chat_received(QString::from(msg.as_str()));
         }
+    }
+
+    fn resolve_supernode_node_id(self: Pin<&mut Self>, node_id: &QString) -> QString {
+        let resolved = self
+            .rust()
+            .resolve_supernode_node_id_str(&node_id.to_string())
+            .unwrap_or_default();
+        QString::from(resolved.as_str())
+    }
+
+    fn is_known_supernode(self: Pin<&mut Self>, node_id: &QString) -> bool {
+        let id = node_id.to_string();
+        self.rust()
+            .peer_store
+            .as_ref()
+            .map(|ps| ps.read().is_supernode_id(&id))
+            .unwrap_or(false)
     }
 
     fn delete_message(mut self: Pin<&mut Self>, msg_id: &QString) {
@@ -1738,7 +1797,16 @@ impl ffi::AppBridge {
     }
 
     fn join_room(mut self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) {
-        let sid = supernode_id.to_string();
+        let Some(sid) = self
+            .rust()
+            .resolve_supernode_node_id_str(&supernode_id.to_string())
+        else {
+            warn!(
+                "[bridge] joinRoom: unknown supernode {}",
+                supernode_id.to_string()
+            );
+            return;
+        };
         let rid = room_id.to_string();
 
         // If we're already in a different room on the same/different supernode,
@@ -1813,7 +1881,12 @@ impl ffi::AppBridge {
     }
 
     fn subscribe_room_chat(mut self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) {
-        let sid = supernode_id.to_string();
+        let Some(sid) = self
+            .rust()
+            .resolve_supernode_node_id_str(&supernode_id.to_string())
+        else {
+            return;
+        };
         let rid = room_id.to_string();
         if sid.is_empty() || rid.is_empty() {
             return;
@@ -1835,7 +1908,12 @@ impl ffi::AppBridge {
     }
 
     fn create_room(self: Pin<&mut Self>, supernode_id: &QString, room_name: &QString) {
-        let sid = supernode_id.to_string();
+        let Some(sid) = self
+            .rust()
+            .resolve_supernode_node_id_str(&supernode_id.to_string())
+        else {
+            return;
+        };
         let name = room_name.to_string();
         if let Some(ref tx) = self.rust().conn_cmd_tx {
             let _ = tx.try_send(ConnectionCommand::CreateRoom {
@@ -1862,12 +1940,17 @@ impl ffi::AppBridge {
     }
 
     fn open_node_portal(mut self: Pin<&mut Self>, supernode_id: &QString) {
-        let sn_id = supernode_id.to_string();
-        info!("[bridge] open_node_portal called sn={}", sn_id);
-        if sn_id.is_empty() {
-            warn!("[bridge] openNodePortal called with empty supernode_id");
+        let Some(sn_id) = self
+            .rust()
+            .resolve_supernode_node_id_str(&supernode_id.to_string())
+        else {
+            warn!(
+                "[bridge] openNodePortal: unknown supernode {}",
+                supernode_id.to_string()
+            );
             return;
-        }
+        };
+        info!("[bridge] open_node_portal called sn={}", sn_id);
         // Request a relay slot — the ConnectionManager will open the QUIC
         // relay connection on RelayGranted, making the scheme handler ready.
         if let Some(ref tx) = self.rust().conn_cmd_tx {
@@ -2191,7 +2274,8 @@ impl ffi::AppBridge {
             return;
         }
         // Persist outbound message so loadRoomChatHistory can replay it.
-        if !rid.is_empty() {
+        if !rid.is_empty() && !sn.is_empty() {
+            let key = room_chat_history_key(&sn, &rid);
             let json = serde_json::json!({
                 "msg_id": uuid::Uuid::new_v4().to_string(),
                 "sender": handle,
@@ -2205,7 +2289,7 @@ impl ffi::AppBridge {
             self.as_mut()
                 .rust_mut()
                 .room_chat_history
-                .entry(rid.clone())
+                .entry(key)
                 .or_default()
                 .push(json);
         }
@@ -2598,6 +2682,38 @@ fn chat_message_to_json(msg: &crate::chat_store::ChatMessage) -> serde_json::Val
     })
 }
 
+fn peer_row_json(record: &crate::peer_store::PeerRecord, online: bool) -> serde_json::Value {
+    serde_json::json!({
+        "peer_id": record.peer_id,
+        "handle": record.handle,
+        "online": online,
+        "in_call": false,
+        "blocked": record.blocked,
+    })
+}
+
+fn non_supernode_peers_json(store: &crate::peer_store::PeerStore, online: bool) -> String {
+    serde_json::to_string(
+        &store
+            .list_non_supernode_peers()
+            .iter()
+            .map(|p| peer_row_json(p, online))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn emit_non_supernode_peers_updated(mut bridge: Pin<&mut ffi::AppBridge>, online: bool) {
+    let json = bridge
+        .rust()
+        .peer_store
+        .as_ref()
+        .map(|ps| non_supernode_peers_json(&ps.read(), online));
+    if let Some(json) = json {
+        bridge.as_mut().peers_updated(QString::from(json.as_str()));
+    }
+}
+
 fn dispatch_event(
     qt_thread: &cxx_qt::CxxQtThread<ffi::AppBridge>,
     ev: ConnectionEvent,
@@ -2836,11 +2952,15 @@ fn dispatch_event(
         }
         ConnectionEvent::SupernodeConnected(id) => {
             let banner = format!("Connected via supernode \u{00b7} {id}");
-            let node_json = format!(r#"[{{"node_id":"{id}","connected":true}}]"#);
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 bridge
                     .as_mut()
                     .set_session_banner(QString::from(banner.as_str()));
+                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&id) else {
+                    return;
+                };
+                let node_json =
+                    serde_json::json!([{ "node_id": canon, "connected": true }]).to_string();
                 bridge
                     .as_mut()
                     .nodes_updated(QString::from(node_json.as_str()));
@@ -2848,11 +2968,15 @@ fn dispatch_event(
         }
         ConnectionEvent::SupernodeDisconnected(id) => {
             let banner = format!("Supernode disconnected \u{00b7} {id}");
-            let node_json = format!(r#"[{{"node_id":"{id}","connected":false}}]"#);
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 bridge
                     .as_mut()
                     .set_session_banner(QString::from(banner.as_str()));
+                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&id) else {
+                    return;
+                };
+                let node_json =
+                    serde_json::json!([{ "node_id": canon, "connected": false }]).to_string();
                 bridge
                     .as_mut()
                     .nodes_updated(QString::from(node_json.as_str()));
@@ -2881,22 +3005,23 @@ fn dispatch_event(
                     );
                 }
             }
-            // Patch the node entry with the received portal URL and title.
-            let node_json = serde_json::json!([{
-                "node_id": supernode_id,
-                "homepage_url": homepage_url,
-                "title": title,
-            }])
-            .to_string();
-            let node_id_q = supernode_id.clone();
             let url_q = homepage_url.clone();
             let title_q = title.clone();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
+                    return;
+                };
+                let node_json = serde_json::json!([{
+                    "node_id": canon,
+                    "homepage_url": homepage_url,
+                    "title": title,
+                }])
+                .to_string();
                 bridge
                     .as_mut()
                     .nodes_updated(QString::from(node_json.as_str()));
                 bridge.as_mut().supernode_info_received(
-                    QString::from(node_id_q.as_str()),
+                    QString::from(canon.as_str()),
                     QString::from(url_q.as_str()),
                     QString::from(title_q.as_str()),
                 );
@@ -2937,19 +3062,18 @@ fn dispatch_event(
                     .typing_changed(QString::from(peer_id.as_str()), is_typing);
             });
         }
-        ConnectionEvent::HandleUpdated { peer_id, handle } => {
-            // Peer list needs a refresh — emit peersUpdated with updated names
+        ConnectionEvent::HandleUpdated { peer_id, handle: _ } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                // Build a minimal peers JSON update
-                let json = serde_json::json!([{
-                    "peer_id": peer_id,
-                    "handle": handle,
-                    "online": true,
-                    "in_call": false,
-                    "blocked": false,
-                }])
-                .to_string();
-                bridge.as_mut().peers_updated(QString::from(json.as_str()));
+                if bridge
+                    .rust()
+                    .peer_store
+                    .as_ref()
+                    .map(|ps| ps.read().is_supernode_id(&peer_id))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                emit_non_supernode_peers_updated(bridge.as_mut(), true);
             });
         }
         ConnectionEvent::AvatarConfigUpdated { peer_id } => {
@@ -3088,6 +3212,7 @@ fn dispatch_event(
             });
         }
         ConnectionEvent::RoomChatMessage {
+            supernode_id,
             room_id,
             sender_id: _,
             sender_handle,
@@ -3104,14 +3229,17 @@ fn dispatch_event(
                 "is_room": true,
             })
             .to_string();
-            let room_id_owned = room_id.clone();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let Some(sn) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
+                    return;
+                };
+                let key = room_chat_history_key(&sn, &room_id);
                 // Persist in session-scoped history so switchToRoom can replay.
                 bridge
                     .as_mut()
                     .rust_mut()
                     .room_chat_history
-                    .entry(room_id_owned)
+                    .entry(key)
                     .or_default()
                     .push(json.clone());
                 bridge
@@ -3130,16 +3258,16 @@ fn dispatch_event(
         // Endpoint update — re-trigger peer list refresh (presence change).
         ConnectionEvent::EndpointUpdated { peer_id, .. } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                // Peer is presumably still online; emit a minimal presence update.
-                let json = serde_json::json!([{
-                    "peer_id": peer_id,
-                    "handle": peer_id,
-                    "online": true,
-                    "in_call": false,
-                    "blocked": false,
-                }])
-                .to_string();
-                bridge.as_mut().peers_updated(QString::from(json.as_str()));
+                if bridge
+                    .rust()
+                    .peer_store
+                    .as_ref()
+                    .map(|ps| ps.read().is_supernode_id(&peer_id))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                emit_non_supernode_peers_updated(bridge.as_mut(), true);
             });
         }
         // Room list received from supernode — forward to QML.
@@ -3147,9 +3275,16 @@ fn dispatch_event(
             supernode_id,
             rooms_json,
         } => {
-            // Wrap with supernode context for QML.
-            let wrapped = format!(r#"{{"supernode_id":"{supernode_id}","rooms":{rooms_json}}}"#);
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
+                    return;
+                };
+                let wrapped = serde_json::json!({
+                    "supernode_id": canon,
+                    "rooms": serde_json::from_str::<serde_json::Value>(&rooms_json)
+                        .unwrap_or(serde_json::Value::Array(vec![])),
+                })
+                .to_string();
                 bridge
                     .as_mut()
                     .sfu_rooms_updated(QString::from(wrapped.as_str()));
@@ -3159,30 +3294,60 @@ fn dispatch_event(
         ConnectionEvent::PresenceUpdated { peer_id, status } => {
             let online = status != "offline";
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                let json = serde_json::json!([{
-                    "peer_id": peer_id,
-                    "handle": peer_id,
-                    "online": online,
-                    "in_call": false,
-                    "blocked": false,
-                }])
-                .to_string();
-                bridge.as_mut().peers_updated(QString::from(json.as_str()));
+                if bridge
+                    .rust()
+                    .peer_store
+                    .as_ref()
+                    .map(|ps| ps.read().is_supernode_id(&peer_id))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                emit_non_supernode_peers_updated(bridge.as_mut(), online);
             });
         }
         // Invite accepted — new peer added.
         ConnectionEvent::InviteAccepted { peer_id, handle } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                // Refresh peer list
-                let json = serde_json::json!([{
-                    "peer_id": peer_id,
-                    "handle": if handle.is_empty() { peer_id.clone() } else { handle.clone() },
-                    "online": true,
-                    "in_call": false,
-                    "blocked": false,
-                }])
-                .to_string();
-                bridge.as_mut().peers_updated(QString::from(json.as_str()));
+                let is_supernode = bridge
+                    .rust()
+                    .peer_store
+                    .as_ref()
+                    .map(|ps| ps.read().is_supernode_id(&peer_id))
+                    .unwrap_or(false);
+                if is_supernode {
+                    let node_json = bridge.rust().peer_store.as_ref().map(|ps| {
+                        let store = ps.read();
+                        let canon = store
+                            .get(&peer_id)
+                            .or_else(|| store.get_by_identity(&peer_id))
+                            .map(|r| r.identity_pub.clone())
+                            .unwrap_or_else(|| peer_id.clone());
+                        let title = if handle.is_empty() {
+                            store
+                                .get(&peer_id)
+                                .or_else(|| store.get_by_identity(&peer_id))
+                                .map(|r| r.handle.clone())
+                                .unwrap_or_default()
+                        } else {
+                            handle.clone()
+                        };
+                        serde_json::json!([{
+                            "node_id": canon,
+                            "connected": false,
+                            "homepage_url": "",
+                            "title": title,
+                        }])
+                        .to_string()
+                    });
+                    if let Some(node_json) = node_json {
+                        bridge
+                            .as_mut()
+                            .nodes_updated(QString::from(node_json.as_str()));
+                    }
+                    return;
+                }
+                emit_non_supernode_peers_updated(bridge.as_mut(), true);
                 bridge.as_mut().peer_added(
                     QString::from(peer_id.as_str()),
                     QString::from(handle.as_str()),

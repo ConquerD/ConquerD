@@ -108,6 +108,7 @@ pub enum ConnectionEvent {
     RoomPeerLeft { peer_id: String },
     /// A text chat message arrived in an SFU room.
     RoomChatMessage {
+        supernode_id: String,
         room_id: String,
         sender_id: String,
         sender_handle: String,
@@ -521,6 +522,8 @@ struct PendingInvite {
     inviter_identity_pub: String,
     invite_id: String,
     relay_hint: String,
+    /// True when the invite payload advertises `is_supernode`.
+    is_supernode: bool,
     /// Wall-clock moment the invite was queued; used for TTL expiry.
     created_at: Instant,
 }
@@ -2396,6 +2399,7 @@ impl ConnectionManager {
                     .to_owned();
                 if !body.is_empty() {
                     let _ = self.event_tx.try_send(ConnectionEvent::RoomChatMessage {
+                        supernode_id: self.current_supernode_id.clone(),
                         room_id,
                         sender_id: msg.sender.clone(),
                         sender_handle,
@@ -2748,6 +2752,8 @@ impl ConnectionManager {
                             identity_pub: inviter_identity_pub.clone(),
                             handle: inviter_handle.clone(),
                             relay_hints,
+                            is_supernode: pending.is_supernode,
+                            supernode_from_invite: pending.is_supernode,
                             created_at: unix_now_f64(),
                             last_seen_at: unix_now_f64(),
                             ..Default::default()
@@ -3082,6 +3088,10 @@ impl ConnectionManager {
             .or_else(|| payload.get("lan_hint").and_then(Value::as_str))
             .map(|s| s.to_owned())
             .unwrap_or_default();
+        let is_supernode = payload
+            .get("is_supernode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let inviter_ephemeral_pub = payload
             .get("inviter_ephemeral_pub")
             .and_then(Value::as_str)
@@ -3111,13 +3121,19 @@ impl ConnectionManager {
                 inviter_identity_pub: inviter_identity_pub.clone(),
                 invite_id: invite_id.clone(),
                 relay_hint: relay_hint.clone(),
+                is_supernode,
                 created_at: Instant::now(),
             },
         );
 
-        // Connect to the relay WS if not already connected
-        if !relay_hint.is_empty() && !self.supernodes.contains_key(&inviter_peer_id) {
-            self.connect_supernode_ws(inviter_peer_id.clone(), relay_hint.clone())
+        // Open a signaling session only for supernode invites. Ordinary peers
+        // may carry a ws relay hint for NAT traversal — that must not register
+        // them in the Rooms sidebar or key a WS session under their identity.
+        if is_supernode
+            && !relay_hint.is_empty()
+            && !self.supernodes.contains_key(&inviter_identity_pub)
+        {
+            self.connect_supernode_ws(inviter_identity_pub.clone(), relay_hint.clone())
                 .await;
         }
 
@@ -3171,7 +3187,7 @@ impl ConnectionManager {
         }
 
         if let Ok(json) = msg.to_json() {
-            if let Some(sn) = self.supernodes.get(&inviter_peer_id) {
+            if let Some(sn) = self.supernodes.get(&inviter_identity_pub) {
                 let _ = sn.send_tx.try_send(WsMessage::Text(json));
             } else {
                 warn!("AcceptInvite: no WS session for inviter — message dropped");
