@@ -61,14 +61,29 @@ fn main() {
     //       download the DNN model data files at configure time; the C source
     //       arrays must already be present in opus/dnn/ (extracted by the
     //       fetch_opus_weights script) before cmake runs.
-    let dst = cmake::Config::new(&opus_src)
+    //
+    // On Windows MSVC prefer the Ninja generator so cached `target/` trees
+    // survive GitHub runner Visual Studio upgrades (VS 17 → VS 18, etc.).
+    // A stale Visual Studio CMakeCache in OUT_DIR would otherwise fail configure.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let cmake_build_dir = out_dir.join("build");
+    let use_ninja = should_use_ninja_generator();
+    if use_ninja {
+        clear_stale_visual_studio_cmake_cache(&cmake_build_dir);
+    }
+
+    let mut config = cmake::Config::new(&opus_src);
+    config
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("OPUS_BUILD_SHARED_LIBRARY", "OFF")
         .define("OPUS_BUILD_TESTING", "OFF")
         .define("OPUS_DRED", "ON")
         .define("FETCHCONTENT_FULLY_DISCONNECTED", "TRUE")
-        .profile("Release")
-        .build();
+        .profile("Release");
+    if use_ninja {
+        config.generator("Ninja");
+    }
+    let dst = config.build();
 
     // The cmake output layout varies by generator and platform:
     //   Unix Makefiles / Ninja:  <dst>/lib/libopus.a
@@ -100,4 +115,36 @@ fn main() {
     println!("cargo:rerun-if-changed=opus/include/opus.h");
     println!("cargo:rerun-if-changed=opus/include/opus_defines.h");
     println!("cargo:rerun-if-changed=opus/CMakeLists.txt");
+    println!("cargo:rerun-if-env-changed=CMAKE_GENERATOR");
+}
+
+/// Use Ninja on Windows MSVC when available — avoids coupling the cmake cache
+/// to a specific Visual Studio generator version on CI runners.
+fn should_use_ninja_generator() -> bool {
+    #[cfg(all(target_os = "windows", target_env = "msvc"))]
+    {
+        return std::process::Command::new("ninja")
+            .arg("--version")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
+    #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+    {
+        false
+    }
+}
+
+/// Drop a cached Visual Studio cmake tree so we can reconfigure with Ninja.
+fn clear_stale_visual_studio_cmake_cache(cmake_build_dir: &std::path::Path) {
+    let cache = cmake_build_dir.join("CMakeCache.txt");
+    if !cache.exists() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&cache) else {
+        return;
+    };
+    if text.contains("Visual Studio") {
+        let _ = std::fs::remove_dir_all(cmake_build_dir);
+    }
 }
