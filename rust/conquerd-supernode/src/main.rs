@@ -75,7 +75,10 @@ fn load_manifest(config: &Config) -> manifest::SupernodeManifest {
     }
 }
 
-fn build_feature_registry(manifest: &manifest::SupernodeManifest, config: &Config) -> FeatureRegistry {
+fn build_feature_registry(
+    manifest: &manifest::SupernodeManifest,
+    config: &Config,
+) -> FeatureRegistry {
     let registry = FeatureRegistry::new();
     let caps = manifest.enabled_capabilities();
     info!(
@@ -1482,12 +1485,8 @@ impl SupernodeHandler {
         if !exists && !is_default {
             let policy = self.state.sfu_room_policy;
             let (denied, reason) = match room_type {
-                sfu::RoomType::Public if !policy.allow_public => {
-                    (true, "public_rooms_disabled")
-                }
-                sfu::RoomType::Private if !policy.allow_private => {
-                    (true, "private_rooms_disabled")
-                }
+                sfu::RoomType::Public if !policy.allow_public => (true, "public_rooms_disabled"),
+                sfu::RoomType::Private if !policy.allow_private => (true, "private_rooms_disabled"),
                 _ => (false, ""),
             };
             if denied {
