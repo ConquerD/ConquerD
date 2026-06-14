@@ -2781,6 +2781,28 @@ impl ConnectionManager {
                 });
             }
             MessageType::SfuRoomCreated => {
+                if msg
+                    .payload
+                    .get("denied")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let reason = msg
+                        .payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("room_creation_denied");
+                    let room_name = msg
+                        .payload
+                        .get("room_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Room");
+                    warn!(
+                        "SFU room create denied by {} for '{room_name}': {reason}",
+                        &msg.sender[..8.min(msg.sender.len())]
+                    );
+                    return;
+                }
                 let room_id = msg
                     .payload
                     .get("room_id")

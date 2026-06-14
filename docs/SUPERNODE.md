@@ -133,8 +133,23 @@ Run `conquerd-supernode --print-default-manifest` for a starting point.
 - Native + WebTransport (browser) clients supported.
 - Room file broadcasts use signed `SfuFile*` frames and are verified by recipients before saving.
 - Room membership is enforced at the capability layer (`room-member` auth tier).
+- Operators can restrict which room types peers may **create** via `room.audio.sfu` manifest params:
+  - `allow_public_rooms` (default `false`) — when `false`, new public room materialization is rejected. The built-in **Public Voice/Chat Room** (`room_id = "default"`) is always present on SFU-enabled nodes.
+  - `allow_private_rooms` (default `true`) — when `false`, new private room materialization is rejected.
+  - Existing rooms may still be replayed/materialized by id; policy applies only to **new** room creation.
+  - Denied creates return `sfu_room_created` with `denied: true` and a `reason` (`public_rooms_disabled` / `private_rooms_disabled`).
+
+Example:
+
+```toml
+[[feature]]
+id = "room.audio.sfu"
+enabled = true
+params = { allow_public_rooms = false, allow_private_rooms = true }
+```
 
 ### Web Hosting
+- `web.host.app.v1` and `web.host.h3.v1` ship **enabled by default** (legacy-derived manifests and supernode-manager installs). Set `web_port` in `supernode.toml` (or `supernode_web_port` env) to bind WebTransport.
 - `web.host.app.v1`: In-app portal for the desktop client's embedded browser (`conquerd://` scheme).
 - `web.host.h3.v1`: WebTransport bridge so browser clients can participate in the same channel fabric as native peers.
 

@@ -11,8 +11,10 @@ use crate::crypto::generate_nonce_hex;
 
 /// Max participants per SFU room.
 pub const MAX_ROOM_SIZE: usize = 32;
-/// Default room ID (always-present "Public Voice" room).
+/// Default room ID (always-present lobby for voice + chat).
 pub const DEFAULT_ROOM_ID: &str = "default";
+/// Display name for [`DEFAULT_ROOM_ID`] — created on every SFU-enabled node at startup.
+pub const DEFAULT_ROOM_NAME: &str = "Public Voice/Chat Room";
 /// Remove user-created SFU rooms after this many seconds with no voice or chat subscribers.
 pub const IDLE_ROOM_GC_SECS: f64 = 900.0;
 
@@ -222,8 +224,9 @@ impl SFURoomManager {
         let mut mgr = Self {
             rooms: HashMap::new(),
         };
-        // Create default "Public Voice" room (never idle-GC'd).
-        let mut default_room = SFURoom::new(DEFAULT_ROOM_ID, "Public Voice", RoomType::Public, "");
+        // Built-in lobby (never idle-GC'd); peers cannot disable via room policy.
+        let mut default_room =
+            SFURoom::new(DEFAULT_ROOM_ID, DEFAULT_ROOM_NAME, RoomType::Public, "");
         default_room.empty_since = None;
         mgr.rooms.insert(DEFAULT_ROOM_ID.to_string(), default_room);
         mgr

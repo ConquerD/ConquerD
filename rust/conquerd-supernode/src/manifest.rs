@@ -34,6 +34,7 @@
 use std::path::Path;
 
 use conquerd_features::descriptor::{AuthTier, CapabilityDescriptor, ChannelKind};
+use conquerd_features::registry::FeatureRegistry;
 use conquerd_features::wellknown;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,6 +50,26 @@ pub struct SupernodeManifest {
     /// Schema version. Loaders refuse anything they don't understand.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+
+    /// QUIC relay bind (`host:port`). Written by supernode-manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
+
+    /// WebSocket signaling bind (`host:port`). Written by supernode-manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_listen_addr: Option<String>,
+
+    /// WebTransport / portal UDP-TCP port. Written by supernode-manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_port: Option<u16>,
+
+    /// Relative path to the node identity inside `CONQUERD_HOME`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+
+    /// Node join access mode (`open`, `tos`, `access_code`, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_mode: Option<String>,
 
     /// Declared features. Order is preserved on round-trip.
     #[serde(default, rename = "feature")]
@@ -164,17 +185,13 @@ impl SupernodeManifest {
         if config.sfu_enabled {
             features.push(FeatureEntry::just("room.audio.sfu"));
         }
-        if config.web_port.is_some() {
-            // Browser-game / WebTransport surface (HTTP/3) — shares the
-            // same TLS cert under <data_dir>/web_{cert,key}.pem.
-            features.push(FeatureEntry::just("web.host.h3.v1"));
-            // In-app portal served over QUIC reliable streams to the
-            // desktop client's embedded Chromium (`conquerd://` scheme).
-            features.push(FeatureEntry::just("web.host.app.v1"));
-        }
+        // Portal surfaces ship enabled by default on every supernode.
+        features.push(FeatureEntry::just("web.host.h3.v1"));
+        features.push(FeatureEntry::just("web.host.app.v1"));
         SupernodeManifest {
             schema_version: SCHEMA_VERSION,
             features,
+            ..Default::default()
         }
     }
 
@@ -204,6 +221,49 @@ impl SupernodeManifest {
             .filter(|f| f.enabled)
             .map(FeatureEntry::resolve)
             .collect()
+    }
+
+    /// Whether the manifest enables any `web.host.*` portal capability.
+    pub fn portal_enabled(&self) -> bool {
+        self.features
+            .iter()
+            .any(|f| f.enabled && f.id.starts_with("web.host"))
+    }
+
+    /// Resolve the effective WebTransport port from top-level `web_port` or
+    /// `web.host.h3.v1` feature params.
+    pub fn resolved_web_port(&self) -> Option<u16> {
+        self.web_port.or_else(|| {
+            self.features
+                .iter()
+                .find(|f| f.enabled && f.id == "web.host.h3.v1")
+                .and_then(|f| f.params.get("port"))
+                .and_then(|v| v.as_u64())
+                .filter(|&p| p <= u16::MAX as u64)
+                .map(|p| p as u16)
+        })
+    }
+
+    /// Merge network fields from the manifest into runtime [`Config`].
+    ///
+    /// Env vars win when the manifest omits a field. When portal features are
+    /// enabled but no web port is declared anywhere, defaults to `8443`.
+    pub fn apply_to_config(&self, config: &mut Config) {
+        if let Some(addr) = &self.listen_addr {
+            if let Some(port) = parse_socket_port(addr) {
+                config.relay_port = port;
+            }
+        }
+        if let Some(addr) = &self.ws_listen_addr {
+            if let Some(port) = parse_socket_port(addr) {
+                config.signaling_port = port;
+            }
+        }
+        if let Some(port) = self.resolved_web_port() {
+            config.web_port = Some(port);
+        } else if self.portal_enabled() && config.web_port.is_none() {
+            config.web_port = Some(8443);
+        }
     }
 
     /// Enabled entries that carry a `cdylib_manifest` path.
@@ -265,6 +325,49 @@ impl FeatureEntry {
     }
 }
 
+/// Operator policy for which SFU room types peers may materialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfuRoomCreationPolicy {
+    pub allow_public: bool,
+    pub allow_private: bool,
+}
+
+impl Default for SfuRoomCreationPolicy {
+    fn default() -> Self {
+        Self {
+            allow_public: false,
+            allow_private: true,
+        }
+    }
+}
+
+/// Read a boolean operator param from a merged capability params object.
+pub fn param_bool(params: &Value, key: &str, default: bool) -> bool {
+    params
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
+/// Resolve SFU room-creation policy from the registered `room.audio.sfu`
+/// descriptor (merged manifest params over well-known defaults).
+pub fn sfu_room_creation_policy(registry: &FeatureRegistry) -> SfuRoomCreationPolicy {
+    let params = registry
+        .get("room.audio.sfu")
+        .map(|c| c.params.clone())
+        .unwrap_or(Value::Null);
+    SfuRoomCreationPolicy {
+        allow_public: param_bool(&params, "allow_public_rooms", false),
+        allow_private: param_bool(&params, "allow_private_rooms", true),
+    }
+}
+
+/// Parse the port component from `host:port` listen addresses.
+fn parse_socket_port(addr: &str) -> Option<u16> {
+    let (_, port) = addr.rsplit_once(':')?;
+    port.parse().ok()
+}
+
 /// Shallow JSON object merge: keys from `over` win.
 fn merge_json(base: Value, over: Value) -> Value {
     match (base, over) {
@@ -303,6 +406,7 @@ fn wellknown_for(id: &str) -> Option<CapabilityDescriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use conquerd_features::registry::FeatureRegistry;
     use serde_json::json;
 
     #[test]
@@ -368,6 +472,78 @@ mod tests {
         assert_eq!(caps[0].auth, AuthTier::TrustedPeer);
         // Pulled from wellknown::core_audio_opus()
         assert_eq!(caps[0].params["codec"], json!("opus"));
+    }
+
+    #[test]
+    fn apply_to_config_reads_network_fields_from_manifest() {
+        let toml = r#"
+            schema_version = 1
+            listen_addr = "0.0.0.0:3578"
+            ws_listen_addr = "0.0.0.0:35035"
+            web_port = 8543
+            [[feature]]
+            id = "web.host.app.v1"
+        "#;
+        let m = SupernodeManifest::from_toml_str(toml).unwrap();
+        let mut config = legacy_config_for(std::path::Path::new("."));
+        config.relay_port = 3478;
+        config.signaling_port = 34935;
+        config.web_port = None;
+        m.apply_to_config(&mut config);
+        assert_eq!(config.relay_port, 3578);
+        assert_eq!(config.signaling_port, 35035);
+        assert_eq!(config.web_port, Some(8543));
+    }
+
+    #[test]
+    fn apply_to_config_defaults_web_port_when_portal_enabled() {
+        let toml = r#"
+            schema_version = 1
+            [[feature]]
+            id = "web.host.app.v1"
+            [[feature]]
+            id = "web.host.h3.v1"
+        "#;
+        let m = SupernodeManifest::from_toml_str(toml).unwrap();
+        let mut config = legacy_config_for(std::path::Path::new("."));
+        config.web_port = None;
+        m.apply_to_config(&mut config);
+        assert_eq!(config.web_port, Some(8443));
+    }
+
+    #[test]
+    fn sfu_room_policy_defaults_private_only() {
+        let toml = r#"
+            schema_version = 1
+            [[feature]]
+            id = "room.audio.sfu"
+        "#;
+        let m = SupernodeManifest::from_toml_str(toml).unwrap();
+        let registry = FeatureRegistry::new();
+        for cap in m.enabled_capabilities() {
+            registry.register(cap).unwrap();
+        }
+        let policy = sfu_room_creation_policy(&registry);
+        assert!(!policy.allow_public);
+        assert!(policy.allow_private);
+    }
+
+    #[test]
+    fn sfu_room_policy_honors_manifest_params() {
+        let toml = r#"
+            schema_version = 1
+            [[feature]]
+            id = "room.audio.sfu"
+            params = { allow_public_rooms = false, allow_private_rooms = true }
+        "#;
+        let m = SupernodeManifest::from_toml_str(toml).unwrap();
+        let registry = FeatureRegistry::new();
+        for cap in m.enabled_capabilities() {
+            registry.register(cap).unwrap();
+        }
+        let policy = sfu_room_creation_policy(&registry);
+        assert!(!policy.allow_public);
+        assert!(policy.allow_private);
     }
 
     #[test]
@@ -439,11 +615,11 @@ mod tests {
         assert!(!ids.contains(&"core.file.v1"));
         assert!(!ids.contains(&"room.file.v1"));
         assert!(!ids.contains(&"room.audio.sfu"));
-        assert!(!ids.contains(&"web.host.app.v1"));
+        assert!(ids.contains(&"web.host.h3.v1"));
+        assert!(ids.contains(&"web.host.app.v1"));
 
         config.files_enabled = true;
         config.sfu_enabled = true;
-        config.web_port = Some(443);
         let m = SupernodeManifest::from_legacy_config(&config);
         let ids: Vec<&str> = m.features.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"core.file.v1"));

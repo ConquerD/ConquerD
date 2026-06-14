@@ -215,6 +215,8 @@ pub fn room_audio_sfu() -> CapabilityDescriptor {
             "codec": "opus",
             "quota_bytes_per_sec": 32 * 1024,
             "quota_datagrams_per_sec": 200,
+            "allow_public_rooms": false,
+            "allow_private_rooms": true,
         }))
         .with_auth(AuthTier::RoomMember)
 }

@@ -62,9 +62,8 @@ const ENDPOINT_MAX_AGE_S: f64 = 86400.0;
 /// keys must be listed in `<data_dir>/trusted_module_keys.txt`; unknown
 /// keys cause the entry to be skipped with a warning (no interactive
 /// prompt on the supernode — add keys to the file to pre-authorise them).
-fn build_feature_registry(config: &Config) -> FeatureRegistry {
-    let registry = FeatureRegistry::new();
-    let manifest = match manifest::SupernodeManifest::load_or_derive(&config.data_dir, config) {
+fn load_manifest(config: &Config) -> manifest::SupernodeManifest {
+    match manifest::SupernodeManifest::load_or_derive(&config.data_dir, config) {
         Ok(m) => m,
         Err(e) => {
             warn!(
@@ -73,7 +72,11 @@ fn build_feature_registry(config: &Config) -> FeatureRegistry {
             );
             manifest::SupernodeManifest::from_legacy_config(config)
         }
-    };
+    }
+}
+
+fn build_feature_registry(manifest: &manifest::SupernodeManifest, config: &Config) -> FeatureRegistry {
+    let registry = FeatureRegistry::new();
     let caps = manifest.enabled_capabilities();
     info!(
         "[features] loaded {} capability(ies) from manifest: {}",
@@ -202,6 +205,8 @@ struct SupernodeState {
     /// already verified via Ed25519 invite/handshake; the cert fingerprint
     /// is just an additional binding over that trusted channel.
     web_cert_fingerprint: Option<String>,
+    /// Which SFU room types peers may materialize (`room.audio.sfu` params).
+    sfu_room_policy: manifest::SfuRoomCreationPolicy,
 }
 
 /// A pending hole-punch registration waiting for both peers.
@@ -1469,6 +1474,44 @@ impl SupernodeHandler {
             .filter(|s| !s.is_empty())
             .unwrap_or(&msg.sender);
 
+        let resolved_id = room_id
+            .map(String::from)
+            .unwrap_or_else(|| crate::crypto::derive_room_id(creator_id, room_name));
+        let is_default = resolved_id == sfu::DEFAULT_ROOM_ID;
+        let exists = sfu.read().get_room(&resolved_id).is_some();
+        if !exists && !is_default {
+            let policy = self.state.sfu_room_policy;
+            let (denied, reason) = match room_type {
+                sfu::RoomType::Public if !policy.allow_public => {
+                    (true, "public_rooms_disabled")
+                }
+                sfu::RoomType::Private if !policy.allow_private => {
+                    (true, "private_rooms_disabled")
+                }
+                _ => (false, ""),
+            };
+            if denied {
+                warn!(
+                    "Denied SFU room create from {}: {} ({})",
+                    &msg.sender[..12.min(msg.sender.len())],
+                    reason,
+                    room_name
+                );
+                self.state.send_signed(
+                    &msg.sender,
+                    MessageType::SfuRoomCreated,
+                    json!({
+                        "room_id": "",
+                        "room_name": room_name,
+                        "room_type": room_type,
+                        "denied": true,
+                        "reason": reason,
+                    }),
+                );
+                return;
+            }
+        }
+
         let mut sfu_lock = sfu.write();
         let Some((room, created_new)) =
             sfu_lock.create_room(room_id, room_name, room_type, creator_id)
@@ -1616,7 +1659,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Config::from_env();
+    let mut config = Config::from_env();
+    let manifest = load_manifest(&config);
+    manifest.apply_to_config(&mut config);
     info!(
         "ConquerD Supernode v{} starting (signaling={}, relay={}, web={:?})",
         APP_VERSION, config.signaling_port, config.relay_port, config.web_port
@@ -1657,7 +1702,7 @@ async fn main() -> anyhow::Result<()> {
         )]);
     }
 
-    let features = Arc::new(build_feature_registry(&config));
+    let features = Arc::new(build_feature_registry(&manifest, &config));
 
     // QUIC relay server
     let relay = {
@@ -1714,6 +1759,7 @@ async fn main() -> anyhow::Result<()> {
             features: Arc::clone(&features),
             web_bridge: BrowserBridge::new(),
             web_cert_fingerprint,
+            sfu_room_policy: manifest::sfu_room_creation_policy(&features),
         });
 
     // Install the `web.host.app.v1` bidi-stream hook on the relay so the
@@ -2190,12 +2236,16 @@ mod build_feature_registry_tests {
     #[test]
     fn falls_back_to_legacy_config_when_no_manifest() {
         let dir = tempdir();
-        let registry = build_feature_registry(&cfg(dir));
+        let config = cfg(dir);
+        let manifest = load_manifest(&config);
+        let registry = build_feature_registry(&manifest, &config);
         let ids: Vec<String> = registry.snapshot().iter().map(|c| c.id.clone()).collect();
-        // Legacy config has all toggles on => chat+files+sfu present.
+        // Legacy config has all toggles on => chat+files+sfu+portal present.
         assert!(ids.iter().any(|i| i == "core.chat.v1"));
         assert!(ids.iter().any(|i| i == "core.file.v1"));
         assert!(ids.iter().any(|i| i == "room.audio.sfu"));
+        assert!(ids.iter().any(|i| i == "web.host.app.v1"));
+        assert!(ids.iter().any(|i| i == "web.host.h3.v1"));
     }
 
     #[test]
@@ -2208,7 +2258,9 @@ mod build_feature_registry_tests {
              id = \"core.chat.v1\"\n",
         )
         .unwrap();
-        let registry = build_feature_registry(&cfg(dir));
+        let config = cfg(dir);
+        let manifest = load_manifest(&config);
+        let registry = build_feature_registry(&manifest, &config);
         let mut ids: Vec<String> = registry.snapshot().iter().map(|c| c.id.clone()).collect();
         ids.sort();
         // Manifest declares chat only; relay + room quota descriptors are always upserted.
