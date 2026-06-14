@@ -343,10 +343,7 @@ impl Default for SfuRoomCreationPolicy {
 
 /// Read a boolean operator param from a merged capability params object.
 pub fn param_bool(params: &Value, key: &str, default: bool) -> bool {
-    params
-        .get(key)
-        .and_then(|v| v.as_bool())
-        .unwrap_or(default)
+    params.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
 /// Resolve SFU room-creation policy from the registered `room.audio.sfu`
