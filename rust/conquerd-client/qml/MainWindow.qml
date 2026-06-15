@@ -61,6 +61,55 @@ ApplicationWindow {
         return -1
     }
 
+    function findNodeIndexRaw(nodeId) {
+        if (!nodeId || nodeId === "") return -1
+        for (var j = 0; j < nodeListModel.count; j++) {
+            if (nodeListModel.get(j).node_id === nodeId)
+                return j
+        }
+        return -1
+    }
+
+    // Rebuild the Rooms sidebar from the trusted peer store, preserving
+    // per-node room snapshots and live connected/sfu flags where possible.
+    function syncRoomsSidebar(nodesJson) {
+        try {
+            var desired = JSON.parse(nodesJson || "[]")
+            var keepIds = {}
+            for (var d = 0; d < desired.length; d++) {
+                if (desired[d].node_id)
+                    keepIds[desired[d].node_id] = true
+            }
+            for (var j = nodeListModel.count - 1; j >= 0; j--) {
+                if (!keepIds[nodeListModel.get(j).node_id])
+                    nodeListModel.remove(j)
+            }
+            for (var i = 0; i < desired.length; i++) {
+                var node = desired[i]
+                var nid = node.node_id || ""
+                if (nid === "") continue
+                var idx = findNodeIndexRaw(nid)
+                if (idx >= 0) {
+                    if (node.title !== undefined && node.title !== "")
+                        nodeListModel.setProperty(idx, "title", node.title)
+                    if (node.homepage_url !== undefined && node.homepage_url !== "")
+                        nodeListModel.setProperty(idx, "homepage_url", node.homepage_url)
+                } else {
+                    nodeListModel.append({
+                        node_id: nid,
+                        connected: node.connected || false,
+                        homepage_url: node.homepage_url || "",
+                        title: node.title || "",
+                        sfu_enabled: node.sfu_enabled || false,
+                        rooms_json: "[]"
+                    })
+                }
+            }
+        } catch (e) {
+            console.warn("syncRoomsSidebar parse error:", e)
+        }
+    }
+
     // Union two room snapshots by room_id (used when deduping alias node rows).
     function mergeRoomLists(a, b) {
         var byId = {}
@@ -135,12 +184,17 @@ ApplicationWindow {
             })
         }
 
-        var roomsJson = JSON.stringify(normalized)
         var nodeIdx = findNodeIndex(canon)
         if (nodeIdx >= 0) {
+            var existing = []
+            try { existing = JSON.parse(nodeListModel.get(nodeIdx).rooms_json || "[]") } catch (e) {}
+            var merged = normalized.length > 0
+                ? root.mergeRoomLists(existing, normalized)
+                : existing
             nodeListModel.setProperty(nodeIdx, "node_id", canon)
-            nodeListModel.setProperty(nodeIdx, "rooms_json", roomsJson)
+            nodeListModel.setProperty(nodeIdx, "rooms_json", JSON.stringify(merged))
         } else if (normalized.length > 0) {
+            var roomsJson = JSON.stringify(normalized)
             nodeListModel.append({
                 node_id: canon,
                 connected: false,
@@ -417,6 +471,8 @@ ApplicationWindow {
             } catch(e) { console.warn("sfuRoomsUpdated parse error:", e) }
         })
 
+        backend.roomsSidebarSync.connect(root.syncRoomsSidebar)
+
         // Wire node connect/disconnect into nodeListModel (upsert by node_id)
         backend.nodesUpdated.connect(function(json) {
             try {
@@ -547,13 +603,15 @@ ApplicationWindow {
             navIndex = 3
         }
         function onSupernodeRemoved(nodeId) {
-            var canon = root.canonicalNodeId(nodeId)
-            if (canon === "") return
+            if (!nodeId || nodeId === "") return
+            // Peer store is already updated when this fires; canonicalNodeId()
+            // would return "" because isKnownSupernode() is false.
             for (var j = nodeListModel.count - 1; j >= 0; j--) {
-                if (root.canonicalNodeId(nodeListModel.get(j).node_id) === canon)
+                if (nodeListModel.get(j).node_id === nodeId)
                     nodeListModel.remove(j)
             }
-            if (root.canonicalNodeId(roomPanel.supernodeId) === canon)
+            root.pruneNonSupernodeEntries()
+            if (roomPanel.supernodeId === nodeId)
                 roomPanel.switchToRoom("", "", "")
         }
         function onRoomRemoved(supernodeId, roomId) {

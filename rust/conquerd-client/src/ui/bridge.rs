@@ -121,6 +121,12 @@ pub mod ffi {
         #[rust_name = "supernode_removed"]
         fn supernodeRemoved(self: Pin<&mut AppBridge>, node_id: QString);
 
+        /// Full Rooms sidebar rebuild from the trusted peer store. `nodes_json`
+        /// is a JSON array of `{node_id, connected, homepage_url, title, sfu_enabled}`.
+        #[qsignal]
+        #[rust_name = "rooms_sidebar_sync"]
+        fn roomsSidebarSync(self: Pin<&mut AppBridge>, nodes_json: QString);
+
         /// Emitted when a supernode sends its homepage / portal info.
         /// Open `url` in the system browser to show the portal.
         #[qsignal]
@@ -1119,6 +1125,35 @@ impl ffi::AppBridge {
             }
         };
 
+        // Re-promote supernodes that were demoted by an older repair pass but
+        // are still referenced by saved room definitions (relay_hints intact).
+        {
+            let room_supernode_ids: Vec<String> = {
+                let rs = room_store.read();
+                let mut ids = std::collections::HashSet::new();
+                for entry in rs.list() {
+                    if !entry.supernode_id.is_empty() {
+                        ids.insert(entry.supernode_id.clone());
+                    }
+                }
+                ids.into_iter().collect()
+            };
+            if !room_supernode_ids.is_empty() {
+                let mut store = peer_store.write();
+                if store.restore_supernodes_referenced_by_ids(&room_supernode_ids) {
+                    if let Err(e) = store.save() {
+                        warn!("Failed to persist restored supernode flags: {e}");
+                    }
+                }
+            }
+            if let Err(e) = room_store
+                .write()
+                .normalize_supernode_ids(&peer_store.read())
+            {
+                warn!("RoomStore supernode id normalize failed: {e}");
+            }
+        }
+
         // ── Split subsystems ──────────────────────────────────────────────
         // Build a shared FeatureRegistry so plugin descriptors registered
         // by `PluginRuntime::start` are visible in the manager's
@@ -1238,27 +1273,9 @@ impl ffi::AppBridge {
             self.as_mut()
                 .peers_updated(QString::from(peers_json.as_str()));
 
-            // Restore the Rooms sidebar from persisted supernode records so
-            // reconnect does not leave known nodes visible only in the Peers tab.
-            let nodes_json = serde_json::to_string(
-                &store
-                    .supernodes()
-                    .iter()
-                    .map(|p| {
-                        serde_json::json!({
-                            "node_id": p.identity_pub,
-                            "connected": false,
-                            "homepage_url": "",
-                            "title": p.handle,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_else(|_| "[]".to_owned());
-            if nodes_json != "[]" {
-                self.as_mut()
-                    .nodes_updated(QString::from(nodes_json.as_str()));
-            }
+            drop(store);
+            emit_rooms_sidebar_sync(self.as_mut());
+            emit_local_rooms_for_all_supernodes(self.as_mut());
         }
 
         let qt_thread = self.qt_thread();
@@ -2311,6 +2328,8 @@ impl ffi::AppBridge {
 
         self.as_mut()
             .supernode_removed(QString::from(canon.as_str()));
+        emit_rooms_sidebar_sync(self.as_mut());
+        emit_local_rooms_for_all_supernodes(self.as_mut());
         info!("Supernode removed: {canon}");
     }
 
@@ -2911,6 +2930,73 @@ fn remember_room_in_store(
     }
 }
 
+fn local_rooms_json_for_supernode(
+    room_store: &crate::room_store::RoomStore,
+    peer_store: &crate::peer_store::PeerStore,
+    supernode_id: &str,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        room_store
+            .list_for_supernode_resolved(peer_store, supernode_id)
+            .iter()
+            .filter(|e| !room_store.is_hidden_from_sidebar(supernode_id, &e.room_id))
+            .map(|e| {
+                serde_json::json!({
+                    "room_id": e.room_id,
+                    "room_name": e.room_name,
+                    "room_type": e.room_type,
+                    "creator_id": e.creator_id,
+                    "member_count": 0,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn merge_room_list_values(
+    local: &serde_json::Value,
+    remote: &serde_json::Value,
+) -> serde_json::Value {
+    let mut by_id: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    for source in [local, remote] {
+        let Some(arr) = source.as_array() else {
+            continue;
+        };
+        for room in arr {
+            let Some(room_id) = room.get("room_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if room_id.is_empty() {
+                continue;
+            }
+            by_id
+                .entry(room_id.to_owned())
+                .and_modify(|existing| {
+                    if room.get("member_count").is_some() {
+                        *existing = room.clone();
+                    }
+                })
+                .or_insert_with(|| room.clone());
+        }
+    }
+    let mut merged: Vec<serde_json::Value> = by_id.into_values().collect();
+    merged.sort_by(|a, b| {
+        let an = a
+            .get("room_name")
+            .or_else(|| a.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let bn = b
+            .get("room_name")
+            .or_else(|| b.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        an.cmp(bn)
+    });
+    serde_json::Value::Array(merged)
+}
+
 fn sync_saved_rooms_from_list(
     room_store: &mut crate::room_store::RoomStore,
     supernode_id: &str,
@@ -2924,7 +3010,7 @@ fn sync_saved_rooms_from_list(
             .get("room_id")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        if room_id.is_empty() || !room_store.contains(supernode_id, room_id) {
+        if room_id.is_empty() {
             continue;
         }
         let room_name = room
@@ -2963,11 +3049,12 @@ fn sync_saved_rooms_from_list(
 
 fn replay_saved_rooms_on_supernode_connect(
     room_store: &crate::room_store::RoomStore,
+    peer_store: &crate::peer_store::PeerStore,
     conn_cmd_tx: &mpsc::Sender<ConnectionCommand>,
     supernode_id: &str,
     my_public_id: &str,
 ) {
-    for entry in room_store.list_for_supernode(supernode_id) {
+    for entry in room_store.list_for_supernode_resolved(peer_store, supernode_id) {
         if entry.room_id == "default" {
             continue;
         }
@@ -3031,6 +3118,72 @@ fn emit_non_supernode_peers_updated(mut bridge: Pin<&mut ffi::AppBridge>, online
         .map(|ps| non_supernode_peers_json(&ps.read(), online));
     if let Some(json) = json {
         bridge.as_mut().peers_updated(QString::from(json.as_str()));
+    }
+}
+
+fn rooms_sidebar_json(store: &crate::peer_store::PeerStore) -> String {
+    serde_json::to_string(
+        &store
+            .supernodes()
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "node_id": p.identity_pub,
+                    "connected": false,
+                    "homepage_url": "",
+                    "title": p.handle,
+                    "sfu_enabled": false,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn emit_rooms_sidebar_sync(mut bridge: Pin<&mut ffi::AppBridge>) {
+    let json = bridge
+        .rust()
+        .peer_store
+        .as_ref()
+        .map(|ps| rooms_sidebar_json(&ps.read()));
+    if let Some(json) = json {
+        bridge
+            .as_mut()
+            .rooms_sidebar_sync(QString::from(json.as_str()));
+    }
+}
+
+fn emit_local_rooms_for_all_supernodes(mut bridge: Pin<&mut ffi::AppBridge>) {
+    let (peer_store, room_store) = (
+        bridge.rust().peer_store.clone(),
+        bridge.rust().room_store.clone(),
+    );
+    let (Some(peer_store), Some(room_store)) = (peer_store, room_store) else {
+        return;
+    };
+    let supernode_ids: Vec<String> = peer_store
+        .read()
+        .supernodes()
+        .iter()
+        .map(|p| p.identity_pub.clone())
+        .collect();
+    for supernode_id in supernode_ids {
+        let ps = peer_store.read();
+        let rs = room_store.read();
+        let local = local_rooms_json_for_supernode(&rs, &ps, &supernode_id);
+        drop(rs);
+        drop(ps);
+        if local.as_array().is_some_and(|a| a.is_empty()) {
+            continue;
+        }
+        let wrapped = serde_json::json!({
+            "supernode_id": supernode_id,
+            "rooms": local,
+        })
+        .to_string();
+        bridge
+            .as_mut()
+            .sfu_rooms_updated(QString::from(wrapped.as_str()));
     }
 }
 
@@ -3285,11 +3438,18 @@ fn dispatch_event(
                     .as_mut()
                     .nodes_updated(QString::from(node_json.as_str()));
                 let my_public_id = bridge.rust().my_public_id.clone();
-                if let (Some(rs), Some(tx)) = (
+                if let (Some(rs), Some(ps), Some(tx)) = (
                     bridge.rust().room_store.as_ref(),
+                    bridge.rust().peer_store.as_ref(),
                     bridge.rust().conn_cmd_tx.as_ref(),
                 ) {
-                    replay_saved_rooms_on_supernode_connect(&rs.read(), tx, &canon, &my_public_id);
+                    replay_saved_rooms_on_supernode_connect(
+                        &rs.read(),
+                        &ps.read(),
+                        tx,
+                        &canon,
+                        &my_public_id,
+                    );
                 }
             });
         }
@@ -3307,6 +3467,27 @@ fn dispatch_event(
                 bridge
                     .as_mut()
                     .nodes_updated(QString::from(node_json.as_str()));
+
+                // If the lost supernode was hosting the active room, perform a
+                // full local leave (SfuClient + CallController + in-room state)
+                // so the client does not remain stuck targeting a dead host
+                // for audio/chat while other supernodes or direct peers are
+                // still usable. This mirrors explicit remove_room / leave paths
+                // and the multi-supernode isolation requirement.
+                if bridge.rust().current_supernode_id == canon {
+                    bridge.as_mut().leave_room();
+                    {
+                        let mut r = bridge.as_mut().rust_mut();
+                        r.current_supernode_id.clear();
+                        r.current_room_id.clear();
+                    }
+                    bridge
+                        .as_mut()
+                        .set_session_banner(QString::from(banner.as_str()));
+                    bridge
+                        .as_mut()
+                        .set_connection_mode(QString::from("offline"));
+                }
             });
         }
         ConnectionEvent::SupernodeInfoReceived {
@@ -3649,14 +3830,19 @@ fn dispatch_event(
                 let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
                     return;
                 };
-                let rooms = serde_json::from_str::<serde_json::Value>(&rooms_json)
+                let remote = serde_json::from_str::<serde_json::Value>(&rooms_json)
                     .unwrap_or(serde_json::Value::Array(vec![]));
-                let rooms = if let Some(rs) = bridge.rust().room_store.as_ref() {
+                let rooms = if let (Some(rs), Some(ps)) = (
+                    bridge.rust().room_store.as_ref(),
+                    bridge.rust().peer_store.as_ref(),
+                ) {
                     let mut store = rs.write();
-                    sync_saved_rooms_from_list(&mut store, &canon, &rooms);
-                    filter_sfu_rooms_for_sidebar(&store, &canon, &rooms)
+                    sync_saved_rooms_from_list(&mut store, &canon, &remote);
+                    let local = local_rooms_json_for_supernode(&store, &ps.read(), &canon);
+                    let merged = merge_room_list_values(&local, &remote);
+                    filter_sfu_rooms_for_sidebar(&store, &canon, &merged)
                 } else {
-                    rooms
+                    remote
                 };
                 let wrapped = serde_json::json!({
                     "supernode_id": canon,
@@ -3694,35 +3880,8 @@ fn dispatch_event(
                     .map(|ps| ps.read().is_supernode_id(&peer_id))
                     .unwrap_or(false);
                 if is_supernode {
-                    let node_json = bridge.rust().peer_store.as_ref().map(|ps| {
-                        let store = ps.read();
-                        let canon = store
-                            .get(&peer_id)
-                            .or_else(|| store.get_by_identity(&peer_id))
-                            .map(|r| r.identity_pub.clone())
-                            .unwrap_or_else(|| peer_id.clone());
-                        let title = if handle.is_empty() {
-                            store
-                                .get(&peer_id)
-                                .or_else(|| store.get_by_identity(&peer_id))
-                                .map(|r| r.handle.clone())
-                                .unwrap_or_default()
-                        } else {
-                            handle.clone()
-                        };
-                        serde_json::json!([{
-                            "node_id": canon,
-                            "connected": false,
-                            "homepage_url": "",
-                            "title": title,
-                        }])
-                        .to_string()
-                    });
-                    if let Some(node_json) = node_json {
-                        bridge
-                            .as_mut()
-                            .nodes_updated(QString::from(node_json.as_str()));
-                    }
+                    emit_rooms_sidebar_sync(bridge.as_mut());
+                    emit_local_rooms_for_all_supernodes(bridge.as_mut());
                     return;
                 }
                 emit_non_supernode_peers_updated(bridge.as_mut(), true);

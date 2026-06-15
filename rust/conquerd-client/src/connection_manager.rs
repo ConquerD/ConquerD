@@ -1492,6 +1492,28 @@ impl ConnectionManager {
                 if let Some(sn) = self.supernodes.get_mut(&peer_id) {
                     sn.connected = false;
                 }
+                // If this supernode was hosting our current SFU room, tear down
+                // local room tracking immediately. We cannot usefully send
+                // SfuLeave over a dead link; the room is supernode-ephemeral.
+                // Clearing here ensures subsequent SendRoomAudio / SFU ops
+                // do not keep targeting the lost host while other supernodes
+                // or direct sessions remain usable.
+                if self.current_supernode_id == peer_id {
+                    self.current_room_id.clear();
+                    self.current_supernode_id.clear();
+                }
+                // Quota / replay / capability cleanup for the supernode id
+                // (room.* features key quotas and replay on the supernode id
+                // as "peer"/sender, just like direct peers use their id).
+                // Must happen on WS disconnect paths for symmetry with
+                // QuicDisconnected + the documented contract.
+                self.feature_registry.clear_peer_quotas(&peer_id);
+                self.feature_registry.clear_peer_outbound_quotas(&peer_id);
+                self.replay_guard.forget_peer(&peer_id);
+                self.peer_capabilities.remove(&peer_id);
+                // The associated QUIC relay (if any) is likely also dead when
+                // signaling is lost; drop the entry so next use re-discovers.
+                self.quic_relays.remove(&peer_id);
                 let _ = self
                     .event_tx
                     .try_send(ConnectionEvent::SupernodeDisconnected(peer_id));
@@ -2974,7 +2996,10 @@ impl ConnectionManager {
                         } else {
                             vec![pending.relay_hint.clone()]
                         };
-                        store.upsert(crate::peer_store::PeerRecord {
+                        if pending.is_supernode && !pending.relay_hint.is_empty() {
+                            store.grandfather_supernode_ws_hint_sharing(&pending.relay_hint);
+                        }
+                        store.upsert_from_invite(crate::peer_store::PeerRecord {
                             peer_id: inviter_peer_id.clone(),
                             identity_pub: inviter_identity_pub.clone(),
                             handle: inviter_handle.clone(),
@@ -3334,11 +3359,61 @@ impl ConnectionManager {
             return;
         }
 
+        if let Some(expires_at) = payload.get("expires_at").and_then(Value::as_i64) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if expires_at < now {
+                warn!("AcceptInvite: invite expired");
+                return;
+            }
+        }
+
+        let inviter_handle = payload
+            .get("inviter_handle")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+
         info!(
             "Accepting invite from {} (id={})",
             &inviter_identity_pub[..8.min(inviter_identity_pub.len())],
             &invite_id[..8.min(invite_id.len())]
         );
+
+        // Supernode invites: trust + persist immediately from the signed URL
+        // payload so the Rooms sidebar updates even if the WS handshake is slow
+        // or the supernode no longer has this invite_id in its pending map.
+        if is_supernode {
+            {
+                let mut store = self.peer_store.write();
+                let relay_hints = if relay_hint.is_empty() {
+                    vec![]
+                } else {
+                    vec![relay_hint.clone()]
+                };
+                if !relay_hint.is_empty() {
+                    store.grandfather_supernode_ws_hint_sharing(&relay_hint);
+                }
+                store.upsert_from_invite(crate::peer_store::PeerRecord {
+                    peer_id: inviter_peer_id.clone(),
+                    identity_pub: inviter_identity_pub.clone(),
+                    handle: inviter_handle.clone(),
+                    relay_hints,
+                    is_supernode: true,
+                    supernode_from_invite: true,
+                    created_at: unix_now_f64(),
+                    last_seen_at: unix_now_f64(),
+                    ..Default::default()
+                });
+                let _ = store.save();
+            }
+            let _ = self.event_tx.try_send(ConnectionEvent::InviteAccepted {
+                peer_id: inviter_peer_id.clone(),
+                handle: inviter_handle.clone(),
+            });
+        }
 
         // Store pending invite (matched when INVITE_HANDSHAKE_ACCEPT arrives)
         self.pending_invites.insert(
@@ -3356,10 +3431,10 @@ impl ConnectionManager {
         // Open a signaling session only for supernode invites. Ordinary peers
         // may carry a ws relay hint for NAT traversal — that must not register
         // them in the Rooms sidebar or key a WS session under their identity.
-        if is_supernode
-            && !relay_hint.is_empty()
-            && !self.supernodes.contains_key(&inviter_identity_pub)
-        {
+        if is_supernode && !relay_hint.is_empty() {
+            if let Some(sn) = self.supernodes.remove(&inviter_identity_pub) {
+                sn.ws_task.abort();
+            }
             self.connect_supernode_ws(inviter_identity_pub.clone(), relay_hint.clone())
                 .await;
         }

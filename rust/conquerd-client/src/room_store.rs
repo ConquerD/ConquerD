@@ -303,6 +303,73 @@ impl RoomStore {
         v
     }
 
+    /// Like [`list_for_supernode`], but matches hex `peer_id` aliases via `peer_store`.
+    pub fn list_for_supernode_resolved(
+        &self,
+        peer_store: &crate::peer_store::PeerStore,
+        supernode_id: &str,
+    ) -> Vec<RoomEntry> {
+        let canon = peer_store
+            .resolve_supernode_identity_pub(supernode_id)
+            .unwrap_or_else(|| supernode_id.to_owned());
+        let mut v: Vec<RoomEntry> = self
+            .rooms
+            .values()
+            .filter(|e| {
+                peer_store
+                    .resolve_supernode_identity_pub(&e.supernode_id)
+                    .unwrap_or_else(|| e.supernode_id.clone())
+                    == canon
+            })
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.room_name.cmp(&b.room_name));
+        v
+    }
+
+    /// Rewrite room rows keyed by hex `peer_id` to canonical `identity_pub`.
+    pub fn normalize_supernode_ids(
+        &mut self,
+        peer_store: &crate::peer_store::PeerStore,
+    ) -> Result<bool> {
+        let mut changed = false;
+        let entries: Vec<RoomEntry> = self.rooms.values().cloned().collect();
+        for entry in entries {
+            let Some(canon) = peer_store.resolve_supernode_identity_pub(&entry.supernode_id) else {
+                continue;
+            };
+            if canon == entry.supernode_id {
+                continue;
+            }
+            let old_key = Self::entry_key(&entry.supernode_id, &entry.room_id);
+            let new_key = Self::entry_key(&canon, &entry.room_id);
+            let mut moved = entry;
+            moved.supernode_id = canon;
+            self.rooms.remove(&old_key);
+            self.rooms.insert(new_key, moved);
+            changed = true;
+        }
+        let old_deleted: Vec<String> = self.deleted_ids.iter().cloned().collect();
+        for key in old_deleted {
+            let Some((sn, rid)) = key.split_once(':') else {
+                continue;
+            };
+            let Some(canon) = peer_store.resolve_supernode_identity_pub(sn) else {
+                continue;
+            };
+            if canon == sn {
+                continue;
+            }
+            self.deleted_ids.remove(&key);
+            self.deleted_ids.insert(Self::entry_key(&canon, rid));
+            changed = true;
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
     pub fn len(&self) -> usize {
         self.rooms.len()
     }
@@ -420,6 +487,38 @@ mod tests {
         assert_eq!(e.creator_id, "creator-x");
         assert_eq!(e.invite_token, "tok");
         assert!(e.is_creator);
+    }
+
+    #[test]
+    fn normalize_supernode_ids_rekeys_hex_peer_id_to_identity_pub() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let peer_path = dir.path().join(crate::peer_store::PEER_STORE_FILE);
+        let room_path = dir.path().join(ROOM_STORE_FILE);
+
+        let mut peer_store = crate::peer_store::PeerStore::open(&id, Some(&peer_path)).unwrap();
+        peer_store.upsert(crate::peer_store::PeerRecord {
+            peer_id: "hex_sn".to_owned(),
+            identity_pub: "b64_sn".to_owned(),
+            is_supernode: true,
+            supernode_from_invite: true,
+            ..Default::default()
+        });
+        peer_store.save().unwrap();
+
+        let mut room_store = RoomStore::open(&id, Some(&room_path)).unwrap();
+        room_store
+            .add(
+                RoomEntry::new("room-1", "yes")
+                    .with_supernode("hex_sn")
+                    .with_type("public"),
+            )
+            .unwrap();
+
+        room_store.normalize_supernode_ids(&peer_store).unwrap();
+        let rooms = room_store.list_for_supernode("b64_sn");
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].room_id, "room-1");
     }
 
     #[test]

@@ -121,54 +121,101 @@ impl PeerStore {
 
     /// Load records from disk; silently resets to empty on corruption.
     pub fn load(&mut self) {
-        if !self.file_path.exists() {
-            return;
+        if self.file_path.exists() {
+            match std::fs::read(&self.file_path) {
+                Ok(envelope) => match decrypt_blob(&self.key, &envelope) {
+                    Ok(plaintext) => {
+                        match serde_json::from_slice::<serde_json::Value>(&plaintext) {
+                            Ok(doc) => {
+                                if let Some(peers) = doc["peers"].as_array() {
+                                    for entry in peers {
+                                        match serde_json::from_value::<PeerRecord>(entry.clone()) {
+                                            Ok(rec) => {
+                                                self.records.insert(rec.peer_id.clone(), rec);
+                                            }
+                                            Err(e) => {
+                                                warn!("Skipping malformed peer record: {e}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => warn!("Malformed peer store JSON: {e}"),
+                        }
+                    }
+                    Err(e) => warn!("Failed to decrypt peer store: {e}"),
+                },
+                Err(e) => {
+                    warn!(
+                        "Failed to read peer store {}: {}",
+                        self.file_path.display(),
+                        e
+                    );
+                }
+            }
         }
-        let envelope = match std::fs::read(&self.file_path) {
-            Ok(b) => b,
+        let mut changed = Self::repair_all_supernode_flags(&mut self.records);
+        if self.import_missing_supernodes_from_legacy_json() {
+            changed = true;
+        }
+        if changed {
+            if let Err(e) = self.save() {
+                warn!("Failed to persist repaired supernode flags: {e}");
+            }
+        }
+    }
+
+    /// Import supernodes from plaintext `peers.json` when they are absent or
+    /// demoted in the encrypted `peers.dat` store (recovery for data loss).
+    fn import_missing_supernodes_from_legacy_json(&mut self) -> bool {
+        let Some(parent) = self.file_path.parent() else {
+            return false;
+        };
+        let legacy_path = parent.join("peers.json");
+        if !legacy_path.exists() {
+            return false;
+        }
+        let text = match std::fs::read_to_string(&legacy_path) {
+            Ok(t) => t,
             Err(e) => {
-                warn!(
-                    "Failed to read peer store {}: {}",
-                    self.file_path.display(),
-                    e
-                );
-                return;
+                warn!("Failed to read legacy peers.json: {e}");
+                return false;
             }
         };
-        let plaintext = match decrypt_blob(&self.key, &envelope) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Failed to decrypt peer store: {}", e);
-                return;
-            }
-        };
-        let doc: serde_json::Value = match serde_json::from_slice(&plaintext) {
+        let doc: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(e) => {
-                warn!("Malformed peer store JSON: {}", e);
-                return;
+                warn!("Malformed legacy peers.json: {e}");
+                return false;
             }
         };
         let peers = match doc["peers"].as_array() {
             Some(a) => a,
-            None => return,
+            None => return false,
         };
+        let mut changed = false;
         for entry in peers {
-            match serde_json::from_value::<PeerRecord>(entry.clone()) {
-                Ok(rec) => {
-                    self.records.insert(rec.peer_id.clone(), rec);
-                }
-                Err(e) => {
-                    warn!("Skipping malformed peer record: {}", e);
-                }
+            let Ok(rec) = serde_json::from_value::<PeerRecord>(entry.clone()) else {
+                continue;
+            };
+            if !rec.is_supernode {
+                continue;
             }
-        }
-        let repaired = Self::repair_all_supernode_flags(&mut self.records);
-        if repaired {
-            if let Err(e) = self.save() {
-                warn!("Failed to persist repaired supernode flags: {}", e);
+            if self.is_supernode_id(&rec.identity_pub) {
+                continue;
             }
+            warn!(
+                "Restoring supernode {} ({}) from legacy peers.json",
+                &rec.identity_pub[..rec.identity_pub.len().min(12)],
+                rec.handle
+            );
+            let mut restored = rec;
+            restored.is_supernode = true;
+            restored.supernode_from_invite = true;
+            self.upsert_from_invite(restored);
+            changed = true;
         }
+        changed
     }
 
     /// Persist records to disk as an encrypted envelope.
@@ -233,6 +280,44 @@ impl PeerStore {
 
     pub fn upsert(&mut self, record: PeerRecord) {
         self.records.insert(record.peer_id.clone(), record);
+    }
+
+    /// Insert or replace a peer accepted via invite without clobbering an
+    /// unrelated record that happens to share the same `peer_id` HashMap key.
+    pub fn upsert_from_invite(&mut self, mut record: PeerRecord) {
+        let stale_keys: Vec<String> = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.identity_pub == record.identity_pub)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale_keys {
+            self.records.remove(&k);
+        }
+        if let Some(existing) = self.records.get(&record.peer_id) {
+            if existing.identity_pub != record.identity_pub {
+                record.peer_id = record.identity_pub.clone();
+            }
+        }
+        self.records.insert(record.peer_id.clone(), record);
+    }
+
+    /// When a supernode invite carries a ws signaling URL already used by
+    /// another trusted supernode, mark those rows invite-flagged so load-time
+    /// repair does not demote them on the next restart.
+    pub fn grandfather_supernode_ws_hint_sharing(&mut self, ws_hint: &str) {
+        let h = ws_hint.trim();
+        if !h.starts_with("ws://") && !h.starts_with("wss://") {
+            return;
+        }
+        for record in self.records.values_mut() {
+            if !record.is_supernode {
+                continue;
+            }
+            if record.relay_hints.iter().any(|hint| hint.trim() == h) {
+                record.supernode_from_invite = true;
+            }
+        }
     }
 
     pub fn remove(&mut self, peer_id: &str) -> Option<PeerRecord> {
@@ -321,6 +406,18 @@ impl PeerStore {
         ) || handle.ends_with(" Relay Node")
     }
 
+    /// Handles that look like infrastructure nodes rather than personal peers.
+    fn looks_like_supernode_handle(handle: &str) -> bool {
+        if handle.is_empty() || Self::looks_like_operator_handle(handle) {
+            return true;
+        }
+        let lower = handle.to_ascii_lowercase();
+        lower.contains("server")
+            || lower.contains("node")
+            || lower.contains("relay")
+            || lower.contains("supernode")
+    }
+
     /// Supernodes eligible to own a ws signaling URL for demotion checks.
     /// Excludes mis-tagged peers (`is_supernode` without invite proof or operator title).
     fn is_trusted_supernode_record(record: &PeerRecord) -> bool {
@@ -378,7 +475,10 @@ impl PeerStore {
             if record.supernode_from_invite {
                 continue;
             }
-            if record.is_supernode && Self::relay_hint_targets_other_supernode(record, &owners) {
+            if record.is_supernode
+                && Self::relay_hint_targets_other_supernode(record, &owners)
+                && !Self::looks_like_supernode_handle(&record.handle)
+            {
                 record.is_supernode = false;
                 changed = true;
                 continue;
@@ -425,6 +525,60 @@ impl PeerStore {
             }
         }
 
+        // Pass 4 — restore infrastructure rows that were incorrectly demoted when
+        // another supernode shared the same ws signaling URL (pre-2026-06 fix).
+        for record in records.values_mut() {
+            if record.is_supernode || record.quic_port > 0 {
+                continue;
+            }
+            if Self::has_supernode_signaling_hint(record)
+                && Self::looks_like_supernode_handle(&record.handle)
+            {
+                record.is_supernode = true;
+                record.supernode_from_invite = true;
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
+    /// Re-promote trusted peers referenced by saved room definitions. Used on
+    /// startup when a supernode was demoted from the Rooms sidebar but room
+    /// history still points at its `identity_pub`.
+    pub fn restore_supernodes_referenced_by_ids(&mut self, supernode_ids: &[String]) -> bool {
+        let mut changed = false;
+        for id in supernode_ids {
+            if id.is_empty() {
+                continue;
+            }
+            if self.is_supernode_id(id) {
+                continue;
+            }
+            let keys: Vec<String> = self
+                .records
+                .iter()
+                .filter(|(_, r)| r.identity_pub == *id || r.peer_id == *id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in keys {
+                let Some(record) = self.records.get_mut(&key) else {
+                    continue;
+                };
+                if record.blocked || record.revoked {
+                    continue;
+                }
+                if !record.is_supernode {
+                    warn!(
+                        "Restored demoted supernode {} from room-store reference",
+                        &record.identity_pub[..record.identity_pub.len().min(12)]
+                    );
+                    record.is_supernode = true;
+                    record.supernode_from_invite = true;
+                    changed = true;
+                }
+            }
+        }
         changed
     }
 }
@@ -630,6 +784,161 @@ mod tests {
     }
 
     #[test]
+    fn two_custom_supernodes_sharing_ws_hint_both_survive_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PEER_STORE_FILE);
+        let id = make_identity();
+        let shared_hint = "ws://relay.example.com:34935/ws".to_owned();
+
+        let mut store = PeerStore::open(&id, Some(&path)).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "sn_a_hex".to_owned(),
+            identity_pub: "sn_a_b64".to_owned(),
+            relay_hints: vec![shared_hint.clone()],
+            handle: "My Home Server".to_owned(),
+            is_supernode: true,
+            ..Default::default()
+        });
+        store.upsert(PeerRecord {
+            peer_id: "sn_b_hex".to_owned(),
+            identity_pub: "sn_b_b64".to_owned(),
+            relay_hints: vec![shared_hint],
+            handle: "Backup Node".to_owned(),
+            is_supernode: true,
+            supernode_from_invite: true,
+            ..Default::default()
+        });
+        store.save().unwrap();
+
+        let store2 = PeerStore::open(&id, Some(&path)).unwrap();
+        assert_eq!(store2.supernodes().len(), 2);
+        assert!(store2.is_supernode_id("sn_a_b64"));
+        assert!(store2.is_supernode_id("sn_b_b64"));
+    }
+
+    #[test]
+    fn upsert_from_invite_does_not_clobber_unrelated_peer_id_key() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let mut store = PeerStore::open(&id, Some(&dir.path().join(PEER_STORE_FILE))).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "shared_hex".to_owned(),
+            identity_pub: "sn_a_b64".to_owned(),
+            handle: "Node A".to_owned(),
+            is_supernode: true,
+            supernode_from_invite: true,
+            ..Default::default()
+        });
+
+        store.upsert_from_invite(PeerRecord {
+            peer_id: "shared_hex".to_owned(),
+            identity_pub: "sn_b_b64".to_owned(),
+            handle: "Node B".to_owned(),
+            relay_hints: vec!["ws://relay:34935/ws".to_owned()],
+            is_supernode: true,
+            supernode_from_invite: true,
+            ..Default::default()
+        });
+
+        assert_eq!(store.supernodes().len(), 2);
+        assert!(store.is_supernode_id("sn_a_b64"));
+        assert!(store.is_supernode_id("sn_b_b64"));
+    }
+
+    #[test]
+    fn import_missing_supernode_from_legacy_peers_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PEER_STORE_FILE);
+        let id = make_identity();
+
+        let legacy = serde_json::json!({
+            "version": 1,
+            "peers": [{
+                "peer_id": "sn_a_hex",
+                "identity_pub": "sn_a_b64",
+                "relay_hints": ["ws://relay:34935/ws"],
+                "handle": "Node A",
+                "is_supernode": true,
+            }]
+        });
+        std::fs::write(dir.path().join("peers.json"), legacy.to_string()).unwrap();
+
+        let store = PeerStore::open(&id, Some(&path)).unwrap();
+        assert!(store.is_supernode_id("sn_a_b64"));
+        assert_eq!(store.supernodes().len(), 1);
+    }
+
+    #[test]
+    fn demoted_infrastructure_supernode_restored_on_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PEER_STORE_FILE);
+        let id = make_identity();
+        let shared_hint = "ws://relay.example.com:34935/ws".to_owned();
+
+        let mut store = PeerStore::open(&id, Some(&path)).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "sn_a_hex".to_owned(),
+            identity_pub: "sn_a_b64".to_owned(),
+            relay_hints: vec![shared_hint.clone()],
+            handle: "Node A".to_owned(),
+            is_supernode: false,
+            ..Default::default()
+        });
+        store.upsert(PeerRecord {
+            peer_id: "sn_b_hex".to_owned(),
+            identity_pub: "sn_b_b64".to_owned(),
+            relay_hints: vec![shared_hint],
+            handle: "Node B".to_owned(),
+            is_supernode: true,
+            supernode_from_invite: true,
+            ..Default::default()
+        });
+        store.save().unwrap();
+
+        let store2 = PeerStore::open(&id, Some(&path)).unwrap();
+        assert_eq!(store2.supernodes().len(), 2);
+        assert!(store2.is_supernode_id("sn_a_b64"));
+        assert!(store2.is_supernode_id("sn_b_b64"));
+    }
+
+    #[test]
+    fn restore_supernodes_referenced_by_ids_promotes_demoted_row() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let mut store = PeerStore::open(&id, Some(&dir.path().join(PEER_STORE_FILE))).unwrap();
+        store.upsert(PeerRecord {
+            peer_id: "sn_a_hex".to_owned(),
+            identity_pub: "sn_a_b64".to_owned(),
+            relay_hints: vec!["ws://relay:34935/ws".to_owned()],
+            handle: "Alice Node".to_owned(),
+            is_supernode: false,
+            ..Default::default()
+        });
+
+        assert!(store.restore_supernodes_referenced_by_ids(&["sn_a_b64".to_owned()]));
+        assert!(store.is_supernode_id("sn_a_b64"));
+    }
+
+    #[test]
+    fn grandfather_supernode_ws_hint_sharing_flags_existing_rows() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let mut store = PeerStore::open(&id, Some(&dir.path().join(PEER_STORE_FILE))).unwrap();
+        let shared_hint = "ws://relay.example.com:34935/ws".to_owned();
+        store.upsert(PeerRecord {
+            peer_id: "sn_a_hex".to_owned(),
+            identity_pub: "sn_a_b64".to_owned(),
+            relay_hints: vec![shared_hint.clone()],
+            handle: "My Home Server".to_owned(),
+            is_supernode: true,
+            ..Default::default()
+        });
+
+        store.grandfather_supernode_ws_hint_sharing(&shared_hint);
+        assert!(store.get("sn_a_hex").unwrap().supernode_from_invite);
+    }
+
+    #[test]
     fn remove_by_any_id_accepts_peer_id_or_identity_pub() {
         let dir = tempdir().unwrap();
         let id = make_identity();
@@ -668,6 +977,54 @@ mod tests {
         let peers = store.list_non_supernode_peers();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].identity_pub, "peer_b64");
+    }
+
+    /// Manual diagnostic for a live profile (uses OS keyring unlock).
+    /// Run: CONQUERD_HOME=C:\Users\AWOL\.conquerd cargo test dump_live_profile -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual: dumps live CONQUERD_HOME peer + room store"]
+    fn dump_live_profile() {
+        use std::path::PathBuf;
+        let key_dir = std::env::var("CONQUERD_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".conquerd")
+            });
+        eprintln!("CONQUERD_HOME={}", key_dir.display());
+        let (identity, _) =
+            crate::identity::Identity::load_with_keyring_or_passphrase(b"", &key_dir)
+                .expect("unlock identity");
+        eprintln!("my_public_id={}", identity.public_id());
+        let peer_path = key_dir.join(PEER_STORE_FILE);
+        let store = PeerStore::open(&identity, Some(&peer_path)).expect("open peers");
+        eprintln!("total_records={}", store.len());
+        for p in store.list_peers() {
+            eprintln!(
+                "peer_id={} identity_pub={} handle={} is_supernode={} supernode_from_invite={} relay_hints={:?}",
+                p.peer_id, p.identity_pub, p.handle, p.is_supernode, p.supernode_from_invite, p.relay_hints
+            );
+        }
+        eprintln!("--- supernodes ---");
+        for sn in store.supernodes() {
+            eprintln!(
+                "  {} handle={} hints={:?}",
+                sn.identity_pub, sn.handle, sn.relay_hints
+            );
+        }
+        let room_path = key_dir.join(crate::room_store::ROOM_STORE_FILE);
+        if room_path.exists() {
+            let rs =
+                crate::room_store::RoomStore::open(&identity, Some(&room_path)).expect("rooms");
+            eprintln!("--- rooms ---");
+            for r in rs.list() {
+                eprintln!(
+                    "  supernode_id={} room_id={} name={}",
+                    r.supernode_id, r.room_id, r.room_name
+                );
+            }
+        }
     }
 
     #[test]

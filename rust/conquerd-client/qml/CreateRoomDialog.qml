@@ -25,6 +25,10 @@ Dialog {
     modal: true
     standardButtons: Dialog.Ok | Dialog.Cancel
     closePolicy: Dialog.CloseOnEscape
+    width: 400
+    padding: Theme.spacingXl
+    implicitHeight: header.height + contentColumn.implicitHeight + buttonBox.implicitHeight
+                    + topPadding + bottomPadding
 
     function openForNode(supernodeId, type) {
         targetSupernodeId = supernodeId || ""
@@ -72,7 +76,8 @@ Dialog {
     }
 
     contentItem: ColumnLayout {
-        spacing: 16
+        id: contentColumn
+        spacing: Theme.spacingMd
 
         Text {
             visible: roomType === "private"
@@ -96,6 +101,7 @@ Dialog {
             TextField {
                 id: roomNameField
                 Layout.fillWidth: true
+                Layout.preferredHeight: Theme.controlHeight
                 placeholderText: qsTr("e.g. Game Night")
                 maximumLength: 64
                 background: Rectangle {
@@ -124,6 +130,7 @@ Dialog {
             ComboBox {
                 id: supernodeBox
                 Layout.fillWidth: true
+                Layout.preferredHeight: Theme.controlHeight
                 model: root.nodeListModel
                 textRole: "title"
 
@@ -196,6 +203,7 @@ Dialog {
     }
 
     footer: DialogButtonBox {
+        id: buttonBox
         standardButtons: root.standardButtons
         background: Rectangle {
             color: Theme.bg0
