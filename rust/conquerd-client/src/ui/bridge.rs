@@ -3341,6 +3341,140 @@ fn filter_sfu_rooms_for_sidebar(
     serde_json::Value::Array(filtered)
 }
 
+fn room_member_display_name(
+    peer_store: &crate::peer_store::PeerStore,
+    my_public_id: &str,
+    peer_id: &str,
+) -> Option<String> {
+    if peer_id == my_public_id {
+        return Some("You".to_owned());
+    }
+    peer_store
+        .get(peer_id)
+        .or_else(|| peer_store.get_by_identity(peer_id))
+        .filter(|rec| !rec.is_supernode)
+        .map(|rec| rec.display_name())
+}
+
+fn enrich_room_voice_participants(
+    rooms: serde_json::Value,
+    peer_store: Option<&crate::peer_store::PeerStore>,
+    my_public_id: &str,
+) -> serde_json::Value {
+    let Some(arr) = rooms.as_array() else {
+        return rooms;
+    };
+    let enriched = arr
+        .iter()
+        .map(|room| {
+            let mut obj = room.as_object().cloned().unwrap_or_default();
+            let participant_ids: Vec<String> = room
+                .get("participant_ids")
+                .or_else(|| room.get("participants"))
+                .and_then(|v| v.as_array())
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let voice_count = if !participant_ids.is_empty() {
+                participant_ids.len()
+            } else {
+                room.get("member_count")
+                    .or_else(|| room.get("voice_count"))
+                    .or_else(|| room.get("count"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize
+            };
+
+            let mut known = Vec::new();
+            if let Some(store) = peer_store {
+                for id in &participant_ids {
+                    if let Some(name) = room_member_display_name(store, my_public_id, id) {
+                        if !known.iter().any(|existing| existing == &name) {
+                            known.push(name);
+                        }
+                    }
+                }
+            }
+            known.sort();
+
+            let unknown = voice_count.saturating_sub(known.len());
+            obj.insert(
+                "known_peers".to_owned(),
+                serde_json::Value::Array(
+                    known.into_iter().map(serde_json::Value::String).collect(),
+                ),
+            );
+            obj.insert(
+                "unknown_peers".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(unknown as u64)),
+            );
+            obj.insert(
+                "voice_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(voice_count as u64)),
+            );
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    serde_json::Value::Array(enriched)
+}
+
+fn room_voice_sidebar_patch(
+    bridge: &AppBridgeRust,
+    supernode_id: &str,
+    room_id: &str,
+    member_ids: &[String],
+) -> Option<String> {
+    if supernode_id.is_empty() || room_id.is_empty() {
+        return None;
+    }
+
+    let mut room = serde_json::json!({
+        "room_id": room_id,
+        "participant_ids": member_ids,
+        "member_count": member_ids.len(),
+    });
+
+    if let (Some(rs), Some(ps)) = (bridge.room_store.as_ref(), bridge.peer_store.as_ref()) {
+        let store = rs.read();
+        let peer_store = ps.read();
+        if let Some(entry) = store.get(supernode_id, room_id) {
+            room["room_name"] = serde_json::Value::String(entry.room_name.clone());
+            room["room_type"] = serde_json::Value::String(entry.room_type.clone());
+            room["creator_id"] = serde_json::Value::String(entry.creator_id.clone());
+            room["is_default"] = serde_json::Value::Bool(entry.room_id == "default");
+        }
+        let rooms = enrich_room_voice_participants(
+            serde_json::Value::Array(vec![room]),
+            Some(&peer_store),
+            bridge.my_public_id.as_str(),
+        );
+        return Some(
+            serde_json::json!({
+                "supernode_id": supernode_id,
+                "rooms": rooms,
+            })
+            .to_string(),
+        );
+    }
+
+    let rooms = enrich_room_voice_participants(
+        serde_json::Value::Array(vec![room]),
+        None,
+        bridge.my_public_id.as_str(),
+    );
+    Some(
+        serde_json::json!({
+            "supernode_id": supernode_id,
+            "rooms": rooms,
+        })
+        .to_string(),
+    )
+}
+
 fn room_participant_label(
     peer_store: Option<&crate::peer_store::PeerStore>,
     peer_id: &str,
@@ -3982,6 +4116,13 @@ fn dispatch_event(
                 bridge
                     .as_mut()
                     .participants_updated(QString::from(json.as_str()));
+                let sn = bridge.rust().current_supernode_id.clone();
+                let rid = bridge.rust().current_room_id.clone();
+                if let Some(patch) = room_voice_sidebar_patch(bridge.rust(), &sn, &rid, &members) {
+                    bridge
+                        .as_mut()
+                        .sfu_rooms_updated(QString::from(patch.as_str()));
+                }
                 emit_peers_updated(bridge.as_mut());
             });
         }
@@ -4024,6 +4165,13 @@ fn dispatch_event(
                 bridge
                     .as_mut()
                     .participants_updated(QString::from(json.as_str()));
+                let sn = bridge.rust().current_supernode_id.clone();
+                let rid = bridge.rust().current_room_id.clone();
+                if let Some(patch) = room_voice_sidebar_patch(bridge.rust(), &sn, &rid, &ids) {
+                    bridge
+                        .as_mut()
+                        .sfu_rooms_updated(QString::from(patch.as_str()));
+                }
                 emit_peers_updated(bridge.as_mut());
             });
         }
@@ -4050,6 +4198,13 @@ fn dispatch_event(
                 bridge
                     .as_mut()
                     .participants_updated(QString::from(json.as_str()));
+                let sn = bridge.rust().current_supernode_id.clone();
+                let rid = bridge.rust().current_room_id.clone();
+                if let Some(patch) = room_voice_sidebar_patch(bridge.rust(), &sn, &rid, &ids) {
+                    bridge
+                        .as_mut()
+                        .sfu_rooms_updated(QString::from(patch.as_str()));
+                }
                 emit_peers_updated(bridge.as_mut());
             });
         }
@@ -4172,11 +4327,21 @@ fn dispatch_event(
                 ) {
                     let mut store = rs.write();
                     sync_saved_rooms_from_list(&mut store, &canon, &remote);
-                    let local = local_rooms_json_for_supernode(&store, &ps.read(), &canon);
+                    let peer_store = ps.read();
+                    let local = local_rooms_json_for_supernode(&store, &peer_store, &canon);
                     let merged = merge_room_list_values(&local, &remote);
-                    filter_sfu_rooms_for_sidebar(&store, &canon, &merged)
+                    let filtered = filter_sfu_rooms_for_sidebar(&store, &canon, &merged);
+                    enrich_room_voice_participants(
+                        filtered,
+                        Some(&peer_store),
+                        bridge.rust().my_public_id.as_str(),
+                    )
                 } else {
-                    remote
+                    enrich_room_voice_participants(
+                        remote,
+                        None,
+                        bridge.rust().my_public_id.as_str(),
+                    )
                 };
                 let wrapped = serde_json::json!({
                     "supernode_id": canon,
