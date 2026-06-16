@@ -349,7 +349,7 @@ This section is the single source of truth for delivery status (condensed from t
 
 ### Health summary
 
-ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (504 unit tests; 113 features + 198 supernode + 138 client + 55 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only.
+ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (499 unit tests; 113 features + 198 supernode + 133 client + 55 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only.
 
 ### P0–P2 — Complete ✅
 
@@ -368,7 +368,7 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 | Version automation | `scripts/check_version_sync.ps1 -BumpTo X.Y.Z` bumps all crates + prints git/tag commands. |
 | Metrics export | `/api/metrics` via `web.host.app.v1`. |
 | Game relay end-to-end | `game.relay.v1` over WebTransport confirmed working: race condition in `/_conquerd/ctx.json` cache fixed (scheme-layer caches now populated on tokio thread in `connection_manager.rs` before any `FetchWebApp` can succeed); self-signed TLS cert now includes `serverAuth` EKU (Chrome WebTransport requirement); cert fingerprint always re-derived from on-disk DER (stale `.hex` cache bug fixed); old certs missing the EKU detected via OID byte-scan and auto-rotated on next supernode start; template SDK synced with source (`ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, `featureForFixedTag` exports added); SDK now fails fast with a clear error when portal context exists but no WebTransport URL is available; cursor relay demo fixed (`encodeCursorLeave` now carries color so peer tracking is stable). |
-| Test suite integrity | Full test run across all four crates: 504 unit tests all green (113 `conquerd-features` + 198 `conquerd-supernode` + 138 `conquerd-client` + 55 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
+| Test suite integrity | Full test run across all four crates: 499 unit tests all green (113 `conquerd-features` + 198 `conquerd-supernode` + 133 `conquerd-client` + 55 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
 | Ephemeral SFU rooms | Supernode in-memory rooms only (`sfu.rs` idle GC, no `sfu_rooms.json`); client `RoomStore` replay on supernode connect; sidebar hide local-only. |
 
 ### P3 backlog (as capacity allows)
