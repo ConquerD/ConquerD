@@ -980,9 +980,10 @@ mod tests {
     }
 
     /// Manual diagnostic for a live profile (uses OS keyring unlock).
-    /// Run: CONQUERD_HOME=C:\Users\AWOL\.conquerd cargo test dump_live_profile -- --ignored --nocapture
+    /// Run: `cargo test -p conquerd-client --features manual-diagnostics dump_live_profile -- --nocapture`
+    /// Optional: `CONQUERD_HOME=C:\Users\YOU\.conquerd` to target a specific profile.
+    #[cfg(feature = "manual-diagnostics")]
     #[test]
-    #[ignore = "manual: dumps live CONQUERD_HOME peer + room store"]
     fn dump_live_profile() {
         use std::path::PathBuf;
         let key_dir = std::env::var("CONQUERD_HOME")
