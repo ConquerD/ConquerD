@@ -379,6 +379,7 @@ impl SFURoomManager {
                     "room_id": r.room_id,
                     "name": r.room_name,
                     "member_count": r.participant_count(),
+                    "participant_ids": r.participant_ids(),
                     "room_type": r.room_type,
                     "creator_id": r.creator_id,
                     "is_default": r.room_id == DEFAULT_ROOM_ID,
@@ -457,6 +458,30 @@ mod tests {
 
         let remaining = mgr.leave_room("peer1", "test");
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn room_list_includes_voice_participant_ids() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("test"), "Test Room", RoomType::Public, "creator")
+            .expect("room");
+        mgr.join_room("peer1", "test");
+        mgr.join_room("peer2", "test");
+
+        let rooms = mgr.get_rooms_for_peer("peer1");
+        let room = rooms
+            .iter()
+            .find(|r| r.get("room_id").and_then(|v| v.as_str()) == Some("test"))
+            .expect("test room in list");
+        let mut ids: Vec<&str> = room
+            .get("participant_ids")
+            .and_then(|v| v.as_array())
+            .expect("participant_ids array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["peer1", "peer2"]);
     }
 
     #[test]
