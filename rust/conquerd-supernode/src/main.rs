@@ -1246,6 +1246,10 @@ impl SupernodeHandler {
             room_id
         );
 
+        // Participant IDs/counts changed; refresh every connected peer's
+        // room sidebar so voice stats stay scoped to the actual room.
+        self.state.broadcast_room_list();
+
         // Attempt relay-coordinated hole punch with existing room members
         self.state.try_relay_punch_for_room(&msg.sender, room_id);
     }
@@ -1273,6 +1277,9 @@ impl SupernodeHandler {
                 json!({"peer_id": msg.sender, "room_id": room_id}),
             );
         }
+
+        // Participant IDs/counts changed; refresh room sidebar stats.
+        self.state.broadcast_room_list();
     }
 
     fn handle_sfu_room_list(&self, msg: &SignalingMessage) {
