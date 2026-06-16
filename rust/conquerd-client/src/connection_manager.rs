@@ -4262,7 +4262,13 @@ mod tests {
         assert!(!ConnectionManager::is_trusted_sender(&store, "stranger"));
 
         // Present-but-blocked and present-but-revoked peers are not trusted.
-        assert!(!ConnectionManager::is_trusted_sender(&store, "base64blocked"));
-        assert!(!ConnectionManager::is_trusted_sender(&store, "base64revoked"));
+        assert!(!ConnectionManager::is_trusted_sender(
+            &store,
+            "base64blocked"
+        ));
+        assert!(!ConnectionManager::is_trusted_sender(
+            &store,
+            "base64revoked"
+        ));
     }
 }
