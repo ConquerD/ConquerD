@@ -12,6 +12,7 @@
 //!    `CxxQtThread::queue`.
 //! 5. QML user actions call invokables which `try_send` on tokio channels.
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -879,6 +880,17 @@ pub struct AppBridgeRust {
     /// one-peer update that would wipe everyone else from the model).
     room_participant_ids: Vec<String>,
 
+    /// Canonical peer-list keys (`PeerRecord::peer_id`) currently considered online.
+    online_peer_ids: HashSet<String>,
+    /// Canonical peer-list keys with an active voice session (room or direct call).
+    in_call_peer_ids: HashSet<String>,
+    /// Peers with a live direct QUIC session.
+    direct_connected_peer_ids: HashSet<String>,
+    /// Peers currently in the same SFU voice room as us.
+    room_present_peer_ids: HashSet<String>,
+    /// Remote peer id for an active direct P2P call (identity_pub or peer_id).
+    active_direct_call_peer_id: String,
+
     /// Rolling in-memory diagnostic log buffer (max 300 entries).
     event_log: std::collections::VecDeque<String>,
 
@@ -930,6 +942,11 @@ impl Default for AppBridgeRust {
             mic_test_active: false,
             room_chat_history: std::collections::HashMap::new(),
             room_participant_ids: Vec::new(),
+            online_peer_ids: HashSet::new(),
+            in_call_peer_ids: HashSet::new(),
+            direct_connected_peer_ids: HashSet::new(),
+            room_present_peer_ids: HashSet::new(),
+            active_direct_call_peer_id: String::new(),
             event_log: std::collections::VecDeque::with_capacity(300),
             avatar_config_json: String::new(),
         }
@@ -1268,12 +1285,7 @@ impl ffi::AppBridge {
 
         // ── Emit initial peer list from store ─────────────────────────────
         {
-            let store = peer_store.read();
-            let peers_json = non_supernode_peers_json(&store, false);
-            self.as_mut()
-                .peers_updated(QString::from(peers_json.as_str()));
-
-            drop(store);
+            emit_peers_updated(self.as_mut());
             emit_rooms_sidebar_sync(self.as_mut());
             emit_local_rooms_for_all_supernodes(self.as_mut());
         }
@@ -1356,8 +1368,21 @@ impl ffi::AppBridge {
         if let Some(ref tx) = self.rust().call_cmd_tx {
             let _ = tx.try_send(CallCommand::StopAudio);
         }
+        {
+            let active = self.rust().active_direct_call_peer_id.clone();
+            if !active.is_empty() {
+                let resolved = lookup_list_peer_id(self.rust(), &active);
+                set_active_direct_call_presence(
+                    &mut *self.as_mut().rust_mut(),
+                    &active,
+                    false,
+                    resolved,
+                );
+            }
+        }
         self.as_mut().set_call_state(QString::from("idle"));
         self.as_mut().set_voice_active(false);
+        emit_peers_updated(self.as_mut());
     }
 
     fn leave_room(mut self: Pin<&mut Self>) {
@@ -1370,8 +1395,10 @@ impl ffi::AppBridge {
             let _ = tx.try_send(CallCommand::StopAudio);
         }
         self.as_mut().rust_mut().room_participant_ids.clear();
+        clear_room_member_presence(&mut *self.as_mut().rust_mut());
         self.as_mut().set_in_room(false);
         self.as_mut().set_voice_active(false);
+        emit_peers_updated(self.as_mut());
     }
 
     fn send_chat(mut self: Pin<&mut Self>, peer_id: &QString, message: &QString) {
@@ -1476,13 +1503,18 @@ impl ffi::AppBridge {
         }
         if let Some(ref tx) = self.rust().call_cmd_tx {
             let _ = tx.try_send(CallCommand::InitiatePeer {
-                peer_id: pid,
+                peer_id: pid.clone(),
                 host: None,
                 port: None,
             });
         }
         self.as_mut().set_call_state(QString::from("connecting"));
         self.as_mut().set_voice_active(true);
+        {
+            let resolved = lookup_list_peer_id(self.rust(), &pid);
+            set_active_direct_call_presence(&mut *self.as_mut().rust_mut(), &pid, true, resolved);
+        }
+        emit_peers_updated(self.as_mut());
     }
 
     fn copy_invite(mut self: Pin<&mut Self>) {
@@ -1850,6 +1882,11 @@ impl ffi::AppBridge {
         }
         self.as_mut().set_call_state(QString::from("in_call"));
         self.as_mut().set_voice_active(true);
+        {
+            let resolved = lookup_list_peer_id(self.rust(), &pid);
+            set_active_direct_call_presence(&mut *self.as_mut().rust_mut(), &pid, true, resolved);
+        }
+        emit_peers_updated(self.as_mut());
     }
 
     fn reject_call(self: Pin<&mut Self>, peer_id: &QString) {
@@ -1919,14 +1956,11 @@ impl ffi::AppBridge {
         let my_id = self.rust().my_public_id.clone();
         if !my_id.is_empty() {
             self.as_mut().rust_mut().room_participant_ids = vec![my_id.clone()];
-            let json = serde_json::json!([{
-                "peer_id": my_id,
-                "handle": my_id,
-                "speaking": false,
-                "muted": false,
-                "is_self": true,
-            }])
-            .to_string();
+            let json = if let Some(ps) = self.rust().peer_store.as_ref() {
+                room_participants_json(Some(&ps.read()), &[my_id.clone()], &my_id)
+            } else {
+                room_participants_json(None, &[my_id.clone()], &my_id)
+            };
             self.as_mut()
                 .participants_updated(QString::from(json.as_str()));
         }
@@ -2890,14 +2924,136 @@ fn chat_message_to_json(msg: &crate::chat_store::ChatMessage) -> serde_json::Val
     })
 }
 
-fn peer_row_json(record: &crate::peer_store::PeerRecord, online: bool) -> serde_json::Value {
+fn peer_row_json_with_presence(
+    record: &crate::peer_store::PeerRecord,
+    online_peer_ids: &HashSet<String>,
+    in_call_peer_ids: &HashSet<String>,
+) -> serde_json::Value {
     serde_json::json!({
         "peer_id": record.peer_id,
         "handle": record.handle,
-        "online": online,
-        "in_call": false,
+        "online": online_peer_ids.contains(&record.peer_id),
+        "in_call": in_call_peer_ids.contains(&record.peer_id),
         "blocked": record.blocked,
     })
+}
+
+fn resolve_list_peer_id(store: &crate::peer_store::PeerStore, id: &str) -> Option<String> {
+    if store.get(id).is_some() {
+        return Some(id.to_owned());
+    }
+    store
+        .get_by_identity(id)
+        .map(|record| record.peer_id.clone())
+}
+
+fn lookup_list_peer_id(bridge: &AppBridgeRust, id: &str) -> Option<String> {
+    let ps = bridge.peer_store.as_ref()?;
+    let store = ps.read();
+    resolve_list_peer_id(&store, id)
+}
+
+fn resolved_room_member_pids(bridge: &AppBridgeRust, member_ids: &[String]) -> Vec<String> {
+    let Some(ps) = bridge.peer_store.as_ref() else {
+        return Vec::new();
+    };
+    let store = ps.read();
+    let my_id = bridge.my_public_id.as_str();
+    member_ids
+        .iter()
+        .filter(|id| id.as_str() != my_id)
+        .filter_map(|id| resolve_list_peer_id(&store, id))
+        .collect()
+}
+
+fn emit_peers_updated(mut bridge: Pin<&mut ffi::AppBridge>) {
+    let online = bridge.rust().online_peer_ids.clone();
+    let in_call = bridge.rust().in_call_peer_ids.clone();
+    let json = bridge.rust().peer_store.as_ref().map(|ps| {
+        let store = ps.read();
+        serde_json::to_string(
+            &store
+                .list_non_supernode_peers()
+                .iter()
+                .map(|p| peer_row_json_with_presence(p, &online, &in_call))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_owned())
+    });
+    if let Some(json) = json {
+        bridge.as_mut().peers_updated(QString::from(json.as_str()));
+    }
+}
+
+fn mark_peer_online(rust: &mut AppBridgeRust, pid: &str, online: bool) {
+    if online {
+        rust.online_peer_ids.insert(pid.to_owned());
+    } else {
+        rust.online_peer_ids.remove(pid);
+    }
+}
+
+fn mark_peer_in_call(rust: &mut AppBridgeRust, pid: &str, in_call: bool) {
+    if in_call {
+        rust.in_call_peer_ids.insert(pid.to_owned());
+    } else {
+        rust.in_call_peer_ids.remove(pid);
+    }
+}
+
+fn mark_direct_connected(rust: &mut AppBridgeRust, pid: &str, connected: bool) {
+    if connected {
+        rust.direct_connected_peer_ids.insert(pid.to_owned());
+        rust.online_peer_ids.insert(pid.to_owned());
+    } else {
+        rust.direct_connected_peer_ids.remove(pid);
+        if !rust.room_present_peer_ids.contains(pid) {
+            rust.online_peer_ids.remove(pid);
+        }
+    }
+}
+
+fn clear_room_member_presence(rust: &mut AppBridgeRust) {
+    for pid in rust.room_present_peer_ids.drain() {
+        rust.in_call_peer_ids.remove(&pid);
+        if !rust.direct_connected_peer_ids.contains(&pid) {
+            rust.online_peer_ids.remove(&pid);
+        }
+    }
+}
+
+fn apply_room_member_presence(rust: &mut AppBridgeRust, member_pids: &[String]) {
+    clear_room_member_presence(rust);
+    for pid in member_pids {
+        rust.room_present_peer_ids.insert(pid.clone());
+        rust.online_peer_ids.insert(pid.clone());
+        rust.in_call_peer_ids.insert(pid.clone());
+    }
+}
+
+fn set_active_direct_call_presence(
+    rust: &mut AppBridgeRust,
+    peer_id: &str,
+    active: bool,
+    resolved_pid: Option<String>,
+) {
+    if active {
+        rust.active_direct_call_peer_id = peer_id.to_owned();
+        if let Some(pid) = resolved_pid {
+            mark_peer_online(rust, &pid, true);
+            mark_peer_in_call(rust, &pid, true);
+        }
+    } else if rust.active_direct_call_peer_id == peer_id {
+        rust.active_direct_call_peer_id.clear();
+        if let Some(pid) = resolved_pid {
+            mark_peer_in_call(rust, &pid, false);
+            if !rust.direct_connected_peer_ids.contains(&pid)
+                && !rust.room_present_peer_ids.contains(&pid)
+            {
+                rust.online_peer_ids.remove(&pid);
+            }
+        }
+    }
 }
 
 fn remember_room_in_store(
@@ -3099,26 +3255,44 @@ fn filter_sfu_rooms_for_sidebar(
     serde_json::Value::Array(filtered)
 }
 
-fn non_supernode_peers_json(store: &crate::peer_store::PeerStore, online: bool) -> String {
+fn room_participant_label(
+    peer_store: Option<&crate::peer_store::PeerStore>,
+    peer_id: &str,
+) -> String {
+    if let Some(store) = peer_store {
+        if let Some(rec) = store
+            .get(peer_id)
+            .or_else(|| store.get_by_identity(peer_id))
+        {
+            return rec.display_name();
+        }
+    }
+    if peer_id.len() > 12 {
+        format!("{}…", &peer_id[..12])
+    } else {
+        peer_id.to_string()
+    }
+}
+
+fn room_participants_json(
+    peer_store: Option<&crate::peer_store::PeerStore>,
+    ids: &[String],
+    my_id: &str,
+) -> String {
     serde_json::to_string(
-        &store
-            .list_non_supernode_peers()
-            .iter()
-            .map(|p| peer_row_json(p, online))
+        &ids.iter()
+            .map(|id| {
+                serde_json::json!({
+                    "peer_id": id,
+                    "handle": room_participant_label(peer_store, id),
+                    "speaking": false,
+                    "muted": false,
+                    "is_self": id == my_id,
+                })
+            })
             .collect::<Vec<_>>(),
     )
     .unwrap_or_else(|_| "[]".to_owned())
-}
-
-fn emit_non_supernode_peers_updated(mut bridge: Pin<&mut ffi::AppBridge>, online: bool) {
-    let json = bridge
-        .rust()
-        .peer_store
-        .as_ref()
-        .map(|ps| non_supernode_peers_json(&ps.read(), online));
-    if let Some(json) = json {
-        bridge.as_mut().peers_updated(QString::from(json.as_str()));
-    }
 }
 
 fn rooms_sidebar_json(store: &crate::peer_store::PeerStore) -> String {
@@ -3203,6 +3377,10 @@ fn dispatch_event(
                     .as_mut()
                     .set_session_banner(QString::from(banner.as_str()));
                 bridge.as_mut().set_connection_mode(QString::from("direct"));
+                if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
+                    mark_direct_connected(&mut *bridge.as_mut().rust_mut(), &pid, true);
+                }
+                emit_peers_updated(bridge.as_mut());
                 // Auto-broadcast own avatar config to the newly connected peer.
                 let cfg = bridge.rust().avatar_config_json.clone();
                 let pid = peer_id.clone();
@@ -3227,6 +3405,10 @@ fn dispatch_event(
                 bridge
                     .as_mut()
                     .set_connection_mode(QString::from("offline"));
+                if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
+                    mark_direct_connected(&mut *bridge.as_mut().rust_mut(), &pid, false);
+                }
+                emit_peers_updated(bridge.as_mut());
             });
         }
         ConnectionEvent::ChatMessage {
@@ -3257,8 +3439,9 @@ fn dispatch_event(
                 warn!("chat_store insert error: {e}");
             }
             // Desktop notification (non-blocking, best-effort)
-            let preview = if body.len() > 80 {
-                format!("{}…", &body[..79])
+            let preview = if body.chars().count() > 80 {
+                let truncated: String = body.chars().take(79).collect();
+                format!("{truncated}\u{2026}")
             } else {
                 body.clone()
             };
@@ -3309,8 +3492,9 @@ fn dispatch_event(
                 bridge
                     .as_mut()
                     .unread_changed(QString::from(peer_id_clone.as_str()), peer_unread);
-                let preview_text = if preview_clone.len() > 60 {
-                    format!("{}\u{2026}", &preview_clone[..59])
+                let preview_text = if preview_clone.chars().count() > 60 {
+                    let truncated: String = preview_clone.chars().take(59).collect();
+                    format!("{truncated}\u{2026}")
                 } else {
                     preview_clone.clone()
                 };
@@ -3392,6 +3576,16 @@ fn dispatch_event(
                 bridge
                     .as_mut()
                     .set_session_banner(QString::from(banner.as_str()));
+                {
+                    let resolved = lookup_list_peer_id(bridge.rust(), &peer_id);
+                    set_active_direct_call_presence(
+                        &mut *bridge.as_mut().rust_mut(),
+                        &peer_id,
+                        true,
+                        resolved,
+                    );
+                }
+                emit_peers_updated(bridge.as_mut());
             });
         }
         ConnectionEvent::CallEnded { .. } => {
@@ -3402,8 +3596,21 @@ fn dispatch_event(
                     let mc = bridge.rust().missed_calls + 1;
                     bridge.as_mut().set_missed_calls(mc);
                 }
+                {
+                    let active = bridge.rust().active_direct_call_peer_id.clone();
+                    if !active.is_empty() {
+                        let resolved = lookup_list_peer_id(bridge.rust(), &active);
+                        set_active_direct_call_presence(
+                            &mut *bridge.as_mut().rust_mut(),
+                            &active,
+                            false,
+                            resolved,
+                        );
+                    }
+                }
                 bridge.as_mut().set_call_state(QString::from("idle"));
                 bridge.as_mut().set_call_duration_secs(0);
+                emit_peers_updated(bridge);
             });
         }
         ConnectionEvent::SessionStateUpdate(state) => {
@@ -3615,16 +3822,27 @@ fn dispatch_event(
         }
         ConnectionEvent::HandleUpdated { peer_id, handle: _ } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                if bridge
+                let is_supernode = bridge
                     .rust()
                     .peer_store
                     .as_ref()
                     .map(|ps| ps.read().is_supernode_id(&peer_id))
-                    .unwrap_or(false)
-                {
-                    return;
+                    .unwrap_or(false);
+                if !is_supernode {
+                    emit_peers_updated(bridge.as_mut());
                 }
-                emit_non_supernode_peers_updated(bridge.as_mut(), true);
+                if bridge.rust().in_room && !bridge.rust().room_participant_ids.is_empty() {
+                    let my_id = bridge.rust().my_public_id.clone();
+                    let ids = bridge.rust().room_participant_ids.clone();
+                    let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
+                        room_participants_json(Some(&ps.read()), &ids, &my_id)
+                    } else {
+                        room_participants_json(None, &ids, &my_id)
+                    };
+                    bridge
+                        .as_mut()
+                        .participants_updated(QString::from(json.as_str()));
+                }
             });
         }
         ConnectionEvent::AvatarConfigUpdated { peer_id } => {
@@ -3654,22 +3872,19 @@ fn dispatch_event(
                     }
                 }
 
-                let json = serde_json::json!(members
-                    .iter()
-                    .map(|id| {
-                        serde_json::json!({
-                            "peer_id": id,
-                            "handle": id,
-                            "speaking": false,
-                            "muted": false,
-                            "is_self": id == &my_id,
-                        })
-                    })
-                    .collect::<Vec<_>>())
-                .to_string();
+                {
+                    let pids = resolved_room_member_pids(bridge.rust(), &members);
+                    apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
+                }
+                let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
+                    room_participants_json(Some(&ps.read()), &members, &my_id)
+                } else {
+                    room_participants_json(None, &members, &my_id)
+                };
                 bridge
                     .as_mut()
                     .participants_updated(QString::from(json.as_str()));
+                emit_peers_updated(bridge.as_mut());
             });
         }
         ConnectionEvent::RoomPeerJoined { peer_id } => {
@@ -3699,22 +3914,19 @@ fn dispatch_event(
                 // Re-emit the full participant list so the model is never partial.
                 let my_id = bridge.rust().my_public_id.clone();
                 let ids = bridge.rust().room_participant_ids.clone();
-                let json = serde_json::json!(ids
-                    .iter()
-                    .map(|id| {
-                        serde_json::json!({
-                            "peer_id": id,
-                            "handle": id,
-                            "speaking": false,
-                            "muted": false,
-                            "is_self": id == &my_id,
-                        })
-                    })
-                    .collect::<Vec<_>>())
-                .to_string();
+                {
+                    let pids = resolved_room_member_pids(bridge.rust(), &ids);
+                    apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
+                }
+                let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
+                    room_participants_json(Some(&ps.read()), &ids, &my_id)
+                } else {
+                    room_participants_json(None, &ids, &my_id)
+                };
                 bridge
                     .as_mut()
                     .participants_updated(QString::from(json.as_str()));
+                emit_peers_updated(bridge.as_mut());
             });
         }
         ConnectionEvent::RoomPeerLeft { peer_id } => {
@@ -3728,22 +3940,19 @@ fn dispatch_event(
                 // Re-emit the full participant list after removal.
                 let my_id = bridge.rust().my_public_id.clone();
                 let ids = bridge.rust().room_participant_ids.clone();
-                let json = serde_json::json!(ids
-                    .iter()
-                    .map(|id| {
-                        serde_json::json!({
-                            "peer_id": id,
-                            "handle": id,
-                            "speaking": false,
-                            "muted": false,
-                            "is_self": id == &my_id,
-                        })
-                    })
-                    .collect::<Vec<_>>())
-                .to_string();
+                {
+                    let pids = resolved_room_member_pids(bridge.rust(), &ids);
+                    apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
+                }
+                let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
+                    room_participants_json(Some(&ps.read()), &ids, &my_id)
+                } else {
+                    room_participants_json(None, &ids, &my_id)
+                };
                 bridge
                     .as_mut()
                     .participants_updated(QString::from(json.as_str()));
+                emit_peers_updated(bridge.as_mut());
             });
         }
         ConnectionEvent::SfuAudioReceived { peer_id, opus_data } => {
@@ -3818,7 +4027,10 @@ fn dispatch_event(
                 {
                     return;
                 }
-                emit_non_supernode_peers_updated(bridge.as_mut(), true);
+                if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
+                    mark_peer_online(&mut *bridge.as_mut().rust_mut(), &pid, true);
+                }
+                emit_peers_updated(bridge.as_mut());
             });
         }
         // Room list received from supernode — forward to QML.
@@ -3867,7 +4079,10 @@ fn dispatch_event(
                 {
                     return;
                 }
-                emit_non_supernode_peers_updated(bridge.as_mut(), online);
+                if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
+                    mark_peer_online(&mut *bridge.as_mut().rust_mut(), &pid, online);
+                }
+                emit_peers_updated(bridge.as_mut());
             });
         }
         // Invite accepted — new peer added.
@@ -3884,7 +4099,10 @@ fn dispatch_event(
                     emit_local_rooms_for_all_supernodes(bridge.as_mut());
                     return;
                 }
-                emit_non_supernode_peers_updated(bridge.as_mut(), true);
+                if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
+                    mark_peer_online(&mut *bridge.as_mut().rust_mut(), &pid, true);
+                }
+                emit_peers_updated(bridge.as_mut());
                 bridge.as_mut().peer_added(
                     QString::from(peer_id.as_str()),
                     QString::from(handle.as_str()),
