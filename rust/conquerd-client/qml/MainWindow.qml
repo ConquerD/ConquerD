@@ -70,6 +70,58 @@ ApplicationWindow {
         return -1
     }
 
+    function supernodeHandleFor(nodeId) {
+        var idx = findNodeIndex(nodeId)
+        if (idx < 0) return ""
+        var handle = nodeListModel.get(idx).title || ""
+        return handle
+    }
+
+    function peerHandleFor(peerId) {
+        if (!peerId || peerId === "") return ""
+        for (var row = 0; row < peerModel.rowCount(); row++) {
+            var idx = peerModel.index(row, 0)
+            if (peerModel.data(idx, 256).toString() === peerId)
+                return peerModel.data(idx, 257).toString()
+        }
+        if (peerId.length > 12)
+            return peerId.substring(0, 12) + "…"
+        return peerId
+    }
+
+    function activeCallPeerHandle() {
+        var peerId = root.activeCallPeerId || chatPanel.selectedPeerId
+        if (!peerId || peerId === "") return ""
+        var handle = root.peerHandleFor(peerId)
+        if (chatPanel.selectedPeerId === peerId && chatPanel.selectedPeerName !== "")
+            return chatPanel.selectedPeerName
+        return handle
+    }
+
+    function trackDirectCall(peerId) {
+        root.activeCallPeerId = peerId || ""
+    }
+
+    function refreshDirectCallModel() {
+        directCallModel.clear()
+        var remoteId = root.activeCallPeerId || chatPanel.selectedPeerId
+        if (!remoteId || remoteId === "") return
+        directCallModel.append({
+            peerId: backend.public_id,
+            handle: "You",
+            muted: voiceRail.muted,
+            audioLevel: 0.0,
+            isSelf: true
+        })
+        directCallModel.append({
+            peerId: remoteId,
+            handle: root.activeCallPeerHandle(),
+            muted: false,
+            audioLevel: 0.0,
+            isSelf: false
+        })
+    }
+
     // Rebuild the Rooms sidebar from the trusted peer store, preserving
     // per-node room snapshots and live connected/sfu flags where possible.
     function syncRoomsSidebar(nodesJson) {
@@ -329,6 +381,10 @@ ApplicationWindow {
     // Kept separate from roomPanel.roomName so browsing chat rooms doesn't
     // change the voice-rail label.
     property string voiceRoomName: ""
+    // Hosting supernode for the active voice room (paired with voiceRoomName).
+    property string voiceSupernodeId: ""
+    // Remote peer for an active direct P2P voice call.
+    property string activeCallPeerId: ""
 
     // Settings section index (0=Audio … 7=Diagnostics). Drives SettingsPage.currentTab.
     property int settingsTab: 0
@@ -632,6 +688,7 @@ ApplicationWindow {
             roomPanel.switchToRoom(roomName, roomId, supernodeId)
             backend.joinRoomWithVoice(supernodeId, roomId)
             root.voiceRoomName = roomName
+            root.voiceSupernodeId = supernodeId
             navIndex = 1
             if (roomType === "private" && inviteToken !== "") {
                 backend.copyToClipboard(inviteToken)
@@ -651,7 +708,10 @@ ApplicationWindow {
         id: incomingCallDialog
         anchors.centerIn: parent
         z: 100
-        onAccepted: function(peerId) { backend.acceptCall(peerId) }
+        onAccepted: function(peerId) {
+            root.trackDirectCall(peerId)
+            backend.acceptCall(peerId)
+        }
         onRejected: function(peerId) { backend.rejectCall(peerId) }
     }
 
@@ -798,24 +858,9 @@ ApplicationWindow {
         function onCall_stateChanged() {
             var cs = backend.call_state
             if (cs === "connecting" || cs === "in_call") {
-                directCallModel.clear()
-                // Self entry
-                directCallModel.append({
-                    peerId: backend.public_id,
-                    handle: "You",
-                    muted: voiceRail.muted,
-                    audioLevel: 0.0,
-                    isSelf: true
-                })
-                // Remote peer entry (name from currently selected peer or "Peer")
-                directCallModel.append({
-                    peerId: chatPanel.selectedPeerId,
-                    handle: chatPanel.selectedPeerId || "Peer",
-                    muted: false,
-                    audioLevel: 0.0,
-                    isSelf: false
-                })
+                root.refreshDirectCallModel()
             } else {
+                root.activeCallPeerId = ""
                 directCallModel.clear()
             }
         }
@@ -891,7 +936,10 @@ ApplicationWindow {
                         navIndex = 0
                         peerModel.setPeerUnread(peerId, 0)
                     }
-                    onStartCallRequested: (peerId) => backend.startCall(peerId)
+                    onStartCallRequested: function(peerId) {
+                        root.trackDirectCall(peerId)
+                        backend.startCall(peerId)
+                    }
                     onRemovePeerRequested: (peerId) => backend.removePeer(peerId)
                     onCopyPeerIdRequested: (peerId) => backend.copyPeerId(peerId)
                     onBlockPeerRequested: (peerId) => backend.blockPeer(peerId)
@@ -923,6 +971,7 @@ ApplicationWindow {
                                     roomContextMenu.targetSupernodeId,
                                     roomContextMenu.targetRoomId)
                                 root.voiceRoomName = roomContextMenu.targetRoomName
+                                root.voiceSupernodeId = roomContextMenu.targetSupernodeId
                                 navIndex = 1
                             }
                         }
@@ -1156,6 +1205,7 @@ ApplicationWindow {
                                                     roomGroup.node_id,
                                                     roomDelegate.room_id)
                                                 root.voiceRoomName = roomDelegate.name || roomDelegate.room_id
+                                                root.voiceSupernodeId = roomGroup.node_id
                                                 navIndex = 1
                                             }
 
@@ -1315,7 +1365,10 @@ ApplicationWindow {
                 youtubePreviewEnabled: settingsModel ? settingsModel.youtube_preview_enabled : true
                 youtubeInlineAck: settingsModel ? settingsModel.youtube_inline_ack : false
                 onSendMessage: (peerId, msg) => backend.sendChat(peerId, msg)
-                onStartCall: (peerId) => backend.startCall(peerId)
+                onStartCall: function(peerId) {
+                    root.trackDirectCall(peerId)
+                    backend.startCall(peerId)
+                }
                 onSendFile: (peerId, fileUrl) => backend.sendFile(peerId, fileUrl)
                 Component.onCompleted: chatPanel.onActiveFocusChanged.connect(function() {
                     if (chatPanel.activeFocus) backend.clearUnread()
@@ -1428,7 +1481,11 @@ ApplicationWindow {
             participantModel: backend.in_room ? roomModel : directCallModel
             contextName: backend.in_room
                 ? root.voiceRoomName
-                : (chatPanel.selectedPeerId || "")
+                : (root.activeCallPeerHandle() || chatPanel.selectedPeerName || chatPanel.selectedPeerId || "Call")
+            supernodeId: backend.in_room ? root.voiceSupernodeId : ""
+            supernodeHandle: backend.in_room
+                ? root.supernodeHandleFor(root.voiceSupernodeId)
+                : ""
             callState: backend.call_state
             inRoom: backend.in_room
             connectionMode: backend.connection_mode
