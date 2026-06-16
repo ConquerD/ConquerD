@@ -25,6 +25,20 @@ Rectangle {
     /// Display name shown in the header (room name or remote peer handle).
     property string contextName: ""
 
+    /// Hosting supernode identity when `inRoom` (Ed25519 pub / peer id).
+    property string supernodeId: ""
+
+    /// Trusted-peer handle for the hosting supernode, when known.
+    property string supernodeHandle: ""
+
+    // Header avatar is room-only (supernode host). Direct P2P peers already
+    // appear in the participant flow below — same voice rail, no duplicate tile.
+    readonly property string headerAvatarPeerId: root.inRoom ? root.supernodeId : ""
+    readonly property string headerAvatarHandle: root.inRoom ? root.supernodeHandle : ""
+    readonly property bool showNameBubbles: root.inRoom
+        || root.callState === "connecting"
+        || root.callState === "in_call"
+
     /// Call/room state passed from bridge: "idle" | "connecting" | "in_call"
     property string callState: "idle"
 
@@ -155,7 +169,7 @@ Rectangle {
             height: 52
             color: Theme.bg3
 
-            ColumnLayout {
+            RowLayout {
                 anchors {
                     fill: parent
                     leftMargin: Theme.spacingMd
@@ -163,37 +177,81 @@ Rectangle {
                     topMargin: Theme.spacingXs
                     bottomMargin: Theme.spacingXs
                 }
-                spacing: 2
+                spacing: Theme.spacingSm
 
-                // Room/peer name
-                Text {
-                    text: root.contextName || (root.inRoom ? "Voice Room" : "Call")
-                    color: Theme.text
-                    font.pixelSize: Theme.fontSizeBody
-                    font.bold: true
-                    elide: Text.ElideRight
-                    Layout.fillWidth: true
+                Item {
+                    visible: root.headerAvatarPeerId !== ""
+                    Layout.preferredWidth: 36
+                    Layout.preferredHeight: 36
+                    Layout.alignment: Qt.AlignVCenter
+
+                    Avatar {
+                        anchors.centerIn: parent
+                        peerId: root.headerAvatarPeerId
+                        size: 28
+                        showRing: true
+                    }
+
+                    Rectangle {
+                        visible: root.headerAvatarHandle !== ""
+                        anchors {
+                            horizontalCenter: parent.horizontalCenter
+                            bottom: parent.bottom
+                        }
+                        implicitWidth: Math.min(handleLabel.implicitWidth + 6, 52)
+                        width: implicitWidth
+                        height: 12
+                        radius: height / 2
+                        color: Theme.accent
+
+                        Text {
+                            id: handleLabel
+                            anchors.centerIn: parent
+                            width: parent.width - 4
+                            text: root.headerAvatarHandle
+                            color: Theme.textInv
+                            font.pixelSize: Theme.fontSizeMicro
+                            font.bold: true
+                            elide: Text.ElideRight
+                            horizontalAlignment: Text.AlignHCenter
+                        }
+                    }
                 }
 
-                // Connection mode pill
-                Rectangle {
-                    width: modePillText.implicitWidth + Theme.spacingSm
-                    height: Theme.fontSizeCaption + Theme.spacingXs
-                    radius: Theme.radiusSm
-                    color: Theme.semanticTint(
-                        Theme.connectionModeColor(root.connectionMode),
-                        0.18
-                    )
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 2
 
+                    // Room/peer name
                     Text {
-                        id: modePillText
-                        anchors.centerIn: parent
-                        text: root.callState === "connecting"
-                            ? "Connecting..."
-                            : Theme.connectionModeLabel(root.connectionMode)
-                        color: Theme.connectionModeColor(root.connectionMode)
-                        font.pixelSize: Theme.fontSizeCaption
+                        text: root.contextName || (root.inRoom ? "Voice Room" : "Call")
+                        color: Theme.text
+                        font.pixelSize: Theme.fontSizeBody
                         font.bold: true
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+
+                    // Connection mode pill
+                    Rectangle {
+                        width: modePillText.implicitWidth + Theme.spacingSm
+                        height: Theme.fontSizeCaption + Theme.spacingXs
+                        radius: Theme.radiusSm
+                        color: Theme.semanticTint(
+                            Theme.connectionModeColor(root.connectionMode),
+                            0.18
+                        )
+
+                        Text {
+                            id: modePillText
+                            anchors.centerIn: parent
+                            text: root.callState === "connecting"
+                                ? "Connecting..."
+                                : Theme.connectionModeLabel(root.connectionMode)
+                            color: Theme.connectionModeColor(root.connectionMode)
+                            font.pixelSize: Theme.fontSizeCaption
+                            font.bold: true
+                        }
                     }
                 }
             }
@@ -246,6 +304,7 @@ Rectangle {
                     audioLevel:  model.isSelf ? backend.mic_level : model.audioLevel
                     isSelf:      model.isSelf
                     ringStore:   root.ringStateForPeer(model.peerId)
+                    showNameBubbles: root.showNameBubbles
                 }
             }
         }
