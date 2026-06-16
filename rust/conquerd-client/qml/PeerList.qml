@@ -36,7 +36,7 @@ Rectangle {
                     left: parent.left
                     leftMargin: Theme.spacingMd
                 }
-                text: "Peers (" + root.peerCount + ")"
+                text: "Peers (" + peerListView.count + ")"
                 color: Theme.muted
                 font.pixelSize: Theme.fontSizeCaption
                 font.capitalization: Font.AllUppercase
@@ -78,7 +78,7 @@ Rectangle {
 
             EmptyState {
                 anchors.centerIn: parent
-                visible: root.peerCount === 0
+                visible: peerListView.count === 0
                 width: Math.min(parent.width - Theme.spacingXl, 170)
                 iconSource: "qrc:/qt/qml/ConquerD/Client/icons/peers.svg"
                 iconSize: 32
@@ -271,4 +271,3 @@ Rectangle {
         }
     }
 }
-
