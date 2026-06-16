@@ -17,7 +17,6 @@
 mod avatar_config;
 mod banner;
 mod call_controller;
-mod chat_manager;
 mod chat_store;
 mod connection_fallback;
 mod connection_manager;

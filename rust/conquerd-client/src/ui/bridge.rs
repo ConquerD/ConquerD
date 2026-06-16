@@ -985,6 +985,10 @@ fn room_chat_history_key(supernode_id: &str, room_id: &str) -> String {
     format!("{supernode_id}:{room_id}")
 }
 
+fn room_chat_store_peer_id(supernode_id: &str, room_id: &str) -> String {
+    format!("room:{supernode_id}:{room_id}")
+}
+
 // ---------------------------------------------------------------------------
 // Invokable implementations
 // ---------------------------------------------------------------------------
@@ -1440,13 +1444,20 @@ impl ffi::AppBridge {
             (sender_pub, handle, cs, msg)
         };
 
-        // Send to the peer.
-        let mut initial_status = crate::chat_store::MessageStatus::Sending;
-        if let Some(ref tx) = self.rust().conn_cmd_tx {
-            let _ = tx.try_send(ConnectionCommand::SendMessage(outbound_msg));
+        // Send to the peer. If the command channel is missing, full, or
+        // closed, mark the message failed immediately so it never lingers in
+        // "sending" — the user can then retry it explicitly.
+        let sent = match self.rust().conn_cmd_tx {
+            Some(ref tx) => tx
+                .try_send(ConnectionCommand::SendMessage(outbound_msg))
+                .is_ok(),
+            None => false,
+        };
+        let initial_status = if sent {
+            crate::chat_store::MessageStatus::Sending
         } else {
-            initial_status = crate::chat_store::MessageStatus::Failed;
-        }
+            crate::chat_store::MessageStatus::Failed
+        };
 
         // Persist outbound message so history replay shows it on both sides.
         let chat_msg = crate::chat_store::ChatMessage {
@@ -1673,6 +1684,19 @@ impl ffi::AppBridge {
         };
         let rid = room_id.to_string();
         let key = room_chat_history_key(&sn, &rid);
+        if let Some(ref cs) = self.rust().chat_store {
+            let store_key = room_chat_store_peer_id(&sn, &rid);
+            let msgs: Vec<serde_json::Value> = cs
+                .get_history(&store_key, 0)
+                .map(|rows| rows.iter().map(room_chat_message_to_json).collect())
+                .unwrap_or_default();
+            for msg in msgs {
+                let json = msg.to_string();
+                self.as_mut()
+                    .room_chat_received(QString::from(json.as_str()));
+            }
+            return;
+        }
         let msgs: Vec<String> = self
             .rust()
             .room_chat_history
@@ -1755,8 +1779,13 @@ impl ffi::AppBridge {
             serde_json::Value::String(msg.sender_handle.clone()),
         );
 
-        let status = if let Some(ref tx) = self.rust().conn_cmd_tx {
-            let _ = tx.try_send(ConnectionCommand::SendMessage(outbound));
+        let sent = match self.rust().conn_cmd_tx {
+            Some(ref tx) => tx
+                .try_send(ConnectionCommand::SendMessage(outbound))
+                .is_ok(),
+            None => false,
+        };
+        let status = if sent {
             crate::chat_store::MessageStatus::Sending
         } else {
             crate::chat_store::MessageStatus::Failed
@@ -2498,7 +2527,12 @@ impl ffi::AppBridge {
 
     fn send_room_chat(mut self: Pin<&mut Self>, body: &QString) {
         let body_str = body.to_string();
-        let (sn, rid, handle) = {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let (sn, rid, handle, sender_id, chat_store_opt) = {
             let r = self.rust();
             let sn = r.current_supernode_id.clone();
             let rid = r.current_room_id.clone();
@@ -2510,39 +2544,78 @@ impl ffi::AppBridge {
                     store.get(&r.my_peer_id).map(|rec| rec.display_name())
                 })
                 .unwrap_or_default();
-            (sn, rid, handle)
+            let sender_id = r.my_public_id.clone();
+            let cs = r.chat_store.clone();
+            (sn, rid, handle, sender_id, cs)
         };
-        if sn.is_empty() {
+        if sn.is_empty() || rid.is_empty() {
             return;
         }
-        // Persist outbound message so loadRoomChatHistory can replay it.
+        let sent = match self.rust().conn_cmd_tx {
+            Some(ref tx) => tx
+                .try_send(ConnectionCommand::SendSfuChat {
+                    supernode_id: sn.clone(),
+                    room_id: rid.clone(),
+                    body: body_str.clone(),
+                    sender_handle: handle.clone(),
+                })
+                .is_ok(),
+            None => false,
+        };
+        let status = if sent { "sent" } else { "failed" };
+        let message_status = if sent {
+            crate::chat_store::MessageStatus::Sent
+        } else {
+            crate::chat_store::MessageStatus::Failed
+        };
+
+        let json = serde_json::json!({
+            "msg_id": message_id.clone(),
+            "sender": handle.clone(),
+            "body": body_str.clone(),
+            "timestamp": now_ts,
+            "kind": "text",
+            "mine": true,
+            "is_room": true,
+            "status": status,
+        })
+        .to_string();
+
+        // Persist outbound message so loadRoomChatHistory can replay it after restart.
+        if let Some(ref cs) = chat_store_opt {
+            let store_key = room_chat_store_peer_id(&sn, &rid);
+            let chat_msg = crate::chat_store::ChatMessage {
+                id: message_id.clone(),
+                peer_id: store_key,
+                sender: sender_id,
+                recipient: rid.clone(),
+                body: body_str.clone(),
+                timestamp: now_ts,
+                is_self: true,
+                status: message_status,
+                kind: crate::chat_store::MessageKind::Text,
+                attachment_name: String::new(),
+                attachment_path: String::new(),
+                size_str: String::new(),
+                status_note: String::new(),
+                sender_handle: handle.clone(),
+            };
+            if let Err(e) = cs.insert(&chat_msg) {
+                warn!("chat_store insert (room outbound) error: {e}");
+            }
+        }
         if !rid.is_empty() && !sn.is_empty() {
             let key = room_chat_history_key(&sn, &rid);
-            let json = serde_json::json!({
-                "msg_id": uuid::Uuid::new_v4().to_string(),
-                "sender": handle,
-                "body": body_str,
-                "timestamp": 0_i64,
-                "kind": "text",
-                "mine": true,
-                "is_room": true,
-            })
-            .to_string();
             self.as_mut()
                 .rust_mut()
                 .room_chat_history
                 .entry(key)
                 .or_default()
-                .push(json);
+                .push(json.clone());
         }
-        if let Some(ref tx) = self.rust().conn_cmd_tx {
-            let _ = tx.try_send(ConnectionCommand::SendSfuChat {
-                supernode_id: sn,
-                room_id: rid,
-                body: body_str,
-                sender_handle: handle,
-            });
-        }
+        let _ = self
+            .as_mut()
+            .room_chat_received(QString::from(json.as_str()));
     }
 
     fn accept_file(self: Pin<&mut Self>, transfer_id: &QString) {
@@ -2920,6 +2993,19 @@ fn chat_message_to_json(msg: &crate::chat_store::ChatMessage) -> serde_json::Val
         "timestamp": msg.timestamp,
         "kind": msg.kind.as_str(),
         "mine": msg.is_self,
+        "status": msg.status.as_str(),
+    })
+}
+
+fn room_chat_message_to_json(msg: &crate::chat_store::ChatMessage) -> serde_json::Value {
+    serde_json::json!({
+        "msg_id": msg.id,
+        "sender": msg.sender_handle,
+        "body": msg.body,
+        "timestamp": msg.timestamp,
+        "kind": msg.kind.as_str(),
+        "mine": msg.is_self,
+        "is_room": true,
         "status": msg.status.as_str(),
     })
 }
@@ -3418,6 +3504,18 @@ fn dispatch_event(
             timestamp,
             sender_handle,
         } => {
+            // Idempotency: the same message can legitimately arrive more than
+            // once — e.g. relayed via a supernode *and* delivered directly, or
+            // a duplicate relay. Rows are keyed by message_id, so if we've
+            // already stored it, skip persist/notify/display to avoid showing
+            // it twice or double-counting unread.
+            if chat_store
+                .get_by_id(&message_id)
+                .map(|m| m.is_some())
+                .unwrap_or(false)
+            {
+                return;
+            }
             // Persist to chat store (best-effort)
             let msg = crate::chat_store::ChatMessage {
                 id: message_id.clone(),
@@ -3974,25 +4072,49 @@ fn dispatch_event(
         ConnectionEvent::RoomChatMessage {
             supernode_id,
             room_id,
-            sender_id: _,
+            sender_id,
             sender_handle,
             body,
             timestamp,
         } => {
+            let message_id = uuid::Uuid::new_v4().to_string();
             let json = serde_json::json!({
-                "msg_id": uuid::Uuid::new_v4().to_string(),
-                "sender": sender_handle,
-                "body": body,
+                "msg_id": message_id.clone(),
+                "sender": sender_handle.clone(),
+                "body": body.clone(),
                 "timestamp": timestamp,
                 "kind": "text",
                 "mine": false,
                 "is_room": true,
+                "status": "delivered",
             })
             .to_string();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 let Some(sn) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
                     return;
                 };
+                if let Some(ref cs) = bridge.rust().chat_store {
+                    let store_key = room_chat_store_peer_id(&sn, &room_id);
+                    let chat_msg = crate::chat_store::ChatMessage {
+                        id: message_id.clone(),
+                        peer_id: store_key,
+                        sender: sender_id.clone(),
+                        recipient: room_id.clone(),
+                        body: body.clone(),
+                        timestamp,
+                        is_self: false,
+                        status: crate::chat_store::MessageStatus::Delivered,
+                        kind: crate::chat_store::MessageKind::Text,
+                        attachment_name: String::new(),
+                        attachment_path: String::new(),
+                        size_str: String::new(),
+                        status_note: String::new(),
+                        sender_handle: sender_handle.clone(),
+                    };
+                    if let Err(e) = cs.insert(&chat_msg) {
+                        warn!("chat_store insert (room inbound) error: {e}");
+                    }
+                }
                 let key = room_chat_history_key(&sn, &room_id);
                 // Persist in session-scoped history so switchToRoom can replay.
                 bridge

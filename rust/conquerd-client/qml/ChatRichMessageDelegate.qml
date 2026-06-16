@@ -116,6 +116,11 @@ Item {
         return s
     }
 
+    function timestampText() {
+        if (root.timestamp <= 0) return ""
+        return Qt.formatDateTime(new Date(root.timestamp * 1000), "MMM d, yyyy hh:mm")
+    }
+
     property string dateSeparator: ""
 
     Column {
@@ -292,9 +297,7 @@ Item {
             spacing: 4
 
             Text {
-                text: root.timestamp > 0
-                    ? Qt.formatTime(new Date(root.timestamp * 1000), "hh:mm")
-                    : ""
+                text: root.timestampText()
                 color: Theme.muted
                 font.pixelSize: Theme.fontSizeCaption
             }

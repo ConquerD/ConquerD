@@ -138,7 +138,28 @@ impl ChatStore {
             key,
         };
         store.migrate()?;
+        // At process start nothing is genuinely in flight: any self-authored
+        // row still marked `sending` is a leftover from a previous session
+        // that was never confirmed delivered or failed. Reconcile it to
+        // `failed` so the UI can offer a retry instead of stranding it.
+        store.fail_stale_sending()?;
         Ok(store)
+    }
+
+    /// Flip any self-authored `sending` messages to `failed`.
+    ///
+    /// Called once on [`open`]. Inbound messages never carry `sending`, so
+    /// this only affects outbound messages that were interrupted (app closed
+    /// or crashed) before an ack/failure arrived. Returns rows updated.
+    fn fail_stale_sending(&self) -> Result<usize> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE messages SET status='failed', \
+             status_note='interrupted before delivery' \
+             WHERE is_self=1 AND status='sending'",
+            [],
+        )?;
+        Ok(n)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -568,6 +589,31 @@ mod tests {
     }
 
     #[test]
+    fn room_keyed_history_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join(CHAT_DB_FILENAME);
+        let id = Identity::generate();
+        let room_key = "room:supernode-a:room-1";
+
+        {
+            let store = ChatStore::open(&id, Some(&db_path)).unwrap();
+            let mut msg = make_msg(room_key, "room hello", true);
+            msg.sender = "me".to_owned();
+            msg.recipient = "room-1".to_owned();
+            msg.sender_handle = "Me".to_owned();
+            store.insert(&msg).unwrap();
+        }
+
+        let store = ChatStore::open(&id, Some(&db_path)).unwrap();
+        let history = store.get_history(room_key, 0).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].peer_id, room_key);
+        assert_eq!(history[0].recipient, "room-1");
+        assert_eq!(history[0].body, "room hello");
+        assert_eq!(history[0].sender_handle, "Me");
+    }
+
+    #[test]
     fn body_is_encrypted_at_rest() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join(CHAT_DB_FILENAME);
@@ -643,5 +689,35 @@ mod tests {
         assert_eq!(page0.len(), PAGE_SIZE);
         let page1 = store.get_history("peer1", 1).unwrap();
         assert_eq!(page1.len(), 25);
+    }
+
+    #[test]
+    fn stale_sending_is_failed_on_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join(CHAT_DB_FILENAME);
+        let id = Identity::generate();
+
+        // First session: persist an outbound message still in `sending`, plus
+        // an inbound message (which must be left untouched).
+        let outbound_id = {
+            let store = ChatStore::open(&id, Some(&db_path)).unwrap();
+            let mut outbound = make_msg("peer1", "in flight", true);
+            outbound.status = MessageStatus::Sending;
+            store.insert(&outbound).unwrap();
+            let inbound = make_msg("peer1", "incoming", false);
+            store.insert(&inbound).unwrap();
+            outbound.id
+        };
+
+        // Reopen: the stale outbound `sending` row must become `failed`.
+        let store = ChatStore::open(&id, Some(&db_path)).unwrap();
+        let reloaded = store.get_by_id(&outbound_id).unwrap().unwrap();
+        assert_eq!(reloaded.status, MessageStatus::Failed);
+        assert_eq!(reloaded.status_note, "interrupted before delivery");
+
+        // The inbound message is unaffected.
+        let history = store.get_history("peer1", 0).unwrap();
+        let inbound = history.iter().find(|m| !m.is_self).unwrap();
+        assert_ne!(inbound.status, MessageStatus::Failed);
     }
 }

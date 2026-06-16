@@ -395,8 +395,6 @@ pub enum PeerConnectionState {
     Connecting,
     /// Fully established session.
     Connected,
-    /// Relay-assisted connection active.
-    Relay,
 }
 
 #[derive(Debug)]
@@ -405,8 +403,6 @@ struct PeerConnection {
     state: PeerConnectionState,
     /// QUIC signaling stream send side (when QUIC is connected).
     quic_sig_tx: Option<mpsc::Sender<Vec<u8>>>,
-    /// Supernode WebSocket sender for forwarding messages (WS fallback).
-    ws_tx: Option<mpsc::Sender<WsMessage>>,
     connected_at: Option<Instant>,
 }
 
@@ -416,7 +412,6 @@ impl PeerConnection {
             peer_id: peer_id.into(),
             state: PeerConnectionState::Disconnected,
             quic_sig_tx: None,
-            ws_tx: None,
             connected_at: None,
         }
     }
@@ -949,13 +944,16 @@ impl ConnectionManager {
             let Some(stats) = self.transport_stats.get(peer_id) else {
                 continue;
             };
-            let relay = peer.state == PeerConnectionState::Relay;
+            // Per-peer transport stats are only collected for direct QUIC
+            // sessions (see `transport_stats` insertion on QUIC connect);
+            // relay-assisted peers are tracked separately in `quic_relays`
+            // and never reach this loop, so a direct stats row is never relay.
             let payload = serde_json::json!({
                 "peer_id": peer_id,
                 "rtt_ms": stats.rtt_ms,
                 "packet_loss_pct": stats.packet_loss_pct,
                 "jitter_ms": stats.jitter_ms,
-                "relay": relay,
+                "relay": false,
                 "bandwidth_kbps": stats.bandwidth_kbps,
             });
             let _ = self.event_tx.try_send(ConnectionEvent::ConnectionStats {
@@ -1065,23 +1063,41 @@ impl ConnectionManager {
             None
         };
         if let Some((peer_id, message_id)) = chat_attempt.clone() {
-            let connected = self
+            let direct_connected = self
                 .peers
                 .get(&peer_id)
                 .map(|peer| peer.state == PeerConnectionState::Connected)
                 .unwrap_or(false);
-            if !connected {
-                warn!(
-                    "No connected peer session for chat message {} to {}",
+            if !direct_connected {
+                // No direct QUIC peer session. Fall back to supernode relay
+                // when a supernode WS session is connected: the supernode
+                // forwards peer-targeted messages to the destination if it is
+                // also connected there (see signaling.rs "Relay to target").
+                // The recipient still verifies signature + replay + blocked
+                // sender end-to-end, so relaying through a supernode does not
+                // weaken the trust model — the supernode is a dumb forwarder
+                // that cannot forge or read intent beyond routing.
+                let relay_available = self.supernodes.values().any(|sn| sn.connected);
+                if !relay_available {
+                    warn!(
+                        "No direct session or supernode relay for chat {} to {}",
+                        message_id,
+                        &peer_id[..8.min(peer_id.len())]
+                    );
+                    let _ = self.event_tx.try_send(ConnectionEvent::ChatSendFailed {
+                        peer_id,
+                        message_id,
+                        reason: "peer is offline".to_owned(),
+                    });
+                    return;
+                }
+                debug!(
+                    "No direct session for chat {}; relaying to {} via supernode",
                     message_id,
                     &peer_id[..8.min(peer_id.len())]
                 );
-                let _ = self.event_tx.try_send(ConnectionEvent::ChatSendFailed {
-                    peer_id,
-                    message_id,
-                    reason: "peer is offline".to_owned(),
-                });
-                return;
+                // Fall through: quota gating + signing happen below, then the
+                // supernode WS fallback route delivers the signed message.
             }
         }
 
@@ -1175,22 +1191,44 @@ impl ConnectionManager {
 
         // Route: QUIC direct > relay WS > supernode WS fallback
         if let Some(target) = &msg.target.clone() {
-            if let Some(peer) = self.peers.get(target) {
+            // Clone the sender so we don't hold a borrow of `self.peers`
+            // while emitting a failure event on `self.event_tx` below.
+            let quic_sig_tx = self.peers.get(target).and_then(|peer| {
                 if peer.state == PeerConnectionState::Connected {
-                    if let Some(sig_tx) = &peer.quic_sig_tx {
-                        // Chat and file ride dedicated channel tags on the
-                        // QUIC peer stream instead of the pure (control)
-                        // signaling channel. Control messages stay untagged
-                        // (raw JSON) for backward compatibility — the inbound
-                        // classifier treats a leading `{` as control.
-                        let bytes = match Self::channel_tag_for(msg_type) {
-                            Some(tag) => channel_frame::encode_frame(tag, json.as_bytes()),
-                            None => json.as_bytes().to_vec(),
-                        };
-                        let _ = sig_tx.try_send(bytes);
-                        return;
+                    peer.quic_sig_tx.clone()
+                } else {
+                    None
+                }
+            });
+            if let Some(sig_tx) = quic_sig_tx {
+                // Chat and file ride dedicated channel tags on the
+                // QUIC peer stream instead of the pure (control)
+                // signaling channel. Control messages stay untagged
+                // (raw JSON) for backward compatibility — the inbound
+                // classifier treats a leading `{` as control.
+                let bytes = match Self::channel_tag_for(msg_type) {
+                    Some(tag) => channel_frame::encode_frame(tag, json.as_bytes()),
+                    None => json.as_bytes().to_vec(),
+                };
+                if sig_tx.try_send(bytes).is_err() {
+                    // The QUIC signaling channel is full or its receiver was
+                    // dropped (the session is tearing down). Surface the
+                    // failure so the message flips to "failed" and can be
+                    // retried, instead of being stranded in "sending".
+                    if let Some((peer_id, message_id)) = chat_attempt {
+                        warn!(
+                            "QUIC signaling channel unavailable for chat {} to {}",
+                            message_id,
+                            &peer_id[..8.min(peer_id.len())]
+                        );
+                        let _ = self.event_tx.try_send(ConnectionEvent::ChatSendFailed {
+                            peer_id,
+                            message_id,
+                            reason: "connection busy".to_owned(),
+                        });
                     }
                 }
+                return;
             }
         }
 
@@ -1223,22 +1261,48 @@ impl ConnectionManager {
             }
         }
 
-        // Fall back: send via first connected supernode WebSocket (legacy path
-        // for untargeted or peer-targeted messages that missed QUIC).
+        // Fall back: deliver via supernode WebSocket relay (legacy path for
+        // untargeted or peer-targeted messages that missed QUIC).
+        //
+        // For peer-targeted chat we don't know *which* supernode the recipient
+        // is connected to, so we fan the signed message out to every connected
+        // supernode. Each one forwards it to the target only if that peer is
+        // connected there (signaling.rs "Relay to target"); the rest drop it.
+        // Inbound chat is idempotent (deduped by message_id), so multiple
+        // copies arriving by different paths are shown exactly once.
+        if chat_attempt.is_some() {
+            let mut delivered_any = false;
+            for sn in self.supernodes.values() {
+                if sn.connected && sn.send_tx.try_send(WsMessage::Text(json.clone())).is_ok() {
+                    delivered_any = true;
+                }
+            }
+            if delivered_any {
+                return;
+            }
+            warn!("No connected supernode accepted chat relay {:?}", msg_type);
+            if let Some((peer_id, message_id)) = chat_attempt {
+                let _ = self.event_tx.try_send(ConnectionEvent::ChatSendFailed {
+                    peer_id,
+                    message_id,
+                    reason: "peer is offline".to_owned(),
+                });
+            }
+            return;
+        }
+
+        // Non-chat untargeted messages: first connected supernode that accepts.
+        // (Chat is handled above and always returns, so it never reaches here.)
         for sn in self.supernodes.values() {
             if sn.connected {
-                let _ = sn.send_tx.try_send(WsMessage::Text(json.clone()));
-                return;
+                // If this supernode's outbound queue is full or closed, try
+                // the next connected supernode rather than dropping silently.
+                if sn.send_tx.try_send(WsMessage::Text(json.clone())).is_ok() {
+                    return;
+                }
             }
         }
         warn!("No connected path to deliver message {:?}", msg_type);
-        if let Some((peer_id, message_id)) = chat_attempt {
-            let _ = self.event_tx.try_send(ConnectionEvent::ChatSendFailed {
-                peer_id,
-                message_id,
-                reason: "peer is offline".to_owned(),
-            });
-        }
     }
 
     // -- QUIC direct connect ------------------------------------------------
@@ -2308,8 +2372,26 @@ impl ConnectionManager {
         self.replay_guard.check_and_record(&msg.sender, &sig_bytes)
     }
 
-    fn is_blocked_sender(peer_store: &Arc<RwLock<PeerStore>>, sender: &str) -> bool {
-        peer_store.read().get(sender).is_some_and(|rec| rec.blocked)
+    /// Returns `true` when `sender` (a base64url `public_id`, as it appears in
+    /// `msg.sender`) resolves to a peer we mutually trust: present in the local
+    /// trust store and neither `revoked` nor `blocked`.
+    ///
+    /// Peer records may be keyed by the hex `peer_id` *or* by the base64url
+    /// `identity_pub` depending on whether the originating invite carried an
+    /// explicit `inviter_peer_id`, so we probe by both `get` (hex key) and
+    /// `get_by_identity` (base64url field) to resolve reliably.
+    ///
+    /// This is what makes supernode-assisted chat safe: a supernode will relay
+    /// any peer-targeted message, but a receiver only honours chat/call
+    /// signaling from peers it already trusts. Two mutually-trusted peers can
+    /// therefore fall back to relay when no direct P2P path exists, while an
+    /// untrusted peer that merely shares a supernode cannot inject signaling.
+    fn is_trusted_sender(peer_store: &Arc<RwLock<PeerStore>>, sender: &str) -> bool {
+        let store = peer_store.read();
+        store
+            .get(sender)
+            .or_else(|| store.get_by_identity(sender))
+            .is_some_and(|rec| !rec.blocked && !rec.revoked)
     }
 
     async fn handle_inbound(&mut self, msg: SignalingMessage) {
@@ -2340,17 +2422,24 @@ impl ConnectionManager {
             );
             return;
         }
-        if Self::is_blocked_sender(&self.peer_store, &msg.sender)
-            && matches!(
-                msg.msg_type,
-                MessageType::ChatMessage
-                    | MessageType::ChatAck
-                    | MessageType::ChatTyping
-                    | MessageType::CallRequest
-            )
+        // Positive mutual-trust gate for chat/call-class signaling. These
+        // message types are only honoured from peers we already trust (present
+        // in the local store, not revoked/blocked). This both closes the
+        // blocked-peer hole and — crucially — bounds the supernode relay
+        // fallback: a supernode forwards anything peer-targeted, so without a
+        // receiver-side trust check an untrusted peer sharing the same
+        // supernode could inject chat/call messages. With it, relay assist
+        // works *only* between two mutually-trusted peers.
+        if matches!(
+            msg.msg_type,
+            MessageType::ChatMessage
+                | MessageType::ChatAck
+                | MessageType::ChatTyping
+                | MessageType::CallRequest
+        ) && !Self::is_trusted_sender(&self.peer_store, &msg.sender)
         {
             debug!(
-                "[signaling] dropping {:?} from blocked peer {}",
+                "[signaling] dropping {:?} from untrusted or blocked peer {}",
                 msg.msg_type,
                 &msg.sender[..8.min(msg.sender.len())],
             );
@@ -4122,5 +4211,58 @@ mod tests {
         assert!(
             rewrite_loopback_wt_url("https://localhost:8443", "ws://127.0.0.1:34935",).is_none()
         );
+    }
+
+    #[test]
+    fn trusted_sender_gate_resolves_and_excludes() {
+        use super::ConnectionManager;
+        use crate::identity::Identity;
+        use crate::peer_store::{PeerRecord, PeerStore};
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let mut store = PeerStore::open(&id, Some(&dir.path().join("peers.dat"))).unwrap();
+
+        // Trusted peer: keyed by a hex peer_id, with a distinct base64url
+        // identity_pub (the value that arrives as `msg.sender`).
+        store.upsert(PeerRecord {
+            peer_id: "hexpeerid".to_owned(),
+            identity_pub: "base64identity".to_owned(),
+            handle: "Trusted".to_owned(),
+            ..Default::default()
+        });
+        store.upsert(PeerRecord {
+            peer_id: "hexblocked".to_owned(),
+            identity_pub: "base64blocked".to_owned(),
+            blocked: true,
+            ..Default::default()
+        });
+        store.upsert(PeerRecord {
+            peer_id: "hexrevoked".to_owned(),
+            identity_pub: "base64revoked".to_owned(),
+            revoked: true,
+            ..Default::default()
+        });
+
+        let store = Arc::new(RwLock::new(store));
+
+        // Resolved via get_by_identity (sender == base64url identity_pub) and
+        // via the hex key — both paths must mark the peer trusted.
+        assert!(ConnectionManager::is_trusted_sender(
+            &store,
+            "base64identity"
+        ));
+        assert!(ConnectionManager::is_trusted_sender(&store, "hexpeerid"));
+
+        // Unknown peer (e.g. a stranger sharing the same supernode) is not
+        // trusted, so its relayed chat/call signaling is dropped.
+        assert!(!ConnectionManager::is_trusted_sender(&store, "stranger"));
+
+        // Present-but-blocked and present-but-revoked peers are not trusted.
+        assert!(!ConnectionManager::is_trusted_sender(&store, "base64blocked"));
+        assert!(!ConnectionManager::is_trusted_sender(&store, "base64revoked"));
     }
 }

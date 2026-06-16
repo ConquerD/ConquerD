@@ -228,15 +228,6 @@ Item {
             fileTransferTooltip: "Attach file"
             onSendMessage: function(message) {
                 backend.sendRoomChat(message)
-                roomChatModel.append({
-                    "msgId": "",
-                    "sender": "me",
-                    "body": message,
-                    "timestamp": Date.now() / 1000,
-                    "kind": "text",
-                    "mine": true,
-                    "status": "sent"
-                })
             }
             onSendFile: function(fileUrl) {
                 backend.sendRoomFile(fileUrl)
