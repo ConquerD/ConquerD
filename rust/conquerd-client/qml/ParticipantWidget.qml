@@ -42,6 +42,18 @@ Item {
 
     property bool showActivityRing: true
     property bool showSelfRing: true
+    /// When true, show a name pill on the avatar (room voice rail).
+    property bool showNameBubbles: false
+
+    readonly property string peerLabelText: {
+        if (root.isSelf)
+            return "you"
+        if (root.displayName && root.displayName !== "Unknown" && root.displayName !== "")
+            return root.displayName
+        if (root.peerId.length > 12)
+            return root.peerId.substring(0, 12) + "…"
+        return root.peerId
+    }
 
     width: 80
     height: 80
@@ -110,13 +122,14 @@ Item {
     }
 
     Rectangle {
-        visible: root.isSelf
+        visible: root.showNameBubbles && root.isSelf
         anchors {
             left: parent.left
             bottom: parent.bottom
             margins: 4
         }
         implicitWidth: youLabel.implicitWidth + 8
+        width: implicitWidth
         height: 14
         radius: height / 2
         color: Theme.accent
@@ -128,6 +141,32 @@ Item {
             color: Theme.textInv
             font.pixelSize: Theme.fontSizeCaption
             font.bold: true
+        }
+    }
+
+    Rectangle {
+        visible: root.showNameBubbles && !root.isSelf && root.peerLabelText !== ""
+        anchors {
+            horizontalCenter: parent.horizontalCenter
+            bottom: parent.bottom
+            bottomMargin: 2
+        }
+        implicitWidth: Math.min(peerNameLabel.implicitWidth + 8, 72)
+        width: implicitWidth
+        height: 14
+        radius: height / 2
+        color: Theme.accent
+
+        Text {
+            id: peerNameLabel
+            anchors.centerIn: parent
+            width: parent.width - 4
+            text: root.peerLabelText
+            color: Theme.textInv
+            font.pixelSize: Theme.fontSizeCaption
+            font.bold: true
+            elide: Text.ElideRight
+            horizontalAlignment: Text.AlignHCenter
         }
     }
 
