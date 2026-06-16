@@ -151,6 +151,22 @@ impl FeatureModule for RoomAudioSfuModule {
     // on_message: inherits default no-op — audio is handled in connection_manager.
 }
 
+/// `room.chat.v1` — advertisement-only descriptor for SFU room text chat.
+///
+/// Advertisement-only on the desktop client: inbound `SfuChat` messages are
+/// surfaced in `connection_manager` and gated through `room.chat.v1` for
+/// per-sender quota enforcement; outbound room chat is gated through
+/// `room.chat.v1` in `dispatch_outbound`. Registering the descriptor here is
+/// what makes the client advertise the capability in `CAPABILITY_ANNOUNCE`
+/// and gives the quota gates a descriptor to meter against.
+pub struct RoomChatModule;
+
+impl FeatureModule for RoomChatModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::room_chat_v1()
+    }
+}
+
 /// Register the three first-party client modules into *registry*.
 ///
 /// Descriptors are taken from their `wellknown` constructors.  All three
@@ -165,6 +181,7 @@ pub fn register_client_modules(registry: &FeatureRegistry) -> Result<(), Feature
         Arc::new(CoreFileModule::new()),
         Arc::new(RoomFileModule),
         Arc::new(RoomAudioSfuModule),
+        Arc::new(RoomChatModule),
     ];
     for m in modules {
         registry.register_module(m)?;
@@ -185,6 +202,7 @@ mod tests {
         assert!(reg.get("core.file.v1").is_some());
         assert!(reg.get("room.file.v1").is_some());
         assert!(reg.get("room.audio.sfu").is_some());
+        assert!(reg.get("room.chat.v1").is_some());
     }
 
     #[test]
