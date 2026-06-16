@@ -116,6 +116,8 @@ webengine = ["qt-ui"]
 # Keep the Windows console window attached (for log output while debugging).
 # Default: console is suppressed in production builds.
 console = []
+# Manual developer diagnostics (live profile dump). Not compiled in CI/default test runs.
+manual-diagnostics = []
 
 [dependencies.cxx]
 version = "1"
