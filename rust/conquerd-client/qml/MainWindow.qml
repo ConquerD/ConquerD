@@ -122,6 +122,48 @@ ApplicationWindow {
         })
     }
 
+    function inviteIconData(colorValue) {
+        var stroke = Theme.toHex(colorValue || Theme.text).replace("#", "%23")
+        return "data:image/svg+xml;utf8,"
+            + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'>"
+            + "<rect x='2' y='4' width='16' height='12' stroke='" + stroke + "' stroke-width='1.4'/>"
+            + "<polyline points='2,4 10,11.5 18,4' fill='none' stroke='" + stroke + "' stroke-width='1.4' stroke-linejoin='miter'/>"
+            + "</svg>"
+    }
+
+    function numericRoomCount(value) {
+        var n = Number(value)
+        return isNaN(n) ? 0 : Math.max(0, n)
+    }
+
+    function roomVoiceCount(room) {
+        if (room.voice_count !== undefined && room.voice_count !== null)
+            return root.numericRoomCount(room.voice_count)
+        if (room.count !== undefined && room.count !== null)
+            return root.numericRoomCount(room.count)
+        if (room.member_count !== undefined && room.member_count !== null)
+            return root.numericRoomCount(room.member_count)
+        return 0
+    }
+
+    function roomKnownPeers(room) {
+        if (!room.known_peers || !Array.isArray(room.known_peers))
+            return []
+        var out = []
+        for (var i = 0; i < room.known_peers.length; i++) {
+            var name = String(room.known_peers[i] || "").trim()
+            if (name !== "")
+                out.push(name)
+        }
+        return out
+    }
+
+    function roomUnknownPeerCount(room, voiceCount, knownPeers) {
+        if (room.unknown_peers !== undefined && room.unknown_peers !== null)
+            return root.numericRoomCount(room.unknown_peers)
+        return Math.max(0, voiceCount - knownPeers.length)
+    }
+
     // Rebuild the Rooms sidebar from the trusted peer store, preserving
     // per-node room snapshots and live connected/sfu flags where possible.
     function syncRoomsSidebar(nodesJson) {
@@ -162,13 +204,47 @@ ApplicationWindow {
         }
     }
 
+    function mergeRoomEntry(existing, incoming) {
+        var merged = {}
+        for (var k in existing) {
+            if (existing.hasOwnProperty(k))
+                merged[k] = existing[k]
+        }
+        for (var j in incoming) {
+            if (!incoming.hasOwnProperty(j))
+                continue
+            var v = incoming[j]
+            if (v === undefined || v === null)
+                continue
+            if ((j === "name" || j === "room_name" || j === "kind" || j === "room_type") && v === "")
+                continue
+            if ((j === "name" || j === "room_name")
+                    && existing[j]
+                    && incoming.room_id
+                    && v === incoming.room_id)
+                continue
+            if ((j === "kind" || j === "room_type")
+                    && existing[j]
+                    && v === "voice"
+                    && incoming.room_id
+                    && !incoming.creator_id
+                    && incoming.is_default === undefined)
+                continue
+            merged[j] = v
+        }
+        return merged
+    }
+
     // Union two room snapshots by room_id (used when deduping alias node rows).
     function mergeRoomLists(a, b) {
         var byId = {}
         for (var i = 0; i < a.length; i++)
             if (a[i].room_id) byId[a[i].room_id] = a[i]
         for (var j = 0; j < b.length; j++)
-            if (b[j].room_id) byId[b[j].room_id] = b[j]
+            if (b[j].room_id)
+                byId[b[j].room_id] = byId.hasOwnProperty(b[j].room_id)
+                    ? root.mergeRoomEntry(byId[b[j].room_id], b[j])
+                    : b[j]
         var out = []
         for (var k in byId) {
             if (byId.hasOwnProperty(k))
@@ -226,11 +302,15 @@ ApplicationWindow {
         var normalized = []
         for (var i = 0; i < rooms.length; i++) {
             var r = rooms[i]
+            var voiceCount = root.roomVoiceCount(r)
+            var knownPeers = root.roomKnownPeers(r)
             normalized.push({
                 room_id: r.room_id || "",
                 name: r.name || r.room_name || r.room_id || "Room",
                 kind: r.kind || r.room_type || "voice",
-                count: r.count || r.member_count || 0,
+                voice_count: voiceCount,
+                known_peers: knownPeers,
+                unknown_peers: root.roomUnknownPeerCount(r, voiceCount, knownPeers),
                 creator_id: r.creator_id || "",
                 is_default: r.is_default === true || r.room_id === "default"
             })
@@ -286,7 +366,7 @@ ApplicationWindow {
             Layout.preferredWidth: 220
             Layout.alignment: Qt.AlignVCenter
             implicitHeight: Theme.controlHeight
-            placeholderText: "Paste invite or peer ID\u2026"
+            placeholderText: "Paste invite\u2026"
             color: Theme.text
             placeholderTextColor: Theme.muted
             font.pixelSize: Theme.fontSizeBody
@@ -310,13 +390,36 @@ ApplicationWindow {
         // Connect button (→)
         Button {
             id: connectBtn
-            icon.source: "qrc:/qt/qml/ConquerD/Client/icons/invite.svg"
             implicitWidth: 36
             implicitHeight: 28
             Layout.alignment: Qt.AlignVCenter
             enabled: inviteField.text.trim().length > 0
             flat: true
             Material.foreground: enabled ? Theme.text : Theme.muted
+            background: Rectangle {
+                radius: Theme.radiusMd
+                color: connectBtn.down
+                    ? Theme.selectedFill()
+                    : connectBtn.hovered
+                        ? Theme.bg3
+                        : Theme.bg2
+                border.color: connectBtn.enabled ? Theme.divider : Theme.bg3
+                border.width: 1
+            }
+            contentItem: Item {
+                implicitWidth: 16
+                implicitHeight: 16
+
+                Image {
+                    anchors.centerIn: parent
+                    source: root.inviteIconData(connectBtn.enabled ? Theme.text : Theme.muted)
+                    sourceSize.width: 16
+                    sourceSize.height: 16
+                    width: 16
+                    height: 16
+                    fillMode: Image.PreserveAspectFit
+                }
+            }
             ToolTip.text: "Connect to peer / accept invite"
             ToolTip.visible: hovered
             onClicked: {
@@ -332,14 +435,41 @@ ApplicationWindow {
         Button {
             id: newInviteBtn
             text: "Invite"
-            icon.source: "qrc:/qt/qml/ConquerD/Client/icons/invite.svg"
-            icon.width: 16
-            icon.height: 16
-            icon.color: Theme.text
             implicitHeight: 28
+            implicitWidth: 82
             Layout.alignment: Qt.AlignVCenter
-            flat: true
-            Material.foreground: Theme.text
+            flat: false
+            Material.foreground: Theme.textInv
+            background: Rectangle {
+                radius: Theme.radiusMd
+                color: newInviteBtn.down
+                    ? Qt.darker(Theme.accent, 1.15)
+                    : newInviteBtn.hovered
+                        ? Qt.lighter(Theme.accent, 1.08)
+                        : Theme.accent
+            }
+            contentItem: Row {
+                anchors.centerIn: parent
+                spacing: Theme.spacingXs
+
+                Image {
+                    source: root.inviteIconData(Theme.textInv)
+                    sourceSize.width: 16
+                    sourceSize.height: 16
+                    width: 16
+                    height: 16
+                    anchors.verticalCenter: parent.verticalCenter
+                    fillMode: Image.PreserveAspectFit
+                }
+
+                Text {
+                    text: newInviteBtn.text
+                    color: Theme.textInv
+                    font: newInviteBtn.font
+                    anchors.verticalCenter: parent.verticalCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
             ToolTip.text: "Copy new invite link to clipboard (Ctrl+N)"
             ToolTip.visible: hovered
             onClicked: {
@@ -1047,6 +1177,7 @@ ApplicationWindow {
                             required property string node_id
                             required property bool connected
                             required property bool sfu_enabled
+                            required property string title
                             required property string rooms_json
 
                             readonly property var rooms: {
@@ -1149,7 +1280,17 @@ ApplicationWindow {
                                             required property string room_id
                                             required property string name
                                             required property string kind
-                                            required property int count
+                                            required property int voice_count
+                                            required property var known_peers
+                                            required property int unknown_peers
+                                            readonly property var knownPeers:
+                                                Array.isArray(roomDelegate.known_peers)
+                                                    ? roomDelegate.known_peers
+                                                    : []
+                                            readonly property int unknownPeers:
+                                                roomDelegate.unknown_peers !== undefined
+                                                    ? root.numericRoomCount(roomDelegate.unknown_peers)
+                                                    : Math.max(0, roomDelegate.voice_count - roomDelegate.knownPeers.length)
                                             required property string creator_id
                                             required property bool is_default
 
@@ -1230,19 +1371,104 @@ ApplicationWindow {
                                                 anchors.right: parent.right
                                                 spacing: Theme.spacingXs
 
-                                                Label {
+                                                RowLayout {
                                                     Layout.fillWidth: true
-                                                    text: roomDelegate.name
-                                                    color: Theme.text
-                                                    font.pixelSize: Theme.fontSizeBody
-                                                    font.bold: roomDelegate.roomSelected
-                                                    elide: Text.ElideRight
+
+                                                    Label {
+                                                        Layout.fillWidth: true
+                                                        text: roomDelegate.name
+                                                        color: Theme.text
+                                                        font.pixelSize: Theme.fontSizeBody
+                                                        font.bold: roomDelegate.roomSelected
+                                                        elide: Text.ElideRight
+                                                    }
+
+                                                    Rectangle {
+                                                        id: roomVoiceBubble
+                                                        Layout.alignment: Qt.AlignVCenter
+                                                        Layout.preferredWidth: voiceBubbleRow.implicitWidth + 10
+                                                        Layout.preferredHeight: 22
+                                                        radius: 11
+                                                        color: roomDelegate.voice_count > 0
+                                                            ? Theme.semanticTint(Theme.online, 0.16)
+                                                            : Theme.bg2
+                                                        border.color: roomDelegate.voice_count > 0
+                                                            ? Theme.online
+                                                            : Theme.divider
+                                                        border.width: 1
+
+                                                        Row {
+                                                            id: voiceBubbleRow
+                                                            anchors.centerIn: parent
+                                                            spacing: 4
+
+                                                            Image {
+                                                                source: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg"
+                                                                sourceSize.width: 12
+                                                                sourceSize.height: 12
+                                                                width: 12
+                                                                height: 12
+                                                                anchors.verticalCenter: parent.verticalCenter
+                                                                fillMode: Image.PreserveAspectFit
+                                                                opacity: roomDelegate.voice_count > 0 ? 1.0 : 0.55
+                                                            }
+
+                                                            Label {
+                                                                text: roomDelegate.voice_count.toString()
+                                                                color: roomDelegate.voice_count > 0 ? Theme.online : Theme.muted
+                                                                font.pixelSize: Theme.fontSizeCaption
+                                                                font.bold: roomDelegate.voice_count > 0
+                                                                anchors.verticalCenter: parent.verticalCenter
+                                                            }
+                                                        }
+
+                                                        HoverHandler { id: roomStatsHover }
+
+                                                        Popup {
+                                                            id: roomVoicePopup
+                                                            parent: roomVoiceBubble
+                                                            visible: roomStatsHover.hovered
+                                                            modal: false
+                                                            focus: false
+                                                            closePolicy: Popup.NoAutoClose
+                                                            padding: 10
+                                                            width: 220
+                                                            x: roomVoiceBubble.width + 6
+                                                            y: Math.round((roomVoiceBubble.height - implicitHeight) / 2)
+
+                                                            background: Rectangle {
+                                                                color: Theme.bg2
+                                                                radius: Theme.radiusMd
+                                                                border.color: Theme.divider
+                                                                border.width: 1
+                                                            }
+
+                                                            contentItem: Column {
+                                                                spacing: Theme.spacingXs
+
+                                                                Label {
+                                                                    width: roomVoicePopup.availableWidth
+                                                                    text: roomDelegate.knownPeers.length > 0
+                                                                        ? "Known: " + roomDelegate.knownPeers.join(", ")
+                                                                        : "Known: none"
+                                                                    color: Theme.text
+                                                                    font.pixelSize: Theme.fontSizeCaption
+                                                                    wrapMode: Text.WordWrap
+                                                                }
+
+                                                                Label {
+                                                                    width: roomVoicePopup.availableWidth
+                                                                    text: "Unknown: " + roomDelegate.unknownPeers
+                                                                    color: Theme.muted
+                                                                    font.pixelSize: Theme.fontSizeCaption
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 }
+
                                                 Label {
                                                     text: roomDelegate.kind
-                                                        + (roomDelegate.count > 0
-                                                           ? " \u00B7 " + roomDelegate.count
-                                                           : "")
                                                     color: Theme.muted
                                                     font.pixelSize: Theme.fontSizeCaption
                                                 }
