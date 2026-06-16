@@ -1106,6 +1106,8 @@ impl ConnectionManager {
                 MessageType::SfuFileOffer
                 | MessageType::SfuFileChunk
                 | MessageType::SfuFileComplete => Some("room.file.v1"),
+                // room.chat.v1 covers SFU room text chat broadcast.
+                MessageType::SfuChat => Some("room.chat.v1"),
                 _ => None,
             };
             if let Some(fid) = feature_gate {
@@ -2559,6 +2561,20 @@ impl ConnectionManager {
                     .unwrap_or("")
                     .to_owned();
                 if !body.is_empty() {
+                    // Enforce the room.chat.v1 per-sender inbound quota,
+                    // symmetric with the outbound gate in dispatch_outbound
+                    // and with room.audio.sfu / room.file.v1.
+                    if !self.check_inbound_feature_quota(
+                        "room.chat.v1",
+                        &msg.sender,
+                        body.len().max(64),
+                    ) {
+                        debug!(
+                            "[room.chat.v1] inbound quota exceeded for {}; dropping message",
+                            &msg.sender[..8.min(msg.sender.len())]
+                        );
+                        return;
+                    }
                     let _ = self.event_tx.try_send(ConnectionEvent::RoomChatMessage {
                         supernode_id: self.current_supernode_id.clone(),
                         room_id,
