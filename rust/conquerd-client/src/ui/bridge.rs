@@ -1969,7 +1969,7 @@ impl ffi::AppBridge {
             &self.rust().room_store,
             &sid,
             &rid,
-            &rid,
+            "",
             "public",
             "",
             false,
@@ -2049,7 +2049,7 @@ impl ffi::AppBridge {
             &self.rust().room_store,
             &sid,
             &rid,
-            &rid,
+            "",
             "public",
             "",
             false,
@@ -3255,11 +3255,19 @@ fn sync_saved_rooms_from_list(
         if room_id.is_empty() {
             continue;
         }
+        let existing = room_store.get(supernode_id, room_id);
         let room_name = room
             .get("name")
             .or_else(|| room.get("room_name"))
             .and_then(|v| v.as_str())
-            .unwrap_or(room_id);
+            .filter(|n| !n.is_empty() && *n != room_id)
+            .map(str::to_owned)
+            .or_else(|| {
+                existing
+                    .filter(|e| !e.room_name.is_empty() && e.room_name != room_id)
+                    .map(|e| e.room_name.clone())
+            })
+            .unwrap_or_else(|| room_id.to_owned());
         let room_type = room
             .get("room_type")
             .and_then(|v| v.as_str())
@@ -3268,7 +3276,6 @@ fn sync_saved_rooms_from_list(
             .get("creator_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let existing = room_store.get(supernode_id, room_id);
         let is_creator = existing.map(|e| e.is_creator).unwrap_or(false);
         let invite_token = existing.map(|e| e.invite_token.as_str()).unwrap_or("");
         let entry = crate::room_store::RoomEntry::new(room_id, room_name)
