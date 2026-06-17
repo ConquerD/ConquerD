@@ -1994,12 +1994,7 @@ impl ffi::AppBridge {
                     &my_public_id,
                 )
             } else {
-                room_participants_json(
-                    None,
-                    &[my_public_id.clone()],
-                    &my_peer_id,
-                    &my_public_id,
-                )
+                room_participants_json(None, &[my_public_id.clone()], &my_peer_id, &my_public_id)
             };
             self.as_mut()
                 .participants_updated(QString::from(json.as_str()));
@@ -4115,12 +4110,7 @@ fn dispatch_event(
                     let my_peer_id = bridge.rust().my_peer_id.clone();
                     let ids = bridge.rust().room_participant_ids.clone();
                     let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                        room_participants_json(
-                            Some(&ps.read()),
-                            &ids,
-                            &my_peer_id,
-                            &my_public_id,
-                        )
+                        room_participants_json(Some(&ps.read()), &ids, &my_peer_id, &my_public_id)
                     } else {
                         room_participants_json(None, &ids, &my_peer_id, &my_public_id)
                     };
@@ -4163,12 +4153,7 @@ fn dispatch_event(
                     apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
                 }
                 let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                    room_participants_json(
-                        Some(&ps.read()),
-                        &members,
-                        &my_peer_id,
-                        &my_public_id,
-                    )
+                    room_participants_json(Some(&ps.read()), &members, &my_peer_id, &my_public_id)
                 } else {
                     room_participants_json(None, &members, &my_peer_id, &my_public_id)
                 };
@@ -4218,12 +4203,7 @@ fn dispatch_event(
                     apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
                 }
                 let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                    room_participants_json(
-                        Some(&ps.read()),
-                        &ids,
-                        &my_peer_id,
-                        &my_public_id,
-                    )
+                    room_participants_json(Some(&ps.read()), &ids, &my_peer_id, &my_public_id)
                 } else {
                     room_participants_json(None, &ids, &my_peer_id, &my_public_id)
                 };
@@ -4257,12 +4237,7 @@ fn dispatch_event(
                     apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
                 }
                 let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                    room_participants_json(
-                        Some(&ps.read()),
-                        &ids,
-                        &my_peer_id,
-                        &my_public_id,
-                    )
+                    room_participants_json(Some(&ps.read()), &ids, &my_peer_id, &my_public_id)
                 } else {
                     room_participants_json(None, &ids, &my_peer_id, &my_public_id)
                 };
