@@ -186,7 +186,7 @@ fn detect_archive() -> Option<PathBuf> {
         .filter(|p| is_conquerd_client_archive(p))
         .collect();
 
-    candidates.sort_by(|a, b| archive_pick_rank(b).cmp(&archive_pick_rank(a)));
+    candidates.sort_by_key(|path| std::cmp::Reverse(archive_pick_rank(path)));
     candidates.into_iter().next()
 }
 
