@@ -208,7 +208,12 @@ impl RoomStore {
         let key = Self::entry_key(&entry.supernode_id, &entry.room_id);
         let merged = if let Some(existing) = self.rooms.get(&key) {
             let mut m = entry;
-            if m.room_name.is_empty() {
+            let incoming_name_is_id = m.room_name == m.room_id;
+            if m.room_name.is_empty()
+                || (incoming_name_is_id
+                    && !existing.room_name.is_empty()
+                    && existing.room_name != existing.room_id)
+            {
                 m.room_name = existing.room_name.clone();
             }
             if m.room_type.is_empty() {
@@ -459,6 +464,33 @@ mod tests {
             .unwrap();
         assert_eq!(store.list_for_supernode("sn-a").len(), 1);
         assert_eq!(store.list_for_supernode("sn-a")[0].room_id, "r1");
+    }
+
+    #[test]
+    fn upsert_preserves_display_name_when_join_passes_room_id() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+        let room_id = "a1b2c3d4e5f67890";
+        store
+            .add(
+                RoomEntry::new(room_id, "My Private Room")
+                    .with_type("private")
+                    .with_supernode("sn-a")
+                    .with_creator("creator-x", true),
+            )
+            .unwrap();
+        // join_room/subscribe_room_chat used to pass room_id as the display name.
+        store
+            .upsert(
+                RoomEntry::new(room_id, room_id)
+                    .with_type("private")
+                    .with_supernode("sn-a"),
+            )
+            .unwrap();
+        let e = store.get("sn-a", room_id).unwrap();
+        assert_eq!(e.room_name, "My Private Room");
     }
 
     #[test]
