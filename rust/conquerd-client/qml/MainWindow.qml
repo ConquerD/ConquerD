@@ -108,7 +108,9 @@ ApplicationWindow {
         if (!remoteId || remoteId === "") return
         directCallModel.append({
             peerId: backend.public_id,
-            handle: "You",
+            handle: (settingsModel.local_handle && settingsModel.local_handle !== "")
+                ? settingsModel.local_handle
+                : backend.public_id,
             muted: voiceRail.muted,
             audioLevel: 0.0,
             isSelf: true
