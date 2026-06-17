@@ -46,8 +46,6 @@ Item {
     property bool showNameBubbles: false
 
     readonly property string peerLabelText: {
-        if (root.isSelf)
-            return "you"
         if (root.displayName && root.displayName !== "Unknown" && root.displayName !== "")
             return root.displayName
         if (root.peerId.length > 12)
@@ -122,30 +120,7 @@ Item {
     }
 
     Rectangle {
-        visible: root.showNameBubbles && root.isSelf
-        anchors {
-            left: parent.left
-            bottom: parent.bottom
-            margins: 4
-        }
-        implicitWidth: youLabel.implicitWidth + 8
-        width: implicitWidth
-        height: 14
-        radius: height / 2
-        color: Theme.accent
-
-        Text {
-            id: youLabel
-            anchors.centerIn: parent
-            text: "you"
-            color: Theme.textInv
-            font.pixelSize: Theme.fontSizeCaption
-            font.bold: true
-        }
-    }
-
-    Rectangle {
-        visible: root.showNameBubbles && !root.isSelf && root.peerLabelText !== ""
+        visible: root.showNameBubbles && root.peerLabelText !== ""
         anchors {
             horizontalCenter: parent.horizontalCenter
             bottom: parent.bottom
