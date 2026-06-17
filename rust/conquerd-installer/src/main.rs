@@ -128,7 +128,54 @@ fn default_install_dir() -> PathBuf {
         .join("ConquerD")
 }
 
-/// Look for a .7z file next to the running executable.
+/// Windows client archives published by our build scripts:
+/// `ConquerD-<version>-win64.7z` or `ConquerD-nightly-win64.7z`.
+fn is_conquerd_client_archive(path: &std::path::Path) -> bool {
+    if !path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("7z"))
+    {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if stem.eq_ignore_ascii_case(github::nightly_archive_name().trim_end_matches(".7z")) {
+        return true;
+    }
+    let prefix = "ConquerD-";
+    let suffix = "-win64";
+    if !stem.starts_with(prefix) || !stem.ends_with(suffix) {
+        return false;
+    }
+    let version = &stem[prefix.len()..stem.len() - suffix.len()];
+    version_token_is_semver(version)
+}
+
+fn version_token_is_semver(token: &str) -> bool {
+    let core = token.split('-').next().unwrap_or(token);
+    let parts: Vec<&str> = core.split('.').collect();
+    if !(2..=4).contains(&parts.len()) {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Sort key for auto-detected archives: prefer newer semver releases over nightly.
+fn archive_pick_rank(path: &std::path::Path) -> (u8, u64, u64, u64) {
+    if let Some(v) = detect_version_from_archive(path) {
+        let mut parts = v.split('.').filter_map(|p| p.parse::<u64>().ok());
+        let major = parts.next().unwrap_or(0);
+        let minor = parts.next().unwrap_or(0);
+        let patch = parts.next().unwrap_or(0);
+        return (1, major, minor, patch);
+    }
+    (0, 0, 0, 0)
+}
+
+/// Look for a ConquerD client .7z next to the running executable.
 fn detect_archive() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -136,26 +183,10 @@ fn detect_archive() -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .map(|ext| ext.eq_ignore_ascii_case("7z"))
-                .unwrap_or(false)
-        })
+        .filter(|p| is_conquerd_client_archive(p))
         .collect();
 
-    // Prefer files whose name starts with "ConquerD"
-    candidates.sort_by(|a, b| {
-        let a_match = a
-            .file_name()
-            .map(|n| n.to_string_lossy().to_lowercase().starts_with("conquerd"))
-            .unwrap_or(false);
-        let b_match = b
-            .file_name()
-            .map(|n| n.to_string_lossy().to_lowercase().starts_with("conquerd"))
-            .unwrap_or(false);
-        b_match.cmp(&a_match)
-    });
-
+    candidates.sort_by(|a, b| archive_pick_rank(b).cmp(&archive_pick_rank(a)));
     candidates.into_iter().next()
 }
 
@@ -641,6 +672,32 @@ fn detect_version_from_archive(archive: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_conquerd_client_archive_accepts_release_and_nightly_names() {
+        assert!(is_conquerd_client_archive(std::path::Path::new(
+            "ConquerD-1.0.0-win64.7z"
+        )));
+        assert!(is_conquerd_client_archive(std::path::Path::new(
+            "conquerd-nightly-win64.7z"
+        )));
+    }
+
+    #[test]
+    fn is_conquerd_client_archive_rejects_unrelated_seven_zip_files() {
+        for name in [
+            "backup.7z",
+            "7z2301-x64.7z",
+            "ConquerD-backup.7z",
+            "ConquerD-1.0.0.7z",
+            "conquerd-supernode-1.0.0-win64.zip",
+        ] {
+            assert!(
+                !is_conquerd_client_archive(std::path::Path::new(name)),
+                "unexpected match for {name}"
+            );
+        }
+    }
 
     #[test]
     fn launchable_current_dir_requires_current_executable() {
