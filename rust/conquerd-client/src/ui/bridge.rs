@@ -1982,13 +1982,24 @@ impl ffi::AppBridge {
         // this seed those closures re-emit the empty list that was left by
         // leave_room(), wiping the model before the authoritative SfuMembers
         // round-trip completes — the "join room, avatar missing" race.
-        let my_id = self.rust().my_public_id.clone();
-        if !my_id.is_empty() {
-            self.as_mut().rust_mut().room_participant_ids = vec![my_id.clone()];
+        let my_public_id = self.rust().my_public_id.clone();
+        let my_peer_id = self.rust().my_peer_id.clone();
+        if !my_public_id.is_empty() {
+            self.as_mut().rust_mut().room_participant_ids = vec![my_public_id.clone()];
             let json = if let Some(ps) = self.rust().peer_store.as_ref() {
-                room_participants_json(Some(&ps.read()), &[my_id.clone()], &my_id)
+                room_participants_json(
+                    Some(&ps.read()),
+                    &[my_public_id.clone()],
+                    &my_peer_id,
+                    &my_public_id,
+                )
             } else {
-                room_participants_json(None, &[my_id.clone()], &my_id)
+                room_participants_json(
+                    None,
+                    &[my_public_id.clone()],
+                    &my_peer_id,
+                    &my_public_id,
+                )
             };
             self.as_mut()
                 .participants_updated(QString::from(json.as_str()));
@@ -2881,6 +2892,19 @@ fn read_voice_bitrate_setting() -> u32 {
     crate::call_controller::DEFAULT_OUTGOING_BITRATE_BPS
 }
 
+/// Read the persisted local display handle from disk without going through QObject.
+fn read_local_handle() -> String {
+    let path = crate::ui::settings_model::settings_file();
+    if let Ok(txt) = std::fs::read_to_string(&path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(handle) = v.get("local_handle").and_then(|x| x.as_str()) {
+                return handle.to_owned();
+            }
+        }
+    }
+    String::new()
+}
+
 /// Read push-to-talk settings from disk without going through the QObject.
 /// Returns `(ptt_enabled, ptt_key)`.
 fn read_settings_for_ptt() -> (bool, String) {
@@ -3485,8 +3509,23 @@ fn room_voice_sidebar_patch(
 fn room_participant_label(
     peer_store: Option<&crate::peer_store::PeerStore>,
     peer_id: &str,
+    my_peer_id: &str,
+    my_public_id: &str,
 ) -> String {
-    if let Some(store) = peer_store {
+    if peer_id == my_public_id || peer_id == my_peer_id {
+        let local = read_local_handle();
+        if !local.is_empty() {
+            return local;
+        }
+        if let Some(store) = peer_store {
+            if let Some(rec) = store.get(my_peer_id) {
+                let name = rec.display_name();
+                if !name.is_empty() {
+                    return name;
+                }
+            }
+        }
+    } else if let Some(store) = peer_store {
         if let Some(rec) = store
             .get(peer_id)
             .or_else(|| store.get_by_identity(peer_id))
@@ -3504,17 +3543,18 @@ fn room_participant_label(
 fn room_participants_json(
     peer_store: Option<&crate::peer_store::PeerStore>,
     ids: &[String],
-    my_id: &str,
+    my_peer_id: &str,
+    my_public_id: &str,
 ) -> String {
     serde_json::to_string(
         &ids.iter()
             .map(|id| {
                 serde_json::json!({
                     "peer_id": id,
-                    "handle": room_participant_label(peer_store, id),
+                    "handle": room_participant_label(peer_store, id, my_peer_id, my_public_id),
                     "speaking": false,
                     "muted": false,
-                    "is_self": id == my_id,
+                    "is_self": id == my_public_id || id == my_peer_id,
                 })
             })
             .collect::<Vec<_>>(),
@@ -4071,12 +4111,18 @@ fn dispatch_event(
                     emit_peers_updated(bridge.as_mut());
                 }
                 if bridge.rust().in_room && !bridge.rust().room_participant_ids.is_empty() {
-                    let my_id = bridge.rust().my_public_id.clone();
+                    let my_public_id = bridge.rust().my_public_id.clone();
+                    let my_peer_id = bridge.rust().my_peer_id.clone();
                     let ids = bridge.rust().room_participant_ids.clone();
                     let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                        room_participants_json(Some(&ps.read()), &ids, &my_id)
+                        room_participants_json(
+                            Some(&ps.read()),
+                            &ids,
+                            &my_peer_id,
+                            &my_public_id,
+                        )
                     } else {
-                        room_participants_json(None, &ids, &my_id)
+                        room_participants_json(None, &ids, &my_peer_id, &my_public_id)
                     };
                     bridge
                         .as_mut()
@@ -4098,10 +4144,11 @@ fn dispatch_event(
 
                 // Initiate QUIC audio sessions for all non-self room members so
                 // direct peer audio works when hole-punch or same-LAN applies.
-                let my_id = bridge.rust().my_public_id.clone();
+                let my_public_id = bridge.rust().my_public_id.clone();
+                let my_peer_id = bridge.rust().my_peer_id.clone();
                 if let Some(ref tx) = bridge.rust().call_cmd_tx {
                     for peer_id in &members {
-                        if peer_id != &my_id {
+                        if peer_id != &my_public_id {
                             let _ = tx.try_send(CallCommand::InitiatePeer {
                                 peer_id: peer_id.clone(),
                                 host: None,
@@ -4116,9 +4163,14 @@ fn dispatch_event(
                     apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
                 }
                 let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                    room_participants_json(Some(&ps.read()), &members, &my_id)
+                    room_participants_json(
+                        Some(&ps.read()),
+                        &members,
+                        &my_peer_id,
+                        &my_public_id,
+                    )
                 } else {
-                    room_participants_json(None, &members, &my_id)
+                    room_participants_json(None, &members, &my_peer_id, &my_public_id)
                 };
                 bridge
                     .as_mut()
@@ -4158,16 +4210,22 @@ fn dispatch_event(
                 }
 
                 // Re-emit the full participant list so the model is never partial.
-                let my_id = bridge.rust().my_public_id.clone();
+                let my_public_id = bridge.rust().my_public_id.clone();
+                let my_peer_id = bridge.rust().my_peer_id.clone();
                 let ids = bridge.rust().room_participant_ids.clone();
                 {
                     let pids = resolved_room_member_pids(bridge.rust(), &ids);
                     apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
                 }
                 let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                    room_participants_json(Some(&ps.read()), &ids, &my_id)
+                    room_participants_json(
+                        Some(&ps.read()),
+                        &ids,
+                        &my_peer_id,
+                        &my_public_id,
+                    )
                 } else {
-                    room_participants_json(None, &ids, &my_id)
+                    room_participants_json(None, &ids, &my_peer_id, &my_public_id)
                 };
                 bridge
                     .as_mut()
@@ -4191,16 +4249,22 @@ fn dispatch_event(
                     .retain(|id| id != &peer_id);
 
                 // Re-emit the full participant list after removal.
-                let my_id = bridge.rust().my_public_id.clone();
+                let my_public_id = bridge.rust().my_public_id.clone();
+                let my_peer_id = bridge.rust().my_peer_id.clone();
                 let ids = bridge.rust().room_participant_ids.clone();
                 {
                     let pids = resolved_room_member_pids(bridge.rust(), &ids);
                     apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
                 }
                 let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                    room_participants_json(Some(&ps.read()), &ids, &my_id)
+                    room_participants_json(
+                        Some(&ps.read()),
+                        &ids,
+                        &my_peer_id,
+                        &my_public_id,
+                    )
                 } else {
-                    room_participants_json(None, &ids, &my_id)
+                    room_participants_json(None, &ids, &my_peer_id, &my_public_id)
                 };
                 bridge
                     .as_mut()
