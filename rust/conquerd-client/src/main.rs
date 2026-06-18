@@ -595,7 +595,7 @@ async fn handle_event(
         // New events handled by the Qt bridge's dispatch_event — ignore here.
         ConnectionEvent::TypingIndicator { .. }
         | ConnectionEvent::HandleUpdated { .. }
-        | ConnectionEvent::RoomMembersChanged(_)
+        | ConnectionEvent::RoomMembersChanged { .. }
         | ConnectionEvent::RoomPeerJoined { .. }
         | ConnectionEvent::RoomPeerLeft { .. }
         | ConnectionEvent::RoomChatMessage { .. }
