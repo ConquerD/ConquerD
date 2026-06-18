@@ -232,6 +232,12 @@ ApplicationWindow {
                     && !incoming.creator_id
                     && incoming.is_default === undefined)
                 continue
+            if (j === "voice_count" || j === "member_count" || j === "count") {
+                var existingCount = root.numericRoomCount(existing[j])
+                var incomingCount = root.numericRoomCount(v)
+                if (incomingCount < existingCount)
+                    continue
+            }
             merged[j] = v
         }
         return merged
