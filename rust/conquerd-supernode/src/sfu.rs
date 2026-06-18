@@ -399,6 +399,15 @@ impl SFURoomManager {
         room.validate_and_consume_token(token, peer_id)
     }
 
+    /// Allow a peer to join an existing private room.
+    pub fn allow_peer(&mut self, room_id: &str, peer_id: &str) -> bool {
+        let Some(room) = self.rooms.get_mut(room_id) else {
+            return false;
+        };
+        room.allow_peer(peer_id);
+        true
+    }
+
     /// Generate an invite token for a room.
     pub fn generate_invite_token(&mut self, room_id: &str, created_by: &str) -> Option<String> {
         self.rooms
@@ -506,6 +515,26 @@ mod tests {
 
         let (ok, _) = mgr.join_room("friend", "priv");
         assert!(ok);
+    }
+
+    #[test]
+    fn materializing_peer_can_join_new_private_room() {
+        let mut mgr = SFURoomManager::new();
+        let (_, created) = mgr
+            .create_room(Some("saved"), "Saved Private", RoomType::Private, "creator")
+            .unwrap();
+        assert!(created);
+        assert!(mgr.allow_peer("saved", "friend"));
+
+        let (ok, members) = mgr.join_room("friend", "saved");
+        assert!(ok);
+        assert_eq!(members, vec!["friend".to_string()]);
+        let rooms = mgr.get_rooms_for_peer("friend");
+        let room = rooms
+            .iter()
+            .find(|r| r.get("room_id").and_then(|v| v.as_str()) == Some("saved"))
+            .expect("saved private room visible");
+        assert_eq!(room.get("member_count").and_then(|v| v.as_u64()), Some(1));
     }
 
     #[test]
