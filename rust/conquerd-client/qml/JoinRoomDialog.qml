@@ -10,13 +10,14 @@ Item {
     visible: false
     focus: visible
     width: 400
-    height: 260
+    height: 320
 
-    signal joinRequested(string supernodeId, string roomId)
+    signal joinRequested(string supernodeId, string roomId, string inviteToken)
 
     function show() {
         supernodeField.text = ""
         roomField.text = ""
+        inviteTokenField.text = ""
         errorLabel.text = ""
         root.visible = true
         supernodeField.forceActiveFocus()
@@ -90,6 +91,24 @@ Item {
                     id: roomField
                     Layout.fillWidth: true
                     placeholderText: "room name or ID"
+                    Keys.onReturnPressed: inviteTokenField.forceActiveFocus()
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingSm
+
+                Label {
+                    text: "Invite"
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeBody
+                    Layout.preferredWidth: 90
+                }
+                StyledTextField {
+                    id: inviteTokenField
+                    Layout.fillWidth: true
+                    placeholderText: "optional token"
                     Keys.onReturnPressed: doJoin()
                 }
             }
@@ -136,6 +155,6 @@ Item {
             return
         }
         root.visible = false
-        root.joinRequested(sn, room)
+        root.joinRequested(sn, room, inviteTokenField.text.trim())
     }
 }
