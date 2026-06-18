@@ -3,7 +3,8 @@
 //! On Windows: writes to HKCU\Software\Classes\conquerd (no elevation needed).
 //! On other platforms: no-op.
 
-use tracing::{info, warn};
+#[cfg(not(target_os = "windows"))]
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -59,9 +60,9 @@ pub fn is_registered() -> bool {
 
 #[cfg(target_os = "windows")]
 mod windows {
-    use super::*;
     use std::os::windows::process::CommandExt;
     use std::path::PathBuf;
+    use tracing::{info, warn};
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     fn exe_path() -> PathBuf {

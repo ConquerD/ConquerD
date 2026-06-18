@@ -9,7 +9,7 @@ use std::sync::{
     Arc,
 };
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // WAV generation helpers
@@ -143,6 +143,7 @@ fn play_wav_once(wav: &[u8]) -> bool {
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
+        use tracing::warn;
         let _ = wav;
         warn!("[ringtone] unsupported platform — audio disabled");
         false
@@ -152,6 +153,7 @@ fn play_wav_once(wav: &[u8]) -> bool {
 #[cfg(target_os = "windows")]
 fn play_wav_windows(wav: &[u8]) -> bool {
     use std::os::windows::process::CommandExt;
+    use tracing::warn;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     // Write to a temp file so winsound / PlaySound can read it.
@@ -187,7 +189,6 @@ fn play_wav_windows(wav: &[u8]) -> bool {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn play_via_cmd(cmd: &str, wav: &[u8]) -> bool {
-    use std::io::Write;
     let tmp = std::env::temp_dir().join("conquerd_ring.wav");
     if std::fs::write(&tmp, wav).is_err() {
         return false;
