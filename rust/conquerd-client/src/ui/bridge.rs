@@ -1988,25 +1988,41 @@ impl ffi::AppBridge {
             }
         }
 
+        let stored = self
+            .rust()
+            .room_store
+            .as_ref()
+            .and_then(|rs| rs.read().get(&sid, &rid).cloned());
+        let room_type = stored
+            .as_ref()
+            .map(|e| e.room_type.clone())
+            .unwrap_or_else(|| "public".to_owned());
+        let use_invite = stored.as_ref().is_some_and(|e| {
+            e.room_type == "private" && !e.is_creator && !e.invite_token.is_empty()
+        });
         if let Some(ref tx) = self.rust().conn_cmd_tx {
-            let _ = tx.try_send(ConnectionCommand::JoinRoom {
-                supernode_id: sid.clone(),
-                room_id: rid.clone(),
-            });
+            if use_invite {
+                let token = stored
+                    .as_ref()
+                    .map(|e| e.invite_token.clone())
+                    .unwrap_or_default();
+                let _ = tx.try_send(ConnectionCommand::JoinRoomWithInvite {
+                    supernode_id: sid.clone(),
+                    room_id: rid.clone(),
+                    invite_token: token,
+                });
+            } else {
+                let _ = tx.try_send(ConnectionCommand::JoinRoom {
+                    supernode_id: sid.clone(),
+                    room_id: rid.clone(),
+                });
+            }
         }
         {
             let mut r = self.as_mut().rust_mut();
             r.current_supernode_id = sid.clone();
             r.current_room_id = rid.clone();
         }
-        let room_type = match self.rust().room_store.as_ref() {
-            Some(rs) => rs
-                .read()
-                .get(&sid, &rid)
-                .map(|e| e.room_type.clone())
-                .unwrap_or_else(|| "public".to_owned()),
-            None => "public".to_owned(),
-        };
         remember_room_in_store(
             &self.rust().room_store,
             &sid,
