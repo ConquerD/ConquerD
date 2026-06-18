@@ -102,7 +102,10 @@ impl SFURoom {
     }
 
     pub fn is_peer_allowed(&self, peer_id: &str) -> bool {
-        self.is_public() || self.allowed.contains(peer_id) || self.creator_id == peer_id
+        self.is_public()
+            || self.allowed.contains(peer_id)
+            || self.creator_id == peer_id
+            || self.participants.contains_key(peer_id)
     }
 
     #[allow(dead_code)]
