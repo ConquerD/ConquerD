@@ -142,10 +142,7 @@ fn is_conquerd_client_archive(path: &std::path::Path) -> bool {
     };
     // Windows-only `.7z` name; do not use `nightly_archive_name()` here — that
     // varies by target OS (AppImage, dmg, …) and breaks archive detection tests on Linux CI.
-    if stem.eq_ignore_ascii_case(
-        github::WINDOWS_CLIENT_NIGHTLY_7Z
-            .trim_end_matches(".7z"),
-    ) {
+    if stem.eq_ignore_ascii_case(github::WINDOWS_CLIENT_NIGHTLY_7Z.trim_end_matches(".7z")) {
         return true;
     }
     let prefix = "ConquerD-";
