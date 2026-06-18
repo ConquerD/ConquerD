@@ -87,6 +87,7 @@ Responsibilities:
 Working style:
 - Prioritize lockup prevention, audio continuity, and deterministic outcomes.
 - Keep acceptance checklist current.
+- Before sign-off on Rust changes: `cargo fmt --all -- --check` in affected workspace(s), then targeted `cargo test` / `cargo clippy -D warnings` for touched crates; use `scripts/ci_local.ps1` when changes span workspaces or hit release/installer paths.
 
 ### 6. DevOps/Infra Agent (Transport + Feature Hosting)
 Responsibilities:
@@ -135,6 +136,7 @@ Working style:
 - Per-feature `auth` tier and quota are mandatory — don't bypass the capability layer for convenience.
 - Stability and security take precedence over new features.
 - Pair meaningful code changes with tests or reproducible validation steps.
+- **Format before finish**: after any Rust edit, run `cargo fmt --all` in every workspace you touched (`rust/` and/or `rust/conquerd-client/`), then verify with `cargo fmt --all -- --check`. CI runs both checks; do not leave formatting for the pipeline to catch. If `--check` prints a diff, apply it (or re-run `cargo fmt --all`) and re-check before moving on.
 
 ## Architecture Notes (Agent Contract)
 
@@ -176,6 +178,7 @@ This section captures implementation locations and invariants that agents must r
 - **Outbound routing** — room signaling must target the correct supernode WS session (`resolve_supernode_ws_target` in `dispatch_outbound`); never fan `SfuRoomCreate` to the first connected supernode when multiple nodes share a host.
 
 ### Build Gotchas (Agent-Relevant)
+- **Two Cargo workspaces — fmt both when unsure**: `rust/` (features, supernode, installer, opus) and `rust/conquerd-client/` (desktop client). `scripts/ci_local.ps1` runs `cargo fmt --all -- --check` in each. Touching only one crate still requires fmt in that crate's workspace root.
 - **`conquerd-opus` DNN data** (required for default `dnn` feature): run `scripts/fetch_opus_weights.ps1` (Windows) or `.sh` (Linux/macOS) before building. Extracts Xiph.Org C arrays into `rust/conquerd-opus/opus/dnn/`. Idempotent. Set `default-features = false` on the dep to build without DNN support.
 - **Qt requirement**: `conquerd-client --features qt-ui` needs Qt 6.x on `PATH` (`QMAKE` or `CMAKE_PREFIX_PATH`). Headless builds (no `qt-ui`) are valid for tests.
 - **Version sync (SignPath requirement)**: `rust/conquerd-client/Cargo.toml` and `rust/conquerd-installer/Cargo.toml` **must** carry the identical version so PE `ProductVersion` metadata matches across signed artifacts.
@@ -407,3 +410,21 @@ Update `agents.md` (this section) in the same change as any signing-related work
 - Update this section in the same change as any work that shifts status or adds risk.
 - Before touching quotas, dispatch, signaling, or capability paths: run the relay/SFU/room tests + a manual 2-client check.
 - Use the 8 Agent Roles above as the per-release checklist; PM keeps updates short (done / in progress / risks).
+
+**Pre-submit validation (agents — run locally, do not defer to CI):**
+
+1. **Format** — in each touched workspace root (`rust/`, `rust/conquerd-client/`):
+   - `cargo fmt --all`
+   - `cargo fmt --all -- --check` (must exit 0; if it fails, read the diff, apply, repeat)
+2. **Compile / lint** — `cargo clippy -D warnings` and `cargo test` for affected crates; full gate: `scripts/ci_local.ps1` (Windows) or equivalent steps on Linux/macOS runners.
+3. **Debug failures before hand-off** — reproduce CI errors locally (fmt diff, clippy, test panic, cross-target naming like Linux CI vs Windows-only paths). Fix root cause in the same change; do not stop at "CI will tell us."
+
+Typical fmt commands from repo root:
+
+```powershell
+# rust/ workspace (features, supernode, installer, opus)
+cd rust; cargo fmt --all; cargo fmt --all -- --check
+
+# client workspace (when conquerd-client changed)
+cd rust/conquerd-client; cargo fmt --all; cargo fmt --all -- --check
+```
