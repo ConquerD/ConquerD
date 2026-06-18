@@ -100,12 +100,24 @@ pub enum ConnectionEvent {
     SessionStateUpdate(PeerSessionState),
     /// Typing indicator from a peer.
     TypingIndicator { peer_id: String, is_typing: bool },
-    /// Room member list changed (full snapshot from SFU_MEMBERS).
-    RoomMembersChanged(Vec<String>),
-    /// A peer joined the current SFU room.
-    RoomPeerJoined { peer_id: String },
-    /// A peer left the current SFU room.
-    RoomPeerLeft { peer_id: String },
+    /// Room member list changed (full snapshot from `SfuMembers`).
+    RoomMembersChanged {
+        supernode_id: String,
+        room_id: String,
+        members: Vec<String>,
+    },
+    /// A peer joined an SFU voice room.
+    RoomPeerJoined {
+        supernode_id: String,
+        room_id: String,
+        peer_id: String,
+    },
+    /// A peer left an SFU voice room.
+    RoomPeerLeft {
+        supernode_id: String,
+        room_id: String,
+        peer_id: String,
+    },
     /// A text chat message arrived in an SFU room.
     RoomChatMessage {
         supernode_id: String,
@@ -242,9 +254,10 @@ pub enum ConnectionCommand {
         supernode_id: String,
         room_id: String,
     },
-    /// Leave the current SFU room (sends `SfuLeave` signaling).
+    /// Leave an SFU voice room (sends `SfuLeave` signaling).
     LeaveRoom {
         supernode_id: String,
+        room_id: String,
     },
     /// Subscribe to SFU room text chat only — no voice participation.
     /// Sends `SfuSubscribe`; the supernode will deliver `SfuChat` messages
@@ -772,10 +785,13 @@ impl ConnectionManager {
                             self.current_room_id = room_id.clone();
                             self.send_room_join(&supernode_id, &room_id).await;
                         }
-                        ConnectionCommand::LeaveRoom { supernode_id } => {
+                        ConnectionCommand::LeaveRoom {
+                            supernode_id,
+                            room_id,
+                        } => {
                             self.current_room_id.clear();
                             self.current_supernode_id.clear();
-                            self.send_room_leave(&supernode_id).await;
+                            self.send_room_leave(&supernode_id, &room_id).await;
                         }
                         ConnectionCommand::RemoveSupernode { supernode_id } => {
                             self.remove_supernode(&supernode_id).await;
@@ -1011,9 +1027,12 @@ impl ConnectionManager {
 
     async fn remove_supernode(&mut self, supernode_id: &str) {
         if self.current_supernode_id == supernode_id {
+            let room_id = self.current_room_id.clone();
             self.current_room_id.clear();
             self.current_supernode_id.clear();
-            self.send_room_leave(supernode_id).await;
+            if !room_id.is_empty() {
+                self.send_room_leave(supernode_id, &room_id).await;
+            }
         }
         if let Some(sn) = self.supernodes.remove(supernode_id) {
             sn.ws_task.abort();
@@ -1731,12 +1750,18 @@ impl ConnectionManager {
         self.dispatch_outbound(msg).await;
     }
 
-    async fn send_room_leave(&mut self, supernode_id: &str) {
+    async fn send_room_leave(&mut self, supernode_id: &str, room_id: &str) {
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuLeave, sender.clone());
         msg.target = Some(supernode_id.to_owned());
         msg.payload
             .insert("peer_id".to_owned(), Value::String(sender));
+        let rid = if room_id.is_empty() {
+            "default".to_owned()
+        } else {
+            room_id.to_owned()
+        };
+        msg.payload.insert("room_id".to_owned(), Value::String(rid));
         self.dispatch_outbound(msg).await;
     }
 
@@ -2594,6 +2619,12 @@ impl ConnectionManager {
                 }
             }
             MessageType::SfuMembers => {
+                let room_id = msg
+                    .payload
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    .to_owned();
                 let members: Vec<String> = msg
                     .payload
                     .get("members")
@@ -2604,31 +2635,49 @@ impl ConnectionManager {
                             .collect()
                     })
                     .unwrap_or_default();
-                let _ = self
-                    .event_tx
-                    .try_send(ConnectionEvent::RoomMembersChanged(members));
+                let _ = self.event_tx.try_send(ConnectionEvent::RoomMembersChanged {
+                    supernode_id: msg.sender.clone(),
+                    room_id,
+                    members,
+                });
             }
             MessageType::SfuPeerJoined => {
+                let room_id = msg
+                    .payload
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    .to_owned();
                 let peer_id = msg
                     .payload
                     .get("peer_id")
                     .and_then(Value::as_str)
                     .unwrap_or(&msg.sender)
                     .to_owned();
-                let _ = self
-                    .event_tx
-                    .try_send(ConnectionEvent::RoomPeerJoined { peer_id });
+                let _ = self.event_tx.try_send(ConnectionEvent::RoomPeerJoined {
+                    supernode_id: msg.sender.clone(),
+                    room_id,
+                    peer_id,
+                });
             }
             MessageType::SfuPeerLeft => {
+                let room_id = msg
+                    .payload
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    .to_owned();
                 let peer_id = msg
                     .payload
                     .get("peer_id")
                     .and_then(Value::as_str)
                     .unwrap_or(&msg.sender)
                     .to_owned();
-                let _ = self
-                    .event_tx
-                    .try_send(ConnectionEvent::RoomPeerLeft { peer_id });
+                let _ = self.event_tx.try_send(ConnectionEvent::RoomPeerLeft {
+                    supernode_id: msg.sender.clone(),
+                    room_id,
+                    peer_id,
+                });
             }
             MessageType::SfuChat => {
                 let room_id = msg
