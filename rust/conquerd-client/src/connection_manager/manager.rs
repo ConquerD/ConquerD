@@ -2517,7 +2517,9 @@ impl ConnectionManager {
                     self.current_supernode_id = supernode_id.clone();
                     self.current_room_id = room_id.clone();
                     self.send_room_join(&supernode_id, &room_id).await;
-                    self.send_room_list_request(&supernode_id).await;
+                    // Join ack (SfuMembers) + supernode broadcast_room_list carry
+                    // authoritative counts; an immediate list request can race and
+                    // publish a pre-join participant_count to the sidebar bubble.
                     let _ = self.event_tx.try_send(ConnectionEvent::RoomCreated {
                         supernode_id,
                         room_id,
@@ -2550,7 +2552,8 @@ impl ConnectionManager {
                         self.current_supernode_id = supernode_id.clone();
                         self.current_room_id = room_id.clone();
                         self.send_room_join(&supernode_id, &room_id).await;
-                        self.send_room_list_request(&supernode_id).await;
+                        // Counts follow from SfuMembers + post-join broadcast; a
+                        // list request here often lands before SfuJoin completes.
                     }
                 } else {
                     self.pending_private_room_joins.remove(&key);
