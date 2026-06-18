@@ -211,6 +211,16 @@ pub mod ffi {
         #[rust_name = "join_room"]
         fn joinRoom(self: Pin<&mut AppBridge>, supernode_id: &QString, room_id: &QString);
 
+        /// Validate a private-room invite token and join the SFU room.
+        #[qinvokable]
+        #[rust_name = "join_room_with_invite"]
+        fn joinRoomWithInvite(
+            self: Pin<&mut AppBridge>,
+            supernode_id: &QString,
+            room_id: &QString,
+            invite_token: &QString,
+        );
+
         /// Subscribe to an SFU room's text chat without joining voice or
         /// leaving the current voice room. Single-clicking a room in the sidebar
         /// calls this so the user can browse chat across rooms freely.
@@ -2035,6 +2045,83 @@ impl ffi::AppBridge {
         self.as_mut().set_in_room(true);
     }
 
+    fn join_room_with_invite(
+        mut self: Pin<&mut Self>,
+        supernode_id: &QString,
+        room_id: &QString,
+        invite_token: &QString,
+    ) {
+        let Some(sid) = self
+            .rust()
+            .resolve_supernode_node_id_str(&supernode_id.to_string())
+        else {
+            warn!(
+                "[bridge] joinRoomWithInvite: unknown supernode {}",
+                supernode_id.to_string()
+            );
+            return;
+        };
+        let rid = room_id.to_string();
+        let token = invite_token.to_string();
+        if sid.is_empty() || rid.is_empty() || token.is_empty() {
+            return;
+        }
+
+        let prev_sn = self.rust().current_supernode_id.clone();
+        let prev_rid = self.rust().current_room_id.clone();
+        if !prev_rid.is_empty() && (prev_rid != rid || prev_sn != sid) {
+            if let Some(ref tx) = self.rust().conn_cmd_tx {
+                let _ = tx.try_send(ConnectionCommand::LeaveRoom {
+                    supernode_id: prev_sn,
+                    room_id: prev_rid.clone(),
+                });
+            }
+        }
+
+        if let Some(ref tx) = self.rust().conn_cmd_tx {
+            let _ = tx.try_send(ConnectionCommand::JoinRoomWithInvite {
+                supernode_id: sid.clone(),
+                room_id: rid.clone(),
+                invite_token: token,
+            });
+        }
+        {
+            let mut r = self.as_mut().rust_mut();
+            r.current_supernode_id = sid.clone();
+            r.current_room_id = rid.clone();
+        }
+        remember_room_in_store(
+            &self.rust().room_store,
+            &sid,
+            &rid,
+            "",
+            "private",
+            "",
+            false,
+            "",
+        );
+
+        let my_public_id = self.rust().my_public_id.clone();
+        let my_peer_id = self.rust().my_peer_id.clone();
+        if !my_public_id.is_empty() {
+            self.as_mut().rust_mut().room_participant_ids = vec![my_public_id.clone()];
+            let json = if let Some(ps) = self.rust().peer_store.as_ref() {
+                room_participants_json(
+                    Some(&ps.read()),
+                    &[my_public_id.clone()],
+                    &my_peer_id,
+                    &my_public_id,
+                )
+            } else {
+                room_participants_json(None, &[my_public_id.clone()], &my_peer_id, &my_public_id)
+            };
+            self.as_mut()
+                .participants_updated(QString::from(json.as_str()));
+        }
+
+        self.as_mut().set_in_room(true);
+    }
+
     fn join_room_with_voice(mut self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) {
         let Some(new_sid) = self
             .rust()
@@ -3304,11 +3391,18 @@ fn room_count_from_json(room: &serde_json::Value) -> u64 {
         .unwrap_or(0)
 }
 
-fn merge_room_entry_counts(existing: &mut serde_json::Value, incoming: &serde_json::Value) {
+fn room_has_count(room: &serde_json::Value) -> bool {
+    room.get("member_count")
+        .or_else(|| room.get("voice_count"))
+        .or_else(|| room.get("count"))
+        .and_then(|v| v.as_u64())
+        .is_some()
+}
+
+fn merge_room_entry(existing: &mut serde_json::Value, incoming: &serde_json::Value) {
     let old_count = room_count_from_json(existing);
-    let new_count = room_count_from_json(incoming);
     let mut merged = incoming.clone();
-    if new_count < old_count {
+    if !room_has_count(incoming) {
         if let Some(obj) = merged.as_object_mut() {
             obj.insert(
                 "member_count".to_owned(),
@@ -3359,7 +3453,7 @@ fn merge_room_list_values(
             }
             by_id
                 .entry(room_id.to_owned())
-                .and_modify(|existing| merge_room_entry_counts(existing, room))
+                .and_modify(|existing| merge_room_entry(existing, room))
                 .or_insert_with(|| room.clone());
         }
     }
@@ -3604,6 +3698,7 @@ fn room_voice_sidebar_patch(
             serde_json::json!({
                 "supernode_id": supernode_id,
                 "rooms": rooms,
+                "replace": false,
             })
             .to_string(),
         );
@@ -3618,6 +3713,7 @@ fn room_voice_sidebar_patch(
         serde_json::json!({
             "supernode_id": supernode_id,
             "rooms": rooms,
+            "replace": false,
         })
         .to_string(),
     )
@@ -3737,6 +3833,7 @@ fn emit_local_rooms_for_all_supernodes(mut bridge: Pin<&mut ffi::AppBridge>) {
         let wrapped = serde_json::json!({
             "supernode_id": supernode_id,
             "rooms": local,
+            "replace": false,
         })
         .to_string();
         bridge
@@ -4558,6 +4655,7 @@ fn dispatch_event(
                 let wrapped = serde_json::json!({
                     "supernode_id": canon,
                     "rooms": rooms,
+                    "replace": true,
                 })
                 .to_string();
                 bridge
