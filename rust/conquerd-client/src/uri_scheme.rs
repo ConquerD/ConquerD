@@ -3,7 +3,7 @@
 //! On Windows: writes to HKCU\Software\Classes\conquerd (no elevation needed).
 //! On other platforms: no-op.
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // Public API

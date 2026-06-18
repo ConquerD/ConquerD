@@ -9,3 +9,7 @@ members = [
 # (rust/conquerd-client/Cargo.toml) so the cxx-qt patch stays isolated there
 # and does not affect server-side builds.
 resolver = "2"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::protocol::{MessageType, SignalingMessage};
+use crate::protocol::MessageType;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 

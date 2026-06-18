@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 
 pub const GITHUB_API: &str = "https://api.github.com";
 pub const DEFAULT_REPO: &str = "vbawol/ConquerD";

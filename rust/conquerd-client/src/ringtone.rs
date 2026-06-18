@@ -151,8 +151,6 @@ fn play_wav_once(wav: &[u8]) -> bool {
 
 #[cfg(target_os = "windows")]
 fn play_wav_windows(wav: &[u8]) -> bool {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 

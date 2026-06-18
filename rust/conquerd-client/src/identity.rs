@@ -13,7 +13,6 @@ use ed25519_dalek::{Signer, SigningKey};
 use keyring::Entry;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;

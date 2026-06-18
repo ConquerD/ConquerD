@@ -284,9 +284,7 @@ unsafe fn create_badge_icon(count: u32) -> windows::Win32::UI::WindowsAndMessagi
         CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC, DeleteObject,
         FillRect, GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW, TRANSPARENT,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateIconIndirect, DestroyIcon, HICON, ICONINFO,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 
     const SIZE: i32 = 16;
     let hdc_screen = GetDC(HWND(0isize as _));
@@ -396,7 +394,7 @@ pub fn start_ptt_polling(
     muted_tx: std::sync::mpsc::SyncSender<bool>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("conquerd-ptt".into())
         .spawn(move || {
             #[cfg(target_os = "windows")]
@@ -425,8 +423,15 @@ pub fn start_ptt_polling(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(16));
             }
-        })
-        .expect("failed to spawn PTT thread")
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::error!("failed to spawn PTT thread: {e}");
+            std::thread::Builder::new()
+                .spawn(|| {})
+                .unwrap_or_else(|_| std::process::abort())
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -471,7 +476,12 @@ fn key_name_to_vk_windows(name: &str) -> i32 {
         "mouse3" | "mmb" => 0x04, // VK_MBUTTON
         "mouse4" | "xb1" => 0x05, // VK_XBUTTON1 (Back)
         "mouse5" | "xb2" => 0x06, // VK_XBUTTON2 (Forward)
-        s if s.len() == 1 => s.chars().next().unwrap().to_uppercase().next().unwrap() as i32,
+        s if s.len() == 1 => s
+            .chars()
+            .next()
+            .and_then(|ch| ch.to_uppercase().next())
+            .map(|c| c as i32)
+            .unwrap_or(0),
         _ => 0,
     }
 }

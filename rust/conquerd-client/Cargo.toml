@@ -135,6 +135,10 @@ features = ["qt_gui", "qt_qml"]
 # ── Workspace (client is its own workspace so cxx-qt patch is isolated here) ──
 # This keeps the server-side workspace (rust/Cargo.toml) free of Qt/cxx-qt,
 # allowing conquerd-supernode to be built on Linux without Qt.
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
 [workspace]
 
 # NOTE: If your local Rust toolchain triggers cxx-qt macro errors (e.g. the

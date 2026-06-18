@@ -11,7 +11,6 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -317,7 +316,10 @@ pub fn verify_official_release_build(
     };
 
     let pubkey_bytes: [u8; 32] = match hex::decode(RELEASE_SIGNER_PUBKEY_HEX) {
-        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
+        Ok(b) if b.len() == 32 => match b.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        },
         _ => return false,
     };
 

@@ -7,7 +7,6 @@
 //! `on_invoke` / `on_message` are intentional no-ops.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conquerd_features::{AuthTier, CapabilityDescriptor, ChannelKind};
@@ -15,8 +14,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::debug;
 
 pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 pub const DEFAULT_MODEL: &str = "llama3";

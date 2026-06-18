@@ -347,6 +347,48 @@ impl SignalingMessage {
     }
 }
 
-// Note: is_fresh logic is covered by supernode tests + the timestamp check in
-// connection_manager::verify_inbound_signature. A matching client unit test
-// would be nice-to-have but is not required for P0 replay protection delivery.
+#[cfg(test)]
+mod tests {
+    use super::{MessageType, SignalingMessage};
+
+    const FRESHNESS_WINDOW_SECS: f64 = 300.0;
+
+    fn msg_with_timestamp(ts: f64) -> SignalingMessage {
+        let mut msg = SignalingMessage::new(MessageType::ChatMessage, "sender".to_owned());
+        msg.timestamp = ts;
+        msg
+    }
+
+    fn now_secs() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    #[test]
+    fn is_fresh_accepts_current_timestamp() {
+        let msg = msg_with_timestamp(now_secs());
+        assert!(msg.is_fresh(FRESHNESS_WINDOW_SECS));
+    }
+
+    #[test]
+    fn is_fresh_rejects_stale_timestamp() {
+        let msg = msg_with_timestamp(now_secs() - FRESHNESS_WINDOW_SECS - 1.0);
+        assert!(!msg.is_fresh(FRESHNESS_WINDOW_SECS));
+    }
+
+    #[test]
+    fn is_fresh_rejects_future_timestamp() {
+        let msg = msg_with_timestamp(now_secs() + FRESHNESS_WINDOW_SECS + 1.0);
+        assert!(!msg.is_fresh(FRESHNESS_WINDOW_SECS));
+    }
+
+    #[test]
+    fn is_fresh_accepts_just_inside_window() {
+        // One second inside the window avoids flaky boundary timing between
+        // `now_secs()` and the second `SystemTime::now()` inside `is_fresh`.
+        let msg = msg_with_timestamp(now_secs() - (FRESHNESS_WINDOW_SECS - 1.0));
+        assert!(msg.is_fresh(FRESHNESS_WINDOW_SECS));
+    }
+}

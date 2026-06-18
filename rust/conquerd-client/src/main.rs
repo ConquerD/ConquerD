@@ -10,11 +10,12 @@
 
 // Suppress the Windows console window unless the `console` feature is enabled.
 #![cfg_attr(all(windows, not(feature = "console")), windows_subsystem = "windows")]
-// Public API items are consumed by the Qt UI layer (qt-ui feature) and by
-// integration tests. Suppress dead-code lints at the crate level.
-#![allow(dead_code, unused_imports)]
+// Headless builds compile the full crate but only exercise a subset of modules;
+// Qt-only surfaces are feature-gated below, and remaining unused items are expected.
+#![cfg_attr(not(feature = "qt-ui"), allow(dead_code))]
 
 mod avatar_config;
+#[cfg(feature = "qt-ui")]
 mod banner;
 mod call_controller;
 mod chat_store;
@@ -26,12 +27,15 @@ mod feature_trust;
 mod file_transfer;
 mod github_updater;
 mod identity;
+#[cfg(feature = "qt-ui")]
 mod metrics;
 mod network_monitor;
 mod ollama_module;
 mod peer_store;
 mod platform;
+#[cfg(feature = "qt-ui")]
 mod plugin_manager;
+#[cfg(feature = "qt-ui")]
 mod plugin_runtime;
 mod protocol;
 mod quic_relay_client;
@@ -42,7 +46,9 @@ mod room_manager;
 mod room_store;
 mod session_state;
 mod sfu_client;
+#[cfg(feature = "qt-ui")]
 mod taskbar_badge;
+#[cfg(feature = "qt-ui")]
 mod ui;
 mod upnp;
 mod uri_scheme;
@@ -212,11 +218,19 @@ fn main() {
 
     // Headless path: block main thread on the tokio runtime.
     #[cfg(not(feature = "qt-ui"))]
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(headless_main());
+    {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("Failed to start tokio runtime: {e}");
+                std::process::exit(1);
+            }
+        };
+        rt.block_on(headless_main());
+    }
 }
 
 #[cfg(not(feature = "qt-ui"))]

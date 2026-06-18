@@ -1,0 +1,3 @@
+# Clippy options for the rust/ workspace (see Cargo.toml [lints.clippy] for lint levels).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

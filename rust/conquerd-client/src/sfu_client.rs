@@ -5,7 +5,7 @@
 //! audio encoding and transport.
 
 use std::collections::HashSet;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::connection_manager::ConnectionCommand;
 use tokio::sync::mpsc;

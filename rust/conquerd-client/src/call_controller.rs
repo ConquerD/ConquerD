@@ -483,10 +483,16 @@ impl AudioPipeline {
     /// Pass `opus_data = None` to trigger Opus PLC (packet loss concealment)
     /// for a missing frame without corrupting the decoder state.
     fn push_inbound(&mut self, peer_id: &str, opus_data: Option<&[u8]>) -> f32 {
-        let decoder = self
-            .decoders
-            .entry(peer_id.to_owned())
-            .or_insert_with(|| OpusDecoder::new(48_000, 1).expect("Opus decoder init"));
+        if !self.decoders.contains_key(peer_id) {
+            let Ok(dec) = OpusDecoder::new(48_000, 1) else {
+                tracing::error!("Opus decoder init failed for peer {peer_id}");
+                return 0.0;
+            };
+            self.decoders.insert(peer_id.to_owned(), dec);
+        }
+        let Some(decoder) = self.decoders.get_mut(peer_id) else {
+            return 0.0;
+        };
         let mut pcm = [0i16; SAMPLES_PER_FRAME];
         match decoder.decode(opus_data, &mut pcm, false) {
             Ok(n) => {
