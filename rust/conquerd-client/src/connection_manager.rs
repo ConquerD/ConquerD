@@ -254,6 +254,12 @@ pub enum ConnectionCommand {
         supernode_id: String,
         room_id: String,
     },
+    /// Validate a private-room invite token, then join the SFU room.
+    JoinRoomWithInvite {
+        supernode_id: String,
+        room_id: String,
+        invite_token: String,
+    },
     /// Leave an SFU voice room (sends `SfuLeave` signaling).
     LeaveRoom {
         supernode_id: String,
@@ -622,6 +628,9 @@ pub struct ConnectionManager {
     /// `supernode_id:room_id` keys for in-flight materialize-only creates.
     /// `SfuRoomCreated` must not auto-join these rooms.
     pending_materialize: HashSet<String>,
+    /// `supernode_id:room_id` keys waiting for private-room invite validation
+    /// before sending the count-producing `SfuJoin`.
+    pending_private_room_joins: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -701,6 +710,7 @@ impl ConnectionManager {
             replay_guard: ReplayGuard::new(Self::MAX_MESSAGE_AGE_SECS),
             transport_stats: HashMap::new(),
             pending_materialize: HashSet::new(),
+            pending_private_room_joins: HashSet::new(),
         };
         (cmd_tx, event_rx, mgr.run_inner())
     }
@@ -784,6 +794,13 @@ impl ConnectionManager {
                             self.current_supernode_id = supernode_id.clone();
                             self.current_room_id = room_id.clone();
                             self.send_room_join(&supernode_id, &room_id).await;
+                        }
+                        ConnectionCommand::JoinRoomWithInvite { supernode_id, room_id, invite_token } => {
+                            self.current_supernode_id = supernode_id.clone();
+                            self.current_room_id = room_id.clone();
+                            let key = format!("{supernode_id}:{room_id}");
+                            self.pending_private_room_joins.insert(key);
+                            self.send_room_invite(&supernode_id, &room_id, &invite_token).await;
                         }
                         ConnectionCommand::LeaveRoom {
                             supernode_id,
@@ -1771,6 +1788,19 @@ impl ConnectionManager {
         msg.target = Some(supernode_id.to_owned());
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
+        self.dispatch_outbound(msg).await;
+    }
+
+    async fn send_room_invite(&mut self, supernode_id: &str, room_id: &str, invite_token: &str) {
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::SfuRoomInvite, sender.clone());
+        msg.target = Some(supernode_id.to_owned());
+        msg.payload
+            .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
+        msg.payload.insert(
+            "invite_token".to_owned(),
+            Value::String(invite_token.to_owned()),
+        );
         self.dispatch_outbound(msg).await;
     }
 
@@ -3027,6 +3057,46 @@ impl ConnectionManager {
                         room_type,
                         invite_token,
                     });
+                }
+            }
+            MessageType::SfuRoomInviteResult => {
+                let room_id = msg
+                    .payload
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let accepted = msg
+                    .payload
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if room_id.is_empty() {
+                    return;
+                }
+                let supernode_id = msg.sender.clone();
+                let key = format!("{supernode_id}:{room_id}");
+                if accepted {
+                    let was_pending = self.pending_private_room_joins.remove(&key);
+                    if was_pending {
+                        self.current_supernode_id = supernode_id.clone();
+                        self.current_room_id = room_id.clone();
+                        self.send_room_join(&supernode_id, &room_id).await;
+                        self.send_room_list_request(&supernode_id).await;
+                    }
+                } else {
+                    self.pending_private_room_joins.remove(&key);
+                    let reason = msg
+                        .payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("invalid_token");
+                    warn!(
+                        "Private room invite rejected by {} for room {}: {}",
+                        &supernode_id[..8.min(supernode_id.len())],
+                        room_id,
+                        reason
+                    );
                 }
             }
             MessageType::PresenceUpdate => {
