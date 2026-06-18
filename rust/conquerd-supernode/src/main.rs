@@ -1549,7 +1549,10 @@ impl SupernodeHandler {
                 "invite_token": invite_token,
             }),
         );
-        self.state.broadcast_room_list();
+        // Do not broadcast here: the room is still empty (no voice join yet).
+        // Broadcasting a count=0 snapshot races the client's immediate SfuJoin
+        // and can overwrite the sidebar bubble with stale stats. Join/leave
+        // paths call broadcast_room_list() once participant_ids are current.
     }
 
     fn handle_sfu_room_invite(&self, msg: &SignalingMessage) {
@@ -1589,15 +1592,10 @@ impl SupernodeHandler {
                 }),
             );
 
-            // Send updated room list so the peer can see the private room
-            if valid {
-                let rooms = sfu.read().get_rooms_for_peer(&msg.sender);
-                self.state.send_signed(
-                    &msg.sender,
-                    MessageType::SfuRoomList,
-                    json!({"rooms": rooms}),
-                );
-            }
+            // Room visibility + counts arrive via the client's pending SfuJoin
+            // (SfuMembers sidebar patch + post-join broadcast_room_list). A
+            // pre-join SfuRoomList here races that path and resets private-room
+            // voice bubbles to the pre-join participant count.
         }
     }
 
