@@ -122,6 +122,7 @@ impl SfuClient {
         if let (Some(ref tx), Some(ref sn_id)) = (&self.conn_cmd_tx, &self.supernode_id) {
             let _ = tx.try_send(ConnectionCommand::LeaveRoom {
                 supernode_id: sn_id.clone(),
+                room_id: self.room_id.clone(),
             });
         }
         self.connected = false;
