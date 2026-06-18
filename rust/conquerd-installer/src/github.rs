@@ -75,11 +75,14 @@ pub fn current_platform_id() -> &'static str {
     }
 }
 
+/// Windows client nightly `.7z` published on the `nightly` GitHub release.
+pub const WINDOWS_CLIENT_NIGHTLY_7Z: &str = "ConquerD-nightly-win64.7z";
+
 /// Platform-specific nightly archive published on the `nightly` GitHub release.
 pub fn nightly_archive_name() -> &'static str {
     #[cfg(windows)]
     {
-        "ConquerD-nightly-win64.7z"
+        WINDOWS_CLIENT_NIGHTLY_7Z
     }
     #[cfg(target_os = "macos")]
     {
