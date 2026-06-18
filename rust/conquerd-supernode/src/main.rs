@@ -1529,6 +1529,10 @@ impl SupernodeHandler {
         let is_private = room_type == sfu::RoomType::Private;
         drop(sfu_lock);
 
+        if created_new && is_private {
+            let _ = sfu.write().allow_peer(&room_id_out, &msg.sender);
+        }
+
         let invite_token = if created_new && is_private {
             sfu.write().generate_invite_token(&room_id_out, creator_id)
         } else {
