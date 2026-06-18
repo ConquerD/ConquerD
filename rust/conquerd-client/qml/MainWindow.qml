@@ -148,6 +148,12 @@ ApplicationWindow {
         return 0
     }
 
+    function roomHasVoiceCount(room) {
+        return (room.voice_count !== undefined && room.voice_count !== null)
+            || (room.count !== undefined && room.count !== null)
+            || (room.member_count !== undefined && room.member_count !== null)
+    }
+
     function roomKnownPeers(room) {
         if (!room.known_peers || !Array.isArray(room.known_peers))
             return []
@@ -232,12 +238,12 @@ ApplicationWindow {
                     && !incoming.creator_id
                     && incoming.is_default === undefined)
                 continue
-            if (j === "voice_count" || j === "member_count" || j === "count") {
-                var existingCount = root.numericRoomCount(existing[j])
-                var incomingCount = root.numericRoomCount(v)
-                if (incomingCount < existingCount)
-                    continue
-            }
+            if ((j === "voice_count" || j === "member_count" || j === "count"
+                    || j === "known_peers" || j === "unknown_peers")
+                    && incoming.count_known === false)
+                continue
+            if (j === "count_known" && v === false && existing.count_known === true)
+                continue
             merged[j] = v
         }
         return merged
@@ -303,7 +309,7 @@ ApplicationWindow {
         pruneNonSupernodeEntries()
     }
 
-    function upsertSfuRoomGroup(supernodeId, rooms) {
+    function upsertSfuRoomGroup(supernodeId, rooms, replaceRooms) {
         var canon = canonicalNodeId(supernodeId)
         if (canon === "") return
 
@@ -311,6 +317,7 @@ ApplicationWindow {
         for (var i = 0; i < rooms.length; i++) {
             var r = rooms[i]
             var voiceCount = root.roomVoiceCount(r)
+            var countKnown = root.roomHasVoiceCount(r)
             var knownPeers = root.roomKnownPeers(r)
             normalized.push({
                 room_id: r.room_id || "",
@@ -319,6 +326,7 @@ ApplicationWindow {
                 voice_count: voiceCount,
                 known_peers: knownPeers,
                 unknown_peers: root.roomUnknownPeerCount(r, voiceCount, knownPeers),
+                count_known: countKnown,
                 creator_id: r.creator_id || "",
                 is_default: r.is_default === true || r.room_id === "default"
             })
@@ -328,9 +336,11 @@ ApplicationWindow {
         if (nodeIdx >= 0) {
             var existing = []
             try { existing = JSON.parse(nodeListModel.get(nodeIdx).rooms_json || "[]") } catch (e) {}
-            var merged = normalized.length > 0
-                ? root.mergeRoomLists(existing, normalized)
-                : existing
+            var merged = existing
+            if (replaceRooms === true)
+                merged = normalized
+            else if (normalized.length > 0)
+                merged = root.mergeRoomLists(existing, normalized)
             nodeListModel.setProperty(nodeIdx, "node_id", canon)
             nodeListModel.setProperty(nodeIdx, "rooms_json", JSON.stringify(merged))
         } else if (normalized.length > 0) {
@@ -661,7 +671,7 @@ ApplicationWindow {
         backend.sfuRoomsUpdated.connect(function(json) {
             try {
                 var obj = JSON.parse(json)
-                root.upsertSfuRoomGroup(obj.supernode_id || "", obj.rooms || [])
+                root.upsertSfuRoomGroup(obj.supernode_id || "", obj.rooms || [], obj.replace === true)
             } catch(e) { console.warn("sfuRoomsUpdated parse error:", e) }
         })
 
@@ -858,9 +868,12 @@ ApplicationWindow {
         id: joinRoomDialog
         anchors.centerIn: parent
         z: 100
-        onJoinRequested: function(supernodeId, roomId) {
+        onJoinRequested: function(supernodeId, roomId, inviteToken) {
             roomPanel.switchToRoom(roomId, roomId, supernodeId)
-            backend.joinRoom(supernodeId, roomId)
+            if ((inviteToken || "").trim() !== "")
+                backend.joinRoomWithInvite(supernodeId, roomId, inviteToken)
+            else
+                backend.joinRoom(supernodeId, roomId)
             navIndex = 1
         }
     }
