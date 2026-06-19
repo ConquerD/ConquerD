@@ -183,8 +183,8 @@ Dialog {
                 Button {
                     text: "Copy"
                     icon.source: "qrc:/qt/qml/ConquerD/Client/icons/clipboard.svg"
-                    icon.width: 16
-                    icon.height: 16
+                    icon.width: 20
+                    icon.height: 20
                     enabled: root.generatedInvite !== ""
                     onClicked: {
                         backend.copyToClipboard(root.generatedInvite)
