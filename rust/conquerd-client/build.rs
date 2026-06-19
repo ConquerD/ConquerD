@@ -233,14 +233,19 @@ fn build_qt_ui() {
     // script (via cargo::metadata=CXX_QT_MANIFEST_PATH=...) because
     // cxx-qt-lib has `links = "cxx-qt-lib"` in its Cargo.toml.
     if let Ok(manifest_path) = std::env::var("DEP_CXX_QT_LIB_CXX_QT_MANIFEST_PATH") {
-        let out_dir = std::path::Path::new(&manifest_path)
-            .parent()
-            .unwrap() // …/cxxqtbuild/
-            .parent()
-            .unwrap(); // …/out/
-        println!("cargo:rustc-link-search=native={}", out_dir.display());
-        println!("cargo:rustc-link-lib=static=cxx-qt-lib-cxxqt-generated");
-        println!("cargo:rustc-link-lib=static:+whole-archive=cxx-qt-call-init-crate_cxx_qt_lib");
+        let manifest_path = std::path::Path::new(&manifest_path);
+        if let Some(out_dir) = manifest_path.parent().and_then(std::path::Path::parent) {
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=static=cxx-qt-lib-cxxqt-generated");
+            println!(
+                "cargo:rustc-link-lib=static:+whole-archive=cxx-qt-call-init-crate_cxx_qt_lib"
+            );
+        } else {
+            eprintln!(
+                "cargo:warning=Unable to resolve cxx-qt-lib output directory from {}",
+                manifest_path.display()
+            );
+        }
     }
 
     // Assemble the QML file list. WebEngine-dependent files are only included
@@ -449,7 +454,11 @@ fn compile_app_icon_cpp() {
         return;
     };
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let Ok(out_dir) = std::env::var("OUT_DIR") else {
+        eprintln!("cargo:warning=app_icon.cpp: OUT_DIR is not set; skipping icon shim");
+        return;
+    };
+    let out_dir = PathBuf::from(out_dir);
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -478,7 +487,11 @@ fn compile_qml_startup_cpp() {
         return;
     };
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let Ok(out_dir) = std::env::var("OUT_DIR") else {
+        eprintln!("cargo:warning=qml_startup.cpp: OUT_DIR is not set; skipping startup shim");
+        return;
+    };
+    let out_dir = PathBuf::from(out_dir);
     let mut build = cc::Build::new();
     build.cpp(true).std("c++17").file("src/ui/qml_startup.cpp");
     configure_qt_cpp_build(
@@ -536,8 +549,16 @@ fn compile_scheme_cpp() {
     let moc = qt_prefix
         .join("bin")
         .join(if cfg!(windows) { "moc.exe" } else { "moc" });
-    let src_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/ui");
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") else {
+        eprintln!("cargo:warning=scheme.cpp: CARGO_MANIFEST_DIR is not set; skipping scheme shim");
+        return;
+    };
+    let Ok(out_dir) = std::env::var("OUT_DIR") else {
+        eprintln!("cargo:warning=scheme.cpp: OUT_DIR is not set; skipping scheme shim");
+        return;
+    };
+    let src_dir = PathBuf::from(manifest_dir).join("src/ui");
+    let out_dir = PathBuf::from(out_dir);
 
     // Tell cargo to rerun when the source changes.
     println!("cargo:rerun-if-changed=src/ui/scheme.cpp");
