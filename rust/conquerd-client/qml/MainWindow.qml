@@ -128,8 +128,21 @@ ApplicationWindow {
         var stroke = Theme.toHex(colorValue || Theme.text).replace("#", "%23")
         return "data:image/svg+xml;utf8,"
             + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'>"
-            + "<rect x='2' y='4' width='16' height='12' stroke='" + stroke + "' stroke-width='1.4'/>"
-            + "<polyline points='2,4 10,11.5 18,4' fill='none' stroke='" + stroke + "' stroke-width='1.4' stroke-linejoin='miter'/>"
+            + "<path d='M3.25 7.75H16.75V16.25H3.25V7.75Z' stroke='" + stroke + "' stroke-width='1.5' stroke-linejoin='round'/>"
+            + "<path d='M3.5 8L10 12.75L16.5 8' stroke='" + stroke + "' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/>"
+            + "<path d='M7.25 3.75H12.75V8.75L10 10.75L7.25 8.75V3.75Z' stroke='" + stroke + "' stroke-width='1.35' stroke-linejoin='round'/>"
+            + "<path d='M15.25 2.75V6.75' stroke='" + stroke + "' stroke-width='1.4' stroke-linecap='round'/>"
+            + "<path d='M13.25 4.75H17.25' stroke='" + stroke + "' stroke-width='1.4' stroke-linecap='round'/>"
+            + "</svg>"
+    }
+
+    function inviteSubmitIconData(colorValue) {
+        var stroke = Theme.toHex(colorValue || Theme.text).replace("#", "%23")
+        return "data:image/svg+xml;utf8,"
+            + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'>"
+            + "<path d='M2.75 8H11.5' stroke='" + stroke + "' stroke-width='1.6' stroke-linecap='round'/>"
+            + "<path d='M8 4.5L11.5 8L8 11.5' stroke='" + stroke + "' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/>"
+            + "<path d='M13.25 3.75V12.25' stroke='" + stroke + "' stroke-width='1.6' stroke-linecap='round'/>"
             + "</svg>"
     }
 
@@ -382,6 +395,7 @@ ApplicationWindow {
         TextField {
             id: inviteField
             Layout.preferredWidth: 220
+            Layout.preferredHeight: Theme.controlHeight
             Layout.alignment: Qt.AlignVCenter
             implicitHeight: Theme.controlHeight
             placeholderText: "Paste invite\u2026"
@@ -406,40 +420,40 @@ ApplicationWindow {
         }
 
         // Connect button (→)
-        Button {
+        Rectangle {
             id: connectBtn
-            implicitWidth: 36
-            implicitHeight: 28
-            Layout.alignment: Qt.AlignVCenter
+            signal clicked()
+            property bool hovered: connectMouse.containsMouse
+            property bool down: connectMouse.pressed
             enabled: inviteField.text.trim().length > 0
-            flat: true
-            Material.foreground: enabled ? Theme.text : Theme.muted
-            background: Rectangle {
-                radius: Theme.radiusMd
-                color: connectBtn.down
-                    ? Theme.selectedFill()
-                    : connectBtn.hovered
-                        ? Theme.bg3
-                        : Theme.bg2
-                border.color: connectBtn.enabled ? Theme.divider : Theme.bg3
-                border.width: 1
-            }
-            contentItem: Item {
-                implicitWidth: 16
-                implicitHeight: 16
+            implicitWidth: 36
+            implicitHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
+            Layout.preferredWidth: 36
+            Layout.preferredHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
+            Layout.minimumHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
+            Layout.maximumHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
+            Layout.alignment: Qt.AlignVCenter
 
-                Image {
-                    anchors.centerIn: parent
-                    source: root.inviteIconData(connectBtn.enabled ? Theme.text : Theme.muted)
-                    sourceSize.width: 16
-                    sourceSize.height: 16
-                    width: 16
-                    height: 16
-                    fillMode: Image.PreserveAspectFit
-                }
+            radius: Theme.radiusMd
+            color: connectBtn.down
+                ? Theme.selectedFill()
+                : connectBtn.hovered
+                    ? Theme.bg3
+                    : Theme.bg2
+            border.color: connectBtn.enabled ? Theme.divider : Theme.bg3
+            border.width: 1
+
+            Image {
+                anchors.centerIn: parent
+                source: root.inviteSubmitIconData(connectBtn.enabled ? Theme.text : Theme.muted)
+                sourceSize.width: 16
+                sourceSize.height: 16
+                width: 16
+                height: 16
+                fillMode: Image.PreserveAspectFit
             }
             ToolTip.text: "Connect to peer / accept invite"
-            ToolTip.visible: hovered
+            ToolTip.visible: connectBtn.hovered
             onClicked: {
                 var u = inviteField.text.trim()
                 if (u.length > 0) {
@@ -447,26 +461,39 @@ ApplicationWindow {
                     inviteField.text = ""
                 }
             }
+
+            MouseArea {
+                id: connectMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: connectBtn.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: if (connectBtn.enabled) connectBtn.clicked()
+            }
         }
 
         // New Invite button
-        Button {
+        Rectangle {
             id: newInviteBtn
-            text: "Invite"
-            implicitHeight: 28
+            signal clicked()
+            property string text: "Invite"
+            property bool hovered: newInviteMouse.containsMouse
+            property bool down: newInviteMouse.pressed
+            implicitHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
             implicitWidth: 82
+            Layout.preferredWidth: 82
+            Layout.preferredHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
+            Layout.minimumHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
+            Layout.maximumHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
             Layout.alignment: Qt.AlignVCenter
-            flat: false
-            Material.foreground: Theme.textInv
-            background: Rectangle {
-                radius: Theme.radiusMd
-                color: newInviteBtn.down
-                    ? Qt.darker(Theme.accent, 1.15)
-                    : newInviteBtn.hovered
-                        ? Qt.lighter(Theme.accent, 1.08)
-                        : Theme.accent
-            }
-            contentItem: Row {
+
+            radius: Theme.radiusMd
+            color: newInviteBtn.down
+                ? Qt.darker(Theme.accent, 1.15)
+                : newInviteBtn.hovered
+                    ? Qt.lighter(Theme.accent, 1.08)
+                    : Theme.accent
+
+            Row {
                 anchors.centerIn: parent
                 spacing: Theme.spacingXs
 
@@ -483,16 +510,24 @@ ApplicationWindow {
                 Text {
                     text: newInviteBtn.text
                     color: Theme.textInv
-                    font: newInviteBtn.font
+                    font.pixelSize: Theme.fontSizeBody
+                    font.weight: Font.DemiBold
                     anchors.verticalCenter: parent.verticalCenter
                     verticalAlignment: Text.AlignVCenter
                 }
             }
             ToolTip.text: "Copy new invite link to clipboard (Ctrl+N)"
-            ToolTip.visible: hovered
+            ToolTip.visible: newInviteBtn.hovered
             onClicked: {
                 backend.copyInvite()
                 invitePopup.visible = true
+            }
+            MouseArea {
+                id: newInviteMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: newInviteBtn.clicked()
             }
             Shortcut {
                 sequence: "Ctrl+N"
