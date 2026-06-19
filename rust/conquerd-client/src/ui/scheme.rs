@@ -22,8 +22,6 @@
 //! `std::free()`. `Box<[u8]>` uses the global allocator, which on all
 //! supported platforms (MSVC, GCC, Clang) is compatible with `free()`.
 
-#![cfg(feature = "webengine")]
-
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -296,12 +294,14 @@ pub unsafe extern "C" fn conquerd_fetch_sync(
 /// Allocate a copy of `src` using the Rust global allocator (compatible with
 /// C `free()` on all supported platforms).
 fn libc_alloc(src: &[u8]) -> *mut u8 {
+    let len = src.len().max(1);
+    let Ok(layout) = std::alloc::Layout::from_size_align(len, 1) else {
+        return std::ptr::null_mut();
+    };
     if src.is_empty() {
         // Return a non-null sentinel that is safe to free.
-        let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
         return unsafe { std::alloc::alloc(layout) };
     }
-    let layout = std::alloc::Layout::from_size_align(src.len(), 1).expect("layout");
     let ptr = unsafe { std::alloc::alloc(layout) };
     if !ptr.is_null() {
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len()) };
