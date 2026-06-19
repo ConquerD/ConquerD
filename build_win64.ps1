@@ -90,6 +90,27 @@ $env:QMAKE = Join-Path $QT_ROOT "bin\qmake6.exe"
 Write-Host "    QMAKE   : $env:QMAKE"
 $WINDEPLOYQT = Join-Path $QT_ROOT "bin\windeployqt6.exe"
 
+function Resolve-VcInstallDir {
+    if ($env:VCINSTALLDIR -and (Test-Path $env:VCINSTALLDIR)) {
+        return $env:VCINSTALLDIR
+    }
+
+    $vswhereCandidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"),
+        (Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe")
+    )
+    foreach ($vswhere in $vswhereCandidates) {
+        if (-not (Test-Path $vswhere)) { continue }
+        $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ($LASTEXITCODE -eq 0 -and $installationPath) {
+            $vcDir = Join-Path $installationPath "VC"
+            if (Test-Path $vcDir) { return $vcDir }
+        }
+    }
+
+    return $null
+}
+
 # Include the Qt WebEngine (Chromium) scheme handler for the in-app node portal
 # (conquerd:// custom scheme). Auto-detected from the Qt install. Override with
 # CONQUERD_NO_WEBENGINE=1 to force-disable (e.g. Qt WebEngine not installed).
@@ -215,12 +236,24 @@ Write-Host "    Copied binaries"
 
 # ── windeployqt6 ─────────────────────────────────────────────────────────────
 Write-Host "`n==> Running windeployqt6..."
+$vcInstallDir = Resolve-VcInstallDir
+$compilerRuntimeArg = if ($vcInstallDir) {
+    $env:VCINSTALLDIR = $vcInstallDir
+    Write-Host "    VC runtime deployment enabled: $vcInstallDir"
+    "--compiler-runtime"
+} else {
+    Write-Host "    VC runtime deployment skipped (Visual C++ tools not found)"
+    "--no-compiler-runtime"
+}
 $_prevPref3 = $ErrorActionPreference; $ErrorActionPreference = "Continue"
-& $WINDEPLOYQT `
-    --qmldir $QML_DIR `
-    --no-translations `
-    --compiler-runtime `
+$windeployArgs = @(
+    "--qmldir", $QML_DIR,
+    "--no-translations",
+    "--skip-plugin-types", "position",
+    $compilerRuntimeArg,
     $BUNDLE_EXE
+)
+& $WINDEPLOYQT @windeployArgs
 $_wdqtExit = $LASTEXITCODE
 $ErrorActionPreference = $_prevPref3
 if ($_wdqtExit -ne 0) { Write-Error "windeployqt6 failed (exit code $_wdqtExit)" }
