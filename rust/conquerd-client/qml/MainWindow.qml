@@ -446,10 +446,10 @@ ApplicationWindow {
             Image {
                 anchors.centerIn: parent
                 source: root.inviteSubmitIconData(connectBtn.enabled ? Theme.text : Theme.muted)
-                sourceSize.width: 16
-                sourceSize.height: 16
-                width: 16
-                height: 16
+                sourceSize.width: 22
+                sourceSize.height: 22
+                width: 22
+                height: 22
                 fillMode: Image.PreserveAspectFit
             }
             ToolTip.text: "Connect to peer / accept invite"
@@ -499,10 +499,10 @@ ApplicationWindow {
 
                 Image {
                     source: root.inviteIconData(Theme.textInv)
-                    sourceSize.width: 16
-                    sourceSize.height: 16
-                    width: 16
-                    height: 16
+                    sourceSize.width: 20
+                    sourceSize.height: 20
+                    width: 20
+                    height: 20
                     anchors.verticalCenter: parent.verticalCenter
                     fillMode: Image.PreserveAspectFit
                 }
@@ -1004,11 +1004,11 @@ ApplicationWindow {
 
                 Button {
                     icon.source: "qrc:/qt/qml/ConquerD/Client/icons/clipboard.svg"
-                    icon.width: 16
-                    icon.height: 16
+                    icon.width: 20
+                    icon.height: 20
                     icon.color: Theme.text
                     implicitHeight: 28
-                    implicitWidth: 36
+                    implicitWidth: 40
                     flat: true
                     Material.foreground: Theme.text
                     ToolTip.text: "Copy to clipboard"
