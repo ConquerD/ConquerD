@@ -1312,13 +1312,19 @@ impl ffi::AppBridge {
 
         let qt_thread = self.qt_thread();
 
-        let rt_thread = std::thread::Builder::new()
+        let rt_thread = match std::thread::Builder::new()
             .name("conquerd-tokio".into())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
+                let rt = match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
-                    .expect("conquerd tokio runtime");
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        error!("failed to create conquerd tokio runtime: {e}");
+                        return;
+                    }
+                };
 
                 // Register the scheme handler callback so conquerd:// URL
                 // fetches can be routed through the ConnectionManager.
@@ -1378,8 +1384,13 @@ impl ffi::AppBridge {
                     }
                     info!("AppBridge event loop exited");
                 });
-            })
-            .expect("failed to spawn conquerd-tokio thread");
+            }) {
+            Ok(thread) => thread,
+            Err(e) => {
+                error!("failed to spawn conquerd-tokio thread: {e}");
+                return;
+            }
+        };
 
         self.as_mut().rust_mut().rt_thread = Some(rt_thread);
     }
@@ -1393,7 +1404,7 @@ impl ffi::AppBridge {
             if !active.is_empty() {
                 let resolved = lookup_list_peer_id(self.rust(), &active);
                 set_active_direct_call_presence(
-                    &mut *self.as_mut().rust_mut(),
+                    &mut self.as_mut().rust_mut(),
                     &active,
                     false,
                     resolved,
@@ -1432,7 +1443,7 @@ impl ffi::AppBridge {
             r.voice_supernode_id.clear();
             r.voice_room_id.clear();
         }
-        clear_room_member_presence(&mut *self.as_mut().rust_mut());
+        clear_room_member_presence(&mut self.as_mut().rust_mut());
         self.as_mut().set_in_room(false);
         self.as_mut().set_voice_active(false);
         emit_peers_updated(self.as_mut());
@@ -1528,8 +1539,7 @@ impl ffi::AppBridge {
         })
         .to_string();
         if self.rust().selected_peer_id == pid {
-            let _ = self
-                .as_mut()
+            self.as_mut()
                 .chat_message_received(QString::from(echo_json.as_str()));
         }
     }
@@ -1556,7 +1566,7 @@ impl ffi::AppBridge {
         self.as_mut().set_voice_active(true);
         {
             let resolved = lookup_list_peer_id(self.rust(), &pid);
-            set_active_direct_call_presence(&mut *self.as_mut().rust_mut(), &pid, true, resolved);
+            set_active_direct_call_presence(&mut self.as_mut().rust_mut(), &pid, true, resolved);
         }
         emit_peers_updated(self.as_mut());
     }
@@ -1946,7 +1956,7 @@ impl ffi::AppBridge {
         self.as_mut().set_voice_active(true);
         {
             let resolved = lookup_list_peer_id(self.rust(), &pid);
-            set_active_direct_call_presence(&mut *self.as_mut().rust_mut(), &pid, true, resolved);
+            set_active_direct_call_presence(&mut self.as_mut().rust_mut(), &pid, true, resolved);
         }
         emit_peers_updated(self.as_mut());
     }
@@ -2047,12 +2057,17 @@ impl ffi::AppBridge {
             let json = if let Some(ps) = self.rust().peer_store.as_ref() {
                 room_participants_json(
                     Some(&ps.read()),
-                    &[my_public_id.clone()],
+                    std::slice::from_ref(&my_public_id),
                     &my_peer_id,
                     &my_public_id,
                 )
             } else {
-                room_participants_json(None, &[my_public_id.clone()], &my_peer_id, &my_public_id)
+                room_participants_json(
+                    None,
+                    std::slice::from_ref(&my_public_id),
+                    &my_peer_id,
+                    &my_public_id,
+                )
             };
             self.as_mut()
                 .participants_updated(QString::from(json.as_str()));
@@ -2124,12 +2139,17 @@ impl ffi::AppBridge {
             let json = if let Some(ps) = self.rust().peer_store.as_ref() {
                 room_participants_json(
                     Some(&ps.read()),
-                    &[my_public_id.clone()],
+                    std::slice::from_ref(&my_public_id),
                     &my_peer_id,
                     &my_public_id,
                 )
             } else {
-                room_participants_json(None, &[my_public_id.clone()], &my_peer_id, &my_public_id)
+                room_participants_json(
+                    None,
+                    std::slice::from_ref(&my_public_id),
+                    &my_peer_id,
+                    &my_public_id,
+                )
             };
             self.as_mut()
                 .participants_updated(QString::from(json.as_str()));
@@ -2684,8 +2704,7 @@ impl ffi::AppBridge {
             .collect();
 
         let array_json = serde_json::Value::Array(msgs).to_string();
-        let _ = self
-            .as_mut()
+        self.as_mut()
             .chat_history_loaded(QString::from(array_json.as_str()));
     }
 
@@ -2702,8 +2721,7 @@ impl ffi::AppBridge {
             .map(chat_message_to_json)
             .collect();
         let array_json = serde_json::Value::Array(msgs).to_string();
-        let _ = self
-            .as_mut()
+        self.as_mut()
             .chat_history_prepended(QString::from(array_json.as_str()));
     }
 
@@ -2805,8 +2823,7 @@ impl ffi::AppBridge {
                 .or_default()
                 .push(json.clone());
         }
-        let _ = self
-            .as_mut()
+        self.as_mut()
             .room_chat_received(QString::from(json.as_str()));
     }
 
@@ -2828,10 +2845,10 @@ impl ffi::AppBridge {
         let pid = peer_id.to_string();
         let raw = file_url.to_string();
         // Accept both file:// URIs and plain absolute paths
-        let path_str = if raw.starts_with("file:///") {
-            raw[8..].replace('/', std::path::MAIN_SEPARATOR_STR)
-        } else if raw.starts_with("file://") {
-            raw[7..].replace('/', std::path::MAIN_SEPARATOR_STR)
+        let path_str = if let Some(stripped) = raw.strip_prefix("file:///") {
+            stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
+        } else if let Some(stripped) = raw.strip_prefix("file://") {
+            stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
         } else {
             raw.clone()
         };
@@ -2865,10 +2882,10 @@ impl ffi::AppBridge {
             return;
         }
         let raw = file_url.to_string();
-        let path_str = if raw.starts_with("file:///") {
-            raw[8..].replace('/', std::path::MAIN_SEPARATOR_STR)
-        } else if raw.starts_with("file://") {
-            raw[7..].replace('/', std::path::MAIN_SEPARATOR_STR)
+        let path_str = if let Some(stripped) = raw.strip_prefix("file:///") {
+            stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
+        } else if let Some(stripped) = raw.strip_prefix("file://") {
+            stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
         } else {
             raw.clone()
         };
@@ -3347,6 +3364,7 @@ fn set_active_direct_call_presence(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn remember_room_in_store(
     room_store: &Option<Arc<RwLock<crate::room_store::RoomStore>>>,
     supernode_id: &str,
@@ -3875,7 +3893,7 @@ fn dispatch_event(
                     .set_session_banner(QString::from(banner.as_str()));
                 bridge.as_mut().set_connection_mode(QString::from("direct"));
                 if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
-                    mark_direct_connected(&mut *bridge.as_mut().rust_mut(), &pid, true);
+                    mark_direct_connected(&mut bridge.as_mut().rust_mut(), &pid, true);
                 }
                 emit_peers_updated(bridge.as_mut());
                 // Auto-broadcast own avatar config to the newly connected peer.
@@ -3903,7 +3921,7 @@ fn dispatch_event(
                     .as_mut()
                     .set_connection_mode(QString::from("offline"));
                 if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
-                    mark_direct_connected(&mut *bridge.as_mut().rust_mut(), &pid, false);
+                    mark_direct_connected(&mut bridge.as_mut().rust_mut(), &pid, false);
                 }
                 emit_peers_updated(bridge.as_mut());
             });
@@ -4088,7 +4106,7 @@ fn dispatch_event(
                 {
                     let resolved = lookup_list_peer_id(bridge.rust(), &peer_id);
                     set_active_direct_call_presence(
-                        &mut *bridge.as_mut().rust_mut(),
+                        &mut bridge.as_mut().rust_mut(),
                         &peer_id,
                         true,
                         resolved,
@@ -4110,7 +4128,7 @@ fn dispatch_event(
                     if !active.is_empty() {
                         let resolved = lookup_list_peer_id(bridge.rust(), &active);
                         set_active_direct_call_presence(
-                            &mut *bridge.as_mut().rust_mut(),
+                            &mut bridge.as_mut().rust_mut(),
                             &active,
                             false,
                             resolved,
@@ -4396,7 +4414,7 @@ fn dispatch_event(
 
                     {
                         let pids = resolved_room_member_pids(bridge.rust(), &members);
-                        apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
+                        apply_room_member_presence(&mut bridge.as_mut().rust_mut(), &pids);
                     }
                     let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
                         room_participants_json(
@@ -4464,7 +4482,7 @@ fn dispatch_event(
                     let ids = bridge.rust().room_participant_ids.clone();
                     {
                         let pids = resolved_room_member_pids(bridge.rust(), &ids);
-                        apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
+                        apply_room_member_presence(&mut bridge.as_mut().rust_mut(), &pids);
                     }
                     let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
                         room_participants_json(Some(&ps.read()), &ids, &my_peer_id, &my_public_id)
@@ -4511,7 +4529,7 @@ fn dispatch_event(
                     let ids = bridge.rust().room_participant_ids.clone();
                     {
                         let pids = resolved_room_member_pids(bridge.rust(), &ids);
-                        apply_room_member_presence(&mut *bridge.as_mut().rust_mut(), &pids);
+                        apply_room_member_presence(&mut bridge.as_mut().rust_mut(), &pids);
                     }
                     let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
                         room_participants_json(Some(&ps.read()), &ids, &my_peer_id, &my_public_id)
@@ -4630,7 +4648,7 @@ fn dispatch_event(
                     return;
                 }
                 if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
-                    mark_peer_online(&mut *bridge.as_mut().rust_mut(), &pid, true);
+                    mark_peer_online(&mut bridge.as_mut().rust_mut(), &pid, true);
                 }
                 emit_peers_updated(bridge.as_mut());
             });
@@ -4693,7 +4711,7 @@ fn dispatch_event(
                     return;
                 }
                 if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
-                    mark_peer_online(&mut *bridge.as_mut().rust_mut(), &pid, online);
+                    mark_peer_online(&mut bridge.as_mut().rust_mut(), &pid, online);
                 }
                 emit_peers_updated(bridge.as_mut());
             });
@@ -4713,7 +4731,7 @@ fn dispatch_event(
                     return;
                 }
                 if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
-                    mark_peer_online(&mut *bridge.as_mut().rust_mut(), &pid, true);
+                    mark_peer_online(&mut bridge.as_mut().rust_mut(), &pid, true);
                 }
                 emit_peers_updated(bridge.as_mut());
                 bridge.as_mut().peer_added(
