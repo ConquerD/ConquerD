@@ -59,14 +59,9 @@ fn default_purpose() -> String {
 // Rust state
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub struct FileTransferModelRust {
     rows: Vec<TransferRow>,
-}
-
-impl Default for FileTransferModelRust {
-    fn default() -> Self {
-        Self { rows: Vec::new() }
-    }
 }
 
 // ---------------------------------------------------------------------------
