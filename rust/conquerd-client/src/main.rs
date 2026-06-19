@@ -10,9 +10,11 @@
 
 // Suppress the Windows console window unless the `console` feature is enabled.
 #![cfg_attr(all(windows, not(feature = "console")), windows_subsystem = "windows")]
-// Headless builds compile the full crate but only exercise a subset of modules;
-// Qt-only surfaces are feature-gated below, and remaining unused items are expected.
-#![cfg_attr(not(feature = "qt-ui"), allow(dead_code))]
+// The client crate has multiple entry surfaces: Qt/QML production UI, headless
+// integration mode, and framework modules that are activated by negotiated
+// features. Rust cannot see QML/runtime entrypoints, so keep these warnings out
+// of local and release builds while preserving the public module surface.
+#![allow(dead_code, unused_imports)]
 
 mod avatar_config;
 #[cfg(feature = "qt-ui")]
