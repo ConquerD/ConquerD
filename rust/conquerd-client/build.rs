@@ -421,7 +421,7 @@ fn configure_qt_cpp_build(build: &mut cc::Build, qt_prefix: &std::path::Path, mo
     }
 }
 
-#[cfg(feature = "qt-ui")]
+#[cfg(all(feature = "qt-ui", feature = "webengine"))]
 fn qt_header_exists(qt_prefix: &std::path::Path, module: &str, header: &str) -> bool {
     let headers = qt_install_headers(qt_prefix);
     if headers.join(module).join(header).exists() {

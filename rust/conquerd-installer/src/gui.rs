@@ -148,6 +148,7 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 

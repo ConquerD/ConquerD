@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -22,21 +23,6 @@ pub(super) async fn run_quic_peer_session(
     peer_id: String,
     internal_tx: mpsc::Sender<InternalEvent>,
 ) {
-    let (mut send_stream, mut recv_stream) = match connection.open_bi().await {
-        Ok(streams) => streams,
-        Err(e) => {
-            warn!(
-                "Failed to open signaling stream to {}: {e}",
-                &peer_id[..8.min(peer_id.len())]
-            );
-            let _ = internal_tx
-                .send(InternalEvent::QuicDisconnected { peer_id })
-                .await;
-            return;
-        }
-    };
-
-    // Channel for the connection manager to push outbound signaling bytes.
     let (sig_tx, mut sig_rx) = mpsc::channel::<Vec<u8>>(64);
 
     let _ = internal_tx
@@ -92,14 +78,28 @@ pub(super) async fn run_quic_peer_session(
     let peer_id_r = peer_id.clone();
 
     // Spawn a task to write outbound messages
+    let write_conn = connection.clone();
     let write_task = tokio::spawn(async move {
         while let Some(bytes) = sig_rx.recv().await {
+            let mut send_stream = match write_conn.open_uni().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!(
+                        "Failed to open QUIC signaling stream to {}: {e}",
+                        &peer_id_w[..8.min(peer_id_w.len())]
+                    );
+                    break;
+                }
+            };
             // Length-prefix framing: 4-byte big-endian length + payload
             let len = (bytes.len() as u32).to_be_bytes();
             if send_stream.write_all(&len).await.is_err() {
                 break;
             }
             if send_stream.write_all(&bytes).await.is_err() {
+                break;
+            }
+            if send_stream.finish().is_err() {
                 break;
             }
         }
@@ -110,32 +110,36 @@ pub(super) async fn run_quic_peer_session(
     });
 
     // Read loop: length-prefixed frames
-    let mut len_buf = [0u8; 4];
     loop {
-        match recv_stream.read_exact(&mut len_buf).await {
-            Ok(()) => {}
-            Err(_) => break,
-        }
-        let frame_len = u32::from_be_bytes(len_buf) as usize;
-        if frame_len > 4 * 1024 * 1024 {
-            // Guard: refuse >4 MiB signaling frames
-            warn!(
-                "QUIC signaling frame too large ({frame_len} bytes) from {}",
-                &peer_id_r[..8.min(peer_id_r.len())]
-            );
-            break;
-        }
-        let mut payload = vec![0u8; frame_len];
-        match recv_stream.read_exact(&mut payload).await {
-            Ok(()) => {
-                let _ = internal_tx
-                    .send(InternalEvent::QuicSignalingData {
-                        peer_id: peer_id_r.clone(),
-                        data: payload,
-                    })
-                    .await;
+        tokio::select! {
+            stream = connection.accept_uni() => {
+                match stream {
+                    Ok(recv_stream) => {
+                        if !read_quic_signaling_stream(
+                            recv_stream,
+                            &peer_id_r,
+                            &internal_tx,
+                        ).await {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
-            Err(_) => break,
+            stream = connection.accept_bi() => {
+                match stream {
+                    Ok((_send_stream, recv_stream)) => {
+                        if !read_quic_signaling_stream(
+                            recv_stream,
+                            &peer_id_r,
+                            &internal_tx,
+                        ).await {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         }
     }
 
@@ -144,4 +148,38 @@ pub(super) async fn run_quic_peer_session(
     let _ = internal_tx
         .send(InternalEvent::QuicDisconnected { peer_id: peer_id_r })
         .await;
+}
+
+async fn read_quic_signaling_stream(
+    mut recv_stream: quinn::RecvStream,
+    peer_id: &str,
+    internal_tx: &mpsc::Sender<InternalEvent>,
+) -> bool {
+    let mut len_buf = [0u8; 4];
+    loop {
+        match recv_stream.read_exact(&mut len_buf).await {
+            Ok(()) => {}
+            Err(_) => return true,
+        }
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        if frame_len > 4 * 1024 * 1024 {
+            warn!(
+                "QUIC signaling frame too large ({frame_len} bytes) from {}",
+                &peer_id[..8.min(peer_id.len())]
+            );
+            return false;
+        }
+        let mut payload = vec![0u8; frame_len];
+        match recv_stream.read_exact(&mut payload).await {
+            Ok(()) => {
+                let _ = internal_tx
+                    .send(InternalEvent::QuicSignalingData {
+                        peer_id: peer_id.to_owned(),
+                        data: payload,
+                    })
+                    .await;
+            }
+            Err(_) => return true,
+        }
+    }
 }

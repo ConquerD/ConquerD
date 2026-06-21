@@ -623,6 +623,7 @@ async fn handle_event(
         | ConnectionEvent::RoomCreated { .. }
         | ConnectionEvent::PresenceUpdated { .. }
         | ConnectionEvent::InviteAccepted { .. }
+        | ConnectionEvent::InviteFailed { .. }
         | ConnectionEvent::FileOffered { .. }
         | ConnectionEvent::FileProgress { .. }
         | ConnectionEvent::FileComplete { .. }

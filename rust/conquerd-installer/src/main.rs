@@ -336,8 +336,15 @@ fn main() -> anyhow::Result<()> {
         return run_silent(&archive, &base_dir, &cli);
     }
 
-    // ── GUI mode ────────────────────────────────────────────────────────
-    // Read current install state to decide the starting flow
+    // No local .7z beside the installer — use the headless GitHub
+    // install/update/launch path. The egui UI is only needed for on-disk
+    // archive installs (and --repair); opening it without a local archive
+    // hits the Launching/download flow and has been observed to crash on Win10.
+    if archive.is_none() {
+        return run_launch(&base_dir, &cli.repo);
+    }
+
+    // ── GUI mode (local .7z detected) ───────────────────────────────────
     let install_state =
         state::read_state(&base_dir).unwrap_or_else(|_| state::InstallState::empty());
 
@@ -373,14 +380,28 @@ fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    // No valid install — fall through to GUI installer
-    log!("No installed version found. Starting installer…");
-    let install_state = st;
+    // Fresh install without a local .7z — download from GitHub silently.
+    log!("No installed version found. Installing from GitHub…");
+    if run_update_and_relaunch(base_dir, repo, false, true).is_ok() {
+        let after = state::read_state(base_dir)?;
+        if launchable_current_dir(&after).is_some() {
+            return Ok(());
+        }
+        log!("Silent install finished but ConquerD.exe is still missing.");
+    } else {
+        log!("Silent install failed.");
+    }
+
+    // Network/manifest/extract failure — last resort UI (may still fail on
+    // some Win10 GPU stacks; check installer.log for the root error).
+    log!("Opening installer UI…");
+    let install_state =
+        state::read_state(base_dir).unwrap_or_else(|_| state::InstallState::empty());
     gui::run_gui(gui::GuiConfig {
         archive: None,
         base_dir: base_dir.to_path_buf(),
         no_shortcuts: false,
-        repo: "ConquerD/ConquerD".to_string(),
+        repo: repo.to_string(),
         kill: false,
         install_state,
         repair: false,

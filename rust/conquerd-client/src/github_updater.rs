@@ -175,11 +175,12 @@ impl Updater {
                                 }
                             }
                         }
-                        UpdaterCommand::ApplyUpdate(rel) => {
+                        UpdaterCommand::ApplyUpdate(_rel) => {
                             if let Some(path) = &self.installer_path {
                                 match std::process::Command::new(path)
-                                    .arg("--install")
-                                    .arg(rel.tag_name)
+                                    .arg("--update-and-relaunch")
+                                    .arg("--silent")
+                                    .arg("--kill")
                                     .spawn()
                                 {
                                     Ok(_) => {

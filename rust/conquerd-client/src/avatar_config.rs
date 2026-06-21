@@ -175,7 +175,30 @@ pub struct AvatarPattern {
     pub shades: Vec<u8>,
 }
 
+/// Normalize any peer identifier to the base64url `identity_pub` avatar seed.
+///
+/// Settings, SFU rooms, and peer avatars all hash `identity_pub`. The Peers
+/// rail passes hex `peer_id`; resolve it via `resolve_identity_pub` when known.
+pub fn avatar_seed_id(
+    raw_id: &str,
+    my_public_id: &str,
+    my_peer_id: &str,
+    resolve_identity_pub: impl Fn(&str) -> Option<String>,
+) -> String {
+    if raw_id == my_public_id || raw_id == my_peer_id {
+        return my_public_id.to_owned();
+    }
+    if let Some(identity_pub) = resolve_identity_pub(raw_id) {
+        if !identity_pub.is_empty() {
+            return identity_pub;
+        }
+    }
+    raw_id.to_owned()
+}
+
 /// Derive a deterministic pattern from `peer_id` and `config`.
+///
+/// `peer_id` is the avatar seed (base64url `identity_pub` for known peers).
 ///
 /// - Cells: SHA-512(peer_id) → `ceil(grid/2) × grid` left half, mirrored.
 ///   Center column is not double-mirrored for odd `grid` sizes.
@@ -541,6 +564,39 @@ mod tests {
     }
     fn untrusted_cfg() -> AvatarConfig {
         AvatarConfig::untrusted()
+    }
+
+    #[test]
+    fn avatar_seed_id_maps_hex_peer_id_to_identity_pub() {
+        let hex = "4a6a66375f593a81b6e155c8db2aee144d9bfb7729219a95fc959a3b6e6250f6";
+        let b64 = "LLgFfmkf9zL3mKUbLNJ-5722nCtF6gRr-PXZ7Z5_6DU=";
+        let lookup = |id: &str| {
+            if id == b64 || id == hex {
+                Some(b64.to_owned())
+            } else {
+                None
+            }
+        };
+        assert_eq!(avatar_seed_id(b64, b64, hex, lookup), b64);
+        assert_eq!(avatar_seed_id(hex, b64, hex, lookup), b64);
+        assert_eq!(
+            avatar_seed_id(hex, b64, "other_local_peer_id", |_| None),
+            hex
+        );
+    }
+
+    #[test]
+    fn hex_peer_id_and_public_id_produce_same_avatar_pattern() {
+        let hex = "4a6a66375f593a81b6e155c8db2aee144d9bfb7729219a95fc959a3b6e6250f6";
+        let b64 = "LLgFfmkf9zL3mKUbLNJ-5722nCtF6gRr-PXZ7Z5_6DU=";
+        let cfg = default_cfg();
+        let from_b64 = pattern_for_peer(b64, &cfg);
+        let from_hex = pattern_for_peer(
+            &avatar_seed_id(hex, b64, hex, |_| Some(b64.to_owned())),
+            &cfg,
+        );
+        assert_eq!(from_hex.hue, from_b64.hue);
+        assert_eq!(from_hex.cells, from_b64.cells);
     }
 
     #[test]

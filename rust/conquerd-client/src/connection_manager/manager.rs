@@ -46,6 +46,34 @@ fn unix_now_f64() -> f64 {
         .unwrap_or(0.0)
 }
 
+fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
+    let trimmed = hint.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = trimmed
+        .strip_prefix("quic://")
+        .or_else(|| trimmed.strip_prefix("udp://"))
+        .unwrap_or(trimmed);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    if authority.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = authority.parse::<SocketAddr>() {
+        return Some((addr.ip().to_string(), addr.port()));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    let host = host.trim_matches(['[', ']']);
+    let port = port.parse::<u16>().ok()?;
+    if host.is_empty() || port == 0 {
+        return None;
+    }
+    Some((host.to_owned(), port))
+}
+
 /// The central connection manager.
 ///
 /// Call [`ConnectionManager::run`] in a tokio task to drive all I/O. The
@@ -58,6 +86,7 @@ pub struct ConnectionManager {
     cmd_rx: mpsc::Receiver<ConnectionCommand>,
 
     peers: HashMap<String, PeerConnection>,
+    quic_peer_aliases: HashMap<String, String>,
     supernodes: HashMap<String, SupernodeSession>,
 
     /// Quinn QUIC endpoint (lazily created on first use).
@@ -157,6 +186,7 @@ impl ConnectionManager {
             event_tx,
             cmd_rx,
             peers: HashMap::new(),
+            quic_peer_aliases: HashMap::new(),
             supernodes: HashMap::new(),
             quic_endpoint: None,
             internal_tx,
@@ -351,6 +381,9 @@ impl ConnectionManager {
                         }
                         ConnectionCommand::AcceptInvite { invite_url } => {
                             self.handle_accept_invite(invite_url).await;
+                        }
+                        ConnectionCommand::GenerateInvite { reply_tx } => {
+                            let _ = reply_tx.send(self.generate_invite_url());
                         }
                         ConnectionCommand::SendFile { peer_id, rel_path, data, purpose } => {
                             let old = self.file_mgr.get_old_data(&rel_path);
@@ -863,6 +896,25 @@ impl ConnectionManager {
                     return;
                 }
             };
+            let actual_peer_id = connection
+                .peer_identity()
+                .and_then(|id| id.downcast::<Vec<rustls::pki_types::CertificateDer>>().ok())
+                .and_then(|certs| certs.first().cloned())
+                .and_then(|cert| quic_tls::cn_from_cert_der(&cert))
+                .and_then(|cn| {
+                    let pub_bytes = hex::decode(&cn).ok()?;
+                    Some(quic_tls::peer_id_from_pub_bytes(&pub_bytes))
+                });
+            if actual_peer_id.as_deref() != Some(peer_id_owned.as_str()) {
+                warn!(
+                    "QUIC peer id mismatch for {addr}: expected {}, got {}; waiting for signed invite handshake",
+                    &peer_id_owned[..8.min(peer_id_owned.len())],
+                    actual_peer_id
+                        .as_deref()
+                        .map(|id| &id[..8.min(id.len())])
+                        .unwrap_or("<none>")
+                );
+            }
 
             info!(
                 "QUIC connected to {addr} (peer {})",
@@ -933,6 +985,7 @@ impl ConnectionManager {
                 let _ = self
                     .event_tx
                     .try_send(ConnectionEvent::PeerConnected(peer_id.clone()));
+                self.send_pending_invite_inits_for_peer(&peer_id).await;
                 // Send capability announce to the newly-connected peer.
                 self.send_capability_announce(&peer_id).await;
                 // Also send build attestation so the peer knows our reproducible build ID.
@@ -945,6 +998,7 @@ impl ConnectionManager {
                 jitter_ms,
                 bandwidth_kbps,
             } => {
+                let peer_id = self.resolve_quic_peer_alias(&peer_id);
                 self.transport_stats.insert(
                     peer_id,
                     PeerTransportStats {
@@ -956,32 +1010,42 @@ impl ConnectionManager {
                 );
             }
             InternalEvent::QuicDisconnected { peer_id } => {
-                self.transport_stats.remove(&peer_id);
+                let canonical_peer_id = self.resolve_quic_peer_alias(&peer_id);
+                self.quic_peer_aliases.remove(&peer_id);
+                self.transport_stats.remove(&canonical_peer_id);
                 if let Some(conn) = self.peers.get_mut(&peer_id) {
                     conn.state = PeerConnectionState::Disconnected;
                     conn.quic_sig_tx = None;
                 }
+                if canonical_peer_id != peer_id {
+                    if let Some(conn) = self.peers.get_mut(&canonical_peer_id) {
+                        conn.state = PeerConnectionState::Disconnected;
+                        conn.quic_sig_tx = None;
+                    }
+                }
                 // Release inbound and outbound quota state so the next
                 // connection starts with fresh token buckets.
-                self.feature_registry.clear_peer_quotas(&peer_id);
-                self.feature_registry.clear_peer_outbound_quotas(&peer_id);
+                self.feature_registry.clear_peer_quotas(&canonical_peer_id);
+                self.feature_registry
+                    .clear_peer_outbound_quotas(&canonical_peer_id);
                 // Release replay-window state for this peer.
-                self.replay_guard.forget_peer(&peer_id);
+                self.replay_guard.forget_peer(&canonical_peer_id);
                 // Remove stale capability advertisement so a reconnecting
                 // peer is forced to re-announce before invoking features.
                 // Without this, entries accumulate for every connect/disconnect
                 // cycle and the intersection check could honour capabilities
                 // from a stale session.
-                self.peer_capabilities.remove(&peer_id);
+                self.peer_capabilities.remove(&canonical_peer_id);
                 info!(
                     "Peer {} QUIC disconnected",
-                    &peer_id[..8.min(peer_id.len())]
+                    &canonical_peer_id[..8.min(canonical_peer_id.len())]
                 );
                 let _ = self
                     .event_tx
-                    .try_send(ConnectionEvent::PeerDisconnected(peer_id));
+                    .try_send(ConnectionEvent::PeerDisconnected(canonical_peer_id));
             }
             InternalEvent::QuicSignalingData { peer_id, data } => {
+                let canonical_peer_id = self.resolve_quic_peer_alias(&peer_id);
                 // The QUIC peer stream multiplexes several channels via a
                 // 1-byte leading tag. `classify` accepts both the tagged
                 // framing and legacy untagged JSON (leading `{`) so a peer
@@ -996,18 +1060,18 @@ impl ConnectionManager {
                             // the handshake) rather than the embedded id.
                             if !self.check_inbound_feature_quota(
                                 "core.audio.opus",
-                                &peer_id,
+                                &canonical_peer_id,
                                 opus_data.len(),
                             ) {
                                 debug!(
                                     "[core.audio.opus] inbound quota exceeded for {}; dropping frame",
-                                    &peer_id[..8.min(peer_id.len())]
+                                    &canonical_peer_id[..8.min(canonical_peer_id.len())]
                                 );
                             } else {
                                 let _ =
                                     self.event_tx
                                         .try_send(ConnectionEvent::DirectAudioReceived {
-                                            peer_id,
+                                            peer_id: canonical_peer_id,
                                             opus_data,
                                         });
                             }
@@ -1025,7 +1089,7 @@ impl ConnectionManager {
                     ) => {
                         if let Ok(text) = std::str::from_utf8(body) {
                             if let Ok(msg) = SignalingMessage::from_json(text) {
-                                self.handle_inbound(msg).await;
+                                self.handle_inbound_from_quic(peer_id.clone(), msg).await;
                             } else {
                                 debug!("Non-JSON QUIC signaling data from {peer_id}");
                             }
@@ -1917,7 +1981,71 @@ impl ConnectionManager {
             .is_some_and(|rec| !rec.blocked && !rec.revoked)
     }
 
+    fn canonical_peer_id_for_sender(&self, sender: &str) -> String {
+        let store = self.peer_store.read();
+        store
+            .get(sender)
+            .or_else(|| store.get_by_identity(sender))
+            .map(|rec| rec.peer_id.clone())
+            .unwrap_or_else(|| sender.to_owned())
+    }
+
+    fn resolve_quic_peer_alias(&self, peer_id: &str) -> String {
+        self.quic_peer_aliases
+            .get(peer_id)
+            .cloned()
+            .unwrap_or_else(|| peer_id.to_owned())
+    }
+
+    fn relabel_quic_peer_session(&mut self, current_peer_id: &str, canonical_peer_id: &str) {
+        if current_peer_id == canonical_peer_id || canonical_peer_id.is_empty() {
+            return;
+        }
+        if canonical_peer_id == self.identity.peer_id() {
+            warn!(
+                "Ignoring QUIC relabel from {} to local peer id {}",
+                &current_peer_id[..8.min(current_peer_id.len())],
+                &canonical_peer_id[..8.min(canonical_peer_id.len())]
+            );
+            return;
+        }
+
+        let Some(mut provisional) = self.peers.remove(current_peer_id) else {
+            return;
+        };
+        provisional.peer_id = canonical_peer_id.to_owned();
+        let entry = self
+            .peers
+            .entry(canonical_peer_id.to_owned())
+            .or_insert_with(|| PeerConnection::new(canonical_peer_id));
+        entry.state = provisional.state;
+        entry.quic_sig_tx = provisional.quic_sig_tx.take();
+        entry.connected_at = provisional.connected_at;
+
+        if let Some(stats) = self.transport_stats.remove(current_peer_id) {
+            self.transport_stats
+                .insert(canonical_peer_id.to_owned(), stats);
+        }
+        self.quic_peer_aliases
+            .insert(current_peer_id.to_owned(), canonical_peer_id.to_owned());
+
+        info!(
+            "QUIC peer relabeled {} -> {} after signed invite handshake",
+            &current_peer_id[..8.min(current_peer_id.len())],
+            &canonical_peer_id[..8.min(canonical_peer_id.len())]
+        );
+    }
+
+    async fn handle_inbound_from_quic(&mut self, transport_peer_id: String, msg: SignalingMessage) {
+        self.handle_inbound_inner(msg, Some(transport_peer_id))
+            .await;
+    }
+
     async fn handle_inbound(&mut self, msg: SignalingMessage) {
+        self.handle_inbound_inner(msg, None).await;
+    }
+
+    async fn handle_inbound_inner(&mut self, msg: SignalingMessage, quic_peer_id: Option<String>) {
         // Enforce signed-transcript model: every inbound signaling message
         // MUST carry a valid Ed25519 signature over its canonical bytes,
         // signed by the key whose public_id is `msg.sender`. Drop silently
@@ -1973,6 +2101,7 @@ impl ConnectionManager {
                 debug!("Pong from {}", msg.sender);
             }
             MessageType::ChatMessage => {
+                let sender_peer_id = self.canonical_peer_id_for_sender(&msg.sender);
                 // Approximate payload size for the chat-feature quota.
                 let payload_size = msg
                     .payload
@@ -2006,13 +2135,13 @@ impl ConnectionManager {
                 if !msg_id.is_empty() {
                     let mut ack =
                         SignalingMessage::new(MessageType::ChatAck, self.identity.public_id());
-                    ack.target = Some(msg.sender.clone());
+                    ack.target = Some(sender_peer_id.clone());
                     ack.payload
                         .insert("message_id".to_string(), Value::String(msg_id.clone()));
                     self.dispatch_outbound(ack).await;
                 }
                 let _ = self.event_tx.try_send(ConnectionEvent::ChatMessage {
-                    peer_id: msg.sender.clone(),
+                    peer_id: sender_peer_id,
                     message_id: msg_id,
                     body,
                     timestamp: msg.timestamp,
@@ -2020,6 +2149,7 @@ impl ConnectionManager {
                 });
             }
             MessageType::ChatAck => {
+                let sender_peer_id = self.canonical_peer_id_for_sender(&msg.sender);
                 // Tiny payload — use a minimal probe so chat-ack stays under
                 // the same quota umbrella as chat messages.
                 if !self.gate_through_feature("core.chat.v1", &msg.sender, &[]) {
@@ -2032,23 +2162,23 @@ impl ConnectionManager {
                     .unwrap_or("")
                     .to_owned();
                 let _ = self.event_tx.try_send(ConnectionEvent::ChatAck {
-                    peer_id: msg.sender.clone(),
+                    peer_id: sender_peer_id,
                     message_id: msg_id,
                 });
             }
             MessageType::CallRequest => {
                 let _ = self.event_tx.try_send(ConnectionEvent::CallRequest {
-                    peer_id: msg.sender.clone(),
+                    peer_id: self.canonical_peer_id_for_sender(&msg.sender),
                 });
             }
             MessageType::CallAccept => {
                 let _ = self.event_tx.try_send(ConnectionEvent::CallAccepted {
-                    peer_id: msg.sender.clone(),
+                    peer_id: self.canonical_peer_id_for_sender(&msg.sender),
                 });
             }
             MessageType::CallEnd | MessageType::CallReject => {
                 let _ = self.event_tx.try_send(ConnectionEvent::CallEnded {
-                    peer_id: msg.sender.clone(),
+                    peer_id: self.canonical_peer_id_for_sender(&msg.sender),
                 });
             }
             MessageType::ChatTyping => {
@@ -2061,7 +2191,7 @@ impl ConnectionManager {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let _ = self.event_tx.try_send(ConnectionEvent::TypingIndicator {
-                    peer_id: msg.sender.clone(),
+                    peer_id: self.canonical_peer_id_for_sender(&msg.sender),
                     is_typing,
                 });
             }
@@ -2072,47 +2202,40 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                let sender_peer_id = self.canonical_peer_id_for_sender(&msg.sender);
                 if !handle.is_empty() {
                     // Persist updated handle in peer store
                     let mut store = self.peer_store.write();
-                    if let Some(rec) = store.get_mut(&msg.sender) {
+                    if let Some(rec) = store.get_mut(&sender_peer_id) {
                         rec.handle = handle.clone();
                     }
                     let _ = store.save();
                     drop(store);
                 }
                 let _ = self.event_tx.try_send(ConnectionEvent::HandleUpdated {
-                    peer_id: msg.sender.clone(),
+                    peer_id: sender_peer_id,
                     handle,
                 });
             }
             MessageType::AvatarConfig => {
-                // Only accept avatar configs from peers that have completed the
-                // Ed25519 handshake, indicated by a non-empty identity_pub.
-                // (transcript_hash was the intended field but is never populated.)
-                let sender = msg.sender.clone();
-                let trusted = {
-                    let store = self.peer_store.read();
-                    store
-                        .get(&sender)
-                        .map(|r| !r.identity_pub.is_empty())
-                        .unwrap_or(false)
-                };
-                if trusted {
-                    // Deserialize from the "config" sub-object in the payload.
-                    if let Some(cfg_val) = msg.payload.get("config") {
-                        if let Ok(cfg) = serde_json::from_value::<PeerAvatarConfig>(cfg_val.clone())
-                        {
-                            let mut store = self.peer_store.write();
-                            if let Some(rec) = store.get_mut(&sender) {
-                                rec.avatar_config = Some(cfg);
-                            }
-                            let _ = store.save();
-                            drop(store);
-                            let _ = self
-                                .event_tx
-                                .try_send(ConnectionEvent::AvatarConfigUpdated { peer_id: sender });
+                if !Self::is_trusted_sender(&self.peer_store, &msg.sender) {
+                    return;
+                }
+                let sender_peer_id = self.canonical_peer_id_for_sender(&msg.sender);
+                // Deserialize from the "config" sub-object in the payload.
+                if let Some(cfg_val) = msg.payload.get("config") {
+                    if let Ok(cfg) = serde_json::from_value::<PeerAvatarConfig>(cfg_val.clone()) {
+                        let mut store = self.peer_store.write();
+                        if let Some(rec) = store.get_mut(&sender_peer_id) {
+                            rec.avatar_config = Some(cfg);
                         }
+                        let _ = store.save();
+                        drop(store);
+                        let _ = self
+                            .event_tx
+                            .try_send(ConnectionEvent::AvatarConfigUpdated {
+                                peer_id: sender_peer_id,
+                            });
                     }
                 }
             }
@@ -2603,6 +2726,9 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                if let Some(ref transport_peer_id) = quic_peer_id {
+                    self.relabel_quic_peer_session(transport_peer_id, &joiner_peer_id);
+                }
                 info!(
                     "InviteHandshakeInit from {} (id={})",
                     &joiner_identity_pub[..8.min(joiner_identity_pub.len())],
@@ -2630,7 +2756,16 @@ impl ConnectionManager {
                 let peer_id_str = self.identity.peer_id();
                 let mut reply =
                     SignalingMessage::new(MessageType::InviteHandshakeAccept, sender.clone());
-                reply.target = Some(joiner_identity_pub.clone());
+                let direct_joiner_connected = self
+                    .peers
+                    .get(&joiner_peer_id)
+                    .map(|peer| peer.state == PeerConnectionState::Connected)
+                    .unwrap_or(false);
+                reply.target = Some(if direct_joiner_connected {
+                    joiner_peer_id.clone()
+                } else {
+                    joiner_identity_pub.clone()
+                });
                 reply
                     .payload
                     .insert("invite_id".into(), Value::String(invite_id));
@@ -2678,6 +2813,22 @@ impl ConnectionManager {
                     .to_owned();
 
                 if let Some(pending) = self.pending_invites.remove(&invite_id) {
+                    if inviter_identity_pub != pending.inviter_identity_pub
+                        || inviter_peer_id != pending.inviter_peer_id
+                    {
+                        warn!(
+                            "InviteHandshakeAccept identity mismatch for invite_id={invite_id}: expected {}/{}, got {}/{}",
+                            &pending.inviter_identity_pub
+                                [..8.min(pending.inviter_identity_pub.len())],
+                            &pending.inviter_peer_id[..8.min(pending.inviter_peer_id.len())],
+                            &inviter_identity_pub[..8.min(inviter_identity_pub.len())],
+                            &inviter_peer_id[..8.min(inviter_peer_id.len())],
+                        );
+                        return;
+                    }
+                    if let Some(ref transport_peer_id) = quic_peer_id {
+                        self.relabel_quic_peer_session(transport_peer_id, &inviter_peer_id);
+                    }
                     info!(
                         "InviteHandshakeAccept from {} (id={})",
                         &inviter_identity_pub[..8.min(inviter_identity_pub.len())],
@@ -2973,13 +3124,106 @@ impl ConnectionManager {
 
     // -- invite acceptance ---------------------------------------------------
 
+    fn generate_invite_url(&mut self) -> Option<String> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        if !self.ensure_quic_endpoint(0) {
+            return None;
+        }
+        let port = self
+            .quic_endpoint
+            .as_ref()
+            .and_then(|ep| ep.local_addr().ok())
+            .map(|addr| addr.port())?;
+        if port == 0 {
+            return None;
+        }
+
+        let invite_id = uuid::Uuid::new_v4().to_string();
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + 900;
+        let payload = serde_json::json!({
+            "inviter_peer_id": self.identity.peer_id(),
+            "inviter_identity_pub": self.identity.public_id(),
+            "invite_id": invite_id,
+            "expires_at": expires_at,
+            "lan_hint": format!("quic://127.0.0.1:{port}"),
+        });
+        let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        Some(format!("conquerd://invite#{encoded}"))
+    }
+
+    fn emit_invite_failed(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        warn!("AcceptInvite: {reason}");
+        let _ = self
+            .event_tx
+            .try_send(ConnectionEvent::InviteFailed { reason });
+    }
+
+    fn build_invite_handshake_init(
+        &self,
+        pending: &PendingInvite,
+        target: String,
+    ) -> SignalingMessage {
+        let sender = self.identity.public_id();
+        let joiner_peer_id = self.identity.peer_id();
+        let joiner_eph = crate::crypto::generate_ephemeral_keypair();
+        let joiner_ephemeral_pub = crate::crypto::b64url_encode_nopad(joiner_eph.public.as_bytes());
+        let joiner_quic_port = self
+            .quic_endpoint
+            .as_ref()
+            .and_then(|ep| ep.local_addr().ok())
+            .map(|addr| addr.port())
+            .unwrap_or(0);
+
+        let mut msg = SignalingMessage::new(MessageType::InviteHandshakeInit, sender.clone());
+        msg.target = Some(target);
+        msg.payload
+            .insert("invite_id".into(), Value::String(pending.invite_id.clone()));
+        msg.payload
+            .insert("joiner_identity_pub".into(), Value::String(sender.clone()));
+        msg.payload
+            .insert("joiner_peer_id".into(), Value::String(joiner_peer_id));
+        msg.payload.insert(
+            "joiner_ephemeral_pub".into(),
+            Value::String(joiner_ephemeral_pub),
+        );
+        msg.payload.insert(
+            "joiner_quic_port".into(),
+            Value::Number(joiner_quic_port.into()),
+        );
+        msg
+    }
+
+    async fn send_pending_invite_inits_for_peer(&mut self, peer_id: &str) {
+        let invite_ids: Vec<String> = self
+            .pending_invites
+            .iter()
+            .filter(|(_, pending)| !pending.is_supernode && pending.inviter_peer_id == peer_id)
+            .map(|(invite_id, _)| invite_id.clone())
+            .collect();
+
+        for invite_id in invite_ids {
+            let Some(pending) = self.pending_invites.get(&invite_id) else {
+                continue;
+            };
+            let msg = self.build_invite_handshake_init(pending, peer_id.to_owned());
+            self.dispatch_outbound(msg).await;
+        }
+    }
+
     async fn handle_accept_invite(&mut self, invite_url: String) {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
         const SCHEME: &str = "conquerd://";
         if !invite_url.starts_with(SCHEME) {
-            warn!("AcceptInvite: invalid scheme in '{invite_url}'");
+            self.emit_invite_failed(format!("invalid scheme in '{invite_url}'"));
             return;
         }
 
@@ -2988,17 +3232,14 @@ impl ConnectionManager {
         let encoded = encoded_raw.trim_start_matches("invite#");
 
         if encoded.len() > 262_144 {
-            warn!(
-                "AcceptInvite: invite URL too large ({} bytes)",
-                encoded.len()
-            );
+            self.emit_invite_failed(format!("invite URL too large ({} bytes)", encoded.len()));
             return;
         }
 
         let json_bytes = match URL_SAFE_NO_PAD.decode(encoded.trim_end_matches('=')) {
             Ok(b) => b,
             Err(e) => {
-                warn!("AcceptInvite: base64 decode error: {e}");
+                self.emit_invite_failed(format!("base64 decode error: {e}"));
                 return;
             }
         };
@@ -3006,7 +3247,7 @@ impl ConnectionManager {
         let payload: serde_json::Value = match serde_json::from_slice(&json_bytes) {
             Ok(v) => v,
             Err(e) => {
-                warn!("AcceptInvite: JSON parse error: {e}");
+                self.emit_invite_failed(format!("JSON parse error: {e}"));
                 return;
             }
         };
@@ -3015,7 +3256,7 @@ impl ConnectionManager {
         {
             Some(s) => s.to_owned(),
             None => {
-                warn!("AcceptInvite: missing inviter_identity_pub");
+                self.emit_invite_failed("missing inviter_identity_pub");
                 return;
             }
         };
@@ -3032,9 +3273,18 @@ impl ConnectionManager {
         let relay_hint = payload
             .get("relay_hint")
             .and_then(Value::as_str)
-            .or_else(|| payload.get("lan_hint").and_then(Value::as_str))
             .map(|s| s.to_owned())
             .unwrap_or_default();
+        let lan_hint = payload
+            .get("lan_hint")
+            .and_then(Value::as_str)
+            .map(|s| s.to_owned())
+            .unwrap_or_default();
+        let supernode_hint = if relay_hint.is_empty() {
+            lan_hint.clone()
+        } else {
+            relay_hint.clone()
+        };
         let is_supernode = payload
             .get("is_supernode")
             .and_then(Value::as_bool)
@@ -3046,11 +3296,11 @@ impl ConnectionManager {
             .to_owned();
 
         if invite_id.is_empty() {
-            warn!("AcceptInvite: missing invite_id");
+            self.emit_invite_failed("missing invite_id");
             return;
         }
         if inviter_identity_pub == self.identity.public_id() {
-            warn!("AcceptInvite: cannot use own invite");
+            self.emit_invite_failed("cannot use own invite");
             return;
         }
 
@@ -3060,7 +3310,7 @@ impl ConnectionManager {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             if expires_at < now {
-                warn!("AcceptInvite: invite expired");
+                self.emit_invite_failed("invite expired");
                 return;
             }
         }
@@ -3083,13 +3333,13 @@ impl ConnectionManager {
         if is_supernode {
             {
                 let mut store = self.peer_store.write();
-                let relay_hints = if relay_hint.is_empty() {
+                let relay_hints = if supernode_hint.is_empty() {
                     vec![]
                 } else {
-                    vec![relay_hint.clone()]
+                    vec![supernode_hint.clone()]
                 };
-                if !relay_hint.is_empty() {
-                    store.grandfather_supernode_ws_hint_sharing(&relay_hint);
+                if !supernode_hint.is_empty() {
+                    store.grandfather_supernode_ws_hint_sharing(&supernode_hint);
                 }
                 store.upsert_from_invite(crate::peer_store::PeerRecord {
                     peer_id: inviter_peer_id.clone(),
@@ -3117,7 +3367,8 @@ impl ConnectionManager {
                 inviter_peer_id: inviter_peer_id.clone(),
                 inviter_identity_pub: inviter_identity_pub.clone(),
                 invite_id: invite_id.clone(),
-                relay_hint: relay_hint.clone(),
+                relay_hint: supernode_hint.clone(),
+                lan_hint: lan_hint.clone(),
                 is_supernode,
                 created_at: Instant::now(),
             },
@@ -3126,12 +3377,29 @@ impl ConnectionManager {
         // Open a signaling session only for supernode invites. Ordinary peers
         // may carry a ws relay hint for NAT traversal — that must not register
         // them in the Rooms sidebar or key a WS session under their identity.
-        if is_supernode && !relay_hint.is_empty() {
+        if is_supernode && !supernode_hint.is_empty() {
             if let Some(sn) = self.supernodes.remove(&inviter_identity_pub) {
                 sn.ws_task.abort();
             }
-            self.connect_supernode_ws(inviter_identity_pub.clone(), relay_hint.clone())
+            self.connect_supernode_ws(inviter_identity_pub.clone(), supernode_hint.clone())
                 .await;
+        }
+
+        if !is_supernode {
+            if inviter_ephemeral_pub.is_empty() {
+                warn!(
+                    "AcceptInvite: invite missing inviter_ephemeral_pub - using legacy handshake"
+                );
+            }
+            if let Some((host, port)) = parse_quic_lan_hint(&lan_hint) {
+                self.connect_direct_quic(&inviter_peer_id, &host, port)
+                    .await;
+            } else {
+                self.emit_invite_failed(
+                    "invite has no reachable local QUIC hint; generate a fresh invite",
+                );
+            }
+            return;
         }
 
         // Build + sign INVITE_HANDSHAKE_INIT and queue directly on the WS send

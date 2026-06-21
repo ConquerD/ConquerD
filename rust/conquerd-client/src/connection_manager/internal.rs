@@ -137,6 +137,7 @@ pub(super) struct PendingInvite {
     pub(super) inviter_identity_pub: String,
     pub(super) invite_id: String,
     pub(super) relay_hint: String,
+    pub(super) lan_hint: String,
     pub(super) is_supernode: bool,
     pub(super) created_at: Instant,
 }

@@ -50,6 +50,8 @@ pub mod ffi {
         #[qproperty(bool, youtube_preview_enabled)]
         /// True once the user has acknowledged the YouTube inline-embed disclosure.
         #[qproperty(bool, youtube_inline_ack)]
+        /// True after the first-run onboarding wizard has completed.
+        #[qproperty(bool, onboarding_complete)]
         /// Noise suppression strength: "off" | "mild" | "moderate" | "aggressive" | "max".
         #[qproperty(QString, noise_strength)]
         /// UI theme: "system" | "dark" | "light".
@@ -150,6 +152,8 @@ struct SettingsSnapshot {
     #[serde(default)]
     youtube_inline_ack: bool,
     #[serde(default)]
+    onboarding_complete: bool,
+    #[serde(default)]
     window_width: i32,
     #[serde(default)]
     window_height: i32,
@@ -224,6 +228,7 @@ impl Default for SettingsSnapshot {
             attestation_policy: default_attestation_policy(),
             youtube_preview_enabled: true,
             youtube_inline_ack: false,
+            onboarding_complete: false,
             window_width: 0,
             window_height: 0,
             avatar_config_json: String::new(),
@@ -260,6 +265,7 @@ pub struct SettingsModelRust {
     ollama_auto_respond_room: bool,
     youtube_preview_enabled: bool,
     youtube_inline_ack: bool,
+    onboarding_complete: bool,
     noise_strength: QString,
     theme: QString,
     relay_allow_gated: bool,
@@ -299,6 +305,7 @@ impl Default for SettingsModelRust {
             ollama_auto_respond_room: s.ollama_auto_respond_room,
             youtube_preview_enabled: s.youtube_preview_enabled,
             youtube_inline_ack: s.youtube_inline_ack,
+            onboarding_complete: s.onboarding_complete,
             noise_strength: QString::from(s.noise_strength.as_str()),
             theme: QString::from(s.theme.as_str()),
             relay_allow_gated: s.relay_allow_gated,
@@ -361,6 +368,7 @@ impl ffi::SettingsModel {
             ollama_auto_respond_room: r.ollama_auto_respond_room,
             youtube_preview_enabled: r.youtube_preview_enabled,
             youtube_inline_ack: r.youtube_inline_ack,
+            onboarding_complete: r.onboarding_complete,
             noise_strength: r.noise_strength.to_string(),
             theme: r.theme.to_string(),
             relay_allow_gated: r.relay_allow_gated,
@@ -443,6 +451,8 @@ impl ffi::SettingsModel {
             .set_youtube_preview_enabled(snap.youtube_preview_enabled);
         self.as_mut()
             .set_youtube_inline_ack(snap.youtube_inline_ack);
+        self.as_mut()
+            .set_onboarding_complete(snap.onboarding_complete);
         self.as_mut().set_window_width(snap.window_width);
         self.as_mut().set_window_height(snap.window_height);
         self.as_mut().set_theme(QString::from(snap.theme.as_str()));

@@ -131,6 +131,11 @@ impl Identity {
 
     /// Default key directory: `~/.conquerd`
     pub fn default_key_dir() -> PathBuf {
+        if let Ok(path) =
+            std::env::var("CONQUERD_KEY_DIR").or_else(|_| std::env::var("CONQUERD_HOME"))
+        {
+            return PathBuf::from(path);
+        }
         dirs_or_home().join(DEFAULT_KEY_DIR_SUFFIX)
     }
 
@@ -408,7 +413,36 @@ fn dirs_or_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn default_key_dir_honors_profile_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_key_dir = std::env::var("CONQUERD_KEY_DIR").ok();
+        let old_home = std::env::var("CONQUERD_HOME").ok();
+        let dir = tempdir().unwrap();
+        let home_dir = dir.path().join("client_home");
+        let key_dir = dir.path().join("client_keys");
+
+        std::env::remove_var("CONQUERD_KEY_DIR");
+        std::env::set_var("CONQUERD_HOME", &home_dir);
+        assert_eq!(Identity::default_key_dir(), home_dir);
+
+        std::env::set_var("CONQUERD_KEY_DIR", &key_dir);
+        assert_eq!(Identity::default_key_dir(), key_dir);
+
+        match old_key_dir {
+            Some(value) => std::env::set_var("CONQUERD_KEY_DIR", value),
+            None => std::env::remove_var("CONQUERD_KEY_DIR"),
+        }
+        match old_home {
+            Some(value) => std::env::set_var("CONQUERD_HOME", value),
+            None => std::env::remove_var("CONQUERD_HOME"),
+        }
+    }
 
     #[test]
     fn generate_and_roundtrip_v1() {

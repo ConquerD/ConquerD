@@ -1,6 +1,7 @@
 //! Connection manager events and commands.
 
 use serde_json::Value;
+use std::sync::mpsc as std_mpsc;
 
 use crate::protocol::SignalingMessage;
 use crate::session_state::PeerSessionState;
@@ -153,6 +154,8 @@ pub enum ConnectionEvent {
     DirectAudioReceived { peer_id: String, opus_data: Vec<u8> },
     /// An invite handshake completed and the peer was added to the store.
     InviteAccepted { peer_id: String, handle: String },
+    /// An invite could not be accepted or routed.
+    InviteFailed { reason: String },
     /// Remote peer sent a file offer.
     FileOffered {
         transfer_id: String,
@@ -288,6 +291,11 @@ pub enum ConnectionCommand {
     /// invite handshake with the inviter.
     AcceptInvite {
         invite_url: String,
+    },
+    /// Generate an invite URL from the transport layer so it can advertise
+    /// the real local QUIC listener.
+    GenerateInvite {
+        reply_tx: std_mpsc::Sender<Option<String>>,
     },
     /// Send a file to a peer.
     SendFile {

@@ -916,6 +916,17 @@ pub struct AppBridgeRust {
     avatar_config_json: String,
 }
 
+fn request_invite_url(rust: &AppBridgeRust) -> Option<String> {
+    let tx = rust.conn_cmd_tx.as_ref()?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    tx.try_send(ConnectionCommand::GenerateInvite { reply_tx })
+        .ok()?;
+    reply_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .ok()
+        .flatten()
+}
+
 impl Default for AppBridgeRust {
     fn default() -> Self {
         Self {
@@ -1579,6 +1590,14 @@ impl ffi::AppBridge {
             warn!("copy_invite: identity not yet unlocked");
             return;
         };
+        if let Some(url) = request_invite_url(self.rust()) {
+            match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(url.clone())) {
+                Ok(_) => info!("Invite link copied to clipboard: {url}"),
+                Err(e) => warn!("Clipboard write failed: {e} - invite URL: {url}"),
+            }
+            self.as_mut().set_invite_url(QString::from(url.as_str()));
+            return;
+        }
         let peer_id = identity.peer_id().to_owned();
         let pub_key = identity.public_id().to_owned();
 
@@ -1615,6 +1634,10 @@ impl ffi::AppBridge {
             warn!("generate_invite: identity not yet unlocked");
             return QString::default();
         };
+        if let Some(url) = request_invite_url(self.rust()) {
+            self.as_mut().set_invite_url(QString::from(url.as_str()));
+            return QString::from(url.as_str());
+        }
         let peer_id = identity.peer_id().to_owned();
         let pub_key = identity.public_id().to_owned();
 
@@ -2996,15 +3019,25 @@ fn resolve_avatar_config(
     peer_id: &QString,
     config_json: &QString,
 ) -> (String, super::avatar::AvatarConfig) {
-    use super::avatar::AvatarConfig;
+    use super::avatar::{avatar_seed_id, AvatarConfig};
 
     let id = peer_id.to_string();
     let cfg_str = config_json.to_string();
+    let seed_id = avatar_seed_id(&id, &bridge.my_public_id, &bridge.my_peer_id, |raw| {
+        bridge.peer_store.as_ref().and_then(|ps| {
+            let store = ps.read();
+            store
+                .get(raw)
+                .or_else(|| store.get_by_identity(raw))
+                .map(|rec| rec.identity_pub.clone())
+                .filter(|pub_id| !pub_id.is_empty())
+        })
+    });
 
     let config = if !cfg_str.is_empty() {
         // Caller provided an explicit config (own-avatar preview).
         serde_json::from_str(&cfg_str).unwrap_or_default()
-    } else if id == bridge.my_public_id {
+    } else if seed_id == bridge.my_public_id {
         // Empty configJson means "factory defaults" for the local user.
         // Do not fall back to AppBridgeRust::avatar_config_json here —
         // that field can lag behind SettingsModel during reset and would
@@ -3012,7 +3045,11 @@ fn resolve_avatar_config(
         AvatarConfig::default()
     } else if let Some(ref ps) = bridge.peer_store {
         let store = ps.read();
-        match store.get(&id) {
+        let rec = store
+            .get(&id)
+            .or_else(|| store.get_by_identity(&id))
+            .or_else(|| store.get_by_identity(&seed_id));
+        match rec {
             None => AvatarConfig::untrusted(),
             Some(rec) if rec.identity_pub.is_empty() => AvatarConfig::untrusted(),
             Some(rec) => rec.avatar_config.clone().unwrap_or_default(),
@@ -3021,7 +3058,7 @@ fn resolve_avatar_config(
         AvatarConfig::untrusted()
     };
 
-    (id, config)
+    (seed_id, config)
 }
 
 /// Read the persisted `audio_input_device` / `audio_output_device` strings
@@ -3965,14 +4002,12 @@ fn dispatch_event(
             if let Err(e) = chat_store.insert(&msg) {
                 warn!("chat_store insert error: {e}");
             }
-            // Desktop notification (non-blocking, best-effort)
             let preview = if body.chars().count() > 80 {
                 let truncated: String = body.chars().take(79).collect();
                 format!("{truncated}\u{2026}")
             } else {
                 body.clone()
             };
-            crate::platform::show_notification(&sender_handle, &preview);
 
             let peer_id_clone = peer_id.clone();
             let preview_clone = preview.clone();
@@ -3999,22 +4034,21 @@ fn dispatch_event(
                     crate::platform::set_taskbar_badge(global);
                 }
 
-                if is_viewing {
-                    let json = serde_json::json!({
-                        "msg_id": message_id_clone,
-                        "peer_id": peer_id_clone,
-                        "sender": sender_handle_clone,
-                        "body": body_clone,
-                        "timestamp": timestamp,
-                        "kind": "text",
-                        "mine": false,
-                        "status": "read",
-                    })
-                    .to_string();
-                    bridge
-                        .as_mut()
-                        .chat_message_received(QString::from(json.as_str()));
-                }
+                let status = if is_viewing { "read" } else { "delivered" };
+                let json = serde_json::json!({
+                    "msg_id": message_id_clone,
+                    "peer_id": peer_id_clone,
+                    "sender": sender_handle_clone,
+                    "body": body_clone,
+                    "timestamp": timestamp,
+                    "kind": "text",
+                    "mine": false,
+                    "status": status,
+                })
+                .to_string();
+                bridge
+                    .as_mut()
+                    .chat_message_received(QString::from(json.as_str()));
 
                 bridge
                     .as_mut()
@@ -4248,6 +4282,8 @@ fn dispatch_event(
                     );
                 }
             }
+            #[cfg(not(feature = "webengine"))]
+            let _ = (&wt_url, &cert_fingerprint);
             let url_q = homepage_url.clone();
             let title_q = title.clone();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
@@ -4741,6 +4777,15 @@ fn dispatch_event(
             });
         }
         // File transfer events — forward to QML.
+        ConnectionEvent::InviteFailed { reason } => {
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let banner = format!("Invite failed: {reason}");
+                bridge
+                    .as_mut()
+                    .set_session_banner(QString::from(banner.as_str()));
+                bridge.as_mut().set_connection_mode(QString::from("error"));
+            });
+        }
         ConnectionEvent::FileOffered {
             transfer_id,
             peer_id,
