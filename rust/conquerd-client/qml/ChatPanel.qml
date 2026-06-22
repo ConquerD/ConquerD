@@ -265,20 +265,20 @@ Item {
             Layout.fillHeight: true
             clip: true
             model: root.chatModel
-            verticalLayoutDirection: ListView.BottomToTop
             spacing: 2
 
             onContentYChanged: {
-                root._pinnedToLatest = contentY <= 24
+                root._pinnedToLatest = contentHeight <= height
+                    || contentY >= contentHeight - height - 24
                 if (root._loadingHistory || !root._hasMoreHistory || root.selectedPeerId === "")
                     return
-                if (contentHeight > height && contentY >= contentHeight - height - 48)
+                if (contentHeight > height && contentY <= 48)
                     root.loadOlderHistory()
             }
 
             onCountChanged: {
                 if (root._pinnedToLatest)
-                    Qt.callLater(function() { msgList.positionViewAtBeginning() })
+                    Qt.callLater(function() { msgList.positionViewAtEnd() })
             }
 
             ColumnLayout {
@@ -608,11 +608,11 @@ Item {
         var d = new Date(ts * 1000)
         if (!root.chatModel)
             return root.formatDateLabel(d)
-        var olderTs = root.chatModel.timestampAt(idx + 1)
-        if (olderTs <= 0)
+        var prevTs = root.chatModel.timestampAt(idx - 1)
+        if (prevTs <= 0)
             return root.formatDateLabel(d)
-        var older = new Date(olderTs * 1000)
-        if (root.sameCalendarDay(d, older))
+        var prev = new Date(prevTs * 1000)
+        if (root.sameCalendarDay(d, prev))
             return ""
         return root.formatDateLabel(d)
     }
