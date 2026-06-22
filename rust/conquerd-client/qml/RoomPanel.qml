@@ -103,9 +103,8 @@ Item {
             Layout.fillHeight: true
             clip: true
             model: roomChatModel
-            verticalLayoutDirection: ListView.BottomToTop
             spacing: 2
-            onCountChanged: Qt.callLater(function() { roomChat.positionViewAtBeginning() })
+            onCountChanged: Qt.callLater(function() { roomChat.positionViewAtEnd() })
 
             EmptyState {
                 anchors.centerIn: parent
