@@ -666,7 +666,7 @@ async fn add_port_mapping(
     service.action(device_url, "AddPortMapping", &payload).await
 }
 
-fn local_ip() -> Option<String> {
+pub(crate) fn local_ip() -> Option<String> {
     // Simple best-effort local IP (for UPnP internal client)
     use std::net::UdpSocket;
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;

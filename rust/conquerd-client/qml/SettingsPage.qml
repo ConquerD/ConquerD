@@ -888,6 +888,57 @@ Item {
                 SettingsSectionHeader { title: "Network" }
 
                 SettingsCard {
+                    title: "Direct P2P"
+                    subtitle: "Listen for trusted peers without requiring a supernode."
+
+                    SettingSwitch {
+                        title: "Enable direct peer-to-peer listener"
+                        checked: root.settings ? root.settings.direct_p2p_enabled : true
+                        onChanged: {
+                            if (!root.settings) return
+                            root.settings.direct_p2p_enabled = checked
+                            root.settings.save()
+                            if (backend)
+                                backend.configureDirectP2p(checked, root.settings.direct_p2p_port)
+                        }
+                    }
+
+                    GridLayout {
+                        Layout.fillWidth: true
+                        columns: 2
+                        columnSpacing: Theme.spacingXl
+
+                        Label { text: "UDP listener port"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        TextField {
+                            Layout.preferredWidth: 120
+                            enabled: root.settings ? root.settings.direct_p2p_enabled : true
+                            text: root.settings ? root.settings.direct_p2p_port.toString() : "61045"
+                            inputMethodHints: Qt.ImhDigitsOnly
+                            validator: IntValidator { bottom: 1; top: 65535 }
+                            color: enabled ? Theme.text : Theme.muted
+                            background: Rectangle { color: Theme.bg3; radius: Theme.radiusMd; border.color: activeFocus ? Theme.accent : Theme.bg3; border.width: 1 }
+                            onEditingFinished: {
+                                if (!root.settings) return
+                                var port = parseInt(text, 10)
+                                if (isNaN(port) || port < 1 || port > 65535) port = 61045
+                                root.settings.direct_p2p_port = port
+                                root.settings.save()
+                                if (backend)
+                                    backend.configureDirectP2p(root.settings.direct_p2p_enabled, port)
+                            }
+                        }
+                    }
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: "Allow UDP through the host firewall. For internet P2P, forward the same UDP port to this device; otherwise use a supernode."
+                        color: Theme.muted
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.fontSizeCaption
+                    }
+                }
+
+                SettingsCard {
                     title: "Relay"
                     subtitle: "Transport assistance stays optional and client-owned."
 

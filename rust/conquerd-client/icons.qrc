@@ -10,6 +10,8 @@
         <file alias="icons/headphone.svg">qml/icons/headphone.svg</file>
         <file alias="icons/person.svg">qml/icons/person.svg</file>
         <file alias="icons/invite.svg">qml/icons/invite.svg</file>
+        <file alias="icons/invite-submit.svg">qml/icons/invite-submit.svg</file>
+        <file alias="icons/logo.svg">qml/icons/logo.svg</file>
         <file alias="icons/lock.svg">qml/icons/lock.svg</file>
         <file alias="icons/key.svg">qml/icons/key.svg</file>
         <file alias="icons/gear.svg">qml/icons/gear.svg</file>

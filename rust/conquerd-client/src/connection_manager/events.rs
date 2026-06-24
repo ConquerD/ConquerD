@@ -203,6 +203,11 @@ pub enum ConnectionCommand {
     StartQuicServer {
         port: u16,
     },
+    /// Apply onboarding's direct-P2P listener choice immediately.
+    ConfigureDirectP2p {
+        enabled: bool,
+        port: u16,
+    },
     /// Join an SFU room for both voice and chat (sends `SfuJoin` signaling).
     JoinRoom {
         supernode_id: String,

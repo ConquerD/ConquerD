@@ -1,5 +1,32 @@
 use super::internal::{host_from_url, is_loopback_or_wildcard, rewrite_loopback_wt_url};
+use super::manager::{parse_quic_lan_hint, peer_quic_endpoint};
 use super::ConnectionManager;
+
+#[test]
+fn parses_saved_quic_endpoints() {
+    assert_eq!(
+        parse_quic_lan_hint("quic://192.168.1.20:61046"),
+        Some(("192.168.1.20".to_owned(), 61046))
+    );
+    assert_eq!(
+        parse_quic_lan_hint("udp://[2001:db8::1]:61047"),
+        Some(("2001:db8::1".to_owned(), 61047))
+    );
+    assert_eq!(parse_quic_lan_hint("quic://localhost:0"), None);
+}
+
+#[test]
+fn peer_endpoint_prefers_persisted_hint() {
+    let record = crate::peer_store::PeerRecord {
+        relay_hints: vec!["quic://10.0.0.8:61048".to_owned()],
+        quic_port: 61049,
+        ..Default::default()
+    };
+    assert_eq!(
+        peer_quic_endpoint(&record),
+        Some(("10.0.0.8".to_owned(), 61048))
+    );
+}
 
 #[test]
 fn host_from_url_variants() {

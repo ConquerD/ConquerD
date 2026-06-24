@@ -9,9 +9,10 @@ Dialog {
     id: root
 
     required property var settingsModel
+    required property var appBackend
 
     property int step: 0
-    readonly property int stepCount: 4
+    readonly property int stepCount: 5
     readonly property bool isWindows: Qt.platform.os === "windows"
     property string generatedInvite: ""
     property bool copiedPublicId: false
@@ -21,12 +22,12 @@ Dialog {
     title: "Welcome to ConquerD"
     modal: true
     closePolicy: Dialog.NoAutoClose
-    width: 640
-    height: 500
+    width: 680
+    height: 580
     padding: 0
 
     function publicIdText() {
-        return backend && backend.public_id ? String(backend.public_id) : ""
+        return root.appBackend && root.appBackend.public_id ? String(root.appBackend.public_id) : ""
     }
 
     function shortPublicId() {
@@ -52,22 +53,35 @@ Dialog {
         root.settingsModel.save()
     }
 
+    function saveConnectivity() {
+        if (!root.settingsModel) return
+        var selectedPort = parseInt(p2pPortField.text, 10)
+        if (isNaN(selectedPort) || selectedPort < 1 || selectedPort > 65535)
+            selectedPort = 61045
+        root.settingsModel.direct_p2p_enabled = directP2pOption.checked
+        root.settingsModel.direct_p2p_port = selectedPort
+        root.settingsModel.save()
+        if (root.appBackend)
+            root.appBackend.configureDirectP2p(directP2pOption.checked, selectedPort)
+    }
+
     function finishWizard() {
         root.saveHandle()
+        root.saveConnectivity()
 
         var invite = incomingInviteField.text.trim()
-        if (invite.length > 0 && backend) {
-            backend.pasteInvite(invite)
+        if (invite.length > 0 && root.appBackend) {
+            root.appBackend.pasteInvite(invite)
         }
 
-        if (root.isWindows && backend) {
+        if (root.isWindows && root.appBackend) {
             var actions = []
             if (uriOption.checked) {
-                backend.registerUriScheme()
+                root.appBackend.registerUriScheme()
                 actions.push("links")
             }
             if (shortcutOption.checked) {
-                backend.createDesktopShortcuts()
+                root.appBackend.createDesktopShortcuts()
                 actions.push("shortcuts")
             }
             root.setupStatus = actions.length > 0 ? "Applied " + actions.join(" and ") : ""
@@ -125,7 +139,8 @@ Dialog {
                     Text {
                         text: root.step === 0 ? "Choose your local display name"
                             : root.step === 1 ? "Review this device identity"
-                            : root.step === 2 ? "Connect now or create an invite"
+                            : root.step === 2 ? "Choose direct or supernode connectivity"
+                            : root.step === 3 ? "Connect now or create an invite"
                             : "Finish local integration"
                         color: Theme.muted
                         font.pixelSize: Theme.fontSizeCaption
@@ -296,7 +311,7 @@ Dialog {
                             success: root.copiedPublicId
                             Layout.alignment: Qt.AlignTop
                             onClicked: {
-                                if (backend) backend.copyToClipboard(root.publicIdText())
+                                if (root.appBackend) root.appBackend.copyToClipboard(root.publicIdText())
                                 root.copiedPublicId = true
                             }
                         }
@@ -306,7 +321,123 @@ Dialog {
                 Item { Layout.fillHeight: true }
             }
 
-            // Step 2: Get connected.
+            // Step 2: Direct P2P connectivity.
+            ColumnLayout {
+                spacing: Theme.spacingMd
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.margins: Theme.spacingXl
+
+                Text {
+                    text: "Direct P2P Connectivity"
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeBody + 4
+                    font.bold: true
+                }
+
+                Text {
+                    text: "Choose how this device should accept peer connections. Supernodes are optional and never act as identity authorities."
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeBody
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+
+                ButtonGroup { id: connectivityGroup }
+
+                RadioButton {
+                    id: directP2pOption
+                    text: "Enable direct peer-to-peer connections"
+                    checked: root.settingsModel ? root.settingsModel.direct_p2p_enabled : true
+                    ButtonGroup.group: connectivityGroup
+                    font.pixelSize: Theme.fontSizeBody
+                    Material.foreground: Theme.text
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: directP2pOption.checked ? 190 : 0
+                    visible: directP2pOption.checked
+                    color: Theme.bg2
+                    border.color: Theme.bg3
+                    border.width: 1
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingMd
+                        spacing: Theme.spacingSm
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.spacingSm
+
+                            Text {
+                                text: "Preferred UDP port"
+                                color: Theme.text
+                                font.pixelSize: Theme.fontSizeBody
+                                font.bold: true
+                            }
+
+                            Item { Layout.fillWidth: true }
+
+                            StyledTextField {
+                                id: p2pPortField
+                                Layout.preferredWidth: 110
+                                text: root.settingsModel ? String(root.settingsModel.direct_p2p_port) : "61045"
+                                horizontalAlignment: TextInput.AlignHCenter
+                                validator: IntValidator { bottom: 1; top: 65535 }
+                                inputMethodHints: Qt.ImhDigitsOnly
+                            }
+                        }
+
+                        Text {
+                            text: "ConquerD reuses this port when available and tries the next port if another local client already uses it."
+                            color: Theme.muted
+                            font.pixelSize: Theme.fontSizeCaption
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
+
+                        Text {
+                            text: "Firewall: allow ConquerD, or allow inbound and outbound UDP on this port. Prefer Private networks on a trusted LAN."
+                            color: Theme.text
+                            font.pixelSize: Theme.fontSizeCaption
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
+
+                        Text {
+                            text: "Internet P2P: forward the same UDP port on your router to this computer and reserve its LAN address. Carrier-grade NAT may still require a supernode."
+                            color: Theme.warn
+                            font.pixelSize: Theme.fontSizeCaption
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
+                    }
+                }
+
+                RadioButton {
+                    id: supernodeOption
+                    text: "I plan to connect through a supernode — skip port setup"
+                    checked: root.settingsModel ? !root.settingsModel.direct_p2p_enabled : false
+                    ButtonGroup.group: connectivityGroup
+                    font.pixelSize: Theme.fontSizeBody
+                    Material.foreground: Theme.text
+                }
+
+                Text {
+                    visible: supernodeOption.checked
+                    text: "No router or inbound-firewall changes are needed for the onboarding flow. You can enable direct P2P later."
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeCaption
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+
+                Item { Layout.fillHeight: true }
+            }
+
+            // Step 3: Get connected.
             ColumnLayout {
                 spacing: Theme.spacingMd
                 Layout.fillWidth: true
@@ -347,7 +478,7 @@ Dialog {
                             id: incomingInviteField
                             Layout.fillWidth: true
                             placeholderText: "conquerd://invite#..."
-                            Keys.onReturnPressed: if (text.trim().length > 0 && backend) backend.pasteInvite(text.trim())
+                            Keys.onReturnPressed: if (text.trim().length > 0 && root.appBackend) root.appBackend.pasteInvite(text.trim())
                         }
 
                         StyledButton {
@@ -355,7 +486,7 @@ Dialog {
                             icon.source: "qrc:/qt/qml/ConquerD/Client/icons/connect.svg"
                             enabled: incomingInviteField.text.trim().length > 0
                             onClicked: {
-                                if (backend) backend.pasteInvite(incomingInviteField.text.trim())
+                                if (root.appBackend) root.appBackend.pasteInvite(incomingInviteField.text.trim())
                                 incomingInviteField.text = ""
                             }
                         }
@@ -406,8 +537,8 @@ Dialog {
                             text: "Generate"
                             icon.source: "qrc:/qt/qml/ConquerD/Client/icons/invite.svg"
                             onClicked: {
-                                if (backend) {
-                                    root.generatedInvite = backend.generateInvite()
+                                if (root.appBackend) {
+                                    root.generatedInvite = root.appBackend.generateInvite()
                                     root.copiedInvite = false
                                 }
                             }
@@ -419,7 +550,7 @@ Dialog {
                             enabled: root.generatedInvite !== ""
                             success: root.copiedInvite
                             onClicked: {
-                                if (backend) backend.copyToClipboard(root.generatedInvite)
+                                if (root.appBackend) root.appBackend.copyToClipboard(root.generatedInvite)
                                 root.copiedInvite = true
                             }
                         }
@@ -429,7 +560,7 @@ Dialog {
                 Item { Layout.fillHeight: true }
             }
 
-            // Step 3: System integration.
+            // Step 4: System integration.
             ColumnLayout {
                 spacing: Theme.spacingMd
                 Layout.fillWidth: true
@@ -540,6 +671,7 @@ Dialog {
                 enabled: root.step !== 0 || handleField.text.trim().length > 0
                 onClicked: {
                     if (root.step === 0) root.saveHandle()
+                    if (root.step === 2) root.saveConnectivity()
                     if (root.step < root.stepCount - 1) {
                         root.step += 1
                     } else {

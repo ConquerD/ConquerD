@@ -5,21 +5,39 @@
 //! certificate CN (peer_id) — no explicit ticket payload is sent on the
 //! wire; the ticket is validated client-side only (expiry / host / port).
 //!
-//! This client is intentionally minimal. It is used by:
+//! This client is used by:
 //!   * [`crate::web_app_client`] — to open a bidirectional QUIC stream
 //!     tagged `web.host.app.v1` and fetch in-app portal assets.
+//!   * Room voice (`room.audio.sfu`) — to send/receive Opus frames as
+//!     unreliable QUIC datagrams instead of base64/JSON over the WebSocket
+//!     signaling channel. Datagrams avoid TCP head-of-line blocking, which
+//!     is the dominant source of room-audio latency on the WS path. The
+//!     frames stay **end-to-end signed** (the datagram carries the same
+//!     signed `SfuAudio` JSON the WS path sends), so the receiver verifies
+//!     the sender's Ed25519 signature exactly as before — the supernode
+//!     remains a dumb forwarder that cannot forge a member's voice.
 //!
 //! Wire format reused for relay command stream draining (best-effort,
 //! discarded): supernode pushes length-prefixed JSON frames via
 //! `conn.open_uni()` (welcome, peer_joined, peer_left, relay_punch).
 //! See `rust/conquerd-supernode/src/wire.rs::encode_relay_cmd`.
+//!
+//! Room-audio datagram wire shape (sent by us → relay → fanned to members):
+//!   * outbound: `[BROADCAST_INDEX][ROOM_AUDIO_TAG][signed SfuAudio JSON]`
+//!   * inbound (forwarded by relay): `[sender_index][ROOM_AUDIO_TAG][signed
+//!     SfuAudio JSON]`. We ignore `sender_index` — the signed JSON is
+//!     self-describing (`msg.sender`) — and hand the JSON to the connection
+//!     manager, which verifies + dispatches it on the normal inbound path.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use bytes::Bytes;
+use conquerd_features::channel_frame::ROOM_AUDIO_TAG;
 use quinn::{Connection, Endpoint};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -28,6 +46,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-relay-cmd frame size sanity cap (matches supernode wire).
 const RELAY_CMD_MAX_FRAME: usize = 64 * 1024;
+
+/// Datagram target index meaning "broadcast to all room members"
+/// (mirrors `conquerd_supernode::wire::BROADCAST_INDEX`).
+const BROADCAST_INDEX: u8 = 0xFF;
 
 /// A live QUIC connection to a supernode's relay listener.
 ///
@@ -61,11 +83,16 @@ impl QuicRelayClient {
     /// `supernode_id` is the supernode's identity pubkey (peer_id); kept
     /// here so callers can identify the relay later without re-parsing
     /// the cert.
+    /// `room_audio_tx` receives the signed `SfuAudio` JSON bytes extracted
+    /// from inbound `room.audio.sfu` datagrams. The connection manager owns
+    /// the receiver and re-injects each frame on its normal inbound path
+    /// (signature verification + quota + dispatch).
     pub async fn connect(
         endpoint: &Endpoint,
         supernode_id: impl Into<String>,
         host: &str,
         port: u16,
+        room_audio_tx: UnboundedSender<Vec<u8>>,
     ) -> anyhow::Result<Self> {
         let supernode_id = supernode_id.into();
         let addr: SocketAddr = format!("{host}:{port}")
@@ -103,6 +130,16 @@ impl QuicRelayClient {
             drain_relay_commands(conn_drain, shutdown_drain, sn_short).await;
         });
 
+        // Datagram receive loop — extracts `room.audio.sfu` frames and hands
+        // the signed JSON to the connection manager. Other tags are ignored
+        // here (the relay only forwards room-scoped datagrams to us today).
+        let conn_dgram = connection.clone();
+        let shutdown_dgram = shutdown.clone();
+        let sn_short_dgram = supernode_id[..12.min(supernode_id.len())].to_owned();
+        tokio::spawn(async move {
+            recv_room_datagrams(conn_dgram, shutdown_dgram, room_audio_tx, sn_short_dgram).await;
+        });
+
         Ok(Self {
             supernode_id,
             relay_host: host.to_owned(),
@@ -135,6 +172,36 @@ impl QuicRelayClient {
     /// True while quinn has not surfaced a close reason.
     pub fn is_alive(&self) -> bool {
         self.connection.close_reason().is_none()
+    }
+
+    /// Send a signed `SfuAudio` JSON frame as a broadcast room-audio datagram.
+    ///
+    /// Builds `[BROADCAST_INDEX][ROOM_AUDIO_TAG][signed_json]` and hands it to
+    /// quinn as an unreliable datagram. Returns `false` if the connection is
+    /// gone or the frame exceeds the negotiated datagram size — the caller
+    /// then falls back to the WebSocket SFU path so audio is never dropped
+    /// solely because the relay datagram couldn't be sent.
+    pub fn send_room_audio(&self, signed_json: &[u8]) -> bool {
+        if self.connection.close_reason().is_some() {
+            return false;
+        }
+        // Respect the peer's advertised datagram limit; oversized frames
+        // would error anyway, so bail early and let the caller use WS.
+        if let Some(max) = self.connection.max_datagram_size() {
+            if signed_json.len() + 2 > max {
+                debug!(
+                    "[relay] room-audio frame {}B exceeds datagram max {}B — WS fallback",
+                    signed_json.len() + 2,
+                    max
+                );
+                return false;
+            }
+        }
+        let mut buf = Vec::with_capacity(2 + signed_json.len());
+        buf.push(BROADCAST_INDEX);
+        buf.push(ROOM_AUDIO_TAG);
+        buf.extend_from_slice(signed_json);
+        self.connection.send_datagram(Bytes::from(buf)).is_ok()
     }
 
     /// Gracefully close the relay connection and stop the drain task.
@@ -201,4 +268,46 @@ async fn drain_relay_commands(conn: Connection, shutdown: Arc<Notify>, sn_short:
         }
     }
     debug!("[relay {}] drain task exiting", sn_short);
+}
+
+/// Receive forwarded room-audio datagrams and forward the signed JSON to the
+/// connection manager. Frames look like `[sender_index][ROOM_AUDIO_TAG][json]`;
+/// `sender_index` is ignored because the signed JSON is self-describing.
+async fn recv_room_datagrams(
+    conn: Connection,
+    shutdown: Arc<Notify>,
+    room_audio_tx: UnboundedSender<Vec<u8>>,
+    sn_short: String,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            dgram = conn.read_datagram() => {
+                match dgram {
+                    Ok(data) => {
+                        // [sender_index:1][tag:1][payload…]; require both
+                        // prefix bytes and the room-audio tag.
+                        if data.len() < 2 || data[1] != ROOM_AUDIO_TAG {
+                            continue;
+                        }
+                        let json = data[2..].to_vec();
+                        if json.is_empty() {
+                            continue;
+                        }
+                        if room_audio_tx.send(json).is_err() {
+                            // Manager dropped the receiver — nothing left to do.
+                            break;
+                        }
+                    }
+                    Err(quinn::ConnectionError::ApplicationClosed(_))
+                    | Err(quinn::ConnectionError::LocallyClosed) => break,
+                    Err(e) => {
+                        debug!("[relay {}] read_datagram ended: {}", sn_short, e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    debug!("[relay {}] datagram task exiting", sn_short);
 }

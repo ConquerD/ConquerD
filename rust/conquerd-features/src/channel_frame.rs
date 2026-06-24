@@ -18,7 +18,14 @@
 //! | `0x01` | direct audio           | `core.audio.opus` |
 //! | `0x02` | text chat              | `core.chat.v1`    |
 //! | `0x03` | file transfer          | `core.file.v1`    |
+//! | `0x04` | room (SFU) audio       | `room.audio.sfu`  |
 //!
+//! The room-audio tag (`0x04`) only appears on the *relayed* datagram path
+//! (a peer's QUIC relay session to a supernode that fans the frame out to
+//! room members). It never rides the direct peer fabric, so [`classify`]
+//! leaves it in [`FrameClass::Other`]; the relay client decodes it manually.
+//! It exists as a fixed tag purely so relay quota accounting attributes the
+//! frame to `room.audio.sfu` rather than the direct `core.audio.opus`.
 //! Frame layout on a reliable stream is `[tag:u8][payload…]` *inside* the
 //! transport's existing length-prefixed envelope. On a datagram it is the
 //! same `[tag:u8][payload…]` with the datagram boundary as the frame
@@ -37,6 +44,10 @@ pub const AUDIO_TAG: u8 = 0x01;
 pub const CHAT_TAG: u8 = 0x02;
 /// File transfer (`core.file.v1`) — reliable stream frames.
 pub const FILE_TAG: u8 = 0x03;
+/// Room (SFU) audio (`room.audio.sfu`) — unreliable datagrams on a relay
+/// session. Distinct from [`AUDIO_TAG`] so the relay attributes the frame to
+/// the room feature's quota bucket rather than the direct-call one.
+pub const ROOM_AUDIO_TAG: u8 = 0x04;
 
 /// Highest fixed first-party tag. Tags above this up to
 /// [`DYNAMIC_TAG_START`](crate::channel_tag::DYNAMIC_TAG_START) stay
@@ -53,6 +64,7 @@ pub fn fixed_tag_for(feature_id: &str) -> Option<u8> {
         "core.audio.opus" => Some(AUDIO_TAG),
         "core.chat.v1" => Some(CHAT_TAG),
         "core.file.v1" => Some(FILE_TAG),
+        "room.audio.sfu" => Some(ROOM_AUDIO_TAG),
         _ => None,
     }
 }
@@ -63,6 +75,7 @@ pub fn feature_for_fixed_tag(tag: u8) -> Option<&'static str> {
         AUDIO_TAG => Some("core.audio.opus"),
         CHAT_TAG => Some("core.chat.v1"),
         FILE_TAG => Some("core.file.v1"),
+        ROOM_AUDIO_TAG => Some("room.audio.sfu"),
         _ => None,
     }
 }
@@ -130,6 +143,7 @@ mod tests {
             ("core.audio.opus", AUDIO_TAG),
             ("core.chat.v1", CHAT_TAG),
             ("core.file.v1", FILE_TAG),
+            ("room.audio.sfu", ROOM_AUDIO_TAG),
         ] {
             assert_eq!(fixed_tag_for(fid), Some(tag));
             assert_eq!(feature_for_fixed_tag(tag), Some(fid));
@@ -140,7 +154,7 @@ mod tests {
 
     #[test]
     fn fixed_tags_are_in_reserved_range() {
-        for tag in [CONTROL_TAG, AUDIO_TAG, CHAT_TAG, FILE_TAG] {
+        for tag in [CONTROL_TAG, AUDIO_TAG, CHAT_TAG, FILE_TAG, ROOM_AUDIO_TAG] {
             assert!(tag <= MAX_FIRST_PARTY_TAG);
             assert!(tag < crate::channel_tag::DYNAMIC_TAG_START);
         }

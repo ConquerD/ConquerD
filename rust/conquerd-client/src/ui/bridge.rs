@@ -196,6 +196,11 @@ pub mod ffi {
         #[rust_name = "paste_invite"]
         fn pasteInvite(self: Pin<&mut AppBridge>, url: &QString);
 
+        /// Apply the onboarding direct-P2P listener choice.
+        #[qinvokable]
+        #[rust_name = "configure_direct_p2p"]
+        fn configureDirectP2p(self: Pin<&mut AppBridge>, enabled: bool, port: i32);
+
         /// Accept an incoming call from `peer_id`.
         #[qinvokable]
         #[rust_name = "accept_call"]
@@ -1951,6 +1956,13 @@ impl ffi::AppBridge {
             let _ = tx.try_send(ConnectionCommand::AcceptInvite {
                 invite_url: url_str,
             });
+        }
+    }
+
+    fn configure_direct_p2p(self: Pin<&mut Self>, enabled: bool, port: i32) {
+        let port = port.clamp(1, u16::MAX as i32) as u16;
+        if let Some(ref tx) = self.rust().conn_cmd_tx {
+            let _ = tx.try_send(ConnectionCommand::ConfigureDirectP2p { enabled, port });
         }
     }
 

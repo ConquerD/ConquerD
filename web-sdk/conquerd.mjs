@@ -73,6 +73,8 @@ export const ChannelTag = Object.freeze({
     CHAT: 0x02,
     /** File transfer (`core.file.v1`). */
     FILE: 0x03,
+    /** Room (SFU) audio (`room.audio.sfu`) on a relay session. */
+    ROOM_AUDIO: 0x04,
 });
 
 /** Fixed channel tag for a first-party feature id, or `undefined`. */
@@ -81,6 +83,7 @@ export function fixedTagFor(featureId) {
         case "core.audio.opus": return ChannelTag.AUDIO;
         case "core.chat.v1": return ChannelTag.CHAT;
         case "core.file.v1": return ChannelTag.FILE;
+        case "room.audio.sfu": return ChannelTag.ROOM_AUDIO;
         default: return undefined;
     }
 }
@@ -91,6 +94,7 @@ export function featureForFixedTag(tag) {
         case ChannelTag.AUDIO: return "core.audio.opus";
         case ChannelTag.CHAT: return "core.chat.v1";
         case ChannelTag.FILE: return "core.file.v1";
+        case ChannelTag.ROOM_AUDIO: return "room.audio.sfu";
         default: return null;
     }
 }

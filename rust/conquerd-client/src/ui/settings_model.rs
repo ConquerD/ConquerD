@@ -25,6 +25,10 @@ pub mod ffi {
         #[qml_element]
         #[qproperty(bool, notifications_enabled)]
         #[qproperty(bool, auto_connect)]
+        /// Accept direct peer-to-peer QUIC connections without a supernode.
+        #[qproperty(bool, direct_p2p_enabled)]
+        /// Preferred UDP listener port for direct peer-to-peer QUIC.
+        #[qproperty(i32, direct_p2p_port)]
         #[qproperty(bool, start_minimized)]
         #[qproperty(bool, push_to_talk)]
         #[qproperty(bool, noise_suppression)]
@@ -95,6 +99,10 @@ struct SettingsSnapshot {
     notifications_enabled: bool,
     #[serde(default)]
     auto_connect: bool,
+    #[serde(default = "default_true")]
+    direct_p2p_enabled: bool,
+    #[serde(default = "default_direct_p2p_port")]
+    direct_p2p_port: i32,
     #[serde(default)]
     start_minimized: bool,
     #[serde(default)]
@@ -164,6 +172,9 @@ struct SettingsSnapshot {
 fn default_true() -> bool {
     true
 }
+fn default_direct_p2p_port() -> i32 {
+    61_045
+}
 fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
 }
@@ -200,6 +211,8 @@ impl Default for SettingsSnapshot {
         Self {
             notifications_enabled: true,
             auto_connect: false,
+            direct_p2p_enabled: true,
+            direct_p2p_port: default_direct_p2p_port(),
             start_minimized: false,
             push_to_talk: false,
             noise_suppression: true,
@@ -243,6 +256,8 @@ impl Default for SettingsSnapshot {
 pub struct SettingsModelRust {
     notifications_enabled: bool,
     auto_connect: bool,
+    direct_p2p_enabled: bool,
+    direct_p2p_port: i32,
     start_minimized: bool,
     push_to_talk: bool,
     noise_suppression: bool,
@@ -283,6 +298,8 @@ impl Default for SettingsModelRust {
         Self {
             notifications_enabled: s.notifications_enabled,
             auto_connect: s.auto_connect,
+            direct_p2p_enabled: s.direct_p2p_enabled,
+            direct_p2p_port: s.direct_p2p_port,
             start_minimized: s.start_minimized,
             push_to_talk: s.push_to_talk,
             noise_suppression: s.noise_suppression,
@@ -324,16 +341,7 @@ impl Default for SettingsModelRust {
 // ---------------------------------------------------------------------------
 
 pub fn settings_file() -> PathBuf {
-    let base = std::env::var("CONQUERD_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".conquerd")
-        });
-    base.join("settings.json")
+    crate::identity::Identity::default_key_dir().join("settings.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +354,8 @@ impl ffi::SettingsModel {
         let snap = SettingsSnapshot {
             notifications_enabled: r.notifications_enabled,
             auto_connect: r.auto_connect,
+            direct_p2p_enabled: r.direct_p2p_enabled,
+            direct_p2p_port: r.direct_p2p_port,
             start_minimized: r.start_minimized,
             push_to_talk: r.push_to_talk,
             noise_suppression: r.noise_suppression,
@@ -411,6 +421,10 @@ impl ffi::SettingsModel {
         self.as_mut()
             .set_notifications_enabled(snap.notifications_enabled);
         self.as_mut().set_auto_connect(snap.auto_connect);
+        self.as_mut()
+            .set_direct_p2p_enabled(snap.direct_p2p_enabled);
+        self.as_mut()
+            .set_direct_p2p_port(snap.direct_p2p_port.clamp(1, u16::MAX as i32));
         self.as_mut().set_start_minimized(snap.start_minimized);
         self.as_mut().set_push_to_talk(snap.push_to_talk);
         // Derive noise_suppression from noise_strength.

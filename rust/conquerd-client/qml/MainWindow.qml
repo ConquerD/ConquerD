@@ -124,28 +124,6 @@ ApplicationWindow {
         })
     }
 
-    function inviteIconData(colorValue) {
-        var stroke = Theme.toHex(colorValue || Theme.text).replace("#", "%23")
-        return "data:image/svg+xml;utf8,"
-            + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'>"
-            + "<path d='M3.25 7.75H16.75V16.25H3.25V7.75Z' stroke='" + stroke + "' stroke-width='1.5' stroke-linejoin='round'/>"
-            + "<path d='M3.5 8L10 12.75L16.5 8' stroke='" + stroke + "' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/>"
-            + "<path d='M7.25 3.75H12.75V8.75L10 10.75L7.25 8.75V3.75Z' stroke='" + stroke + "' stroke-width='1.35' stroke-linejoin='round'/>"
-            + "<path d='M15.25 2.75V6.75' stroke='" + stroke + "' stroke-width='1.4' stroke-linecap='round'/>"
-            + "<path d='M13.25 4.75H17.25' stroke='" + stroke + "' stroke-width='1.4' stroke-linecap='round'/>"
-            + "</svg>"
-    }
-
-    function inviteSubmitIconData(colorValue) {
-        var stroke = Theme.toHex(colorValue || Theme.text).replace("#", "%23")
-        return "data:image/svg+xml;utf8,"
-            + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'>"
-            + "<path d='M2.75 8H11.5' stroke='" + stroke + "' stroke-width='1.6' stroke-linecap='round'/>"
-            + "<path d='M8 4.5L11.5 8L8 11.5' stroke='" + stroke + "' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/>"
-            + "<path d='M13.25 3.75V12.25' stroke='" + stroke + "' stroke-width='1.6' stroke-linecap='round'/>"
-            + "</svg>"
-    }
-
     function numericRoomCount(value) {
         var n = Number(value)
         return isNaN(n) ? 0 : Math.max(0, n)
@@ -381,14 +359,13 @@ ApplicationWindow {
         }
         appWindow: root
 
-        // Logo — ConquerD "D" chevron SVG as inline data URI
         Image {
             id: logoImage
             Layout.preferredWidth: 48
             Layout.preferredHeight: 22
             Layout.alignment: Qt.AlignVCenter
             fillMode: Image.PreserveAspectFit
-            source: "data:image/svg+xml;utf8,<svg viewBox='0 0 122 56' xmlns='http://www.w3.org/2000/svg'><path fill-rule='evenodd' clip-rule='evenodd' d='M0,0 L36,0 L48,28 L36,56 L0,56 Z M11,11 L28,11 L37,28 L28,45 L11,45 Z' fill='%23FF2B40'/><rect x='58' y='17' width='8' height='8' rx='1' fill='%23FF2B40'/><rect x='58' y='41' width='8' height='8' rx='1' fill='%23FF2B40'/><polygon points='76,56 87,56 105,0 94,0' fill='%23FF2B40'/><polygon points='92,56 103,56 121,0 110,0' fill='%23FF2B40'/></svg>"
+            source: "qrc:/qt/qml/ConquerD/Client/icons/logo.svg"
         }
 
         // Invite / peer-ID paste field
@@ -445,12 +422,13 @@ ApplicationWindow {
 
             Image {
                 anchors.centerIn: parent
-                source: root.inviteSubmitIconData(connectBtn.enabled ? Theme.text : Theme.muted)
+                source: "qrc:/qt/qml/ConquerD/Client/icons/invite-submit.svg"
                 sourceSize.width: 32
                 sourceSize.height: 32
                 width: 32
                 height: 32
                 fillMode: Image.PreserveAspectFit
+                opacity: connectBtn.enabled ? 1.0 : 0.45
             }
             ToolTip.text: "Connect to peer / accept invite"
             ToolTip.visible: connectBtn.hovered
@@ -498,7 +476,7 @@ ApplicationWindow {
                 spacing: Theme.spacingXs
 
                 Image {
-                    source: root.inviteIconData(Theme.textInv)
+                    source: "qrc:/qt/qml/ConquerD/Client/icons/invite.svg"
                     sourceSize.width: 30
                     sourceSize.height: 30
                     width: 30
@@ -764,11 +742,24 @@ ApplicationWindow {
         })
 
         backend.initializeBackend()
+        if (!settingsModel.onboarding_complete)
+            Qt.callLater(function() {
+                if (backend.public_id && backend.public_id !== "")
+                    onboardingWizard.open()
+            })
         // Drop any stale non-supernode rows left from older builds.
         Qt.callLater(root.pruneNonSupernodeEntries)
     }
 
     // ── Passphrase dialog — shown when identity needs unlocking/creation ──
+    OnboardingWizard {
+        id: onboardingWizard
+        anchors.centerIn: parent
+        z: 120
+        settingsModel: settingsModel
+        appBackend: backend
+    }
+
     PassphraseDialog {
         id: passphraseDialog
         onSubmitted: function(passphrase, filePath) {
@@ -780,6 +771,12 @@ ApplicationWindow {
     // Listen for "Incorrect passphrase" banner to re-show dialog with error
     Connections {
         target: backend
+        function onPublic_idChanged() {
+            if (!settingsModel.onboarding_complete
+                    && backend.public_id && backend.public_id !== ""
+                    && !onboardingWizard.opened)
+                onboardingWizard.open()
+        }
         function onSession_bannerChanged() {
             const txt = backend.session_banner
             if (txt === "Incorrect passphrase \u2014 try again.") {

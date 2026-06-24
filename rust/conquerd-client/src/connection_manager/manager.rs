@@ -38,6 +38,9 @@ const _CONNECT_TIMEOUT_S: f64 = 4.0;
 const WS_RECONNECT_DELAY_S: u64 = 5;
 const PING_INTERVAL_S: u64 = 30;
 const AUDIO_CHANNEL_TAG: u8 = channel_frame::AUDIO_TAG;
+const DEFAULT_QUIC_LISTENER_PORT: u16 = 61_045;
+const QUIC_PORT_SEARCH_LIMIT: u16 = 128;
+const QUIC_PORT_FILE: &str = "quic_listener_port";
 
 fn unix_now_f64() -> f64 {
     std::time::SystemTime::now()
@@ -46,7 +49,7 @@ fn unix_now_f64() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
+pub(super) fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
     let trimmed = hint.trim();
     if trimmed.is_empty() {
         return None;
@@ -72,6 +75,73 @@ fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
         return None;
     }
     Some((host.to_owned(), port))
+}
+
+fn saved_quic_port_path() -> std::path::PathBuf {
+    Identity::default_key_dir().join(QUIC_PORT_FILE)
+}
+
+fn load_saved_quic_port() -> Option<u16> {
+    std::fs::read_to_string(saved_quic_port_path())
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+}
+
+fn save_quic_port(port: u16) {
+    let path = saved_quic_port_path();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("Could not create QUIC port state directory: {e}");
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&path, port.to_string()) {
+        warn!(
+            "Could not persist QUIC listener port to {}: {e}",
+            path.display()
+        );
+    }
+}
+
+fn load_direct_p2p_settings() -> (bool, u16) {
+    let path = Identity::default_key_dir().join("settings.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (
+            true,
+            load_saved_quic_port().unwrap_or(DEFAULT_QUIC_LISTENER_PORT),
+        );
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return (
+            true,
+            load_saved_quic_port().unwrap_or(DEFAULT_QUIC_LISTENER_PORT),
+        );
+    };
+    let enabled = value
+        .get("direct_p2p_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let port = load_saved_quic_port()
+        .or_else(|| {
+            value
+                .get("direct_p2p_port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+        })
+        .unwrap_or(DEFAULT_QUIC_LISTENER_PORT);
+    (enabled, port)
+}
+
+pub(super) fn peer_quic_endpoint(record: &crate::peer_store::PeerRecord) -> Option<(String, u16)> {
+    record
+        .relay_hints
+        .iter()
+        .find_map(|hint| parse_quic_lan_hint(hint))
+        .or_else(|| (record.quic_port != 0).then(|| ("127.0.0.1".to_owned(), record.quic_port)))
 }
 
 /// The central connection manager.
@@ -132,6 +202,12 @@ pub struct ConnectionManager {
     /// `supernode_id:room_id` keys waiting for private-room invite validation
     /// before sending the count-producing `SfuJoin`.
     pending_private_room_joins: HashSet<String>,
+    /// Sender handed to each [`QuicRelayClient`] so inbound `room.audio.sfu`
+    /// datagrams (signed `SfuAudio` JSON) are re-injected on the normal
+    /// inbound path. Cloned per relay connection.
+    relay_audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Receiver side of [`Self::relay_audio_tx`], polled in the run loop.
+    relay_audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
 impl ConnectionManager {
@@ -179,6 +255,7 @@ impl ConnectionManager {
         let (event_tx, event_rx) = mpsc::channel::<ConnectionEvent>(256);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnectionCommand>(64);
         let (internal_tx, internal_rx) = mpsc::channel::<InternalEvent>(128);
+        let (relay_audio_tx, relay_audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         let mgr = Self {
             identity,
@@ -205,35 +282,91 @@ impl ConnectionManager {
             transport_stats: HashMap::new(),
             pending_materialize: HashSet::new(),
             pending_private_room_joins: HashSet::new(),
+            relay_audio_tx,
+            relay_audio_rx,
         };
         (cmd_tx, event_rx, mgr.run_inner())
     }
 
-    /// Lazily create the QUIC endpoint on the given port (0 = ephemeral).
+    /// Lazily create the QUIC endpoint. Port 0 means the saved profile port,
+    /// then the default. If that port is occupied, try consecutive ports.
     fn ensure_quic_endpoint(&mut self, port: u16) -> bool {
         if self.quic_endpoint.is_some() {
             return true;
         }
-        match quic_tls::make_quic_endpoint(self.identity.signing_key(), port) {
-            Ok(ep) => {
-                info!(
-                    "QUIC endpoint bound on {}",
-                    ep.local_addr().map(|a| a.to_string()).unwrap_or_default()
-                );
-                self.quic_endpoint = Some(ep);
-                true
-            }
-            Err(e) => {
-                error!("Failed to create QUIC endpoint: {e}");
-                false
+        let preferred = if port == 0 {
+            load_saved_quic_port().unwrap_or(DEFAULT_QUIC_LISTENER_PORT)
+        } else {
+            port
+        };
+        let mut last_error = None;
+        for offset in 0..QUIC_PORT_SEARCH_LIMIT {
+            let Some(candidate) = preferred.checked_add(offset) else {
+                break;
+            };
+            match quic_tls::make_quic_endpoint(self.identity.signing_key(), candidate) {
+                Ok(ep) => {
+                    info!(
+                        "QUIC endpoint bound on {}",
+                        ep.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                    );
+                    save_quic_port(candidate);
+                    self.quic_endpoint = Some(ep);
+                    return true;
+                }
+                Err(e) => {
+                    debug!("QUIC port {candidate} unavailable: {e}");
+                    last_error = Some(e);
+                }
             }
         }
+        error!(
+            "Failed to create QUIC endpoint starting at port {preferred}: {}",
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no usable port in range".to_owned())
+        );
+        false
+    }
+
+    fn local_quic_hint(&self) -> Option<String> {
+        let port = self.quic_endpoint.as_ref()?.local_addr().ok()?.port();
+        let host = crate::platform::local_ip().unwrap_or_else(|| "127.0.0.1".to_owned());
+        Some(format!("quic://{host}:{port}"))
     }
 
     // -- internal event loop -------------------------------------------------
 
     async fn run_inner(mut self) {
         info!("ConnectionManager started");
+
+        // Every direct-P2P profile keeps a stable listener port when possible.
+        // Multiple local profiles naturally occupy consecutive ports.
+        let (direct_p2p_enabled, direct_p2p_port) = load_direct_p2p_settings();
+        if direct_p2p_enabled {
+            self.ensure_quic_endpoint(direct_p2p_port);
+        } else {
+            info!("Direct P2P listener disabled; using supernode connectivity");
+        }
+
+        // Reconnect trusted direct peers that were accepted with an endpoint.
+        if direct_p2p_enabled {
+            let direct_peers: Vec<(String, String, u16)> = {
+                let store = self.peer_store.read();
+                store
+                    .auto_connect_peers()
+                    .into_iter()
+                    .filter(|record| !record.is_supernode)
+                    .filter_map(|record| {
+                        let (host, port) = peer_quic_endpoint(record)?;
+                        Some((record.peer_id.clone(), host, port))
+                    })
+                    .collect()
+            };
+            for (peer_id, host, port) in direct_peers {
+                self.connect_direct_quic(&peer_id, &host, port).await;
+            }
+        }
 
         // Connect to known supernodes from peer store.
         // Key by identity_pub (base64url Ed25519 pubkey) so that outbound
@@ -284,10 +417,24 @@ impl ConnectionManager {
                             self.ensure_quic_endpoint(port);
                             info!("QUIC server listening on port {port}");
                         }
+                        ConnectionCommand::ConfigureDirectP2p { enabled, port } => {
+                            if let Some(endpoint) = self.quic_endpoint.take() {
+                                endpoint.close(0u32.into(), b"listener reconfigured");
+                            }
+                            if enabled {
+                                self.ensure_quic_endpoint(port);
+                            } else {
+                                info!("Direct P2P listener disabled by onboarding");
+                            }
+                        }
                         ConnectionCommand::JoinRoom { supernode_id, room_id } => {
                             self.current_supernode_id = supernode_id.clone();
                             self.current_room_id = room_id.clone();
                             self.send_room_join(&supernode_id, &room_id).await;
+                            // Establish a QUIC relay session for low-latency room
+                            // audio (datagrams instead of WS). Harmless if it
+                            // never arrives — send_room_audio falls back to WS.
+                            self.ensure_room_relay(&supernode_id).await;
                         }
                         ConnectionCommand::JoinRoomWithInvite { supernode_id, room_id, invite_token } => {
                             self.current_supernode_id = supernode_id.clone();
@@ -295,6 +442,7 @@ impl ConnectionManager {
                             let key = format!("{supernode_id}:{room_id}");
                             self.pending_private_room_joins.insert(key);
                             self.send_room_invite(&supernode_id, &room_id, &invite_token).await;
+                            self.ensure_room_relay(&supernode_id).await;
                         }
                         ConnectionCommand::LeaveRoom {
                             supernode_id,
@@ -443,6 +591,13 @@ impl ConnectionManager {
                 // Internal events from QUIC and WS tasks
                 Some(ev) = self.internal_rx.recv() => {
                     self.handle_internal_event(ev).await;
+                }
+                // Inbound room-audio frames forwarded over a QUIC relay
+                // datagram. Each item is a signed `SfuAudio` JSON; re-inject it
+                // on the normal inbound path so signature + quota + dispatch
+                // run exactly as for the WebSocket route.
+                Some(json) = self.relay_audio_rx.recv() => {
+                    self.handle_relay_room_audio(json).await;
                 }
                 // Accept incoming QUIC connections
                 incoming = async {
@@ -1214,6 +1369,7 @@ impl ConnectionManager {
         };
         let endpoint = endpoint.clone();
         let internal_tx = self.internal_tx.clone();
+        let relay_audio_tx = self.relay_audio_tx.clone();
         let sn_id_for_task = supernode_id.clone();
         tokio::spawn(async move {
             let client = match QuicRelayClient::connect(
@@ -1221,6 +1377,7 @@ impl ConnectionManager {
                 sn_id_for_task.clone(),
                 &relay_host,
                 relay_port,
+                relay_audio_tx,
             )
             .await
             {
@@ -1276,6 +1433,21 @@ impl ConnectionManager {
     }
 
     // -- relay request -------------------------------------------------------
+
+    /// Request a relay grant for `supernode_id` so room audio can ride QUIC
+    /// datagrams. No-op when a live relay session already exists. The grant
+    /// flow (`RelayGranted` → background connect) is best-effort; room audio
+    /// transparently falls back to the WebSocket SFU path if it never lands.
+    async fn ensure_room_relay(&mut self, supernode_id: &str) {
+        if self
+            .quic_relays
+            .get(supernode_id)
+            .is_some_and(|r| r.is_alive())
+        {
+            return;
+        }
+        self.request_relay(supernode_id).await;
+    }
 
     async fn request_relay(&mut self, supernode_id: &str) {
         let sender = self.identity.public_id();
@@ -1474,14 +1646,18 @@ impl ConnectionManager {
         // If no QUIC, drop silently — audio is real-time; WS relay is too slow.
     }
 
-    /// Send a room audio frame to the supernode via WebSocket SFU_AUDIO.
+    /// Send a room audio frame to the supernode for SFU fan-out.
+    ///
+    /// Prefers an unreliable QUIC **relay datagram** when a live relay session
+    /// to the room's supernode exists: datagrams avoid the TCP head-of-line
+    /// blocking that dominates room-audio latency on the WebSocket path. The
+    /// frame is the *same signed `SfuAudio` JSON* either way, so the receiver
+    /// verifies the sender's Ed25519 signature identically and the supernode
+    /// stays a dumb forwarder. Falls back to the WebSocket SFU path when no
+    /// relay session is available or the datagram could not be sent.
     ///
     /// Outbound quota uses `room.audio.sfu` (gated against the supernode peer id).
     /// See `send_audio_datagram` for the direct P2P `core.audio.opus` path.
-    ///
-    /// This is the fallback path for when no direct QUIC connections exist
-    /// between room members (typical over the Internet behind separate NATs).
-    /// The supernode relays the frame to all other room members.
     async fn send_room_audio(&mut self, opus_data: Vec<u8>) {
         if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
             return; // Not in a room
@@ -1499,12 +1675,54 @@ impl ConnectionManager {
         use base64::Engine;
         let audio_b64 = base64::engine::general_purpose::URL_SAFE.encode(&opus_data);
         let mut msg = SignalingMessage::new(MessageType::SfuAudio, sender);
-        msg.target = Some(supernode_id);
+        msg.target = Some(supernode_id.clone());
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id));
         msg.payload
             .insert("audio".to_owned(), Value::String(audio_b64));
+
+        // Fast path: relay datagram (no TCP head-of-line blocking). The Arc
+        // clone drops the `self.quic_relays` borrow before we sign / fall back.
+        let relay = self
+            .quic_relays
+            .get(&supernode_id)
+            .filter(|r| r.is_alive())
+            .cloned();
+        if let Some(relay) = relay {
+            if let Some(json) = self.sign_message_json(&mut msg) {
+                if relay.send_room_audio(json.as_bytes()) {
+                    return;
+                }
+            }
+        }
+        // Fallback: WebSocket SFU relay (re-signs; deterministic Ed25519 yields
+        // the identical signature, so this is safe even after the attempt above).
         self.dispatch_outbound(msg).await;
+    }
+
+    /// Sign `msg` in place (Ed25519 over its canonical bytes) and return the
+    /// serialized JSON, mirroring the signing step in [`Self::dispatch_outbound`].
+    /// Returns `None` if canonicalization or serialization fails.
+    fn sign_message_json(&self, msg: &mut SignalingMessage) -> Option<String> {
+        let canonical = msg.canonical_bytes().ok()?;
+        let sig = self.identity.sign(&canonical);
+        use base64::Engine;
+        msg.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(sig));
+        msg.to_json().ok()
+    }
+
+    /// Re-inject a signed `SfuAudio` JSON received over a QUIC relay datagram
+    /// on the normal inbound path (signature verification + replay/freshness +
+    /// `room.audio.sfu` quota + dispatch all run as for the WebSocket route).
+    async fn handle_relay_room_audio(&mut self, json: Vec<u8>) {
+        let text = match std::str::from_utf8(&json) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        match SignalingMessage::from_json(text) {
+            Ok(msg) => self.handle_inbound(msg).await,
+            Err(e) => debug!("[relay] dropping malformed room-audio datagram: {e}"),
+        }
     }
 
     // -- typing indicator ----------------------------------------------------
@@ -2726,6 +2944,19 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                let joiner_quic_port = msg
+                    .payload
+                    .get("joiner_quic_port")
+                    .and_then(Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .unwrap_or(0);
+                let joiner_lan_hint = msg
+                    .payload
+                    .get("joiner_lan_hint")
+                    .and_then(Value::as_str)
+                    .filter(|hint| parse_quic_lan_hint(hint).is_some())
+                    .unwrap_or("")
+                    .to_owned();
                 if let Some(ref transport_peer_id) = quic_peer_id {
                     self.relabel_quic_peer_session(transport_peer_id, &joiner_peer_id);
                 }
@@ -2738,17 +2969,35 @@ impl ConnectionManager {
                 // Add joiner to peer store
                 {
                     let mut store = self.peer_store.write();
-                    if !store.contains(&joiner_peer_id) {
+                    if let Some(record) = store.get_mut(&joiner_peer_id) {
+                        record.last_seen_at = unix_now_f64();
+                        record.auto_connect = true;
+                        if joiner_quic_port != 0 {
+                            record.quic_port = joiner_quic_port;
+                        }
+                        if !joiner_lan_hint.is_empty()
+                            && !record.relay_hints.contains(&joiner_lan_hint)
+                        {
+                            record.relay_hints.push(joiner_lan_hint.clone());
+                        }
+                    } else {
                         store.upsert(crate::peer_store::PeerRecord {
                             peer_id: joiner_peer_id.clone(),
                             identity_pub: joiner_identity_pub.clone(),
                             handle: joiner_handle.clone(),
+                            relay_hints: if joiner_lan_hint.is_empty() {
+                                vec![]
+                            } else {
+                                vec![joiner_lan_hint.clone()]
+                            },
+                            auto_connect: true,
+                            quic_port: joiner_quic_port,
                             created_at: unix_now_f64(),
                             last_seen_at: unix_now_f64(),
                             ..Default::default()
                         });
-                        let _ = store.save();
                     }
+                    let _ = store.save();
                 }
 
                 // Send INVITE_HANDSHAKE_ACCEPT back
@@ -2850,6 +3099,10 @@ impl ConnectionManager {
                             identity_pub: inviter_identity_pub.clone(),
                             handle: inviter_handle.clone(),
                             relay_hints,
+                            auto_connect: !pending.is_supernode,
+                            quic_port: parse_quic_lan_hint(&pending.lan_hint)
+                                .map(|(_, port)| port)
+                                .unwrap_or(0),
                             is_supernode: pending.is_supernode,
                             supernode_from_invite: pending.is_supernode,
                             created_at: unix_now_f64(),
@@ -3151,7 +3404,8 @@ impl ConnectionManager {
             "inviter_identity_pub": self.identity.public_id(),
             "invite_id": invite_id,
             "expires_at": expires_at,
-            "lan_hint": format!("quic://127.0.0.1:{port}"),
+            "lan_hint": self.local_quic_hint()
+                .unwrap_or_else(|| format!("quic://127.0.0.1:{port}")),
         });
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
         Some(format!("conquerd://invite#{encoded}"))
@@ -3197,6 +3451,10 @@ impl ConnectionManager {
             "joiner_quic_port".into(),
             Value::Number(joiner_quic_port.into()),
         );
+        if let Some(hint) = self.local_quic_hint() {
+            msg.payload
+                .insert("joiner_lan_hint".into(), Value::String(hint));
+        }
         msg
     }
 
@@ -3444,6 +3702,10 @@ impl ConnectionManager {
             "joiner_quic_port".into(),
             Value::Number(joiner_quic_port.into()),
         );
+        if let Some(hint) = self.local_quic_hint() {
+            msg.payload
+                .insert("joiner_lan_hint".into(), Value::String(hint));
+        }
 
         if let Ok(canonical) = msg.canonical_bytes() {
             let sig = self.identity.sign(&canonical);
