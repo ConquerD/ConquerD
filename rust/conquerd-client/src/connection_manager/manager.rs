@@ -202,6 +202,12 @@ pub struct ConnectionManager {
     /// `supernode_id:room_id` keys waiting for private-room invite validation
     /// before sending the count-producing `SfuJoin`.
     pending_private_room_joins: HashSet<String>,
+    /// Consecutive room-audio relay-datagram send failures. After a few in a
+    /// row we stop trying the relay each frame and use WS for a cooldown.
+    room_relay_fail_streak: u32,
+    /// Remaining frames to send room audio over WS before re-trying the relay.
+    /// Avoids per-frame relay/WS thrashing when the relay path is unhealthy.
+    room_relay_cooldown_frames: u32,
     /// Sender handed to each [`QuicRelayClient`] so inbound `room.audio.sfu`
     /// datagrams (signed `SfuAudio` JSON) are re-injected on the normal
     /// inbound path. Cloned per relay connection.
@@ -284,6 +290,8 @@ impl ConnectionManager {
             pending_private_room_joins: HashSet::new(),
             relay_audio_tx,
             relay_audio_rx,
+            room_relay_fail_streak: 0,
+            room_relay_cooldown_frames: 0,
         };
         (cmd_tx, event_rx, mgr.run_inner())
     }
@@ -592,12 +600,13 @@ impl ConnectionManager {
                 Some(ev) = self.internal_rx.recv() => {
                     self.handle_internal_event(ev).await;
                 }
-                // Inbound room-audio frames forwarded over a QUIC relay
-                // datagram. Each item is a signed `SfuAudio` JSON; re-inject it
-                // on the normal inbound path so signature + quota + dispatch
-                // run exactly as for the WebSocket route.
+                // Inbound signed signaling frames forwarded over a QUIC relay —
+                // `SfuAudio` datagrams plus `room.chat.v1` / `room.file.v1`
+                // frames from the reliable signaling stream. Re-inject each on
+                // the normal inbound path so signature + freshness + quota +
+                // dispatch run exactly as for the WebSocket route.
                 Some(json) = self.relay_audio_rx.recv() => {
-                    self.handle_relay_room_audio(json).await;
+                    self.handle_relay_reinject(json).await;
                 }
                 // Accept incoming QUIC connections
                 incoming = async {
@@ -737,6 +746,20 @@ impl ConnectionManager {
             | MessageType::FileTransferError => Some(channel_frame::FILE_TAG),
             _ => None,
         }
+    }
+
+    /// Supernode-targeted room broadcast messages that may ride the reliable
+    /// QUIC relay signaling stream (`room.chat.v1` / `room.file.v1`) instead of
+    /// the WebSocket signaling path. `SfuAudio` is excluded — it rides the
+    /// unreliable relay datagram path.
+    fn is_relay_signaling_type(msg_type: &MessageType) -> bool {
+        matches!(
+            msg_type,
+            MessageType::SfuChat
+                | MessageType::SfuFileOffer
+                | MessageType::SfuFileChunk
+                | MessageType::SfuFileComplete
+        )
     }
 
     async fn dispatch_outbound(&mut self, mut msg: SignalingMessage) {
@@ -925,6 +948,17 @@ impl ConnectionManager {
         // session — room creates/lists from SN-B would land on SN-A instead.
         if let Some(target) = msg.target.clone() {
             if let Some(sn_id) = self.resolve_supernode_ws_target(&target) {
+                // Reliable room broadcasts (room.chat.v1 / room.file.v1) prefer
+                // the QUIC relay signaling stream when a live relay session
+                // exists — no TCP head-of-line blocking. Falls through to the
+                // WebSocket route below if the stream is unavailable/backed up.
+                if Self::is_relay_signaling_type(&msg_type) {
+                    if let Some(relay) = self.quic_relays.get(&sn_id).filter(|r| r.is_alive()) {
+                        if relay.send_signaling(json.as_bytes()) {
+                            return;
+                        }
+                    }
+                }
                 match self.supernodes.get(&sn_id) {
                     Some(sn) if sn.connected => {
                         let _ = sn.send_tx.try_send(WsMessage::Text(json.clone()));
@@ -1487,6 +1521,12 @@ impl ConnectionManager {
     }
 
     async fn send_room_subscribe(&mut self, supernode_id: &str, room_id: &str) {
+        // Establish a QUIC relay session (if not already up) so room chat/file
+        // ride the reliable signaling stream rather than the WebSocket path —
+        // even for chat-only rooms with no active voice. No-op if a live relay
+        // already exists; room messaging still works over WS if the grant
+        // never lands.
+        self.ensure_room_relay(supernode_id).await;
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuSubscribe, sender.clone());
         msg.target = Some(supernode_id.to_owned());
@@ -1681,18 +1721,36 @@ impl ConnectionManager {
         msg.payload
             .insert("audio".to_owned(), Value::String(audio_b64));
 
-        // Fast path: relay datagram (no TCP head-of-line blocking). The Arc
+        // Fast path: relay datagram (no TCP head-of-line blocking), unless we're
+        // in a WS cooldown after repeated relay failures (anti-thrash). The Arc
         // clone drops the `self.quic_relays` borrow before we sign / fall back.
-        let relay = self
-            .quic_relays
-            .get(&supernode_id)
-            .filter(|r| r.is_alive())
-            .cloned();
+        let try_relay = self.room_relay_cooldown_frames == 0;
+        if self.room_relay_cooldown_frames > 0 {
+            self.room_relay_cooldown_frames -= 1;
+        }
+        let relay = if try_relay {
+            self.quic_relays
+                .get(&supernode_id)
+                .filter(|r| r.is_alive())
+                .cloned()
+        } else {
+            None
+        };
         if let Some(relay) = relay {
             if let Some(json) = self.sign_message_json(&mut msg) {
                 if relay.send_room_audio(json.as_bytes()) {
+                    self.room_relay_fail_streak = 0;
                     return;
                 }
+            }
+            // Relay path is unhealthy; after a short streak, prefer WS for a
+            // ~3 s cooldown (≈150 frames at 50 fps) rather than retrying — and
+            // probably failing — on every frame.
+            self.room_relay_fail_streak += 1;
+            if self.room_relay_fail_streak >= 5 {
+                self.room_relay_cooldown_frames = 150;
+                self.room_relay_fail_streak = 0;
+                debug!("[room.audio.sfu] relay datagram unhealthy; using WS for ~3 s");
             }
         }
         // Fallback: WebSocket SFU relay (re-signs; deterministic Ed25519 yields
@@ -1711,10 +1769,12 @@ impl ConnectionManager {
         msg.to_json().ok()
     }
 
-    /// Re-inject a signed `SfuAudio` JSON received over a QUIC relay datagram
-    /// on the normal inbound path (signature verification + replay/freshness +
-    /// `room.audio.sfu` quota + dispatch all run as for the WebSocket route).
-    async fn handle_relay_room_audio(&mut self, json: Vec<u8>) {
+    /// Re-inject a signed signaling JSON received over the QUIC relay — either
+    /// an `SfuAudio` datagram or a `room.chat.v1` / `room.file.v1` frame from
+    /// the reliable signaling stream — on the normal inbound path (signature
+    /// verification + replay/freshness + per-feature quota + dispatch all run
+    /// exactly as for the WebSocket route).
+    async fn handle_relay_reinject(&mut self, json: Vec<u8>) {
         let text = match std::str::from_utf8(&json) {
             Ok(s) => s,
             Err(_) => return,

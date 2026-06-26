@@ -4861,6 +4861,18 @@ fn dispatch_event(
         }
         ConnectionEvent::ConnectionStats { json, .. } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                // Feed transport loss/RTT into the call controller's adaptive
+                // bitrate control before forwarding the stats to QML.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                    let loss_pct = v
+                        .get("packet_loss_pct")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0) as f32;
+                    let rtt_ms = v.get("rtt_ms").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                    if let Some(ref tx) = bridge.rust().call_cmd_tx {
+                        let _ = tx.try_send(CallCommand::UpdateNetworkQuality { loss_pct, rtt_ms });
+                    }
+                }
                 bridge
                     .as_mut()
                     .connection_stats(QString::from(json.as_str()));

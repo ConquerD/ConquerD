@@ -823,6 +823,116 @@ fn sfu_file_inbound_byte_count(msg: &SignalingMessage, mt: MessageType) -> usize
     }
 }
 
+/// Re-encode the relay cert CN (base64url **no-pad**) into the padded
+/// `URL_SAFE` form used everywhere else as the canonical `public_id`
+/// (`peer_sockets`, `quic_senders`, chat-subscriber rosters), so QUIC and
+/// WebSocket delivery key peers identically. Falls back to the input on a
+/// decode error.
+fn canonical_peer_id(relay_cn: &str) -> String {
+    use base64::Engine;
+    match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(relay_cn) {
+        Ok(bytes) => base64::engine::general_purpose::URL_SAFE.encode(bytes),
+        Err(_) => relay_cn.to_string(),
+    }
+}
+
+/// Drive one peer's reliable QUIC relay **signaling** stream.
+///
+/// Inbound: length-prefixed signed `room.chat.v1` / `room.file.v1` frames run
+/// the same verify + freshness + replay pipeline as the WebSocket path
+/// ([`SignalingServer::accept_signed`]) before routing through the shared
+/// [`SupernodeHandler::on_message`]. Outbound: room broadcasts addressed to
+/// this peer by `send_to_peer` are written back over the same stream. The
+/// connection is cert-authenticated, so the signed `sender` must match the
+/// stream's peer. Only room broadcast message types are accepted here;
+/// membership/handshake/control stay on the WebSocket signaling path.
+async fn handle_relay_signaling_stream(
+    state: Arc<SupernodeState>,
+    relay_peer_id: String,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) {
+    const MAX_FRAME: usize = 262_144;
+    let peer_id = canonical_peer_id(&relay_peer_id);
+
+    // Outbound: `send_to_peer` pushes JSON into this channel; the writer task
+    // frames it onto the QUIC stream as `[u32 BE len][json]`.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    state.signaling.register_quic_sender(&peer_id, tx.clone());
+
+    let writer = tokio::spawn(async move {
+        while let Some(json) = rx.recv().await {
+            let body = json.as_bytes();
+            if body.len() > MAX_FRAME {
+                continue;
+            }
+            if send
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if send.write_all(body).await.is_err() {
+                break;
+            }
+        }
+        let _ = send.finish();
+    });
+
+    let handler = SupernodeHandler {
+        state: state.clone(),
+    };
+
+    loop {
+        let mut len_buf = [0u8; 4];
+        if recv.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_FRAME {
+            break;
+        }
+        let mut buf = vec![0u8; len];
+        if recv.read_exact(&mut buf).await.is_err() {
+            break;
+        }
+        let Ok(raw) = String::from_utf8(buf) else {
+            continue;
+        };
+        let Some(msg) = state.signaling.accept_signed(&raw) else {
+            continue;
+        };
+        if msg.sender != peer_id {
+            warn!(
+                "Relay signaling sender {} != stream peer {} — dropping {:?}",
+                &msg.sender[..12.min(msg.sender.len())],
+                &peer_id[..12.min(peer_id.len())],
+                msg.msg_type,
+            );
+            continue;
+        }
+        match msg.msg_type {
+            MessageType::SfuChat
+            | MessageType::SfuFileOffer
+            | MessageType::SfuFileChunk
+            | MessageType::SfuFileComplete => {
+                handler.on_message(msg, &raw);
+            }
+            other => {
+                debug!(
+                    "Ignoring non-broadcast {:?} on relay signaling stream from {}",
+                    other,
+                    &peer_id[..12.min(peer_id.len())],
+                );
+            }
+        }
+    }
+
+    state.signaling.unregister_quic_sender(&peer_id, &tx);
+    writer.abort();
+}
+
 /// Implements SignalingHandler for the supernode.
 struct SupernodeHandler {
     state: Arc<SupernodeState>,
@@ -1362,7 +1472,12 @@ impl SupernodeHandler {
             .get("room_id")
             .and_then(|v| v.as_str())
             .unwrap_or(sfu::DEFAULT_ROOM_ID);
-        let recipients = sfu.read().get_room_members(room_id);
+        // Active-speaker gate: drop the frame entirely when the sender is over
+        // the room's concurrent-talker cap (bounds per-receiver fan-out).
+        let recipients = match sfu.write().audio_forward_targets_now(room_id, &msg.sender) {
+            Some(r) => r,
+            None => return,
+        };
         let wire_bytes = raw.len();
         for peer in &recipients {
             if peer == &msg.sender {
@@ -1784,10 +1899,12 @@ async fn main() -> anyhow::Result<()> {
                 std::sync::Arc::new(web_app_module::WebAppHostModule::new(weak, &data_dir));
             let hook: relay::BidiStreamHook = {
                 let module = module.clone();
-                std::sync::Arc::new(move |peer_id, send, recv| {
+                std::sync::Arc::new(move |peer_id, send, recv, prefetched_len| {
                     let module = module.clone();
                     tokio::spawn(async move {
-                        module.handle_stream(peer_id, send, recv).await;
+                        module
+                            .handle_stream(peer_id, send, recv, prefetched_len)
+                            .await;
                     });
                 })
             };
@@ -1803,6 +1920,91 @@ async fn main() -> anyhow::Result<()> {
                 state.config.data_dir.display(),
                 state.config.data_dir.display()
             );
+        }
+    }
+
+    // Install the reliable signaling-stream hook so `room.chat.v1` /
+    // `room.file.v1` broadcasts ride the QUIC relay connection (no TCP
+    // head-of-line blocking) whenever a peer has a relay session open, with
+    // the WebSocket signaling path as automatic fallback. Requires the SFU
+    // (rooms) and the relay listener.
+    if state.sfu.is_some() {
+        if let Some(ref relay) = state.relay {
+            let weak = std::sync::Arc::downgrade(&state);
+            let hook: relay::SignalStreamHook = std::sync::Arc::new(move |peer_id, send, recv| {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                tokio::spawn(handle_relay_signaling_stream(state, peer_id, send, recv));
+            });
+            relay.set_signal_hook(hook);
+            info!(
+                "[features] room.chat.v1/room.file.v1 reliable broadcast over QUIC relay enabled"
+            );
+        }
+    }
+
+    // Install the room-audio datagram bridge so `room.audio.sfu` frames a peer
+    // sends over its QUIC relay session (unreliable datagrams — no TCP
+    // head-of-line blocking) are fanned out to *every* room member by their
+    // best transport: relay datagram for relay-connected members, WebSocket
+    // for the rest. The frame stays end-to-end signed, so this never
+    // partitions a WS-only member or weakens the signed-forwarder model.
+    if state.sfu.is_some() {
+        if let Some(ref relay) = state.relay {
+            let weak = std::sync::Arc::downgrade(&state);
+            let bridge: relay::RoomAudioBridgeHook = std::sync::Arc::new(
+                move |from_peer: String, sender_index: u8, room_id: String, inner: Vec<u8>| {
+                    let Some(state) = weak.upgrade() else {
+                        return;
+                    };
+                    let Some(ref sfu) = state.sfu else {
+                        return;
+                    };
+                    let Some(ref relay) = state.relay else {
+                        return;
+                    };
+                    // `inner` is `[ROOM_AUDIO_TAG][signed SfuAudio JSON]`. WS
+                    // recipients want the signed JSON; relay recipients want the
+                    // index-prefixed datagram.
+                    let signed_json = &inner[1..];
+                    let Ok(raw) = std::str::from_utf8(signed_json) else {
+                        return;
+                    };
+                    let fwd = crate::wire::build_forwarded_datagram(sender_index, &inner);
+                    // Active-speaker gate (same cap as the WS path): drop the
+                    // frame server-side when the sender is over the room's
+                    // concurrent-talker limit.
+                    let members = match sfu.write().audio_forward_targets_now(&room_id, &from_peer)
+                    {
+                        Some(m) => m,
+                        None => return,
+                    };
+                    for member in members {
+                        if member == from_peer {
+                            continue;
+                        }
+                        match relay.send_room_datagram(&member, &fwd) {
+                            // Delivered (or dropped on quota/send error) over the
+                            // relay — do not also send over WS for this member.
+                            Some(_) => {}
+                            // Not relay-connected: deliver over WebSocket,
+                            // charging the same `room.audio.sfu` outbound quota.
+                            None => {
+                                if state.features.gate_through_feature(
+                                    "room.audio.sfu",
+                                    &member,
+                                    raw.len(),
+                                ) {
+                                    state.signaling.send_to_peer(&member, raw);
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+            relay.set_room_audio_bridge(bridge);
+            info!("[features] room.audio.sfu datagram fan-out over QUIC relay enabled");
         }
     }
 

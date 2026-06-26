@@ -118,6 +118,11 @@ webengine = ["qt-ui"]
 console = []
 # Manual developer diagnostics (live profile dump). Not compiled in CI/default test runs.
 manual-diagnostics = []
+# Experimental acoustic echo cancellation on the capture path (pure-Rust NLMS,
+# no extra dependencies). Off by default; the canceller compiles either way (so
+# its DSP unit tests always run) but is only activated at runtime when enabled.
+# Build: cargo build --features qt-ui,aec
+aec = []
 
 [dependencies.cxx]
 version = "1"

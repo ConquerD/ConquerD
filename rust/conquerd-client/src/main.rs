@@ -16,6 +16,7 @@
 // of local and release builds while preserving the public module surface.
 #![allow(dead_code, unused_imports)]
 
+mod aec;
 mod avatar_config;
 #[cfg(feature = "qt-ui")]
 mod banner;

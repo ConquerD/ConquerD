@@ -60,17 +60,23 @@ impl WebAppHostModule {
     /// Handle one QUIC bidirectional stream tagged for `web.host.app.v1`.
     /// Errors are logged at debug level and turned into a best-effort 500
     /// response when the header has not yet been sent.
+    ///
+    /// `prefetched_len` is the request frame's `u32` length-prefix, which the
+    /// relay already consumed to disambiguate this stream from a reliable
+    /// signaling stream; [`serve`](Self::serve) uses it instead of re-reading.
     pub async fn handle_stream(
         &self,
         peer_id: PeerId,
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
+        prefetched_len: u32,
     ) {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(STREAM_DEADLINE_SECS);
 
         let result = tokio::time::timeout_at(deadline, async {
-            self.serve(&peer_id, &mut send, &mut recv).await
+            self.serve(&peer_id, &mut send, &mut recv, prefetched_len)
+                .await
         })
         .await;
 
@@ -104,9 +110,12 @@ impl WebAppHostModule {
         peer_id: &str,
         send: &mut quinn::SendStream,
         recv: &mut quinn::RecvStream,
+        prefetched_len: u32,
     ) -> Result<(), String> {
         // ── 1. Read the request frame (u32be length-prefixed JSON) ──────
-        let req_len = read_u32(recv).await?;
+        // The `u32` length-prefix was already consumed by the relay's
+        // stream-kind demux, so we take it as `prefetched_len` here.
+        let req_len = prefetched_len;
         if req_len as usize > WEB_APP_MAX_FRAME_BYTES {
             return self
                 .send_error_header(send, peer_id, 413, "request too large")
@@ -345,14 +354,6 @@ impl WebAppHostModule {
         }
         Ok(())
     }
-}
-
-async fn read_u32(recv: &mut quinn::RecvStream) -> Result<u32, String> {
-    let mut buf = [0u8; 4];
-    recv.read_exact(&mut buf)
-        .await
-        .map_err(|e| format!("read length prefix: {e}"))?;
-    Ok(u32::from_be_bytes(buf))
 }
 
 /// Resolve `rel` (which may be empty for the index) under `root`,

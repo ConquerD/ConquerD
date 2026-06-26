@@ -135,16 +135,39 @@ pub struct QUICRelayServer {
     shutdown: Arc<Notify>,
     identity_pub_id: String,
     bidi_hook: Arc<RwLock<Option<BidiStreamHook>>>,
+    signal_hook: Arc<RwLock<Option<SignalStreamHook>>>,
+    room_audio_bridge: Arc<RwLock<Option<RoomAudioBridgeHook>>>,
     features: Arc<FeatureRegistry>,
 }
 
-/// Fire-and-forget hook invoked for every server-accepted bidi stream
-/// from a peer connection. The hook takes ownership of the streams and
-/// is responsible for spawning its own task and applying any per-feature
-/// validation. See [`crate::web_app_module::WebAppHostModule`] for the
-/// reference consumer (`web.host.app.v1`).
+/// Fire-and-forget hook invoked for every server-accepted `web.host.app.v1`
+/// bidi stream from a peer connection. The relay reads the leading `u32`
+/// length-prefix (to disambiguate stream kinds — see [`SignalStreamHook`])
+/// and passes it as `prefetched_len` so the hook does not re-read it. The
+/// hook takes ownership of the streams, spawns its own task, and applies
+/// per-feature validation. See [`crate::web_app_module::WebAppHostModule`].
 pub type BidiStreamHook =
+    Arc<dyn Fn(String, quinn::SendStream, quinn::RecvStream, u32) + Send + Sync + 'static>;
+
+/// Fire-and-forget hook invoked for a server-accepted **reliable signaling**
+/// bidi stream — i.e. one whose leading `u32` equals
+/// [`conquerd_features::channel_frame::RELAY_SIGNAL_STREAM_MAGIC`]. Carries
+/// `room.chat.v1` / `room.file.v1` broadcasts both directions over the
+/// already-identity-verified relay connection. The hook owns the streams and
+/// spawns its own task. See `handle_relay_signaling_stream` in `main.rs`.
+pub type SignalStreamHook =
     Arc<dyn Fn(String, quinn::SendStream, quinn::RecvStream) + Send + Sync + 'static>;
+
+/// Hook invoked when the relay receives a broadcast `room.audio.sfu` datagram.
+///
+/// The supernode uses it to fan the (already end-to-end signed) frame out to
+/// *all* SFU room members by their best transport — relay datagram for
+/// relay-connected members, WebSocket for the rest — so a member that joined
+/// over WS but never opened a relay session is never partitioned. Arguments:
+/// `(from_peer, sender_index, room_id, inner_payload)` where `inner_payload`
+/// is `[ROOM_AUDIO_TAG][signed SfuAudio JSON]` (the bytes after the datagram's
+/// leading target-index byte). See `install_room_audio_bridge` in `main.rs`.
+pub type RoomAudioBridgeHook = Arc<dyn Fn(String, u8, String, Vec<u8>) + Send + Sync + 'static>;
 
 impl QUICRelayServer {
     pub fn new(identity_pub_id: String, features: Arc<FeatureRegistry>) -> Self {
@@ -153,6 +176,8 @@ impl QUICRelayServer {
             shutdown: Arc::new(Notify::new()),
             identity_pub_id,
             bidi_hook: Arc::new(RwLock::new(None)),
+            signal_hook: Arc::new(RwLock::new(None)),
+            room_audio_bridge: Arc::new(RwLock::new(None)),
             features,
         }
     }
@@ -162,6 +187,45 @@ impl QUICRelayServer {
     /// connection; later updates apply to new connections only.
     pub fn set_bidi_hook(&self, hook: BidiStreamHook) {
         *self.bidi_hook.write() = Some(hook);
+    }
+
+    /// Install (or replace) the reliable-signaling-stream hook. Like
+    /// [`set_bidi_hook`](Self::set_bidi_hook) the hook is re-read per stream,
+    /// so registering it after `start` still covers existing connections.
+    pub fn set_signal_hook(&self, hook: SignalStreamHook) {
+        *self.signal_hook.write() = Some(hook);
+    }
+
+    /// Install (or replace) the room-audio datagram bridge hook. Re-read per
+    /// inbound datagram, so registering it after `start` still applies.
+    pub fn set_room_audio_bridge(&self, hook: RoomAudioBridgeHook) {
+        *self.room_audio_bridge.write() = Some(hook);
+    }
+
+    /// Forward a pre-built room-audio datagram to `recipient` over their relay
+    /// connection, charging the outbound `room.audio.sfu` quota. Returns:
+    /// * `None` — `recipient` has no live relay session (caller should use WS);
+    /// * `Some(true)` — delivered;
+    /// * `Some(false)` — relay-connected but dropped (quota exceeded or send
+    ///   error); the caller must NOT also send over WS, to avoid duplicate
+    ///   delivery / double quota accounting.
+    pub fn send_room_datagram(&self, recipient: &str, fwd: &[u8]) -> Option<bool> {
+        let st = self.state.read();
+        let peer = st.peers.get(recipient)?;
+        if peer.connection.close_reason().is_some() {
+            return None;
+        }
+        if !self
+            .features
+            .gate_through_feature("room.audio.sfu", recipient, fwd.len())
+        {
+            return Some(false);
+        }
+        Some(
+            peer.connection
+                .send_datagram(Bytes::copy_from_slice(fwd))
+                .is_ok(),
+        )
     }
 
     /// Authorize a peer to connect via QUIC relay.
@@ -292,6 +356,8 @@ impl QUICRelayServer {
         let state = self.state.clone();
         let shutdown = self.shutdown.clone();
         let bidi_hook = self.bidi_hook.clone();
+        let signal_hook = self.signal_hook.clone();
+        let room_audio_bridge = self.room_audio_bridge.clone();
         let features = self.features.clone();
 
         // Accept loop
@@ -306,10 +372,12 @@ impl QUICRelayServer {
                         // This fixes a race where peers connecting before
                         // set_bidi_hook() is called get hook=None forever.
                         let hook = bidi_hook.clone();
+                        let signal_hook = signal_hook.clone();
+                        let room_audio_bridge = room_audio_bridge.clone();
                         let features = features.clone();
                         tokio::spawn(async move {
                             if let Err(e) =
-                                handle_connection(incoming, state, hook, features).await
+                                handle_connection(incoming, state, hook, signal_hook, room_audio_bridge, features).await
                             {
                                 debug!("Relay connection error: {e}");
                             }
@@ -354,6 +422,8 @@ async fn handle_connection(
     incoming: quinn::Incoming,
     state: Arc<RwLock<RelayState>>,
     bidi_hook: Arc<RwLock<Option<BidiStreamHook>>>,
+    signal_hook: Arc<RwLock<Option<SignalStreamHook>>>,
+    room_audio_bridge: Arc<RwLock<Option<RoomAudioBridgeHook>>>,
     features: Arc<FeatureRegistry>,
 ) -> anyhow::Result<()> {
     let connection = incoming.await?;
@@ -437,22 +507,40 @@ async fn handle_connection(
         remote_addr
     );
 
-    // Bidi-stream accept loop (dispatches to feature hook, e.g.
-    // `web.host.app.v1`). Runs concurrently with the datagram loop and
-    // terminates automatically when the QUIC connection closes.
-    // The hook is re-read on every accepted stream so hooks registered
-    // after this connection was established (startup race) are picked up.
+    // Bidi-stream accept loop. Each accepted stream is multiplexed by its
+    // leading `u32`: `RELAY_SIGNAL_STREAM_MAGIC` routes to the reliable
+    // signaling hook (`room.chat.v1` / `room.file.v1`); any other value is a
+    // `web.host.app.v1` request length-prefix and is handed to the bidi hook
+    // as `prefetched_len`. Runs concurrently with the datagram loop and ends
+    // when the connection closes. Hooks are re-read per stream so ones
+    // registered after this connection began (startup race) are picked up.
     {
         let conn_streams = connection.clone();
         let peer_id_streams = peer_id.clone();
         let hook_lock = bidi_hook.clone();
+        let signal_lock = signal_hook.clone();
         tokio::spawn(async move {
-            while let Ok((send, recv)) = conn_streams.accept_bi().await {
-                if let Some(hook) = hook_lock.read().clone() {
-                    (hook)(peer_id_streams.clone(), send, recv);
-                }
-                // If no hook is registered the stream is dropped
-                // (remote side gets a clean reset).
+            while let Ok((send, mut recv)) = conn_streams.accept_bi().await {
+                let peer = peer_id_streams.clone();
+                let hook = hook_lock.read().clone();
+                let signal = signal_lock.read().clone();
+                // Read the discriminating prefix on its own task so a slow
+                // client can't stall the accept loop for other streams.
+                tokio::spawn(async move {
+                    let mut len_buf = [0u8; 4];
+                    if recv.read_exact(&mut len_buf).await.is_err() {
+                        return;
+                    }
+                    let first = u32::from_be_bytes(len_buf);
+                    if first == conquerd_features::channel_frame::RELAY_SIGNAL_STREAM_MAGIC {
+                        if let Some(signal) = signal {
+                            (signal)(peer, send, recv);
+                        }
+                    } else if let Some(hook) = hook {
+                        (hook)(peer, send, recv, first);
+                    }
+                    // No matching hook → streams drop (remote gets a reset).
+                });
             }
         });
     }
@@ -461,6 +549,7 @@ async fn handle_connection(
     let state_clone = state.clone();
     let peer_id_clone = peer_id.clone();
     let features_clone = features.clone();
+    let room_audio_bridge_clone = room_audio_bridge.clone();
 
     // Datagram forwarding loop
     loop {
@@ -471,6 +560,7 @@ async fn handle_connection(
                         handle_datagram(
                             &state_clone,
                             &features_clone,
+                            &room_audio_bridge_clone,
                             &peer_id_clone,
                             &data,
                         );
@@ -547,6 +637,7 @@ fn try_forward_datagram(
 fn handle_datagram(
     state: &Arc<RwLock<RelayState>>,
     features: &FeatureRegistry,
+    room_audio_bridge: &Arc<RwLock<Option<RoomAudioBridgeHook>>>,
     from_peer: &str,
     data: &[u8],
 ) {
@@ -570,6 +661,27 @@ fn handle_datagram(
         return;
     };
     let sender_index = from.peer_index;
+
+    // Room audio broadcast: hand off to the SFU-aware bridge so the frame
+    // reaches *every* room member — relay datagram for relay-connected peers,
+    // WebSocket for the rest — rather than only relay-connected members, which
+    // would silently partition WS-only members. The frame stays end-to-end
+    // signed; the supernode just chooses each member's transport.
+    if target_idx == wire::BROADCAST_INDEX && feature_id == "room.audio.sfu" {
+        let bridge = room_audio_bridge.read().clone();
+        if let Some(bridge) = bridge {
+            let room_id = from.room_id.clone();
+            let inner = payload.to_vec();
+            drop(st);
+            if let Some(room_id) = room_id {
+                (bridge)(from_peer.to_string(), sender_index, room_id, inner);
+            }
+            return;
+        }
+        // No bridge installed (e.g. unit tests): fall through to the generic
+        // relay-only broadcast below.
+    }
+
     let mut relayed = 0u64;
 
     if target_idx == wire::BROADCAST_INDEX {
@@ -969,10 +1081,49 @@ mod tests {
             conquerd_features::wellknown::core_chat_v1(),
             conquerd_features::wellknown::core_file_v1(),
             conquerd_features::wellknown::game_relay_v1(),
+            conquerd_features::wellknown::room_audio_sfu(),
         ] {
             let _ = r.upsert(cap);
         }
         r
+    }
+
+    #[test]
+    fn send_room_datagram_unconnected_peer_returns_none() {
+        // A peer that holds no live relay connection must yield `None` so the
+        // bridge falls back to the WebSocket SFU path rather than charging
+        // quota or silently dropping the frame.
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
+        assert_eq!(
+            srv.send_room_datagram("ghost-peer", &[0x01, 0x04, 0x7b]),
+            None
+        );
+    }
+
+    #[test]
+    fn room_audio_datagram_wire_round_trip() {
+        // End-to-end byte layout the client and relay agree on:
+        //   client → relay:  [BROADCAST_INDEX][ROOM_AUDIO_TAG][signed json]
+        //   relay  → member: [sender_index ][ROOM_AUDIO_TAG][signed json]
+        use conquerd_features::channel_frame::ROOM_AUDIO_TAG;
+        let signed_json = br#"{"type":"sfu_audio","sender":"abc"}"#;
+
+        // What the client's `send_room_audio` puts on the wire.
+        let mut outbound = vec![wire::BROADCAST_INDEX, ROOM_AUDIO_TAG];
+        outbound.extend_from_slice(signed_json);
+
+        // Relay strips the target index and classifies by the inner tag.
+        let (target_idx, payload) = wire::parse_datagram(&outbound).unwrap();
+        assert_eq!(target_idx, wire::BROADCAST_INDEX);
+        assert_eq!(relay_datagram_feature(payload).0, "room.audio.sfu");
+
+        // Relay re-frames with the sender's index for fan-out.
+        let fwd = wire::build_forwarded_datagram(7, payload);
+        assert_eq!(fwd[0], 7);
+        assert_eq!(fwd[1], ROOM_AUDIO_TAG);
+        // What the receiving client extracts: it ignores fwd[0], checks the
+        // tag at fwd[1], and recovers the signed JSON from fwd[2..].
+        assert_eq!(&fwd[2..], signed_json);
     }
 
     #[test]
@@ -988,6 +1139,14 @@ mod tests {
 
         let (fid, _) = relay_datagram_feature(&encode_frame(FILE_TAG, b"chunk"));
         assert_eq!(fid, "core.file.v1");
+
+        // Room audio rides its own fixed tag so the relay attributes it to
+        // `room.audio.sfu` quota, not the direct-call `core.audio.opus` bucket.
+        let (fid, _) = relay_datagram_feature(&encode_frame(
+            conquerd_features::channel_frame::ROOM_AUDIO_TAG,
+            b"signed-json",
+        ));
+        assert_eq!(fid, "room.audio.sfu");
 
         let (fid, _) = relay_datagram_feature(b"opaque-game-payload");
         assert_eq!(fid, "game.relay.v1");

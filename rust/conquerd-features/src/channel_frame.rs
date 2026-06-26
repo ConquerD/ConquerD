@@ -54,6 +54,16 @@ pub const ROOM_AUDIO_TAG: u8 = 0x04;
 /// reserved for future first-party channels.
 pub const MAX_FIRST_PARTY_TAG: u8 = 0x0F;
 
+/// Sentinel u32 (big-endian) a client writes as the **first frame** of a
+/// QUIC relay *bidirectional* stream to mark it as the reliable signaling
+/// channel (`room.chat.v1` / `room.file.v1` broadcasts), as opposed to a
+/// `web.host.app.v1` request whose first u32 is a length-prefix.
+///
+/// The value is far above [`web_app::WEB_APP_MAX_FRAME_BYTES`](crate::web_app::WEB_APP_MAX_FRAME_BYTES)
+/// (16 KiB), so a valid web-app request length can never collide with it and
+/// the supernode can disambiguate the two stream kinds by reading 4 bytes.
+pub const RELAY_SIGNAL_STREAM_MAGIC: u32 = 0x5147_4E4C; // "QGNL"
+
 /// The fixed channel tag for a first-party feature id, if one exists.
 ///
 /// Only `core.*` features that ride a dedicated channel have a fixed tag;

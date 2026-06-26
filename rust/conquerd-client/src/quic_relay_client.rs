@@ -35,9 +35,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
-use conquerd_features::channel_frame::ROOM_AUDIO_TAG;
-use quinn::{Connection, Endpoint};
-use tokio::sync::mpsc::UnboundedSender;
+use conquerd_features::channel_frame::{RELAY_SIGNAL_STREAM_MAGIC, ROOM_AUDIO_TAG};
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -46,6 +46,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-relay-cmd frame size sanity cap (matches supernode wire).
 const RELAY_CMD_MAX_FRAME: usize = 64 * 1024;
+
+/// Per reliable-signaling-frame size cap (matches the supernode side).
+const SIGNAL_MAX_FRAME: usize = 262_144;
+
+/// Bound on queued outbound signaling frames before `send_signaling` reports
+/// back-pressure (and the caller falls back to WebSocket).
+const SIGNAL_OUT_CAPACITY: usize = 512;
 
 /// Datagram target index meaning "broadcast to all room members"
 /// (mirrors `conquerd_supernode::wire::BROADCAST_INDEX`).
@@ -61,6 +68,11 @@ pub struct QuicRelayClient {
     relay_port: u16,
     connection: Connection,
     shutdown: Arc<Notify>,
+    /// Outbound queue for the reliable signaling stream (`room.chat.v1` /
+    /// `room.file.v1`). `None` if the stream could not be opened — callers
+    /// then fall back to the WebSocket signaling path. Bounded so a stalled
+    /// stream surfaces as back-pressure rather than unbounded growth.
+    signal_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for QuicRelayClient {
@@ -83,16 +95,18 @@ impl QuicRelayClient {
     /// `supernode_id` is the supernode's identity pubkey (peer_id); kept
     /// here so callers can identify the relay later without re-parsing
     /// the cert.
-    /// `room_audio_tx` receives the signed `SfuAudio` JSON bytes extracted
-    /// from inbound `room.audio.sfu` datagrams. The connection manager owns
-    /// the receiver and re-injects each frame on its normal inbound path
-    /// (signature verification + quota + dispatch).
+    /// `reinject_tx` receives signed signaling JSON bytes that arrive over the
+    /// relay — both `SfuAudio` extracted from inbound `room.audio.sfu`
+    /// datagrams and `room.chat.v1` / `room.file.v1` broadcasts delivered on
+    /// the reliable signaling stream. The connection manager owns the receiver
+    /// and re-injects each frame on its normal inbound path (signature
+    /// verification + freshness + replay + quota + dispatch).
     pub async fn connect(
         endpoint: &Endpoint,
         supernode_id: impl Into<String>,
         host: &str,
         port: u16,
-        room_audio_tx: UnboundedSender<Vec<u8>>,
+        reinject_tx: UnboundedSender<Vec<u8>>,
     ) -> anyhow::Result<Self> {
         let supernode_id = supernode_id.into();
         let addr: SocketAddr = format!("{host}:{port}")
@@ -136,9 +150,37 @@ impl QuicRelayClient {
         let conn_dgram = connection.clone();
         let shutdown_dgram = shutdown.clone();
         let sn_short_dgram = supernode_id[..12.min(supernode_id.len())].to_owned();
+        let reinject_dgram = reinject_tx.clone();
         tokio::spawn(async move {
-            recv_room_datagrams(conn_dgram, shutdown_dgram, room_audio_tx, sn_short_dgram).await;
+            recv_room_datagrams(conn_dgram, shutdown_dgram, reinject_dgram, sn_short_dgram).await;
         });
+
+        // Reliable signaling stream — carries `room.chat.v1` / `room.file.v1`
+        // broadcasts both directions. Opened best-effort: if it can't be
+        // established the client transparently uses the WebSocket path.
+        let signal_tx = match connection.open_bi().await {
+            Ok((send, recv)) => {
+                let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(SIGNAL_OUT_CAPACITY);
+                let shutdown_sig = shutdown.clone();
+                let sn_short_sig = supernode_id[..12.min(supernode_id.len())].to_owned();
+                tokio::spawn(async move {
+                    run_signaling_stream(
+                        send,
+                        recv,
+                        out_rx,
+                        reinject_tx,
+                        shutdown_sig,
+                        sn_short_sig,
+                    )
+                    .await;
+                });
+                Some(out_tx)
+            }
+            Err(e) => {
+                warn!("[relay] could not open signaling stream: {e}; using WS for room chat/file");
+                None
+            }
+        };
 
         Ok(Self {
             supernode_id,
@@ -146,6 +188,7 @@ impl QuicRelayClient {
             relay_port: port,
             connection,
             shutdown,
+            signal_tx,
         })
     }
 
@@ -202,6 +245,24 @@ impl QuicRelayClient {
         buf.push(ROOM_AUDIO_TAG);
         buf.extend_from_slice(signed_json);
         self.connection.send_datagram(Bytes::from(buf)).is_ok()
+    }
+
+    /// Queue a signed signaling frame (`room.chat.v1` / `room.file.v1` JSON)
+    /// for delivery over the reliable signaling stream. Returns `false` if the
+    /// stream was never opened, the connection is gone, or the outbound queue
+    /// is full — the caller then falls back to the WebSocket path so a frame is
+    /// never dropped solely because the QUIC stream is unavailable/backed up.
+    pub fn send_signaling(&self, json: &[u8]) -> bool {
+        if self.connection.close_reason().is_some() {
+            return false;
+        }
+        if json.len() > SIGNAL_MAX_FRAME {
+            return false;
+        }
+        match &self.signal_tx {
+            Some(tx) => tx.try_send(json.to_vec()).is_ok(),
+            None => false,
+        }
     }
 
     /// Gracefully close the relay connection and stop the drain task.
@@ -310,4 +371,94 @@ async fn recv_room_datagrams(
         }
     }
     debug!("[relay {}] datagram task exiting", sn_short);
+}
+
+/// Drive the reliable signaling stream: write the [`RELAY_SIGNAL_STREAM_MAGIC`]
+/// marker, then pump queued outbound frames (`[u32 BE len][json]`) while a
+/// concurrent reader re-injects inbound broadcasts via `reinject_tx`.
+async fn run_signaling_stream(
+    mut send: SendStream,
+    recv: RecvStream,
+    mut out_rx: mpsc::Receiver<Vec<u8>>,
+    reinject_tx: UnboundedSender<Vec<u8>>,
+    shutdown: Arc<Notify>,
+    sn_short: String,
+) {
+    // Mark this bidi stream as the signaling channel so the supernode routes
+    // it to the signaling hook instead of the `web.host.app.v1` handler.
+    if let Err(e) = send
+        .write_all(&RELAY_SIGNAL_STREAM_MAGIC.to_be_bytes())
+        .await
+    {
+        debug!(
+            "[relay {}] signaling stream open write failed: {}",
+            sn_short, e
+        );
+        return;
+    }
+
+    let reader = {
+        let shutdown = shutdown.clone();
+        let sn_short = sn_short.clone();
+        tokio::spawn(
+            async move { read_signaling_frames(recv, reinject_tx, shutdown, sn_short).await },
+        )
+    };
+
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            frame = out_rx.recv() => {
+                let Some(frame) = frame else { break };
+                if frame.len() > SIGNAL_MAX_FRAME {
+                    continue;
+                }
+                if send
+                    .write_all(&(frame.len() as u32).to_be_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if send.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = send.finish();
+    reader.abort();
+    debug!("[relay {}] signaling stream task exiting", sn_short);
+}
+
+/// Read length-prefixed signed signaling frames from the supernode and hand
+/// each to the connection manager for re-injection on the normal inbound path.
+async fn read_signaling_frames(
+    mut recv: RecvStream,
+    reinject_tx: UnboundedSender<Vec<u8>>,
+    shutdown: Arc<Notify>,
+    sn_short: String,
+) {
+    loop {
+        let mut len_buf = [0u8; 4];
+        let read = tokio::select! {
+            _ = shutdown.notified() => break,
+            r = recv.read_exact(&mut len_buf) => r,
+        };
+        if read.is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > SIGNAL_MAX_FRAME {
+            break;
+        }
+        let mut buf = vec![0u8; len];
+        if recv.read_exact(&mut buf).await.is_err() {
+            break;
+        }
+        if reinject_tx.send(buf).is_err() {
+            break; // manager dropped the receiver
+        }
+    }
+    debug!("[relay {}] signaling reader exiting", sn_short);
 }

@@ -20,8 +20,13 @@ type PeerTx = mpsc::UnboundedSender<String>;
 
 /// Shared signaling state.
 pub struct SignalingState {
-    /// identity_pub → sender channel
+    /// identity_pub → WebSocket sender channel
     pub peer_sockets: HashMap<String, PeerTx>,
+    /// identity_pub → reliable QUIC relay signaling-stream sender channel.
+    /// Populated by the relay's signaling-stream hook; preferred over the
+    /// WebSocket socket by [`SignalingServer::send_to_peer`] for lower-latency,
+    /// head-of-line-blocking-free room broadcast delivery.
+    pub quic_senders: HashMap<String, PeerTx>,
     /// Number of connected peers
     pub connected_count: usize,
 }
@@ -30,6 +35,7 @@ impl SignalingState {
     pub fn new() -> Self {
         Self {
             peer_sockets: HashMap::new(),
+            quic_senders: HashMap::new(),
             connected_count: 0,
         }
     }
@@ -71,18 +77,95 @@ impl SignalingServer {
     }
 
     /// Send a raw JSON message to a specific peer.
+    ///
+    /// Prefers the peer's reliable QUIC relay signaling stream when one is
+    /// registered (room broadcasts avoid TCP head-of-line blocking that way),
+    /// falling back to the WebSocket socket if no QUIC stream exists or its
+    /// channel has closed.
     pub fn send_to_peer(&self, identity_pub: &str, json: &str) -> bool {
         let st = self.state.read();
+        if let Some(tx) = st.quic_senders.get(identity_pub) {
+            if tx.send(json.to_string()).is_ok() {
+                return true;
+            }
+        }
         if let Some(tx) = st.peer_sockets.get(identity_pub) {
-            tx.send(json.to_string()).is_ok()
-        } else {
-            false
+            return tx.send(json.to_string()).is_ok();
+        }
+        false
+    }
+
+    /// Register a peer's reliable QUIC relay signaling-stream sender. Called
+    /// by the relay signaling hook when a peer opens its signaling stream.
+    pub fn register_quic_sender(&self, identity_pub: &str, tx: PeerTx) {
+        self.state
+            .write()
+            .quic_senders
+            .insert(identity_pub.to_string(), tx);
+    }
+
+    /// Remove a peer's QUIC signaling sender, but only if it is still the
+    /// `tx` registered (guards against tearing down a newer stream after a
+    /// reconnect replaced this one).
+    pub fn unregister_quic_sender(&self, identity_pub: &str, tx: &PeerTx) {
+        let mut st = self.state.write();
+        if st
+            .quic_senders
+            .get(identity_pub)
+            .is_some_and(|stored| stored.same_channel(tx))
+        {
+            st.quic_senders.remove(identity_pub);
         }
     }
 
-    /// Check if a peer is currently connected.
+    /// Parse, verify (Ed25519 signature + 5-minute freshness), and run the
+    /// shared sliding-window replay guard over a raw signaling frame. Returns
+    /// the parsed message when it should be routed; `None` (logging the
+    /// reason) when it must be dropped. Used by the reliable QUIC relay
+    /// signaling stream so it enforces exactly the same checks as the WS path
+    /// (and shares the replay guard, so a frame replayed across transports is
+    /// still caught). `SfuAudio` is never expected here (it rides datagrams).
+    pub fn accept_signed(&self, raw: &str) -> Option<SignalingMessage> {
+        if raw.len() > 262_144 {
+            warn!(
+                "Oversized relay signaling frame ({} bytes) — dropping",
+                raw.len()
+            );
+            return None;
+        }
+        let parsed = SignalingMessage::from_json(raw).ok()?;
+        if !parsed.verify() || !parsed.is_fresh(300.0) {
+            warn!(
+                "Invalid signature/freshness on relay signaling {:?} from {} — dropping",
+                parsed.msg_type,
+                &parsed.sender[..12.min(parsed.sender.len())],
+            );
+            return None;
+        }
+        let fresh = parsed
+            .signature
+            .as_deref()
+            .map(|sig| {
+                self.replay_guard
+                    .check_and_record(&parsed.sender, sig.as_bytes())
+            })
+            .unwrap_or(false);
+        if !fresh {
+            warn!(
+                "Replayed or unsigned relay signaling {:?} from {} — dropping",
+                parsed.msg_type,
+                &parsed.sender[..12.min(parsed.sender.len())],
+            );
+            return None;
+        }
+        Some(parsed)
+    }
+
+    /// Check if a peer is currently connected (via WebSocket or QUIC relay
+    /// signaling stream).
     pub fn is_peer_connected(&self, identity_pub: &str) -> bool {
-        self.state.read().peer_sockets.contains_key(identity_pub)
+        let st = self.state.read();
+        st.peer_sockets.contains_key(identity_pub) || st.quic_senders.contains_key(identity_pub)
     }
 
     /// Get all connected peer IDs.

@@ -93,7 +93,12 @@ impl FeatureModule for SfuRoomModule {
 
         let Some(ref sfu) = state.sfu else { return };
         let members = match self.members_kind {
-            MembersKind::Audio => sfu.read().get_room_members(&room_id),
+            // Active-speaker gate: drop browser audio frames from speakers over
+            // the room's concurrent-talker cap (parity with the native paths).
+            MembersKind::Audio => match sfu.write().audio_forward_targets_now(&room_id, &source) {
+                Some(m) => m,
+                None => return,
+            },
             MembersKind::Chat => sfu.read().get_chat_recipients(&room_id),
         };
         let wire_bytes = payload.len();

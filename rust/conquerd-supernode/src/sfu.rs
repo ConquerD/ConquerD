@@ -18,11 +18,46 @@ pub const DEFAULT_ROOM_NAME: &str = "Public Voice/Chat Room";
 /// Remove user-created SFU rooms after this many seconds with no voice or chat subscribers.
 pub const IDLE_ROOM_GC_SECS: f64 = 900.0;
 
+/// Maximum number of simultaneous talkers the SFU forwards per room. Audio
+/// frames from speakers beyond this cap are dropped server-side (the receiver
+/// fills the brief gap with Opus PLC), so each member's inbound stream count —
+/// and therefore decode load and bandwidth — stays bounded no matter how large
+/// the room is. Rooms with at most this many concurrent talkers (the common
+/// case) are unaffected: every active speaker is forwarded.
+pub const MAX_ACTIVE_SPEAKERS: usize = 5;
+
+/// Half-life (seconds of silence) of a speaker's activity score. A speaker who
+/// keeps sending frames accumulates a high score; one who pauses decays toward
+/// zero, so the active set tracks *sustained* talkers rather than brief blips.
+const SPEAKER_SCORE_HALF_LIFE_SECS: f64 = 2.0;
+
+/// Drop a speaker from activity tracking (and free its active slot) after this
+/// long with no audio frames. Matches the client's per-peer silence timeout.
+const SPEAKER_SILENCE_SECS: f64 = 0.6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RoomType {
     Public,
     Private,
+}
+
+/// Decaying activity score for one speaker, used to pick the room's top-K
+/// active talkers without the supernode ever decoding the (opaque) Opus audio.
+#[derive(Debug, Clone, Copy)]
+struct SpeakerScore {
+    /// Accumulated, time-decayed activity (one unit per forwarded-frame attempt).
+    score: f64,
+    /// Wall-clock seconds of the last audio frame seen from this speaker.
+    last_active: f64,
+}
+
+impl SpeakerScore {
+    /// Score decayed forward to `now` (does not mutate).
+    fn effective(&self, now: f64) -> f64 {
+        let dt = (now - self.last_active).max(0.0);
+        self.score * 0.5f64.powf(dt / SPEAKER_SCORE_HALF_LIFE_SECS)
+    }
 }
 
 /// A single SFU room.
@@ -34,6 +69,12 @@ pub struct SFURoom {
     pub creator_id: String,
     /// identity_pub → participant index
     participants: HashMap<String, u8>,
+    /// Active-speaker tracking: sender → decaying activity score.
+    speaker_scores: HashMap<String, SpeakerScore>,
+    /// Currently committed active-speaker set (≤ [`MAX_ACTIVE_SPEAKERS`]).
+    /// Kept sticky across frames to avoid per-frame flapping; re-evaluated on
+    /// each inbound frame against [`Self::speaker_scores`].
+    active_speakers: Vec<String>,
     /// Text-chat subscribers (not voice-joined)
     subscribers: std::collections::HashSet<String>,
     /// Allowed peers for private rooms
@@ -64,6 +105,8 @@ impl SFURoom {
             room_type,
             creator_id: creator_id.to_string(),
             participants: HashMap::new(),
+            speaker_scores: HashMap::new(),
+            active_speakers: Vec::new(),
             subscribers: std::collections::HashSet::new(),
             allowed: std::collections::HashSet::new(),
             invite_tokens: HashMap::new(),
@@ -149,8 +192,79 @@ impl SFURoom {
         let removed = self.participants.remove(peer_id).is_some();
         if removed {
             self.mark_unused_if_empty();
+            self.speaker_scores.remove(peer_id);
+            self.active_speakers.retain(|id| id != peer_id);
         }
         removed
+    }
+
+    /// Record an inbound audio frame from `sender` and decide whether the SFU
+    /// should forward it this tick. Returns `false` only when the room already
+    /// has [`MAX_ACTIVE_SPEAKERS`] louder/longer-sustained talkers — i.e. the
+    /// frame is shed server-side to bound per-receiver fan-out.
+    ///
+    /// The decision is energy-free: it ranks speakers by a decaying count of
+    /// recent frames (Opus DTX means a silent mic sends nothing, so "frames
+    /// arriving" is a good proxy for "currently talking"). A committed active
+    /// set provides hysteresis; a new talker only displaces an active one once
+    /// it strictly out-scores the weakest current member.
+    pub fn note_audio_should_forward(&mut self, sender: &str, now: f64) -> bool {
+        // Decay + bump the sender's score.
+        {
+            let e = self
+                .speaker_scores
+                .entry(sender.to_owned())
+                .or_insert(SpeakerScore {
+                    score: 0.0,
+                    last_active: now,
+                });
+            let dt = (now - e.last_active).max(0.0);
+            e.score = e.score * 0.5f64.powf(dt / SPEAKER_SCORE_HALF_LIFE_SECS) + 1.0;
+            e.last_active = now;
+        }
+
+        // Drop long-silent speakers from tracking and the active set so their
+        // slots free up for whoever talks next.
+        self.speaker_scores
+            .retain(|_, s| now - s.last_active <= SPEAKER_SILENCE_SECS);
+        let scores = &self.speaker_scores;
+        self.active_speakers.retain(|id| scores.contains_key(id));
+
+        // Already an active speaker → forward.
+        if self.active_speakers.iter().any(|id| id == sender) {
+            return true;
+        }
+        // Free slot → admit.
+        if self.active_speakers.len() < MAX_ACTIVE_SPEAKERS {
+            self.active_speakers.push(sender.to_owned());
+            return true;
+        }
+        // Full: displace the weakest active speaker iff this sender now strictly
+        // out-scores them (hysteresis prevents flapping between equal talkers).
+        let sender_eff = self
+            .speaker_scores
+            .get(sender)
+            .map(|s| s.effective(now))
+            .unwrap_or(0.0);
+        let mut weakest_idx = 0usize;
+        let mut weakest_eff = f64::MAX;
+        for (i, id) in self.active_speakers.iter().enumerate() {
+            let eff = self
+                .speaker_scores
+                .get(id)
+                .map(|s| s.effective(now))
+                .unwrap_or(0.0);
+            if eff < weakest_eff {
+                weakest_eff = eff;
+                weakest_idx = i;
+            }
+        }
+        if sender_eff > weakest_eff {
+            self.active_speakers[weakest_idx] = sender.to_owned();
+            true
+        } else {
+            false
+        }
     }
 
     /// Subscribe a peer to text chat (without voice join).
@@ -173,6 +287,10 @@ impl SFURoom {
     pub fn remove_peer_entirely(&mut self, peer_id: &str) -> bool {
         let was_participant = self.participants.remove(peer_id).is_some();
         let was_subscriber = self.subscribers.remove(peer_id);
+        if was_participant {
+            self.speaker_scores.remove(peer_id);
+            self.active_speakers.retain(|id| id != peer_id);
+        }
         if was_participant || was_subscriber {
             self.mark_unused_if_empty();
         }
@@ -339,11 +457,32 @@ impl SFURoomManager {
         self.rooms.get(room_id)
     }
 
-    pub fn get_room_members(&self, room_id: &str) -> Vec<String> {
-        self.rooms
-            .get(room_id)
-            .map(|r| r.participant_ids())
-            .unwrap_or_default()
+    /// Active-speaker gate for an inbound audio frame. Records `sender`'s
+    /// activity and returns the voice recipients (all room participants) when
+    /// the frame should be forwarded, or `None` when `sender` is over the
+    /// room's active-speaker cap and the frame should be dropped server-side.
+    /// `now` is wall-clock seconds (see [`Self::audio_forward_targets_now`]).
+    pub fn audio_forward_targets(
+        &mut self,
+        room_id: &str,
+        sender: &str,
+        now: f64,
+    ) -> Option<Vec<String>> {
+        let room = self.rooms.get_mut(room_id)?;
+        if room.note_audio_should_forward(sender, now) {
+            Some(room.participant_ids())
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::audio_forward_targets`] using the current wall clock.
+    pub fn audio_forward_targets_now(
+        &mut self,
+        room_id: &str,
+        sender: &str,
+    ) -> Option<Vec<String>> {
+        self.audio_forward_targets(room_id, sender, SFURoom::now_secs())
     }
 
     /// Get all peers who should receive text chat (participants + subscribers).
@@ -560,5 +699,134 @@ mod tests {
         mgr.leave_room("p1", "anon");
         // Should be GC'd
         assert!(mgr.get_room("anon").is_none());
+    }
+
+    // ── Active-speaker forwarding ───────────────────────────────────────────
+
+    fn room_with(participants: usize) -> SFURoomManager {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("r"), "R", RoomType::Public, "creator");
+        for i in 0..participants {
+            mgr.join_room(&format!("p{i}"), "r");
+        }
+        mgr
+    }
+
+    #[test]
+    fn active_speaker_under_cap_forwards_everyone() {
+        // A room with no more concurrent talkers than the cap must forward
+        // every speaker's frames — the common small-room case is unaffected.
+        let mut mgr = room_with(MAX_ACTIVE_SPEAKERS);
+        let mut now = 0.0_f64;
+        for _ in 0..20 {
+            for i in 0..MAX_ACTIVE_SPEAKERS {
+                assert!(
+                    mgr.audio_forward_targets("r", &format!("p{i}"), now)
+                        .is_some(),
+                    "speaker p{i} within the cap should always be forwarded"
+                );
+                now += 0.001;
+            }
+            now += 0.02; // next 20 ms frame
+        }
+    }
+
+    #[test]
+    fn active_speaker_caps_extra_concurrent_talker() {
+        // Cap distinct simultaneous talkers: once MAX_ACTIVE_SPEAKERS are
+        // established, an additional concurrent talker is shed server-side.
+        let mut mgr = room_with(MAX_ACTIVE_SPEAKERS + 1);
+        let mut now = 0.0_f64;
+        for _ in 0..30 {
+            for i in 0..MAX_ACTIVE_SPEAKERS {
+                let _ = mgr.audio_forward_targets("r", &format!("p{i}"), now);
+                now += 0.001;
+            }
+            now += 0.02;
+        }
+        let extra = format!("p{MAX_ACTIVE_SPEAKERS}");
+        assert!(
+            mgr.audio_forward_targets("r", &extra, now).is_none(),
+            "a talker beyond the cap, against an established active set, is dropped"
+        );
+    }
+
+    #[test]
+    fn active_speaker_silent_member_frees_slot() {
+        // When an active speaker goes silent past the timeout, its slot frees
+        // and a previously-capped talker is admitted.
+        let mut mgr = room_with(MAX_ACTIVE_SPEAKERS + 1);
+        let mut now = 0.0_f64;
+        // Warm up p0..p_{K-1} as the active set.
+        for _ in 0..30 {
+            for i in 0..MAX_ACTIVE_SPEAKERS {
+                let _ = mgr.audio_forward_targets("r", &format!("p{i}"), now);
+                now += 0.001;
+            }
+            now += 0.02;
+        }
+        // p0 falls silent; p1..p_{K-1} keep talking and p_K starts. After p0's
+        // silence exceeds the timeout its slot is freed and p_K is admitted.
+        let newcomer = format!("p{MAX_ACTIVE_SPEAKERS}");
+        for _ in 0..60 {
+            for i in 1..MAX_ACTIVE_SPEAKERS {
+                let _ = mgr.audio_forward_targets("r", &format!("p{i}"), now);
+                now += 0.001;
+            }
+            let _ = mgr.audio_forward_targets("r", &newcomer, now);
+            now += 0.021;
+        }
+        assert!(
+            mgr.audio_forward_targets("r", &newcomer, now).is_some(),
+            "after a silent member is pruned, the freed slot admits a new talker"
+        );
+    }
+
+    #[test]
+    fn active_speaker_sustained_talker_displaces_one_shot() {
+        // A sustained new talker displaces a one-shot active speaker even
+        // before the silence timeout (pure score-based displacement).
+        let mut mgr = room_with(MAX_ACTIVE_SPEAKERS + 1);
+        let mut now = 0.0_f64;
+        // Each of p0..p_{K-1} sends a single frame → active set full, score 1.
+        for i in 0..MAX_ACTIVE_SPEAKERS {
+            let _ = mgr.audio_forward_targets("r", &format!("p{i}"), now);
+            now += 0.001;
+        }
+        // p_K hammers frames; within a few it out-scores the one-shot members.
+        let newcomer = format!("p{MAX_ACTIVE_SPEAKERS}");
+        let mut forwarded = false;
+        for _ in 0..20 {
+            if mgr.audio_forward_targets("r", &newcomer, now).is_some() {
+                forwarded = true;
+                break;
+            }
+            now += 0.001;
+        }
+        assert!(
+            forwarded,
+            "a sustained talker displaces a one-shot active speaker"
+        );
+        assert!(
+            now < SPEAKER_SILENCE_SECS,
+            "displacement happened within the silence window, not via pruning"
+        );
+    }
+
+    #[test]
+    fn active_speaker_state_cleared_on_leave() {
+        // Leaving the room must drop the peer from speaker tracking so a stale
+        // entry can't hold an active slot.
+        let mut mgr = room_with(1);
+        assert!(mgr.audio_forward_targets("r", "p0", 0.0).is_some());
+        let room = mgr.get_room("r").unwrap();
+        assert!(room.speaker_scores.contains_key("p0"));
+        mgr.leave_room("p0", "r");
+        // Room "r" has a creator so it survives the leave; re-join and confirm
+        // the rejoined peer starts with clean speaker tracking.
+        mgr.join_room("p0", "r");
+        let room = mgr.get_room("r").unwrap();
+        assert!(!room.speaker_scores.contains_key("p0"));
+        assert!(room.active_speakers.is_empty());
     }
 }
