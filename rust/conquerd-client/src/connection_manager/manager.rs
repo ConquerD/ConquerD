@@ -3545,9 +3545,7 @@ impl ConnectionManager {
             return;
         }
 
-        // Support both formats: conquerd://<b64> and legacy conquerd://invite#<b64>
-        let encoded_raw = &invite_url[SCHEME.len()..];
-        let encoded = encoded_raw.trim_start_matches("invite#");
+        let encoded = &invite_url[SCHEME.len()..];
 
         if encoded.len() > 262_144 {
             self.emit_invite_failed(format!("invite URL too large ({} bytes)", encoded.len()));
@@ -3705,9 +3703,10 @@ impl ConnectionManager {
 
         if !is_supernode {
             if inviter_ephemeral_pub.is_empty() {
-                warn!(
-                    "AcceptInvite: invite missing inviter_ephemeral_pub - using legacy handshake"
+                self.emit_invite_failed(
+                    "invite missing inviter_ephemeral_pub; generate a fresh invite",
                 );
+                return;
             }
             if let Some((host, port)) = parse_quic_lan_hint(&lan_hint) {
                 self.connect_direct_quic(&inviter_peer_id, &host, port)
@@ -3726,19 +3725,21 @@ impl ConnectionManager {
         let joiner_peer_id = self.identity.peer_id();
         let joiner_eph = crate::crypto::generate_ephemeral_keypair();
         let joiner_ephemeral_pub = crate::crypto::b64url_encode_nopad(joiner_eph.public.as_bytes());
-        if !inviter_ephemeral_pub.is_empty() {
-            if let Err(e) = crate::crypto::derive_invite_session_key(
-                &joiner_eph.secret,
-                &inviter_ephemeral_pub,
-                &invite_id,
-                &inviter_identity_pub,
-                &sender,
-                &joiner_ephemeral_pub,
-            ) {
-                warn!("AcceptInvite: session key derivation failed: {e}");
-            }
-        } else {
-            warn!("AcceptInvite: invite missing inviter_ephemeral_pub — using legacy handshake");
+        if inviter_ephemeral_pub.is_empty() {
+            self.emit_invite_failed(
+                "invite missing inviter_ephemeral_pub; generate a fresh invite",
+            );
+            return;
+        }
+        if let Err(e) = crate::crypto::derive_invite_session_key(
+            &joiner_eph.secret,
+            &inviter_ephemeral_pub,
+            &invite_id,
+            &inviter_identity_pub,
+            &sender,
+            &joiner_ephemeral_pub,
+        ) {
+            warn!("AcceptInvite: session key derivation failed: {e}");
         }
         let joiner_quic_port = self
             .quic_endpoint

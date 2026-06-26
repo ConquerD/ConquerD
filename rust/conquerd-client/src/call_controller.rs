@@ -79,6 +79,16 @@ struct AudioPipeline {
     /// canceller. `None` unless the `aec` feature is active. The mixed playback
     /// frame is tee'd here in `mix_and_play`; the capture closure pops it.
     aec_ref_prod: Option<ringbuf::HeapProd<f32>>,
+    /// V12: Expected packet-loss percentage shared with the capture callback so
+    /// `set_packet_loss_perc` can be called on each Opus frame when the value
+    /// changes without locking the encoder.
+    fec_loss_pct: Arc<AtomicU32>,
+    /// V9: Exponential moving average of playback ring fill ratio (0.0–1.0).
+    /// Used to detect and correct sustained positive clock drift (timer fires
+    /// faster than the device drains).
+    ring_fill_ema: f32,
+    /// V10: PRNG seed for comfort-noise generation; advanced per CNG sample.
+    cng_seed: u32,
 }
 
 /// Capture-side echo-cancellation state, owned by the capture callback closure.
@@ -152,6 +162,26 @@ fn apply_encoder_bitrate(
             debug!("Applied outgoing Opus bitrate: {desired} bps");
         }
         Err(e) => warn!("Failed to apply outgoing Opus bitrate {desired}: {e}"),
+    }
+}
+
+/// V12: Update the Opus encoder's packet-loss hint from the shared atomic.
+/// Called once per capture callback alongside `apply_encoder_bitrate`.
+fn apply_encoder_fec_loss(
+    encoder: &mut OpusEncoder,
+    loss_arc: &Arc<AtomicU32>,
+    current_pct: &mut u8,
+) {
+    let desired = loss_arc.load(Ordering::Relaxed).clamp(0, 50) as u8;
+    if desired == *current_pct {
+        return;
+    }
+    match encoder.set_packet_loss_perc(desired) {
+        Ok(()) => {
+            *current_pct = desired;
+            debug!("Applied FEC packet-loss hint: {desired}%");
+        }
+        Err(e) => warn!("Failed to apply FEC packet-loss hint {desired}%: {e}"),
     }
 }
 
@@ -269,6 +299,10 @@ impl AudioPipeline {
         let mut resamp_phase: f64 = 0.0; // fractional source-sample position [0,1)
         let resamp_ratio: f64 = in_sr as f64 / SAMPLE_RATE as f64;
 
+        // V12: Packet-loss hint shared between the capture callback (encoder)
+        // and the call controller (receives transport stats).
+        let fec_loss_arc = Arc::new(AtomicU32::new(10));
+
         // Echo cancellation (off unless built with the `aec` feature). The
         // far-end reference ring decouples the playback and capture callbacks;
         // the capture-side canceller models the speaker→mic echo path and
@@ -292,7 +326,9 @@ impl AudioPipeline {
         let capture_stream = match in_sample_fmt {
             cpal::SampleFormat::F32 => {
                 let bitrate_cap = Arc::clone(&bitrate_arc);
+                let fec_loss_cap = Arc::clone(&fec_loss_arc);
                 let mut encoder_bitrate_bps = outgoing_bitrate_bps;
+                let mut encoder_fec_loss_pct: u8 = 10;
                 input_dev
                     .build_input_stream(
                         &input_cfg,
@@ -301,6 +337,11 @@ impl AudioPipeline {
                                 &mut encoder,
                                 &bitrate_cap,
                                 &mut encoder_bitrate_bps,
+                            );
+                            apply_encoder_fec_loss(
+                                &mut encoder,
+                                &fec_loss_cap,
+                                &mut encoder_fec_loss_pct,
                             );
                             let ns = noise_strength_cap.load(Ordering::Relaxed);
                             let ig = input_gain_cap.load(Ordering::Relaxed) as f32 / 100.0;
@@ -335,7 +376,9 @@ impl AudioPipeline {
             }
             cpal::SampleFormat::I16 => {
                 let bitrate_cap = Arc::clone(&bitrate_arc);
+                let fec_loss_cap = Arc::clone(&fec_loss_arc);
                 let mut encoder_bitrate_bps = outgoing_bitrate_bps;
+                let mut encoder_fec_loss_pct: u8 = 10;
                 input_dev
                     .build_input_stream(
                         &input_cfg,
@@ -344,6 +387,11 @@ impl AudioPipeline {
                                 &mut encoder,
                                 &bitrate_cap,
                                 &mut encoder_bitrate_bps,
+                            );
+                            apply_encoder_fec_loss(
+                                &mut encoder,
+                                &fec_loss_cap,
+                                &mut encoder_fec_loss_pct,
                             );
                             let ns = noise_strength_cap.load(Ordering::Relaxed);
                             let ig = input_gain_cap.load(Ordering::Relaxed) as f32 / 100.0;
@@ -378,7 +426,9 @@ impl AudioPipeline {
             }
             cpal::SampleFormat::U16 => {
                 let bitrate_cap = Arc::clone(&bitrate_arc);
+                let fec_loss_cap = Arc::clone(&fec_loss_arc);
                 let mut encoder_bitrate_bps = outgoing_bitrate_bps;
+                let mut encoder_fec_loss_pct: u8 = 10;
                 input_dev
                     .build_input_stream(
                         &input_cfg,
@@ -387,6 +437,11 @@ impl AudioPipeline {
                                 &mut encoder,
                                 &bitrate_cap,
                                 &mut encoder_bitrate_bps,
+                            );
+                            apply_encoder_fec_loss(
+                                &mut encoder,
+                                &fec_loss_cap,
+                                &mut encoder_fec_loss_pct,
                             );
                             let ns = noise_strength_cap.load(Ordering::Relaxed);
                             let ig = input_gain_cap.load(Ordering::Relaxed) as f32 / 100.0;
@@ -518,6 +573,9 @@ impl AudioPipeline {
                 output_gain: output_gain_arc,
                 decoders: HashMap::new(),
                 aec_ref_prod,
+                fec_loss_pct: fec_loss_arc,
+                ring_fill_ema: 0.0,
+                cng_seed: 0xDEAD_BEEF,
             },
             encoded_rx,
             speaking_rx,
@@ -551,6 +609,25 @@ impl AudioPipeline {
         let mut pcm = [0i16; SAMPLES_PER_FRAME];
         match decoder.decode(opus_data, &mut pcm, false) {
             Ok(n) => {
+                // V10: Comfort-noise generation after extended DTX silence.
+                // Opus PLC fades to near-silence after ~400 ms. Once the output
+                // is effectively silent (-66 dBFS RMS), add low-level white
+                // noise so the listener perceives a live connection rather than
+                // digital black. Only applied to PLC frames (opus_data == None).
+                if opus_data.is_none() && n > 0 {
+                    let sum_sq: f64 = pcm[..n].iter().map(|&s| (s as f64).powi(2)).sum::<f64>();
+                    if sum_sq / (n as f64) < (20.0_f64).powi(2) {
+                        // RMS < 20 ≈ −64 dBFS: Opus has fully faded to silence.
+                        // Inject noise at ≈−66 dBFS (±16 peak i16).
+                        for s in &mut pcm[..n] {
+                            self.cng_seed ^= self.cng_seed << 13;
+                            self.cng_seed ^= self.cng_seed >> 17;
+                            self.cng_seed ^= self.cng_seed << 5;
+                            *s = s.saturating_add((self.cng_seed as i32 >> 27) as i16);
+                        }
+                    }
+                }
+
                 // Compute RMS from decoded PCM (i16 → normalised float),
                 // then apply the same dB-scale used for the local mic capture
                 // so remote levels have comparable visual weight on the ring.
@@ -618,6 +695,26 @@ impl AudioPipeline {
             let gain = self.output_gain.load(Ordering::Relaxed) as f32 / 100.0;
             let slices: Vec<&[i16]> = decoded.iter().map(|(n, pcm)| &pcm[..*n]).collect();
             let mixed = mix_pcm_frames(&slices, gain);
+
+            // V9: Track ring fill ratio via EMA to detect sustained positive
+            // clock drift (tokio 20 ms timer fires faster than the CPAL device
+            // drains, causing the ring to fill steadily).
+            let ring_fill = self.playback_prod.occupied_len();
+            let capacity = self.playback_prod.capacity().get();
+            self.ring_fill_ema =
+                self.ring_fill_ema * 0.985 + (ring_fill as f32 / capacity as f32) * 0.015;
+            // When the EMA exceeds 65 % of capacity, skip this push to allow
+            // the device callback to drain the backlog. A single skipped frame
+            // (20 ms gap) is far less disruptive than an unpredictable hard
+            // drop once the ring overflows completely.
+            if self.ring_fill_ema > 0.65 {
+                debug!(
+                    "Playout drift: ring EMA {:.0}% full — skipping push",
+                    self.ring_fill_ema * 100.0
+                );
+                return levels;
+            }
+
             // Tee the far-end (what's about to play) into the echo canceller's
             // reference ring so the capture side can subtract it from the mic.
             // No-op unless the `aec` feature created the ring.
@@ -663,6 +760,12 @@ impl AudioPipeline {
             bps.clamp(MIN_OUTGOING_BITRATE_BPS, MAX_OUTGOING_BITRATE_BPS),
             Ordering::Relaxed,
         );
+    }
+
+    /// V12: Update the FEC packet-loss hint (0–50 %) fed to the Opus encoder.
+    fn set_fec_loss_pct(&self, pct: u8) {
+        self.fec_loss_pct
+            .store(pct.clamp(0, 50) as u32, Ordering::Relaxed);
     }
 
     fn set_input_gain(&self, pct: u32) {
@@ -1272,6 +1375,38 @@ impl CallController {
         }
         self.jitter_depth = depth;
         self.jitter_low_streak = streak;
+
+        // V11: Room/relay calls don't produce per-peer QUIC transport stats,
+        // so `UpdateNetworkQuality` is never sent on that path and the ABR loop
+        // sits idle. Synthesise a loss signal from jitter-buffer underruns:
+        // underruns are a direct symptom of the same network degradation that
+        // would normally drive bitrate reduction.
+        if self.room_mode {
+            let underrun_pct = self.playout_underruns as f32 * 100.0 / self.playout_frames as f32;
+            if underrun_pct > 0.5 {
+                // Meaningful underrun signal — blend into the loss EMA.
+                self.net_loss_ema = self.net_loss_ema * 0.7 + underrun_pct * 0.3;
+            } else {
+                // Very low underruns: gently recover the EMA toward 0.
+                self.net_loss_ema = (self.net_loss_ema * 0.85).max(0.0);
+            }
+            let new_bps = next_bitrate(
+                self.outgoing_bitrate_bps,
+                self.bitrate_ceiling_bps,
+                self.net_loss_ema,
+            );
+            if new_bps != self.outgoing_bitrate_bps {
+                self.outgoing_bitrate_bps = new_bps;
+                if let Some(p) = &self.audio {
+                    p.set_outgoing_bitrate(new_bps);
+                }
+                debug!(
+                    "Room ABR → {} bps (relay loss proxy EMA {:.1}%)",
+                    new_bps, self.net_loss_ema
+                );
+            }
+        }
+
         self.playout_frames = 0;
         self.playout_underruns = 0;
     }
@@ -1515,6 +1650,13 @@ impl CallController {
                                     "Adaptive bitrate → {} bps (loss EMA {:.1}%)",
                                     new, self.net_loss_ema
                                 );
+                            }
+                            // V12: Also update the FEC packet-loss hint so the
+                            // encoder packs more in-band redundancy as measured
+                            // loss rises, without a separate control path.
+                            if let Some(p) = &self.audio {
+                                let fec_pct = self.net_loss_ema.round().clamp(0.0, 50.0) as u8;
+                                p.set_fec_loss_pct(fec_pct);
                             }
                         }
                         CallCommand::DirectAudioInbound { peer_id, opus_data } => {

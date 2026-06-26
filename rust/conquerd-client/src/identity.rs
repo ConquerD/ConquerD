@@ -1,11 +1,7 @@
 //! Identity management — Ed25519 keypair, on-disk persistence.
 //!
-//! Supports:
-//! - v1 plaintext JSON (`identity.json`) — read-only after migration
-//! - v2 AES-256-GCM encrypted JSON (`identity.dat`) — Argon2id KDF +
-//!   optional OS keyring auto-unlock
-//!
-//! Existing identity files can be read without migration.
+//! Identities are stored as AES-256-GCM encrypted JSON (`identity.dat`)
+//! using Argon2id KDF with optional OS keyring auto-unlock.
 
 use base64::engine::general_purpose::URL_SAFE;
 use base64::Engine;
@@ -30,8 +26,7 @@ const KDF_P: u32 = 4;
 const KEYRING_SERVICE: &str = "conquerd";
 
 pub const DEFAULT_KEY_DIR_SUFFIX: &str = ".conquerd";
-pub const KEY_FILENAME: &str = "identity.json"; // v1 legacy
-pub const IDENTITY_FILENAME: &str = "identity.dat"; // v2 encrypted
+pub const IDENTITY_FILENAME: &str = "identity.dat";
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -139,27 +134,7 @@ impl Identity {
         dirs_or_home().join(DEFAULT_KEY_DIR_SUFFIX)
     }
 
-    /// Save as v1 plaintext JSON (`identity.json`).
-    ///
-    /// Only used for initial generation; prefer `save_encrypted` for ongoing use.
-    pub fn save_v1(&self, directory: &Path) -> Result<PathBuf> {
-        std::fs::create_dir_all(directory)?;
-        let path = directory.join(KEY_FILENAME);
-        let data = serde_json::json!({
-            "version": 1,
-            "public_key": self.public_id(),
-            "private_key": URL_SAFE.encode(self.signing.to_bytes()),
-        });
-        std::fs::write(&path, serde_json::to_string_pretty(&data)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(path)
-    }
-
-    /// Save as v2 AES-256-GCM encrypted (`identity.dat`).
+    /// Save as AES-256-GCM encrypted (`identity.dat`).
     ///
     /// The passphrase bytes are hashed with Argon2id; the resulting key encrypts
     /// the private seed with AES-256-GCM using the public_id as AAD.
@@ -197,19 +172,7 @@ impl Identity {
         Ok(path)
     }
 
-    /// Load from v1 plaintext JSON (`identity.json`).
-    pub fn load_v1(directory: &Path) -> Result<Self> {
-        let path = directory.join(KEY_FILENAME);
-        let text = std::fs::read_to_string(&path)?;
-        let data: serde_json::Value = serde_json::from_str(&text)?;
-        let private_b64 = data["private_key"]
-            .as_str()
-            .ok_or_else(|| ClientError::Identity("missing private_key".into()))?;
-        let seed = b64url_decode(private_b64)?;
-        Self::from_seed(&seed)
-    }
-
-    /// Load from v2 encrypted identity file using a derived AES key.
+    /// Load from the encrypted identity file using a derived AES key.
     pub fn load_encrypted(aes_key: &[u8], directory: &Path) -> Result<Self> {
         let path = directory.join(IDENTITY_FILENAME);
         let text = std::fs::read_to_string(&path)?;
@@ -317,31 +280,21 @@ impl Identity {
         Ok(data["identity_pub"].as_str().map(str::to_owned))
     }
 
-    /// Load from disk — tries v2 encrypted first, then v1 plaintext.
+    /// Load from `identity.dat`.
     ///
-    /// `passphrase` is only used when loading the v2 encrypted file.
+    /// Returns `Err(Io(NotFound))` when no identity file exists.
     pub fn load(passphrase: Option<&str>, directory: &Path) -> Result<Self> {
-        let v2 = directory.join(IDENTITY_FILENAME);
-        if v2.exists() {
-            let pass = passphrase.ok_or_else(|| {
-                ClientError::Identity("passphrase required for encrypted identity".into())
-            })?;
-            return Self::load_with_passphrase(pass.as_bytes(), directory);
+        let dat = directory.join(IDENTITY_FILENAME);
+        if !dat.exists() {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no identity file found",
+            )));
         }
-        Self::load_v1(directory)
-    }
-
-    /// Load or create a new identity, returning `(identity, was_created)`.
-    pub fn load_or_create(passphrase: Option<&str>, directory: &Path) -> Result<(Self, bool)> {
-        match Self::load(passphrase, directory) {
-            Ok(id) => Ok((id, false)),
-            Err(ClientError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                let id = Self::generate();
-                id.save_v1(directory)?;
-                Ok((id, true))
-            }
-            Err(e) => Err(e),
-        }
+        let pass = passphrase.ok_or_else(|| {
+            ClientError::Identity("passphrase required for encrypted identity".into())
+        })?;
+        Self::load_with_passphrase(pass.as_bytes(), directory)
     }
 }
 
@@ -442,18 +395,6 @@ mod tests {
             Some(value) => std::env::set_var("CONQUERD_HOME", value),
             None => std::env::remove_var("CONQUERD_HOME"),
         }
-    }
-
-    #[test]
-    fn generate_and_roundtrip_v1() {
-        let dir = tempdir().unwrap();
-        let id = Identity::generate();
-        let pub_id = id.public_id();
-        let peer_id = id.peer_id();
-        id.save_v1(dir.path()).unwrap();
-        let loaded = Identity::load_v1(dir.path()).unwrap();
-        assert_eq!(loaded.public_id(), pub_id);
-        assert_eq!(loaded.peer_id(), peer_id);
     }
 
     #[test]

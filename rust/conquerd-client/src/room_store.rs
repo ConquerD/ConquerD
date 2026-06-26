@@ -6,6 +6,12 @@
 //!
 //! File: `~/.conquerd/my_rooms.dat` — AES-256-GCM envelope keyed by HKDF
 //! subkey of the user's Identity.
+//!
+//! ## Schema versioning
+//!
+//! The inner JSON carries `"schema": 1`. Bump to `2` (and add a migration
+//! in `load`) if a field is renamed, removed, or changes type. New optional
+//! fields with `#[serde(default)]` do NOT require a bump.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -84,9 +90,15 @@ impl RoomEntry {
 
 #[derive(Serialize, Deserialize)]
 struct StoreData {
+    #[serde(default = "default_schema")]
+    schema: u32,
     rooms: Vec<RoomEntry>,
     #[serde(default)]
     deleted_ids: Vec<String>,
+}
+
+fn default_schema() -> u32 {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -136,10 +148,17 @@ impl RoomStore {
         let plaintext = decrypt_blob(&self.key, &envelope)?;
         let data: StoreData = serde_json::from_slice(&plaintext)
             .map_err(|e| crate::error::ClientError::Store(e.to_string()))?;
+        if data.schema != 1 {
+            warn!(
+                "Room store schema version {} is newer than supported (1); \
+                 some fields may be ignored",
+                data.schema
+            );
+        }
         for entry in data.rooms {
             if entry.supernode_id.is_empty() {
                 warn!(
-                    "RoomStore: skipping legacy entry without supernode_id ({})",
+                    "RoomStore: skipping malformed entry with missing supernode_id ({})",
                     &entry.room_id[..entry.room_id.len().min(12)]
                 );
                 continue;
@@ -155,6 +174,7 @@ impl RoomStore {
 
     fn save(&self) -> Result<()> {
         let data = StoreData {
+            schema: 1,
             rooms: {
                 let mut v: Vec<RoomEntry> = self.rooms.values().cloned().collect();
                 v.sort_by(|a, b| {
@@ -580,5 +600,62 @@ mod tests {
         store.remove("sn-a", "room-del").unwrap();
         assert!(!store.contains("sn-a", "room-del"));
         assert!(store.is_deleted("sn-a", "room-del"));
+    }
+
+    /// Wire-format field stability guard.
+    ///
+    /// If you rename a field in `RoomEntry`, add `#[serde(rename = "old_name")]`
+    /// to keep the on-disk key stable, then update this list.
+    /// If you intentionally change the wire name, bump `schema` in `StoreData`
+    /// and add a migration in `load()`.
+    #[test]
+    fn room_entry_wire_fields_are_stable() {
+        let entry = RoomEntry {
+            room_id: "room-abc".into(),
+            room_name: "Test Room".into(),
+            room_type: "public".into(),
+            supernode_id: "sn-xyz".into(),
+            creator_id: "creator-abc".into(),
+            invite_token: "tok123".into(),
+            is_creator: true,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        let obj = json.as_object().unwrap();
+        let required = [
+            "room_id",
+            "room_name",
+            "room_type",
+            "supernode_id",
+            "creator_id",
+            "invite_token",
+            "is_creator",
+        ];
+        for key in required {
+            assert!(
+                obj.contains_key(key),
+                "RoomEntry wire field missing or renamed: `{key}`"
+            );
+        }
+    }
+
+    #[test]
+    fn store_data_carries_schema_version() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+        store
+            .add(RoomEntry::new("room-v", "Version Check").with_supernode("sn-a"))
+            .unwrap();
+        // Read the raw decrypted bytes and verify schema field is present
+        let key = id.derive_store_key(ROOM_STORE_LABEL).unwrap();
+        let envelope = std::fs::read(&path).unwrap();
+        let plaintext = crate::crypto::decrypt_blob(&key, &envelope).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(
+            doc["schema"].as_u64(),
+            Some(1),
+            "StoreData must carry schema version 1"
+        );
     }
 }

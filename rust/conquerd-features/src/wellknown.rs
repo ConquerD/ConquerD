@@ -346,4 +346,44 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: {}", cap.id, e));
         }
     }
+
+    /// Wire-protocol feature-ID stability guard.
+    ///
+    /// These strings are sent on the wire during capability negotiation.
+    /// Renaming or removing one silently drops interoperability with peers
+    /// that already know the old name. To make a breaking change:
+    ///   1. Add the new ID alongside the old one in `local_capabilities()`.
+    ///   2. Keep the old ID until all peers have migrated.
+    ///   3. Remove the old ID and update this list in the same PR.
+    #[test]
+    fn feature_ids_are_stable() {
+        let caps = super::local_capabilities();
+        let ids: Vec<&str> = caps.iter().map(|c| c.id.as_str()).collect();
+        let expected = [
+            "transport.quic.audio.v1",
+            "transport.quic.relay.v1",
+            "transport.quic.stream.v1",
+            "transport.quic.feature_datagram.v1",
+            "transport.quic.uni_stream.v1",
+            "transport.quic.stream_priority.v1",
+            "transport.quic.zero_rtt.v1",
+            "transport.quic.pmtud.v1",
+            "transport.quic.migration.v1",
+            "transport.quic.flow_control.v1",
+            "core.chat.v1",
+            "core.file.v1",
+            "core.audio.opus",
+            "room.audio.sfu",
+            "room.chat.v1",
+            "room.file.v1",
+            "web.host.app.v1",
+            "web.host.h3.v1",
+            "game.relay.v1",
+        ];
+        assert_eq!(
+            ids, expected,
+            "local_capabilities() ID list changed — update this test AND \
+             coordinate the change with all peers before shipping"
+        );
+    }
 }

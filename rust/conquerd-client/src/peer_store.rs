@@ -1,8 +1,14 @@
 //! Peer store — local, client-owned storage for trusted peers.
 //!
 //! Data is stored on disk as an AES-256-GCM envelope keyed by an HKDF
-//! subkey of the user's Identity. Existing `peers.dat` files can be read
-//! without migration.
+//! subkey of the user's Identity.
+//!
+//! ## Schema versioning
+//!
+//! The on-disk envelope contains JSON with a top-level `"version": 1` field.
+//! Bump this to `2` (and add a migration in `load`) whenever a field is
+//! renamed, removed, or changes type. New optional fields (with `#[serde(default)]`)
+//! do NOT require a version bump.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -127,6 +133,12 @@ impl PeerStore {
                     Ok(plaintext) => {
                         match serde_json::from_slice::<serde_json::Value>(&plaintext) {
                             Ok(doc) => {
+                                if let Some(v) = doc["version"].as_u64() {
+                                    if v != 1 {
+                                        warn!("Peer store schema version {v} is newer than supported (1); \
+                                               some fields may be ignored");
+                                    }
+                                }
                                 if let Some(peers) = doc["peers"].as_array() {
                                     for entry in peers {
                                         match serde_json::from_value::<PeerRecord>(entry.clone()) {
@@ -154,68 +166,11 @@ impl PeerStore {
                 }
             }
         }
-        let mut changed = Self::repair_all_supernode_flags(&mut self.records);
-        if self.import_missing_supernodes_from_legacy_json() {
-            changed = true;
-        }
-        if changed {
+        if Self::repair_all_supernode_flags(&mut self.records) {
             if let Err(e) = self.save() {
                 warn!("Failed to persist repaired supernode flags: {e}");
             }
         }
-    }
-
-    /// Import supernodes from plaintext `peers.json` when they are absent or
-    /// demoted in the encrypted `peers.dat` store (recovery for data loss).
-    fn import_missing_supernodes_from_legacy_json(&mut self) -> bool {
-        let Some(parent) = self.file_path.parent() else {
-            return false;
-        };
-        let legacy_path = parent.join("peers.json");
-        if !legacy_path.exists() {
-            return false;
-        }
-        let text = match std::fs::read_to_string(&legacy_path) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Failed to read legacy peers.json: {e}");
-                return false;
-            }
-        };
-        let doc: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Malformed legacy peers.json: {e}");
-                return false;
-            }
-        };
-        let peers = match doc["peers"].as_array() {
-            Some(a) => a,
-            None => return false,
-        };
-        let mut changed = false;
-        for entry in peers {
-            let Ok(rec) = serde_json::from_value::<PeerRecord>(entry.clone()) else {
-                continue;
-            };
-            if !rec.is_supernode {
-                continue;
-            }
-            if self.is_supernode_id(&rec.identity_pub) {
-                continue;
-            }
-            warn!(
-                "Restoring supernode {} ({}) from legacy peers.json",
-                &rec.identity_pub[..rec.identity_pub.len().min(12)],
-                rec.handle
-            );
-            let mut restored = rec;
-            restored.is_supernode = true;
-            restored.supernode_from_invite = true;
-            self.upsert_from_invite(restored);
-            changed = true;
-        }
-        changed
     }
 
     /// Persist records to disk as an encrypted envelope.
@@ -512,20 +467,7 @@ impl PeerStore {
             }
         }
 
-        // Pass 3 — legacy promotion (operator/default title only).
-        for record in records.values_mut() {
-            if !record.is_supernode
-                && Self::has_supernode_signaling_hint(record)
-                && record.quic_port == 0
-                && (record.handle.is_empty() || Self::looks_like_operator_handle(&record.handle))
-            {
-                record.is_supernode = true;
-                record.supernode_from_invite = true;
-                changed = true;
-            }
-        }
-
-        // Pass 4 — restore infrastructure rows that were incorrectly demoted when
+        // Pass 3 — restore infrastructure rows that were incorrectly demoted when
         // another supernode shared the same ws signaling URL (pre-2026-06 fix).
         for record in records.values_mut() {
             if record.is_supernode || record.quic_port > 0 {
@@ -654,29 +596,6 @@ mod tests {
             Some("b64_identity".to_owned())
         );
         assert!(store.resolve_supernode_identity_pub("unknown").is_none());
-    }
-
-    #[test]
-    fn legacy_supernode_promoted_on_load_from_ws_hint_and_operator_title() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(PEER_STORE_FILE);
-        let id = make_identity();
-
-        let mut store = PeerStore::open(&id, Some(&path)).unwrap();
-        store.upsert(PeerRecord {
-            peer_id: "sn_hex".to_owned(),
-            identity_pub: "sn_b64".to_owned(),
-            relay_hints: vec!["ws://relay.example.com:34935/ws".to_owned()],
-            handle: "Relay Node".to_owned(),
-            ..Default::default()
-        });
-        store.save().unwrap();
-
-        let store2 = PeerStore::open(&id, Some(&path)).unwrap();
-        let sns = store2.supernodes();
-        assert_eq!(sns.len(), 1);
-        assert_eq!(sns[0].identity_pub, "sn_b64");
-        assert!(store2.is_supernode_id("sn_b64"));
     }
 
     #[test]
@@ -843,29 +762,6 @@ mod tests {
         assert_eq!(store.supernodes().len(), 2);
         assert!(store.is_supernode_id("sn_a_b64"));
         assert!(store.is_supernode_id("sn_b_b64"));
-    }
-
-    #[test]
-    fn import_missing_supernode_from_legacy_peers_json() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(PEER_STORE_FILE);
-        let id = make_identity();
-
-        let legacy = serde_json::json!({
-            "version": 1,
-            "peers": [{
-                "peer_id": "sn_a_hex",
-                "identity_pub": "sn_a_b64",
-                "relay_hints": ["ws://relay:34935/ws"],
-                "handle": "Node A",
-                "is_supernode": true,
-            }]
-        });
-        std::fs::write(dir.path().join("peers.json"), legacy.to_string()).unwrap();
-
-        let store = PeerStore::open(&id, Some(&path)).unwrap();
-        assert!(store.is_supernode_id("sn_a_b64"));
-        assert_eq!(store.supernodes().len(), 1);
     }
 
     #[test]
@@ -1045,5 +941,79 @@ mod tests {
         let id2 = Identity::generate();
         let store2 = PeerStore::open(&id2, Some(&path)).unwrap();
         assert!(store2.is_empty());
+    }
+
+    /// Wire-format field stability guard.
+    ///
+    /// If you rename a field in `PeerRecord`, add `#[serde(rename = "old_name")]`
+    /// to keep the on-disk key stable, then update this list.
+    /// If you intentionally change the wire name, bump `"version"` in `save()`
+    /// and add a migration in `load()`.
+    #[test]
+    fn peer_record_wire_fields_are_stable() {
+        let rec = PeerRecord {
+            peer_id: "pid".into(),
+            identity_pub: "pub_b64".into(),
+            relay_hints: vec!["ws://relay:34935/ws".into()],
+            handle: "Alice".into(),
+            blocked: true,
+            revoked: false,
+            auto_connect: true,
+            is_supernode: false,
+            supernode_from_invite: false,
+            transcript_hash: "abc".into(),
+            created_at: 1.0,
+            last_seen_at: 2.0,
+            last_ice: Some(serde_json::json!({"candidate": "test"})),
+            quic_port: 34934,
+            peer_version: "1.0".into(),
+            peer_build_hash: "bld".into(),
+            peer_source_hash: "src".into(),
+            peer_protocol_hash: "prot".into(),
+            peer_attestation_sig: "sig".into(),
+            last_attestation_at: 3.0,
+            attestation_status: "verified".into(),
+            last_nonce_challenge: "nonce".into(),
+            avatar_config: None,
+        };
+        let json = serde_json::to_value(&rec).unwrap();
+        let obj = json.as_object().unwrap();
+        // These are the canonical on-disk field names. Changing any of these
+        // without a serde rename breaks backward-read of existing stores.
+        let required = [
+            "peer_id",
+            "identity_pub",
+            "relay_hints",
+            "handle",
+            "blocked",
+            "revoked",
+            "auto_connect",
+            "is_supernode",
+            "supernode_from_invite",
+            "transcript_hash",
+            "created_at",
+            "last_seen_at",
+            "last_ice",
+            "quic_port",
+            "peer_version",
+            "peer_build_hash",
+            "peer_source_hash",
+            "peer_protocol_hash",
+            "peer_attestation_sig",
+            "last_attestation_at",
+            "attestation_status",
+            "last_nonce_challenge",
+        ];
+        for key in required {
+            assert!(
+                obj.contains_key(key),
+                "PeerRecord wire field missing or renamed: `{key}`"
+            );
+        }
+        // avatar_config uses skip_serializing_if = "Option::is_none"; absent when None
+        assert!(
+            !obj.contains_key("avatar_config"),
+            "avatar_config should be absent when None"
+        );
     }
 }

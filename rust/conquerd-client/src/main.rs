@@ -375,12 +375,6 @@ fn unlock_identity(key_dir: &std::path::Path) -> error::Result<Identity> {
         ));
     }
 
-    // Try v1 plaintext (legacy migration)
-    let json = key_dir.join(identity::KEY_FILENAME);
-    if json.exists() {
-        return Identity::load_v1(key_dir);
-    }
-
     // ── First launch: no identity exists yet ──────────────────────────────
     first_launch_setup(key_dir)
 }
@@ -408,11 +402,10 @@ fn first_launch_setup(key_dir: &std::path::Path) -> error::Result<Identity> {
         .map_err(|e| error::ClientError::Identity(format!("Cannot create key dir: {e}")))?;
 
     let id = Identity::generate();
+    id.save_encrypted(pass1.as_bytes(), key_dir)?;
     if pass1.is_empty() {
-        id.save_v1(key_dir)?;
         eprintln!("\nIdentity created (no passphrase).");
     } else {
-        id.save_encrypted(pass1.as_bytes(), key_dir)?;
         eprintln!("\nIdentity created and encrypted with your passphrase.");
     }
     info!(

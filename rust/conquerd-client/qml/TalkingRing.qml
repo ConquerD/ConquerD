@@ -20,8 +20,6 @@ Item {
     property bool muted: false
     property real level: 0.0
     property int sampleCount: 60
-    property real baseRadiusRatio: 0.300   // kept for API compatibility
-    property real amplitudeRatio: 0.205    // kept for API compatibility
     property color accentColor: Theme.online
 
     // When true: GPU ShaderEffect renderer. When false: Canvas fallback.

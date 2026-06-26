@@ -79,7 +79,7 @@ Working style:
 
 ### 5. QA/Testing Agent
 Responsibilities:
-- Run unit and integration tests and targeted manual checks (509 Rust unit tests; 113 in `conquerd-features`).
+- Run unit and integration tests and targeted manual checks (529 Rust unit tests; 113 in `conquerd-features`).
 - Stress race-prone flows (rapid connect/disconnect, duplicate signaling).
 - Validate trusted-peer persistence and UI synchronization.
 - Cover QUIC relay path and WebSocket membership signaling for room audio.
@@ -349,11 +349,11 @@ No central feature registry, no mandatory features, no implicit cross-feature pr
 
 This section is the single source of truth for delivery status (condensed from the former `ROADMAP.md` / `IMPROVEMENT_PLAN.md` / `TODO.md`).
 
-**Last reviewed:** 2026-06-23 (accuracy pass: test counts refreshed to 509, `ROOM_AUDIO_TAG=0x04` documented, `connection_manager/` module split path references corrected).
+**Last reviewed:** 2026-06-25 (test counts refreshed to 529; voice/audio items V9–V12, F1 completed; VOICE_CHAT_REVIEW.md folded in and removed).
 
 ### Health summary
 
-ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (509 unit tests; 113 features + 204 supernode + 118 headless client + 74 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only.
+ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (529 unit tests; 113 features + 204 supernode + 138 headless client + 74 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only.
 
 ### P0–P2 — Complete ✅
 
@@ -372,7 +372,7 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 | Version automation | `scripts/check_version_sync.ps1 -BumpTo X.Y.Z` bumps all crates + prints git/tag commands. |
 | Metrics export | `/api/metrics` via `web.host.app.v1`. |
 | Game relay end-to-end | `game.relay.v1` over WebTransport confirmed working: race condition in `/_conquerd/ctx.json` cache fixed (scheme-layer caches now populated on tokio thread in `connection_manager.rs` before any `FetchWebApp` can succeed); self-signed TLS cert now includes `serverAuth` EKU (Chrome WebTransport requirement); cert fingerprint always re-derived from on-disk DER (stale `.hex` cache bug fixed); old certs missing the EKU detected via OID byte-scan and auto-rotated on next supernode start; template SDK synced with source (`ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, `featureForFixedTag` exports added); SDK now fails fast with a clear error when portal context exists but no WebTransport URL is available; cursor relay demo fixed (`encodeCursorLeave` now carries color so peer tracking is stable). |
-| Test suite integrity | Full test run across all four crates: 509 unit tests all green (113 `conquerd-features` + 204 `conquerd-supernode` + 118 headless `conquerd-client` + 74 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
+| Test suite integrity | Full test run across all four crates: 529 unit tests all green (113 `conquerd-features` + 204 `conquerd-supernode` + 138 headless `conquerd-client` + 74 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
 | Ephemeral SFU rooms | Supernode in-memory rooms only (`sfu.rs` idle GC, no `sfu_rooms.json`); client `RoomStore` replay on supernode connect; sidebar hide local-only. |
 
 ### P3 backlog (as capacity allows)
@@ -380,6 +380,7 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 - WASM plugin sandbox (currently native cdylib with load-time trust prompts).
 - Ollama / plugin UX polish (currently experimental).
 - In-band capability gossip (supernode bundle exchange between connected peers).
+- **Voice/chat audio-quality polish.** All items from the 2026-06-23 deep-dive are now resolved or decided. **Complete:** room voice over QUIC relay datagrams — T1 (no more TCP head-of-line blocking; WS fallback preserved for non-relay members); SFU active-speaker cap of 5 — T2 (frames from talkers beyond the cap dropped server-side; receiver fills via Opus PLC); client-side multi-party mixing via `mix_and_play` — V1 (peers summed, not concatenated); adaptive jitter buffer 40–240 ms — V3; AIMD adaptive bitrate for direct calls — V4; per-peer decoder leak fix — V5; soft-limiter on mix bus — V6; relay anti-thrash cooldown — X1; feature-flagged pure-Rust NLMS echo canceller (`aec` feature, off by default, needs real two-device delay tuning before enabling in shipped builds) — V2; adaptive FEC packet-loss hint via shared Arc — V12; room-call ABR from jitter-buffer underrun proxy (relay/WS path has no per-peer QUIC stats) — V11; playout ring-fill EMA drift correction — V9 (skips one 20 ms push when EMA > 65% to prevent ring overflow); comfort-noise CNG for extended PLC silence — V10 (injects ≈−66 dBFS white noise once Opus PLC fades below −64 dBFS RMS); file-transfer security audit — F1 (decompression-bomb cap in `zlib_decompress`, `total_chunks` consistency check in `on_offer_received`). **Still open:** polyphase resampling (V7 — linear interpolation is near-inaudible for 8 kHz voice at typical device rates; a windowed-sinc or `rubato` `FastFixedIn` drop-in is the right fix if this becomes perceptible); stereo/spatial mixdown (V8 — per-peer pan in `mix_pcm_frames` + stereo ring buffer; Low priority, pure UX enhancement). **Declined:** read receipts (`MessageStatus::Read`) — deliberately unwired; surfacing read timestamps is at odds with the privacy-first stance; if ever revisited, gate behind a privacy toggle defaulting **off**. Room-chat history for joiners — struck from scope; supernode does not persist messages. Offline store-and-forward — deferred; would require the supernode to hold signed, supernode-opaque E2E-encrypted messages with a TTL (in-memory TTL mailbox mirroring the endpoint-mailbox precedent); revisit as a standalone design.
 
 
 ### Pre-signing checklist (SignPath Foundation)

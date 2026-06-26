@@ -416,6 +416,23 @@ impl FileTransferManager {
                 payload: p,
             }];
         }
+        // Reject inconsistent total_chunks: a peer claiming millions of chunks
+        // for a tiny file is a protocol error (or a resource-exhaustion probe).
+        let expected_chunks = size.div_ceil(CHUNK_SIZE).max(1);
+        if total_chunks != expected_chunks {
+            let mut p = serde_json::Map::new();
+            p.insert("transfer_id".into(), Value::String(transfer_id.to_owned()));
+            p.insert("reason".into(), Value::String("invalid_chunk_count".into()));
+            warn!(
+                "Rejected transfer {transfer_id}: total_chunks {total_chunks} \
+                 != expected {expected_chunks} for size {size}"
+            );
+            return vec![TransferEvent::SendMessage {
+                peer_id: peer_id.to_owned(),
+                message_type: MessageType::FileTransferReject,
+                payload: p,
+            }];
+        }
 
         let xfer = InboundTransfer::new(
             transfer_id.to_owned(),
@@ -838,8 +855,19 @@ fn zlib_compress(data: &[u8], level: u32) -> Result<Vec<u8>, String> {
 
 fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut dec = ZlibDecoder::new(data);
-    let mut out = Vec::with_capacity(data.len() * 2);
-    dec.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(data.len().min(MAX_TRANSFER_SIZE));
+    // Cap decompression output to prevent decompression-bomb DoS: a crafted
+    // zlib stream can otherwise expand to gigabytes from a tiny payload.
+    use std::io::Read as _;
+    dec.by_ref()
+        .take((MAX_TRANSFER_SIZE + 1) as u64)
+        .read_to_end(&mut out)
+        .map_err(|e| e.to_string())?;
+    if out.len() > MAX_TRANSFER_SIZE {
+        return Err(format!(
+            "decompressed output exceeds {MAX_TRANSFER_SIZE} bytes"
+        ));
+    }
     Ok(out)
 }
 

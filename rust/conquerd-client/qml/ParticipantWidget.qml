@@ -36,10 +36,6 @@ Item {
         )
     }
 
-    // Persistent waveform history provided by VoiceRail; retained for API
-    // compatibility with richer ring renderers.
-    property var ringStore: null
-
     property bool showActivityRing: true
     property bool showSelfRing: true
     /// When true, show a name pill on the avatar (room voice rail).
