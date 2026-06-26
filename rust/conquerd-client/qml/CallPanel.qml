@@ -22,14 +22,14 @@ Rectangle {
 
     RowLayout {
         anchors.fill: parent
-        anchors.margins: 12
+        anchors.margins: Theme.spacingMd
         spacing: 8
 
         // Call state indicator
         Rectangle {
             width: 10
             height: 10
-            radius: 5
+            radius: Theme.radiusPill
               color: root.callState === "in_call" ? Theme.online
                   : root.callState === "connecting" ? Theme.warn
                   : Theme.danger
@@ -40,7 +40,7 @@ Rectangle {
                 : root.callState === "connecting" ? "Connecting…"
                 : root.callState
             color: Theme.textInv
-            font.pixelSize: 13
+            font.pixelSize: Theme.fontSizeBody
             Layout.fillWidth: true
         }
 

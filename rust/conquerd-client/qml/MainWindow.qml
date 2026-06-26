@@ -1754,7 +1754,7 @@ ApplicationWindow {
             clip: true
 
             Behavior on Layout.preferredWidth {
-                NumberAnimation { duration: 180; easing.type: Easing.InOutQuad }
+                NumberAnimation { duration: Theme.animFast; easing.type: Easing.InOutQuad }
             }
 
             participantModel: backend.in_room ? roomModel : directCallModel

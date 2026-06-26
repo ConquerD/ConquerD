@@ -58,6 +58,7 @@ QtObject {
     readonly property int radiusSm: 0
     readonly property int radiusMd: 0
     readonly property int radiusLg: 0
+    readonly property int radiusPill: 999
 
     readonly property int spacingXs: 4
     readonly property int spacingSm: 8
@@ -80,6 +81,7 @@ QtObject {
     property color linkPeer: "#8EA7FF"
 
     // ── Motion (DESIGN.md: ≤ 300 ms) ──────────────────────────────────────────
+    readonly property int animMicro: 80
     readonly property int animFast: 160
     readonly property int animNormal: 250
     readonly property int animSlow: 300

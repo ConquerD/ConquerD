@@ -359,10 +359,10 @@ Rectangle {
 
                 // Mute toggle
                 Rectangle {
-                    width: 36; height: 36; radius: 18
+                    width: 36; height: 36; radius: Theme.radiusPill
                     color: root.muted ? Theme.danger : Theme.bg2
 
-                    Behavior on color { ColorAnimation { duration: 120 } }
+                    Behavior on color { ColorAnimation { duration: Theme.animFast } }
 
                     Image {
                         anchors.centerIn: parent
@@ -392,7 +392,7 @@ Rectangle {
 
                 // End / Leave button
                 Rectangle {
-                    width: 36; height: 36; radius: 18
+                    width: 36; height: 36; radius: Theme.radiusPill
                     color: Theme.danger
 
                     Image {

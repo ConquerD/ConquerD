@@ -71,7 +71,7 @@ ItemDelegate {
             visible: root.badge > 0
             width: Math.max(18, badgeLabel.width + 8)
             height: 18
-            radius: 9
+            radius: Theme.radiusPill
             color: Theme.accent
 
             Text {

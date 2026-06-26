@@ -191,7 +191,7 @@ Rectangle {
                         visible: delegateItem.unreadCount > 0
                         width: Math.max(20, badgeText.implicitWidth + 8)
                         height: 20
-                        radius: 10
+                        radius: Theme.radiusPill
                         color: Theme.danger
                         Layout.alignment: Qt.AlignVCenter
 

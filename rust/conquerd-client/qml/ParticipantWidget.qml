@@ -12,6 +12,7 @@ Item {
     property bool isMuted: false
     property real audioLevel: 0.0
     property bool isSelf: false
+    property var ringStore: null
 
     readonly property real visualLevel: isMuted ? 0.0 : Math.max(0.0, Math.min(1.0, audioLevel))
     readonly property real quantizedLevel: Math.round(visualLevel * 32) / 32
@@ -85,10 +86,10 @@ Item {
             border.color: root.activityColor
             opacity: root.speaking ? Math.min(1.0, 0.36 + root.quantizedLevel * 0.64) : 0.0
 
-            Behavior on width { NumberAnimation { duration: 70; easing.type: Easing.OutQuad } }
-            Behavior on border.width { NumberAnimation { duration: 70; easing.type: Easing.OutQuad } }
-            Behavior on border.color { ColorAnimation { duration: 90 } }
-            Behavior on opacity { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
+            Behavior on width { NumberAnimation { duration: Theme.animMicro; easing.type: Easing.OutQuad } }
+            Behavior on border.width { NumberAnimation { duration: Theme.animMicro; easing.type: Easing.OutQuad } }
+            Behavior on border.color { ColorAnimation { duration: Theme.animMicro } }
+            Behavior on opacity { NumberAnimation { duration: Theme.animMicro; easing.type: Easing.OutQuad } }
         }
     }
 

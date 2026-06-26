@@ -225,7 +225,7 @@ Item {
         opacity: root.muted ? 0.38 : 1.0
 
         Behavior on opacity {
-            NumberAnimation { duration: 140; easing.type: Easing.OutQuad }
+            NumberAnimation { duration: Theme.animFast; easing.type: Easing.OutQuad }
         }
     }
 
@@ -238,7 +238,7 @@ Item {
         opacity: root.muted ? 0.38 : 1.0
 
         Behavior on opacity {
-            NumberAnimation { duration: 140; easing.type: Easing.OutQuad }
+            NumberAnimation { duration: Theme.animFast; easing.type: Easing.OutQuad }
         }
 
         onPaint: {

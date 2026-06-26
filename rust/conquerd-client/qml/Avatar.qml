@@ -20,7 +20,7 @@ Item {
     property bool speaking: false
     property real audioLevel: 0.0
     property string _svgSource: ""
-    property string _tintHex: "#747F8D"
+    property string _tintHex: Theme.toHex(Theme.muted)
     property bool _imageSmooth: true
     readonly property color tintColor: _tintHex
     readonly property bool _ringVisible: root.showRing || root.speaking
@@ -38,7 +38,7 @@ Item {
     function _refresh() {
         if (!peerId) {
             _svgSource = ""
-            _tintHex = "#747F8D"
+            _tintHex = Theme.toHex(Theme.muted)
             _imageSmooth = true
             return
         }
@@ -69,7 +69,7 @@ Item {
         visible: border.width > 0
 
         Behavior on border.color {
-            ColorAnimation { duration: 80 }
+            ColorAnimation { duration: Theme.animMicro }
         }
     }
 

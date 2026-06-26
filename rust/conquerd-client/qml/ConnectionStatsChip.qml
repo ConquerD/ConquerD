@@ -40,7 +40,7 @@ Rectangle {
         Rectangle {
             width: 6
             height: 6
-            radius: 3
+            radius: Theme.radiusPill
             anchors.verticalCenter: parent.verticalCenter
             color: root.qualityColor
         }

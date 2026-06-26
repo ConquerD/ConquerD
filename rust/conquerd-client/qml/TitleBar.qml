@@ -107,7 +107,7 @@ Item {
         width: 46; height: parent.height
         color: hoverArea.containsMouse ? hoverColor : "transparent"
 
-        Behavior on color { ColorAnimation { duration: 80 } }
+        Behavior on color { ColorAnimation { duration: Theme.animMicro } }
 
         Image {
             anchors.centerIn: parent

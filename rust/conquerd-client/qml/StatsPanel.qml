@@ -59,7 +59,7 @@ Rectangle {
                 Layout.fillWidth: true
             }
             Rectangle {
-                width: 8; height: 8; radius: 4
+                width: 8; height: 8; radius: Theme.radiusPill
                 color: root.isRelay ? Theme.warn : Theme.online
             }
             Text {
