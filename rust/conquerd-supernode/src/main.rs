@@ -2391,8 +2391,11 @@ fn ensure_web_cert(data_dir: &std::path::Path) -> Option<String> {
         return None;
     }
     if let Err(e) = std::fs::write(&fp_path, &fingerprint) {
-        warn!("[web-cert] write fingerprint failed: {e}");
-        return None;
+        // Non-fatal: the cert and key were written; we have the fingerprint
+        // in memory. The .hex cache is only used to check freshness on the
+        // next restart. Without it the next startup regenerates the cert
+        // one restart early — acceptable, not a reason to drop the fingerprint.
+        warn!("[web-cert] write fingerprint cache failed (non-fatal): {e}");
     }
 
     info!(
