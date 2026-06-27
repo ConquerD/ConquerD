@@ -537,6 +537,33 @@ pub async fn run_listener(bridge: BrowserBridge, data_dir: PathBuf, port: u16) {
     let cert_path = data_dir.join("web_cert.pem");
     let key_path = data_dir.join("web_key.pem");
 
+    // Warn early when the cert on disk is stale. Chrome's WebTransport rejects
+    // certs outside their validity window even when serverCertificateHashes is
+    // used, so an expired cert causes "Opening handshake failed" in game demos.
+    // Rotation only happens at restart — operators should restart every ≤7 days,
+    // or implement runtime rotation.
+    if let Ok(meta) = std::fs::metadata(&cert_path) {
+        if let Ok(mtime) = meta.modified() {
+            if let Ok(age) = std::time::SystemTime::now().duration_since(mtime) {
+                let age_days = age.as_secs() / 86400;
+                if age_days >= 13 {
+                    tracing::error!(
+                        "[web.host.h3.v1] WebTransport cert is {} days old and has EXPIRED — \
+                         browser clients will see \"Opening handshake failed\". \
+                         Restart the supernode to regenerate the cert.",
+                        age_days
+                    );
+                } else if age_days >= 7 {
+                    tracing::warn!(
+                        "[web.host.h3.v1] WebTransport cert is {} days old (rotation threshold \
+                         is 7 days). Restart the supernode soon to avoid cert expiry.",
+                        age_days
+                    );
+                }
+            }
+        }
+    }
+
     let identity = match wtransport::Identity::load_pemfiles(&cert_path, &key_path).await {
         Ok(id) => id,
         Err(e) => {
