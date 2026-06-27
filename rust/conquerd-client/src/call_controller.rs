@@ -1024,6 +1024,11 @@ pub struct CallController {
     /// Exponentially-smoothed packet loss percentage (0–100) from transport
     /// stats, the signal driving adaptive bitrate.
     net_loss_ema: f32,
+    /// Remaining adaptation ticks to skip after entering room mode.
+    /// Jitter-buffer underruns during the initial buffering phase are not
+    /// genuine congestion signals; suppressing ABR for the first few ticks
+    /// prevents the bitrate from spiraling down during call setup.
+    abr_warmup_ticks: u8,
 }
 
 impl CallController {
@@ -1071,6 +1076,7 @@ impl CallController {
             outgoing_bitrate_bps: DEFAULT_OUTGOING_BITRATE_BPS,
             bitrate_ceiling_bps: DEFAULT_OUTGOING_BITRATE_BPS,
             net_loss_ema: 0.0,
+            abr_warmup_ticks: 0,
         };
         (cmd_tx, event_rx, ctrl.run())
     }
@@ -1382,28 +1388,37 @@ impl CallController {
         // underruns are a direct symptom of the same network degradation that
         // would normally drive bitrate reduction.
         if self.room_mode {
-            let underrun_pct = self.playout_underruns as f32 * 100.0 / self.playout_frames as f32;
-            if underrun_pct > 0.5 {
-                // Meaningful underrun signal — blend into the loss EMA.
-                self.net_loss_ema = self.net_loss_ema * 0.7 + underrun_pct * 0.3;
+            // Skip ABR during the warmup window — underruns while the jitter
+            // buffer is still filling are expected and are not congestion.
+            if self.abr_warmup_ticks > 0 {
+                self.abr_warmup_ticks -= 1;
             } else {
-                // Very low underruns: gently recover the EMA toward 0.
-                self.net_loss_ema = (self.net_loss_ema * 0.85).max(0.0);
-            }
-            let new_bps = next_bitrate(
-                self.outgoing_bitrate_bps,
-                self.bitrate_ceiling_bps,
-                self.net_loss_ema,
-            );
-            if new_bps != self.outgoing_bitrate_bps {
-                self.outgoing_bitrate_bps = new_bps;
-                if let Some(p) = &self.audio {
-                    p.set_outgoing_bitrate(new_bps);
+                let underrun_pct =
+                    self.playout_underruns as f32 * 100.0 / self.playout_frames as f32;
+                if underrun_pct > 0.5 {
+                    // Meaningful underrun signal — blend into the loss EMA.
+                    self.net_loss_ema = self.net_loss_ema * 0.7 + underrun_pct * 0.3;
+                } else {
+                    // Low underruns: recover the EMA toward 0. Factor 0.70 (vs the
+                    // previous 0.85) brings EMA from 10% to below 4% in ~3 clean
+                    // ticks (6 s) instead of ~6 ticks (12 s).
+                    self.net_loss_ema = (self.net_loss_ema * 0.70).max(0.0);
                 }
-                debug!(
-                    "Room ABR → {} bps (relay loss proxy EMA {:.1}%)",
-                    new_bps, self.net_loss_ema
+                let new_bps = next_bitrate(
+                    self.outgoing_bitrate_bps,
+                    self.bitrate_ceiling_bps,
+                    self.net_loss_ema,
                 );
+                if new_bps != self.outgoing_bitrate_bps {
+                    self.outgoing_bitrate_bps = new_bps;
+                    if let Some(p) = &self.audio {
+                        p.set_outgoing_bitrate(new_bps);
+                    }
+                    debug!(
+                        "Room ABR → {} bps (relay loss proxy EMA {:.1}%)",
+                        new_bps, self.net_loss_ema
+                    );
+                }
             }
         }
 
@@ -1686,6 +1701,11 @@ impl CallController {
                         }
                         CallCommand::SetRoomMode { supernode_id, room_id } => {
                             self.room_mode = true;
+                            // Reset the loss EMA and suppress ABR for the first
+                            // 6 ticks (12 s) so initial jitter-buffer underruns
+                            // during call setup are not mistaken for congestion.
+                            self.net_loss_ema = 0.0;
+                            self.abr_warmup_ticks = 6;
                             debug!("Call controller: entered room audio mode (supernode={}, room={})", supernode_id, room_id);
                         }
                         CallCommand::ClearRoomMode => {
