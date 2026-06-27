@@ -501,20 +501,34 @@ export class ConquerdClient {
             if (typeof window !== "undefined" && window?.conquerd?.ready) {
                 const ctx = await window.conquerd.ready;
                 inPortal = true;
+                let wtApiCfg = null;
                 if (ctx?.wtBaseUrl) {
                     url = ctx.wtBaseUrl;
                 } else if (ctx?.fetch) {
-                    const wtCfg = await ctx.fetch("/api/wt-url")
+                    wtApiCfg = await ctx.fetch("/api/wt-url")
                         .then(r => r.ok ? r.json() : null)
                         .catch(() => null);
-                    if (wtCfg?.url) url = wtCfg.url;
+                    if (wtApiCfg?.url) url = wtApiCfg.url;
                     // Fingerprint is also included in the /api/wt-url response
                     // so the fallback path can also use serverCertificateHashes.
-                    if (wtCfg?.certHash) certHash = wtCfg.certHash;
+                    if (wtApiCfg?.certHash) certHash = wtApiCfg.certHash;
                 }
                 // Cert fingerprint is delivered via the ConquerD trust chain
                 // (SUPERNODE_INFO → ctx.json → bridge script).  No CA needed.
-                if (ctx?.wtCertHash) certHash = ctx.wtCertHash;
+                if (ctx?.wtCertHash) {
+                    certHash = ctx.wtCertHash;
+                } else if (!certHash && ctx?.fetch) {
+                    // wtBaseUrl was delivered via SUPERNODE_INFO but cert_fingerprint
+                    // was absent (e.g. supernode running an older build, or fingerprint
+                    // write failed at startup).  Query /api/wt-url directly for the
+                    // live fingerprint from the supernode.
+                    if (!wtApiCfg) {
+                        wtApiCfg = await ctx.fetch("/api/wt-url")
+                            .then(r => r.ok ? r.json() : null)
+                            .catch(() => null);
+                    }
+                    if (wtApiCfg?.certHash) certHash = wtApiCfg.certHash;
+                }
             }
         } catch { /* not in portal context — fall back to host:port */ }
         // When inside the native portal but neither SUPERNODE_INFO nor
