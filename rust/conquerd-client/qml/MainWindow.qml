@@ -1019,19 +1019,6 @@ ApplicationWindow {
         }
     }
 
-    // ── Session banner below topbar ───────────────────────────────────────
-    SessionBanner {
-        id: banner
-        anchors {
-            top: customTitleBar.bottom
-            left: parent.left
-            right: parent.right
-        }
-        height: Theme.bannerHeight
-        bannerText: backend.session_banner
-        connectionMode: backend.connection_mode
-    }
-
     // ── Synthetic participant model for direct P2P calls ─────────────────
     // Populated from bridge when call_state changes; cleared on idle.
     ListModel { id: directCallModel }
@@ -1055,10 +1042,10 @@ ApplicationWindow {
         }
     }
 
-    // ── Main body below banner ────────────────────────────────────────────
+    // ── Main body ─────────────────────────────────────────────────────────
     RowLayout {
         anchors {
-            top: banner.bottom
+            top: customTitleBar.bottom
             left: parent.left
             right: parent.right
             bottom: parent.bottom
@@ -1286,7 +1273,7 @@ ApplicationWindow {
 
                                     ToolTip {
                                         visible: groupSnHover.hovered
-                                        text: roomGroup.node_id
+                                        text: "Left Click — Open Portal\nRight Click — Options"
                                         delay: 300
                                         timeout: 5000
                                     }
