@@ -717,6 +717,7 @@ Item {
                     SettingSwitch { title: "Enable notifications"; checked: root.settings ? root.settings.notifications_enabled : true; onChanged: if (root.settings) root.settings.notifications_enabled = checked }
                     SettingSwitch { title: "Auto-connect to known peers"; checked: root.settings ? root.settings.auto_connect : false; onChanged: if (root.settings) root.settings.auto_connect = checked }
                     SettingSwitch { title: "Start minimized"; checked: root.settings ? root.settings.start_minimized : false; onChanged: if (root.settings) root.settings.start_minimized = checked }
+                    SettingSwitch { title: "Minimize to tray on close"; description: "Keep ConquerD running in the system tray instead of quitting when the window is closed or minimized"; checked: root.settings ? root.settings.minimize_to_tray : false; onChanged: if (root.settings) root.settings.minimize_to_tray = checked }
                     SettingSwitch { title: "Check for updates automatically"; checked: root.settings ? root.settings.update_check_enabled : true; onChanged: if (root.settings) root.settings.update_check_enabled = checked }
                     SettingSwitch { title: "Enable UPnP port mapping"; checked: root.settings ? root.settings.upnp_enabled : true; onChanged: if (root.settings) root.settings.upnp_enabled = checked }
 
