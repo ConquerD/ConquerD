@@ -51,10 +51,12 @@ This is the third official game demo (after the cursor relay and shared drawing)
 
 ```bash
 # From repo root
-cargo run -p conquerd-supernode -- --data-dir ./supernode-data
-# (enable game.relay.v1 + web.host.h3.v1 in supernode.toml or via the portal)
+export CONQUERD_HOME="$PWD/supernode-data"
+cd rust
+cargo run -p conquerd-supernode
+# Enable game.relay.v1 + web.host.h3.v1 in $CONQUERD_HOME/supernode.toml
 ```
 
-Then open `http://localhost:8443/games/brick-breaker/?room=test` (or the https WebTransport endpoint).
+Then open `https://localhost:8443/games/brick-breaker/?room=test`.
 
 Have fun breaking bricks together!

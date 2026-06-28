@@ -34,7 +34,7 @@ Responsibilities:
 - Maintain direct client-to-client signaling and handshake lifecycle.
 - Enforce signed, transcript-bound messaging for all signaling.
   - Invite/handshake bootstrap has strong replay protection (expiry + transcript binding).
-  - Post-handshake signaling is Ed25519-signed and enforces a 5-minute timestamp freshness window (`MAX_MESSAGE_AGE_SECS = 300.0` in `connection_manager/manager.rs` on the client; `is_fresh(300.0)` in `protocol.rs` on the supernode WS path) **plus** a per-sender sliding-window replay guard (`conquerd_features::ReplayGuard`) keyed on the message signature, which rejects re-delivery of an already-seen message *within* the freshness window. Real-time `SfuAudio` frames are exempt from the dedup guard (ephemeral, high-rate). `ReplayGuard` negative-path tests cover replays; explicit `is_fresh` stale/future timestamp unit tests remain a gap on the client path.
+  - Post-handshake signaling is Ed25519-signed and enforces a 5-minute timestamp freshness window (`MAX_MESSAGE_AGE_SECS = 300.0` in `connection_manager/manager.rs` on the client; `is_fresh(300.0)` in `protocol.rs` on the supernode WS path) **plus** a per-sender sliding-window replay guard (`conquerd_features::ReplayGuard`) keyed on the message signature, which rejects re-delivery of an already-seen message *within* the freshness window. Real-time `SfuAudio` frames are exempt from the dedup guard (ephemeral, high-rate). `ReplayGuard` negative-path tests cover replays; client `protocol.rs` and `connection_manager::tests` cover stale/future timestamp rejection.
 - Keep endpoint/invite behavior stable and restart-safe.
 
 Working style:
@@ -79,7 +79,7 @@ Working style:
 
 ### 5. QA/Testing Agent
 Responsibilities:
-- Run unit and integration tests and targeted manual checks (529 Rust unit tests; 113 in `conquerd-features`).
+- Run unit and integration tests and targeted manual checks (539 Rust unit tests; 114 in `conquerd-features`).
 - Stress race-prone flows (rapid connect/disconnect, duplicate signaling).
 - Validate trusted-peer persistence and UI synchronization.
 - Cover QUIC relay path and WebSocket membership signaling for room audio.
@@ -151,7 +151,7 @@ This section captures implementation locations and invariants that agents must r
   - `src/room_store.rs`: client-owned encrypted room definitions (`my_rooms.dat`), keyed by `(supernode_id, room_id)`; sidebar hide list; replay source for `SfuRoomCreate` on supernode connect. **Never** persist room definitions on the supernode.
   - `src/identity.rs`: Ed25519 + OS keyring integration.
   - `ConnectionManager` (`src/connection_manager/` module — `mod.rs`, `manager.rs`, `internal.rs`, `quic.rs`, `ws.rs`, `events.rs`, `tests.rs`): direct QUIC + relay client paths; outbound `core.chat.v1` / `core.file.v1` must call `gate_through_feature`; audio datagrams must use the quota-checked send helpers.
-- `conquerd-features`: the spine. `FeatureRegistry`, `FeatureModule` trait, `dispatch_message` / `dispatch_invoke_datagram`, inbound/outbound quota enforcement (token-bucket per `(feature, peer)`), auth tiers, channel-tag registry. 113 unit tests. All transports (direct QUIC, relay, WS, WebTransport) must go through the registry for capability-gated paths; hot paths may call `gate_inbound_through_feature` directly but must still respect the same buckets.
+- `conquerd-features`: the spine. `FeatureRegistry`, `FeatureModule` trait, `dispatch_message` / `dispatch_invoke_datagram`, inbound/outbound quota enforcement (token-bucket per `(feature, peer)`), auth tiers, channel-tag registry. 114 unit tests. All transports (direct QUIC, relay, WS, WebTransport) must go through the registry for capability-gated paths; hot paths may call `gate_inbound_through_feature` directly but must still respect the same buckets.
 - `conquerd-opus`: first-party libopus wrapper (DRED + OSCE). Requires DNN data (see Build Notes). Linked only into `conquerd-client`.
 - `conquerd-supernode`: sole supernode implementation (QUIC relay, WS signaling, WebTransport `web.host.h3.v1`, QUIC bidi `web.host.app.v1` portal, SFU, manifest-driven feature hosting).
 - `conquerd-installer`: release download + apply + manifest verification + signing helper.
@@ -160,7 +160,7 @@ This section captures implementation locations and invariants that agents must r
 
 **CXX-Qt qproperty rule**: every `#[qproperty(T, name)]` in a `#[cxx_qt::bridge]` block must have a matching field in the Rust state struct (`AppBridgeRust` etc.) and be initialised in `impl Default`. Missing fields are silent in headless mode but fail at runtime/Qt meta-object construction.
 
-**Replay / freshness rule**: post-handshake signaling uses Ed25519 signatures + 5-minute freshness window (`MAX_MESSAGE_AGE_SECS` on the client; `is_fresh(300.0)` on the supernode WS path) + per-sender `ReplayGuard` (keyed on signature) inside the freshness window. `SfuAudio` frames are exempt. `ReplayGuard` replay negative-path tests are in `replay.rs`; add explicit `is_fresh` stale/future timestamp unit tests when touching this path.
+**Replay / freshness rule**: post-handshake signaling uses Ed25519 signatures + 5-minute freshness window (`MAX_MESSAGE_AGE_SECS` on the client; `is_fresh(300.0)` on the supernode WS path) + per-sender `ReplayGuard` (keyed on signature) inside the freshness window. `SfuAudio` frames are exempt. `ReplayGuard` replay negative-path tests are in `replay.rs`; client stale/future timestamp rejection is covered in `protocol.rs` and `connection_manager::tests`.
 
 **Supernode detection invariant** (client UI + transport):
 - **Authoritative source**: signed invite payload `is_supernode` → persisted on accept as `PeerRecord.is_supernode` and `PeerRecord.supernode_from_invite` (`connection_manager/manager.rs` `AcceptInvite` / `InviteHandshakeAccept`). `docs/THREAT_MODEL.md` calls the invite field advisory for *security escalation* — the client still uses it as the canonical UI/transport classifier.
@@ -224,7 +224,7 @@ if !state.features.bind_module("x.vendor.thing", m.clone()) {
 
 ### Supernode capability surface
 
-Hosted features come from `<data_dir>/supernode.toml` (typed schema in `rust/conquerd-supernode/src/manifest.rs`). The manifest drives `SUPERNODE_INFO` and the WebTransport bridge. **Do not** add new env-var toggles — extend the manifest. Reserved namespaces: `core.*`, `transport.*`, `room.*`, `web.*`, `game.*`. Bespoke modules use `x.<vendor>.*`.
+Hosted feature declarations come from `<data_dir>/supernode.toml` (typed schema in `rust/conquerd-supernode/src/manifest.rs`). The supernode also upserts built-in core/room/game descriptors into the registry so quota gates and relay fan-out can classify first-party traffic even when a manifest omits those entries. **Do not** add new env-var toggles — extend the manifest. Reserved namespaces: `core.*`, `transport.*`, `room.*`, `web.*`, `game.*`. Bespoke modules use `x.<vendor>.*`.
 
 ### Capability negotiation
 
@@ -349,18 +349,18 @@ No central feature registry, no mandatory features, no implicit cross-feature pr
 
 This section is the single source of truth for delivery status (condensed from the former `ROADMAP.md` / `IMPROVEMENT_PLAN.md` / `TODO.md`).
 
-**Last reviewed:** 2026-06-25 (test counts refreshed to 529; voice/audio items V9–V12, F1 completed; VOICE_CHAT_REVIEW.md folded in and removed).
+**Last reviewed:** 2026-06-28 (test counts refreshed to 539 unit tests by `cargo test -- --list`; voice/audio items V9–V12, F1 completed; VOICE_CHAT_REVIEW.md folded in and removed).
 
 ### Health summary
 
-ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (529 unit tests; 113 features + 204 supernode + 138 headless client + 74 installer — all green), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only.
+ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (539 unit tests listed; 114 features + 212 supernode + 139 headless client + 74 installer), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only.
 
 ### P0–P2 — Complete ✅
 
 | Item | Outcome |
 |---|---|
 | CI hardening | `fmt --check` + `clippy -D warnings` (both workspaces) + headless client tests + `cargo-audit`; all SHA-pinned. |
-| Post-handshake replay protection | 5-minute timestamp freshness window (`MAX_MESSAGE_AGE_SECS` on client, `is_fresh(300.0)` on supernode WS path), **plus** a per-sender sliding-window dedup guard (`conquerd_features::ReplayGuard`) keyed on the message signature; `ReplayGuard` replay negative-path tests in `replay.rs` (explicit `is_fresh` stale/future unit tests still a client-path gap). |
+| Post-handshake replay protection | 5-minute timestamp freshness window (`MAX_MESSAGE_AGE_SECS` on client, `is_fresh(300.0)` on supernode WS path), **plus** a per-sender sliding-window dedup guard (`conquerd_features::ReplayGuard`) keyed on the message signature; `ReplayGuard` replay negative-path tests in `replay.rs`; client stale/future timestamp rejection tests in `protocol.rs` and `connection_manager::tests`. |
 | Relay + SFU smoke tests | Real mTLS QUIC suite: 2-peer room broadcast, unauthorized rejection, leave/rejoin, ticket renewal. |
 | Quota symmetry | Inbound + outbound gating on direct P2P (`core.audio.opus`), client room audio (`room.audio.sfu`), supernode WS `SfuAudio`/`SfuChat`/`SfuFile*` relay, QUIC relay datagram fan-out, and WebTransport browser fan-out (`BrowserBridge::on_inbound` + `send` + `release_session` cleanup). Bug-review pass (2026-06-11): QUIC relay now clears quota buckets on disconnect, reconnect-replacement, revoke, and stale-peer sweep (`relay.rs`); reconnect no longer lets the old connection's exit path tear down the new session (stable_id guard); dynamic-tag allocation hardened against >224-feature overflow in `webtransport.rs` and both web-SDK copies. |
 | Audio dispatch decision | Real-time Opus bypasses `dispatch_message` module callbacks but is explicitly gated at the transport layer via `check_audio_quota` / `check_room_audio_outbound_quota` / `check_inbound_feature_quota` so quota enforcement cannot be skipped accidentally. |
@@ -371,8 +371,8 @@ ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-
 | Threat model | `docs/THREAT_MODEL.md`. |
 | Version automation | `scripts/check_version_sync.ps1 -BumpTo X.Y.Z` bumps all crates + prints git/tag commands. |
 | Metrics export | `/api/metrics` via `web.host.app.v1`. |
-| Game relay end-to-end | `game.relay.v1` over WebTransport confirmed working: race condition in `/_conquerd/ctx.json` cache fixed (scheme-layer caches now populated on tokio thread in `connection_manager.rs` before any `FetchWebApp` can succeed); self-signed TLS cert now includes `serverAuth` EKU (Chrome WebTransport requirement); cert fingerprint always re-derived from on-disk DER (stale `.hex` cache bug fixed); old certs missing the EKU detected via OID byte-scan and auto-rotated on next supernode start; template SDK synced with source (`ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, `featureForFixedTag` exports added); SDK now fails fast with a clear error when portal context exists but no WebTransport URL is available; cursor relay demo fixed (`encodeCursorLeave` now carries color so peer tracking is stable). |
-| Test suite integrity | Full test run across all four crates: 529 unit tests all green (113 `conquerd-features` + 204 `conquerd-supernode` + 138 headless `conquerd-client` + 74 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary). |
+| Game relay end-to-end | `game.relay.v1` over WebTransport confirmed working: race condition in `/_conquerd/ctx.json` cache fixed (scheme-layer caches now populated on tokio thread in `connection_manager/manager.rs` before any `FetchWebApp` can succeed); self-signed TLS cert now includes `serverAuth` EKU (Chrome WebTransport requirement); cert fingerprint always re-derived from on-disk DER (stale `.hex` cache bug fixed); old certs missing the EKU detected via OID byte-scan and auto-rotated on next supernode start; template SDK synced with source (`ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, `featureForFixedTag` exports added); SDK now fails fast with a clear error when portal context exists but no WebTransport URL is available; cursor relay demo fixed (`encodeCursorLeave` now carries color so peer tracking is stable). |
+| Test suite integrity | Current listed unit tests: 539 total (114 `conquerd-features` + 212 `conquerd-supernode` + 139 headless `conquerd-client` + 74 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary); `conquerd-opus` has one doc-test. |
 | Ephemeral SFU rooms | Supernode in-memory rooms only (`sfu.rs` idle GC, no `sfu_rooms.json`); client `RoomStore` replay on supernode connect; sidebar hide local-only. |
 
 ### P3 backlog (as capacity allows)

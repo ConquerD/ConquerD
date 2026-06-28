@@ -54,10 +54,11 @@
 
 **Mitigations (current):**  
 - Every signaling message is Ed25519-signed over canonical bytes by the sender's long-term key.  
-- `verify_inbound_signature` + timestamp freshness window (P0 replay protection: 5-minute `MAX_MESSAGE_AGE_SECS`).  
-- Per-peer transcript ordering on some paths; capability intersection enforced before any feature activation.
+- `verify_inbound_signature` + timestamp freshness window (5-minute `MAX_MESSAGE_AGE_SECS` on the client; `is_fresh(300.0)` on the supernode WebSocket path).
+- Per-sender `conquerd_features::ReplayGuard` rejects re-delivery of an already-seen message signature within the freshness window; real-time `SfuAudio` frames are exempt from dedup because they are high-rate and ephemeral.
+- Capability intersection enforced before any feature activation.
 
-**Residual (documented):** Sliding-window counter/bitmap not yet implemented for all signaling (P0 partial mitigation via timestamp). Full sequence + bitmap would be ideal for very long-lived sessions.
+**Residual (documented):** A monotonic sequence-number bitmap would provide stricter ordering semantics for very long-lived sessions, but duplicate signed envelopes inside the active freshness window are already rejected.
 
 ### 4. QUIC Direct Sessions
 **Threats:**  
@@ -65,8 +66,8 @@
 - QUIC implementation bugs (quinn/rustls).
 
 **Mitigations:**  
-- 0-RTT disabled for initial handshake; forward-secret resumption.  
-- ALPN `conquerd/1`; strict Ed25519 client cert verification (CN = peer identity).  
+- Application messages are sent only after the signed invite/session handshake; no custom app-layer early-data path is used for trust establishment.
+- ALPN `conquerd/1`; self-signed Ed25519 QUIC certificates carry the identity in the CN, with peer-id checks performed after certificate extraction.
 - Per-feature quotas applied at datagram/stream layer before delivery.
 
 **Residual:** QUIC fingerprinting (standard for any QUIC app).
@@ -131,11 +132,11 @@
 - **Traffic analysis / metadata leakage** by relays or network observers (accepted for usability).  
 - **Social engineering** around invite distribution (out-of-band).  
 - **Supply-chain** attacks on the binary or browser (mitigated by code-signing, Sigstore, pinned actions).  
-- **Long-term session replay** without full sequence numbers (partially mitigated by timestamp windows; full bitmap is future work).  
+- **Long-term session ordering** without full sequence numbers (duplicate envelopes within the freshness window are blocked; strict monotonic ordering remains a possible hardening item).
 - **Browser-origin attacks** on WebTransport clients (same risk surface as any web app).
 
 ## Recommendations (aligned with P3)
-- Consider adding monotonic sequence numbers + sliding-window bitmap for all post-handshake signaling (closes the remaining replay window).  
+- Consider adding monotonic sequence numbers + sliding-window bitmap for all post-handshake signaling if strict ordering becomes necessary.
 - Formalize this document and keep it in sync with protocol changes.  
 - Add negative-path tests for the replay and consent boundaries (already partially present in P0/P1 work).
 

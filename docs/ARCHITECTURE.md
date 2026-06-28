@@ -230,9 +230,10 @@ example"]
 
 | Flow | Path |
 |---|---|
-| Peer message | QML → AppBridge → ConnectionManager → QUIC/WS → Supernode → peer |
-| Voice audio | CPAL mic → AEC → OpusEncoder → QUIC datagram → SFU → peers → OpusDecoder → CPAL speaker |
-| File transfer | FileTransfer module → FeatureRegistry → QUIC datagrams (chunked) |
+| Peer message | QML → AppBridge → ConnectionManager → tagged QUIC peer stream, or supernode relay fallback → peer |
+| Direct voice audio | CPAL mic → AEC/noise/VAD → OpusEncoder → direct QUIC datagram → peer → JitterBuffer → OpusDecoder → CPAL speaker |
+| Room voice audio | CPAL mic → OpusEncoder → QuicRelayClient room datagram → supernode SFU/relay fan-out → peers |
+| File transfer | FileTransfer module → FeatureRegistry quota gate → `core.file.v1` / `room.file.v1` reliable signaling path |
 | Browser game | games/index.html → web-sdk.mjs → WebTransport H3 → webtransport.rs → relay |
 | Identity handshake | identity.rs (Ed25519) → handshake.rs (X25519 ECDH) → HKDF → AES-GCM session |
 | Auto-update | GithubUpdater → GitHub Releases API → conquerd-installer (extract + apply) |

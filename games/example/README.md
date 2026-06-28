@@ -12,8 +12,8 @@ parses the game payload.
 ## Requirements
 
 - A running `conquerd-supernode` with `game.relay.v1` enabled.
-- A TLS certificate that browsers trust (or a dev cert accepted via a browser
-  flag — see the supernode README).
+- The supernode's WebTransport cert fingerprint, supplied automatically in the
+  native portal or via the SDK's `certHash` path for standalone browser access.
 
 ---
 
@@ -80,6 +80,6 @@ The game uses a simple 5-byte header; all payloads are opaque to the relay:
 ## Extending this example
 
 - Replace cursor positions with player state (position, health, action).
-- Add a server-authoritative lobby (`game.lobby.v1`) for joining/leaving.
+- Add a coordination feature such as `x.conquerd.matchmaker.v1` for joining/leaving.
 - Use `transport.quic.uni_stream.v1` for ordered reliable events alongside
   `game.relay.v1` unreliable datagrams for real-time state.

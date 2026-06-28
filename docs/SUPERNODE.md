@@ -7,10 +7,11 @@ The supernode provides optional transport assistance (QUIC relay, SFU rooms, Web
 ## Quick Start
 
 ```bash
-# Build
+# Build from the outer Rust workspace
+cd rust
 cargo build -p conquerd-supernode --release
 
-# Run with defaults (data in ./data)
+# Run with defaults (data in $HOME/.conquerd, or %USERPROFILE%\.conquerd on Windows)
 ./target/release/conquerd-supernode
 ```
 
@@ -66,11 +67,11 @@ Supported local package suffixes: `linux-x86_64`, `linux-aarch64`, `macos-arm64`
 
 CI validates packaging on all three release targets (`test-supernode-linux-x86_64`, `test-linux-arm64`, `test-supernode-windows` in `.github/workflows/ci.yml`).
 
-Configuration is read from `<data_dir>/supernode.toml` (see below). Legacy environment variables are supported for backward compatibility but are deprecated.
+Hosted feature declarations are read from `<data_dir>/supernode.toml` (see below). Legacy environment variables are supported for backward compatibility, and built-in first-party descriptors are always present in the registry for quota and relay accounting.
 
 ## Configuration (supernode.toml)
 
-Create `<data_dir>/supernode.toml` (default data dir is `./data` or `$CONQUERD_DATA_DIR`).
+Create `<data_dir>/supernode.toml`. The default data dir is `$CONQUERD_HOME` when set, otherwise `$HOME/.conquerd` on Linux/macOS or `%USERPROFILE%\.conquerd` on Windows.
 
 Example:
 
@@ -81,12 +82,6 @@ schema_version = 1
 listen_addr = "0.0.0.0:3478"          # QUIC relay + feature ports
 ws_listen_addr = "0.0.0.0:3479"       # WebSocket signaling (optional)
 web_port = 8443                       # For web.host.h3.v1 (WebTransport)
-
-# Identity (generated on first run if missing)
-identity_file = "identity.json"
-
-# Access control (see access.rs for details)
-access_mode = "open"                  # open | tos | access_code | timer | custom
 
 # Feature manifest (recommended)
 [[feature]]
@@ -117,9 +112,7 @@ enabled = true
 cdylib_manifest = "plugins/acme-matchmaker.toml"
 ```
 
-See `rust/conquerd-supernode/src/manifest.rs` for the full schema.
-
-Run `conquerd-supernode --print-default-manifest` for a starting point.
+See `rust/conquerd-supernode/src/manifest.rs` for the full schema. The example above is the current starting point; the binary does not expose a manifest-printing CLI flag.
 
 ## Key Features & Hosting
 
@@ -162,13 +155,12 @@ Static assets live in `<data_dir>/web/` and `<data_dir>/games/<slug>/`.
 
 ## Access Control
 
-Supported modes (set via manifest or legacy env vars):
+Supported modes are currently selected with the `supernode_access_mode` environment variable:
 
 - `open`
 - `tos` (terms of service acceptance)
-- `access_code`
-- `timer` / ad-gate (time or ad-based)
-- `custom` (implement your own `AccessController`)
+- `code`
+- `ad` (timer / ad-gate)
 
 See `src/access.rs` for the trait and examples.
 
@@ -202,11 +194,7 @@ The supernode exposes basic stats via:
 
 ## Example Deployment
 
-See the example `supernode.toml` in the repo root or generate one with:
-
-```bash
-conquerd-supernode --example-config > /etc/conquerd/supernode.toml
-```
+Start from the `supernode.toml` example in this guide and place it under the data directory before launching the service.
 
 Typical systemd unit (example):
 
@@ -216,7 +204,8 @@ Description=ConquerD Supernode
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/conquerd-supernode --data-dir /var/lib/conquerd
+Environment=CONQUERD_HOME=/var/lib/conquerd
+ExecStart=/usr/local/bin/conquerd-supernode
 User=conquerd
 Restart=on-failure
 LimitNOFILE=65536
