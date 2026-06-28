@@ -22,7 +22,7 @@ use crate::file_transfer::{FileTransferManager, TransferEvent};
 use crate::identity::Identity;
 use crate::peer_store::PeerStore;
 use crate::protocol::{MessageType, SignalingMessage};
-use crate::quic_relay_client::QuicRelayClient;
+use crate::quic_relay_client::{QuicRelayClient, RelaySignalingInbound};
 use crate::quic_tls;
 use crate::web_app_client::{self, WebAppResponse};
 
@@ -211,9 +211,9 @@ pub struct ConnectionManager {
     /// Sender handed to each [`QuicRelayClient`] so inbound `room.audio.sfu`
     /// datagrams (signed `SfuAudio` JSON) are re-injected on the normal
     /// inbound path. Cloned per relay connection.
-    relay_audio_tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// Receiver side of [`Self::relay_audio_tx`], polled in the run loop.
-    relay_audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    relay_signaling_tx: mpsc::UnboundedSender<RelaySignalingInbound>,
+    /// Receiver side of [`Self::relay_signaling_tx`], polled in the run loop.
+    relay_signaling_rx: mpsc::UnboundedReceiver<RelaySignalingInbound>,
 }
 
 impl ConnectionManager {
@@ -261,7 +261,8 @@ impl ConnectionManager {
         let (event_tx, event_rx) = mpsc::channel::<ConnectionEvent>(256);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnectionCommand>(64);
         let (internal_tx, internal_rx) = mpsc::channel::<InternalEvent>(128);
-        let (relay_audio_tx, relay_audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (relay_signaling_tx, relay_signaling_rx) =
+            mpsc::unbounded_channel::<RelaySignalingInbound>();
 
         let mgr = Self {
             identity,
@@ -288,8 +289,8 @@ impl ConnectionManager {
             transport_stats: HashMap::new(),
             pending_materialize: HashSet::new(),
             pending_private_room_joins: HashSet::new(),
-            relay_audio_tx,
-            relay_audio_rx,
+            relay_signaling_tx,
+            relay_signaling_rx,
             room_relay_fail_streak: 0,
             room_relay_cooldown_frames: 0,
         };
@@ -475,8 +476,21 @@ impl ConnectionManager {
                         ConnectionCommand::SendTyping { peer_id, is_typing } => {
                             self.send_typing(&peer_id, is_typing).await;
                         }
-                        ConnectionCommand::SendSfuChat { supernode_id, room_id, body, sender_handle } => {
-                            self.send_sfu_chat(&supernode_id, &room_id, &body, &sender_handle).await;
+                        ConnectionCommand::SendSfuChat {
+                            supernode_id,
+                            room_id,
+                            body,
+                            sender_handle,
+                            message_id,
+                        } => {
+                            self.send_sfu_chat(
+                                &supernode_id,
+                                &room_id,
+                                &body,
+                                &sender_handle,
+                                &message_id,
+                            )
+                            .await;
                         }
                         ConnectionCommand::SendSfuFile { supernode_id, room_id, rel_path, data, purpose } => {
                             let size = data.len();
@@ -605,8 +619,8 @@ impl ConnectionManager {
                 // frames from the reliable signaling stream. Re-inject each on
                 // the normal inbound path so signature + freshness + quota +
                 // dispatch run exactly as for the WebSocket route.
-                Some(json) = self.relay_audio_rx.recv() => {
-                    self.handle_relay_reinject(json).await;
+                Some(frame) = self.relay_signaling_rx.recv() => {
+                    self.handle_relay_reinject(frame).await;
                 }
                 // Accept incoming QUIC connections
                 incoming = async {
@@ -917,15 +931,18 @@ impl ConnectionManager {
                 // signaling channel. Control messages stay untagged
                 // (raw JSON) for backward compatibility — the inbound
                 // classifier treats a leading `{` as control.
-                let bytes = match Self::channel_tag_for(msg_type) {
+                let bytes = match Self::channel_tag_for(msg_type.clone()) {
                     Some(tag) => channel_frame::encode_frame(tag, json.as_bytes()),
                     None => json.as_bytes().to_vec(),
                 };
-                if sig_tx.try_send(bytes).is_err() {
-                    // The QUIC signaling channel is full or its receiver was
-                    // dropped (the session is tearing down). Surface the
-                    // failure so the message flips to "failed" and can be
-                    // retried, instead of being stranded in "sending".
+                if sig_tx.try_send(bytes).is_ok() {
+                    return;
+                }
+                // Peer-targeted chat: a full or closing QUIC channel should
+                // not strand the message when a supernode relay path exists.
+                if chat_attempt.is_some() && self.supernodes.values().any(|sn| sn.connected) {
+                    debug!("QUIC signaling channel busy for chat; falling back to supernode relay");
+                } else {
                     if let Some((peer_id, message_id)) = chat_attempt {
                         warn!(
                             "QUIC signaling channel unavailable for chat {} to {}",
@@ -938,8 +955,8 @@ impl ConnectionManager {
                             reason: "connection busy".to_owned(),
                         });
                     }
+                    return;
                 }
-                return;
             }
         }
 
@@ -1341,8 +1358,8 @@ impl ConnectionManager {
                     .event_tx
                     .try_send(ConnectionEvent::SupernodeDisconnected(peer_id));
             }
-            InternalEvent::WsSignalingMessage { msg } => {
-                self.handle_inbound(msg).await;
+            InternalEvent::WsSignalingMessage { supernode_id, msg } => {
+                self.handle_inbound_from_supernode(supernode_id, msg).await;
             }
             InternalEvent::RelayClientReady {
                 supernode_id,
@@ -1403,7 +1420,7 @@ impl ConnectionManager {
         };
         let endpoint = endpoint.clone();
         let internal_tx = self.internal_tx.clone();
-        let relay_audio_tx = self.relay_audio_tx.clone();
+        let relay_signaling_tx = self.relay_signaling_tx.clone();
         let sn_id_for_task = supernode_id.clone();
         tokio::spawn(async move {
             let client = match QuicRelayClient::connect(
@@ -1411,7 +1428,7 @@ impl ConnectionManager {
                 sn_id_for_task.clone(),
                 &relay_host,
                 relay_port,
-                relay_audio_tx,
+                relay_signaling_tx,
             )
             .await
             {
@@ -1774,14 +1791,17 @@ impl ConnectionManager {
     /// the reliable signaling stream — on the normal inbound path (signature
     /// verification + replay/freshness + per-feature quota + dispatch all run
     /// exactly as for the WebSocket route).
-    async fn handle_relay_reinject(&mut self, json: Vec<u8>) {
-        let text = match std::str::from_utf8(&json) {
+    async fn handle_relay_reinject(&mut self, frame: RelaySignalingInbound) {
+        let text = match std::str::from_utf8(&frame.json) {
             Ok(s) => s,
             Err(_) => return,
         };
         match SignalingMessage::from_json(text) {
-            Ok(msg) => self.handle_inbound(msg).await,
-            Err(e) => debug!("[relay] dropping malformed room-audio datagram: {e}"),
+            Ok(msg) => {
+                self.handle_inbound_from_supernode(frame.supernode_id, msg)
+                    .await
+            }
+            Err(e) => debug!("[relay] dropping malformed relay signaling frame: {e}"),
         }
     }
 
@@ -1804,6 +1824,7 @@ impl ConnectionManager {
         room_id: &str,
         body: &str,
         sender_handle: &str,
+        message_id: &str,
     ) {
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuChat, sender);
@@ -1816,6 +1837,12 @@ impl ConnectionManager {
             "sender_handle".to_owned(),
             Value::String(sender_handle.to_owned()),
         );
+        if !message_id.is_empty() {
+            msg.payload.insert(
+                "message_id".to_owned(),
+                Value::String(message_id.to_owned()),
+            );
+        }
         self.dispatch_outbound(msg).await;
     }
 
@@ -2199,25 +2226,22 @@ impl ConnectionManager {
             return false;
         }
 
-        // Basic replay protection via timestamp window.
-        // This catches old replays without requiring protocol changes or per-peer state.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-
-        let age = (now - msg.timestamp).abs();
-        if age > Self::MAX_MESSAGE_AGE_SECS {
+        if !msg.is_fresh(Self::MAX_MESSAGE_AGE_SECS) {
             warn!(
-                "[signaling] dropping {:?} from {} — stale or future timestamp (age={:.1}s)",
+                "[signaling] dropping {:?} from {} — stale or future timestamp",
                 msg.msg_type,
                 &msg.sender[..8.min(msg.sender.len())],
-                age
             );
             return false;
         }
 
         true
+    }
+
+    /// Test hook for signature + freshness verification on the client path.
+    #[cfg(test)]
+    pub(crate) fn verify_inbound_signature_for_test(msg: &SignalingMessage) -> bool {
+        Self::verify_inbound_signature(msg)
     }
 
     /// Sliding-window replay check, keyed on the message's Ed25519 signature.
@@ -2315,15 +2339,25 @@ impl ConnectionManager {
     }
 
     async fn handle_inbound_from_quic(&mut self, transport_peer_id: String, msg: SignalingMessage) {
-        self.handle_inbound_inner(msg, Some(transport_peer_id))
+        self.handle_inbound_inner(msg, Some(transport_peer_id), None)
             .await;
     }
 
     async fn handle_inbound(&mut self, msg: SignalingMessage) {
-        self.handle_inbound_inner(msg, None).await;
+        self.handle_inbound_inner(msg, None, None).await;
     }
 
-    async fn handle_inbound_inner(&mut self, msg: SignalingMessage, quic_peer_id: Option<String>) {
+    async fn handle_inbound_from_supernode(&mut self, supernode_id: String, msg: SignalingMessage) {
+        self.handle_inbound_inner(msg, None, Some(supernode_id))
+            .await;
+    }
+
+    async fn handle_inbound_inner(
+        &mut self,
+        msg: SignalingMessage,
+        quic_peer_id: Option<String>,
+        inbound_supernode_id: Option<String>,
+    ) {
         // Enforce signed-transcript model: every inbound signaling message
         // MUST carry a valid Ed25519 signature over its canonical bytes,
         // signed by the key whose public_id is `msg.sender`. Drop silently
@@ -2597,6 +2631,12 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                let message_id = msg
+                    .payload
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
                 if !body.is_empty() {
                     // Enforce the room.chat.v1 per-sender inbound quota,
                     // symmetric with the outbound gate in dispatch_outbound
@@ -2612,13 +2652,17 @@ impl ConnectionManager {
                         );
                         return;
                     }
+                    let supernode_id = inbound_supernode_id
+                        .or_else(|| msg.target.clone())
+                        .unwrap_or_default();
                     let _ = self.event_tx.try_send(ConnectionEvent::RoomChatMessage {
-                        supernode_id: self.current_supernode_id.clone(),
+                        supernode_id,
                         room_id,
                         sender_id: msg.sender.clone(),
                         sender_handle,
                         body,
                         timestamp: msg.timestamp,
+                        message_id,
                     });
                 }
             }

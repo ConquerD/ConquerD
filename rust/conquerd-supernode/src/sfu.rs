@@ -493,6 +493,14 @@ impl SFURoomManager {
             .unwrap_or_default()
     }
 
+    /// True when `peer_id` is a voice participant or text-only subscriber in
+    /// `room_id` — the minimum bar for accepting an outbound `SfuChat`.
+    pub fn is_chat_sender(&self, room_id: &str, peer_id: &str) -> bool {
+        self.rooms.get(room_id).is_some_and(|r| {
+            r.participants.contains_key(peer_id) || r.subscribers.contains(peer_id)
+        })
+    }
+
     /// Subscribe a peer to a room's text chat without voice join.
     pub fn subscribe(&mut self, peer_id: &str, room_id: &str) -> bool {
         if let Some(room) = self.rooms.get_mut(room_id) {
@@ -591,6 +599,18 @@ pub struct SFURoomStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_chat_sender_requires_membership() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("r1"), "Room", RoomType::Public, "creator")
+            .expect("room");
+        mgr.join_room("talker", "r1");
+        assert!(mgr.is_chat_sender("r1", "talker"));
+        assert!(!mgr.is_chat_sender("r1", "outsider"));
+        assert!(mgr.subscribe("listener", "r1"));
+        assert!(mgr.is_chat_sender("r1", "listener"));
+    }
 
     #[test]
     fn test_room_lifecycle() {

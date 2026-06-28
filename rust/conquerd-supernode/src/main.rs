@@ -1519,6 +1519,14 @@ impl SupernodeHandler {
             .get("room_id")
             .and_then(|v| v.as_str())
             .unwrap_or(sfu::DEFAULT_ROOM_ID);
+        if !sfu.read().is_chat_sender(room_id, &msg.sender) {
+            tracing::debug!(
+                "[room.chat.v1] sender {} is not a member of room {} — dropping chat",
+                &msg.sender[..12.min(msg.sender.len())],
+                &room_id[..12.min(room_id.len())]
+            );
+            return;
+        }
         let recipients = sfu.read().get_chat_recipients(room_id);
         let wire_bytes = raw.len();
         for peer in &recipients {

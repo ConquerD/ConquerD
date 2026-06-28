@@ -92,7 +92,10 @@ async fn connect_and_run_ws(
                     Some(Ok(WsMessage::Text(text))) => {
                         match serde_json::from_str::<SignalingMessage>(&text) {
                             Ok(sm) => {
-                                let _ = internal_tx.try_send(InternalEvent::WsSignalingMessage { msg: sm });
+                                let _ = internal_tx.try_send(InternalEvent::WsSignalingMessage {
+                                    supernode_id: peer_id.to_owned(),
+                                    msg: sm,
+                                });
                             }
                             Err(e) => {
                                 debug!("Ignoring non-signaling WS message: {}", e);

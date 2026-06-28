@@ -78,6 +78,7 @@ pub enum ConnectionEvent {
         sender_handle: String,
         body: String,
         timestamp: f64,
+        message_id: String,
     },
     /// A peer updated their display handle.
     HandleUpdated { peer_id: String, handle: String },
@@ -247,6 +248,7 @@ pub enum ConnectionCommand {
         room_id: String,
         body: String,
         sender_handle: String,
+        message_id: String,
     },
     /// Send a file to every recipient subscribed to an SFU room's chat.
     SendSfuFile {

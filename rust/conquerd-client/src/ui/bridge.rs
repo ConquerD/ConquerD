@@ -2803,6 +2803,7 @@ impl ffi::AppBridge {
                     room_id: rid.clone(),
                     body: body_str.clone(),
                     sender_handle: handle.clone(),
+                    message_id: message_id.clone(),
                 })
                 .is_ok(),
             None => false,
@@ -4622,8 +4623,20 @@ fn dispatch_event(
             sender_handle,
             body,
             timestamp,
+            message_id,
         } => {
-            let message_id = uuid::Uuid::new_v4().to_string();
+            let message_id = if message_id.is_empty() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                message_id
+            };
+            if chat_store
+                .get_by_id(&message_id)
+                .map(|m| m.is_some())
+                .unwrap_or(false)
+            {
+                return;
+            }
             let json = serde_json::json!({
                 "msg_id": message_id.clone(),
                 "sender": sender_handle.clone(),

@@ -143,3 +143,38 @@ fn trusted_sender_gate_resolves_and_excludes() {
         "base64revoked"
     ));
 }
+
+#[test]
+fn verify_inbound_signature_rejects_stale_and_future_timestamps() {
+    use crate::identity::Identity;
+    use crate::protocol::{MessageType, SignalingMessage};
+    use base64::Engine;
+
+    const MAX_AGE: f64 = 300.0;
+    let id = Identity::generate();
+
+    let signed = |timestamp: f64| -> SignalingMessage {
+        let mut msg = SignalingMessage::new(MessageType::ChatMessage, id.public_id());
+        msg.timestamp = timestamp;
+        msg.target = Some("peer-target".to_owned());
+        let canonical = msg.canonical_bytes().expect("canonical");
+        let sig = id.sign(&canonical);
+        msg.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(sig));
+        msg
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    assert!(ConnectionManager::verify_inbound_signature_for_test(
+        &signed(now)
+    ));
+    assert!(!ConnectionManager::verify_inbound_signature_for_test(
+        &signed(now - MAX_AGE - 1.0)
+    ));
+    assert!(!ConnectionManager::verify_inbound_signature_for_test(
+        &signed(now + MAX_AGE + 1.0)
+    ));
+}

@@ -70,8 +70,11 @@ pub(super) enum InternalEvent {
         peer_id: String,
     },
     WsSignalingMessage {
+        /// Identity pubkey of the supernode that delivered this frame.
+        supernode_id: String,
         msg: SignalingMessage,
     },
+
     RelayClientReady {
         supernode_id: String,
         client: Option<Arc<QuicRelayClient>>,

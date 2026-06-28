@@ -54,6 +54,15 @@ const SIGNAL_MAX_FRAME: usize = 262_144;
 /// back-pressure (and the caller falls back to WebSocket).
 const SIGNAL_OUT_CAPACITY: usize = 512;
 
+/// Signed signaling JSON received over a QUIC relay, tagged with the hosting
+/// supernode's identity pubkey so the connection manager can attribute room
+/// broadcasts correctly when multiple supernodes are connected.
+#[derive(Debug)]
+pub struct RelaySignalingInbound {
+    pub supernode_id: String,
+    pub json: Vec<u8>,
+}
+
 /// Datagram target index meaning "broadcast to all room members"
 /// (mirrors `conquerd_supernode::wire::BROADCAST_INDEX`).
 const BROADCAST_INDEX: u8 = 0xFF;
@@ -95,10 +104,11 @@ impl QuicRelayClient {
     /// `supernode_id` is the supernode's identity pubkey (peer_id); kept
     /// here so callers can identify the relay later without re-parsing
     /// the cert.
-    /// `reinject_tx` receives signed signaling JSON bytes that arrive over the
+    /// `reinject_tx` receives signed signaling frames that arrive over the
     /// relay — both `SfuAudio` extracted from inbound `room.audio.sfu`
     /// datagrams and `room.chat.v1` / `room.file.v1` broadcasts delivered on
-    /// the reliable signaling stream. The connection manager owns the receiver
+    /// the reliable signaling stream. Each frame carries the hosting
+    /// supernode's identity pubkey. The connection manager owns the receiver
     /// and re-injects each frame on its normal inbound path (signature
     /// verification + freshness + replay + quota + dispatch).
     pub async fn connect(
@@ -106,7 +116,7 @@ impl QuicRelayClient {
         supernode_id: impl Into<String>,
         host: &str,
         port: u16,
-        reinject_tx: UnboundedSender<Vec<u8>>,
+        reinject_tx: UnboundedSender<RelaySignalingInbound>,
     ) -> anyhow::Result<Self> {
         let supernode_id = supernode_id.into();
         let addr: SocketAddr = format!("{host}:{port}")
@@ -149,10 +159,18 @@ impl QuicRelayClient {
         // here (the relay only forwards room-scoped datagrams to us today).
         let conn_dgram = connection.clone();
         let shutdown_dgram = shutdown.clone();
+        let sn_id_dgram = supernode_id.clone();
         let sn_short_dgram = supernode_id[..12.min(supernode_id.len())].to_owned();
         let reinject_dgram = reinject_tx.clone();
         tokio::spawn(async move {
-            recv_room_datagrams(conn_dgram, shutdown_dgram, reinject_dgram, sn_short_dgram).await;
+            recv_room_datagrams(
+                conn_dgram,
+                shutdown_dgram,
+                reinject_dgram,
+                sn_id_dgram,
+                sn_short_dgram,
+            )
+            .await;
         });
 
         // Reliable signaling stream — carries `room.chat.v1` / `room.file.v1`
@@ -162,6 +180,7 @@ impl QuicRelayClient {
             Ok((send, recv)) => {
                 let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(SIGNAL_OUT_CAPACITY);
                 let shutdown_sig = shutdown.clone();
+                let sn_id_sig = supernode_id.clone();
                 let sn_short_sig = supernode_id[..12.min(supernode_id.len())].to_owned();
                 tokio::spawn(async move {
                     run_signaling_stream(
@@ -170,6 +189,7 @@ impl QuicRelayClient {
                         out_rx,
                         reinject_tx,
                         shutdown_sig,
+                        sn_id_sig,
                         sn_short_sig,
                     )
                     .await;
@@ -337,7 +357,8 @@ async fn drain_relay_commands(conn: Connection, shutdown: Arc<Notify>, sn_short:
 async fn recv_room_datagrams(
     conn: Connection,
     shutdown: Arc<Notify>,
-    room_audio_tx: UnboundedSender<Vec<u8>>,
+    reinject_tx: UnboundedSender<RelaySignalingInbound>,
+    supernode_id: String,
     sn_short: String,
 ) {
     loop {
@@ -355,7 +376,13 @@ async fn recv_room_datagrams(
                         if json.is_empty() {
                             continue;
                         }
-                        if room_audio_tx.send(json).is_err() {
+                        if reinject_tx
+                            .send(RelaySignalingInbound {
+                                supernode_id: supernode_id.clone(),
+                                json,
+                            })
+                            .is_err()
+                        {
                             // Manager dropped the receiver — nothing left to do.
                             break;
                         }
@@ -380,8 +407,9 @@ async fn run_signaling_stream(
     mut send: SendStream,
     recv: RecvStream,
     mut out_rx: mpsc::Receiver<Vec<u8>>,
-    reinject_tx: UnboundedSender<Vec<u8>>,
+    reinject_tx: UnboundedSender<RelaySignalingInbound>,
     shutdown: Arc<Notify>,
+    supernode_id: String,
     sn_short: String,
 ) {
     // Mark this bidi stream as the signaling channel so the supernode routes
@@ -399,10 +427,11 @@ async fn run_signaling_stream(
 
     let reader = {
         let shutdown = shutdown.clone();
+        let sn_id = supernode_id.clone();
         let sn_short = sn_short.clone();
-        tokio::spawn(
-            async move { read_signaling_frames(recv, reinject_tx, shutdown, sn_short).await },
-        )
+        tokio::spawn(async move {
+            read_signaling_frames(recv, reinject_tx, shutdown, sn_id, sn_short).await
+        })
     };
 
     loop {
@@ -435,8 +464,9 @@ async fn run_signaling_stream(
 /// each to the connection manager for re-injection on the normal inbound path.
 async fn read_signaling_frames(
     mut recv: RecvStream,
-    reinject_tx: UnboundedSender<Vec<u8>>,
+    reinject_tx: UnboundedSender<RelaySignalingInbound>,
     shutdown: Arc<Notify>,
+    supernode_id: String,
     sn_short: String,
 ) {
     loop {
@@ -456,7 +486,13 @@ async fn read_signaling_frames(
         if recv.read_exact(&mut buf).await.is_err() {
             break;
         }
-        if reinject_tx.send(buf).is_err() {
+        if reinject_tx
+            .send(RelaySignalingInbound {
+                supernode_id: supernode_id.clone(),
+                json: buf,
+            })
+            .is_err()
+        {
             break; // manager dropped the receiver
         }
     }
