@@ -783,6 +783,24 @@ impl SupernodeState {
     }
 }
 
+/// Re-pad an un-padded base64url identifier (as produced by the relay's
+/// `extract_peer_id`) into the padded form used by the SFU / signaling layer
+/// (`public_id`). Appends `=` until the length is a multiple of 4; a string
+/// that is already padded (or whose length is already aligned) is returned
+/// unchanged. Cheap and infallible — no decode/re-encode round-trip.
+fn pad_base64url(id: &str) -> String {
+    match id.len() % 4 {
+        0 => id.to_string(),
+        rem => {
+            let pad = 4 - rem;
+            let mut s = String::with_capacity(id.len() + pad);
+            s.push_str(id);
+            s.extend(std::iter::repeat_n('=', pad));
+            s
+        }
+    }
+}
+
 /// Decode the Opus payload size from a native `SfuAudio` signaling message.
 fn sfu_audio_opus_byte_count(msg: &SignalingMessage) -> usize {
     use base64::Engine;
@@ -1981,6 +1999,15 @@ async fn main() -> anyhow::Result<()> {
                         return;
                     };
                     let fwd = crate::wire::build_forwarded_datagram(sender_index, &inner);
+                    // The relay identifies peers by the *un-padded* base64url id
+                    // (`extract_peer_id`), but the SFU room — populated from the
+                    // WebSocket `SfuJoin` — keys participants by the *padded*
+                    // `public_id`. Re-pad `from_peer` into the SFU's id space so
+                    // the active-speaker gate recognizes the sender and the
+                    // exclusion below actually fires; otherwise the talker is
+                    // never excluded from the fan-out and hears their own audio
+                    // echoed back through the codec round-trip.
+                    let from_peer = pad_base64url(&from_peer);
                     // Active-speaker gate (same cap as the WS path): drop the
                     // frame server-side when the sender is over the room's
                     // concurrent-talker limit.
@@ -2412,6 +2439,45 @@ fn ensure_web_cert(data_dir: &std::path::Path) -> Option<String> {
         &fingerprint[..16.min(fingerprint.len())]
     );
     Some(fingerprint)
+}
+
+#[cfg(test)]
+mod identity_normalization_tests {
+    use super::*;
+    use base64::Engine;
+
+    /// The relay derives `from_peer` as un-padded base64url of the 32-byte
+    /// public key (`extract_peer_id`), while the SFU/signaling layer uses the
+    /// padded `public_id` (`URL_SAFE.encode`). `pad_base64url` must bridge the
+    /// two exactly, or the room-audio fan-out fails to exclude the sender and
+    /// the talker hears their own voice echoed back through the codec.
+    #[test]
+    fn pad_base64url_matches_padded_public_id_for_all_keys() {
+        let no_pad = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let padded = base64::engine::general_purpose::URL_SAFE;
+        // Sweep several distinct 32-byte keys; Ed25519 keys are always 32 bytes
+        // → 43 unpadded chars → 44 padded (one trailing '=').
+        for seed in [0u8, 1, 7, 42, 255] {
+            let key = [seed; 32];
+            let relay_id = no_pad.encode(key); // what the relay sees
+            let sfu_id = padded.encode(key); // what the SFU stores
+            assert_ne!(relay_id, sfu_id, "test premise: forms differ");
+            assert_eq!(
+                pad_base64url(&relay_id),
+                sfu_id,
+                "re-padded relay id must equal the SFU's padded public_id"
+            );
+        }
+    }
+
+    #[test]
+    fn pad_base64url_is_idempotent_on_already_padded() {
+        // Feeding an already-padded id (or one whose length is aligned) back
+        // through must not append spurious '='.
+        assert_eq!(pad_base64url("YWJj"), "YWJj"); // len 4, aligned
+        assert_eq!(pad_base64url("YWJjZA=="), "YWJjZA=="); // already padded
+        assert_eq!(pad_base64url("YWJjZGU="), "YWJjZGU="); // already padded
+    }
 }
 
 #[cfg(test)]
