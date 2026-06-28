@@ -4,6 +4,7 @@
 // Binds to AppBridge (exposed from Rust via cxx-qt) for live state.
 
 import QtQuick
+import QtQuick.Window
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import Qt.labs.platform as Platform
@@ -1773,7 +1774,7 @@ ApplicationWindow {
     Platform.SystemTrayIcon {
         id: trayIcon
         visible: true
-        icon.source: "qrc:/icons/conquerd.png"
+        icon.source: "qrc:/assets/conquerd.ico"
         tooltip: backend.session_banner.length > 0 ? backend.session_banner : "ConquerD"
 
         menu: Platform.Menu {
@@ -1827,13 +1828,47 @@ ApplicationWindow {
     onWidthChanged:  if (!root._restoringGeometry) geometrySaveTimer.restart()
     onHeightChanged: if (!root._restoringGeometry) geometrySaveTimer.restart()
 
-    // Closing the window quits the application. (Previously this hid the
-    // window into the system tray and left ConquerD.exe running in the
-    // background, which surprised users who had no visible indication
-    // the process was still alive.) Use the tray icon's Quit / Show items
-    // for explicit background operation.
+    // True once we've explained (via a tray balloon) that the window was hidden
+    // to the tray rather than closed — shown only on the first hide per session
+    // so users aren't surprised by a process with no visible window.
+    property bool _trayHintShown: false
+
+    // Hide the window into the system tray and, the first time, tell the user
+    // the app is still running and how to get it back.
+    function hideToTray() {
+        root.hide()
+        if (!root._trayHintShown && trayIcon.available) {
+            trayIcon.showMessage(
+                qsTr("ConquerD is still running"),
+                qsTr("The window was minimized to the tray. Click the tray icon to restore it, or use Quit to exit."),
+                Platform.SystemTrayIcon.Information,
+                5000)
+            root._trayHintShown = true
+        }
+    }
+
+    // Closing the window quits the application — unless "Minimize to tray" is
+    // enabled and a tray icon is available, in which case the window is hidden
+    // into the tray and ConquerD keeps running in the background. (Without the
+    // setting, hiding on close surprised users who had no visible indication
+    // the process was still alive.) The tray icon's Quit / Show items always
+    // provide explicit control.
     onClosing: function(close) {
-        Qt.quit()
+        if (settingsModel.minimize_to_tray && trayIcon.available) {
+            close.accepted = false
+            hideToTray()
+        } else {
+            Qt.quit()
+        }
+    }
+
+    // Minimizing the window also tucks it into the tray when the setting is on.
+    onVisibilityChanged: function(visibility) {
+        if (visibility === Window.Minimized
+                && settingsModel.minimize_to_tray
+                && trayIcon.available) {
+            hideToTray()
+        }
     }
 
     // ── Global keyboard shortcuts ─────────────────────────────────────────
