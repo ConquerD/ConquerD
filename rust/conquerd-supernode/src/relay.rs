@@ -210,6 +210,11 @@ impl QUICRelayServer {
     ///   error); the caller must NOT also send over WS, to avoid duplicate
     ///   delivery / double quota accounting.
     pub fn send_room_datagram(&self, recipient: &str, fwd: &[u8]) -> Option<bool> {
+        // Normalize: relay peers are keyed by the un-padded base64url id (see
+        // `extract_peer_id`), but callers pass the SFU's padded `public_id`.
+        // Without this strip the lookup misses and every relay-connected
+        // recipient silently falls back to the WebSocket path.
+        let recipient = recipient.trim_end_matches('=');
         let st = self.state.read();
         let peer = st.peers.get(recipient)?;
         if peer.connection.close_reason().is_some() {
