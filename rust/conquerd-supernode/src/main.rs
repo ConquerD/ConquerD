@@ -54,8 +54,9 @@ const ENDPOINT_MAX_AGE_S: f64 = 86400.0;
 /// Build the supernode's [`FeatureRegistry`] from the manifest at
 /// `<data_dir>/supernode.toml`, falling back to the legacy env-var
 /// `Config` toggles when the file is absent. The manifest is the single
-/// source of truth for what the supernode advertises in `SUPERNODE_INFO`
-/// / `CAPABILITY_ANNOUNCE`.
+/// source for operator-declared hosted features. Built-in first-party
+/// descriptors are upserted later so relay/quota accounting can still classify
+/// core, room, and game traffic when the manifest omits those entries.
 ///
 /// After registering well-known capabilities, any manifest entries with a
 /// `cdylib_manifest` path are loaded via [`NativeModuleLoader`]. Signer

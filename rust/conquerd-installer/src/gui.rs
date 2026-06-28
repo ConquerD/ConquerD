@@ -17,12 +17,21 @@ pub struct GuiConfig {
     pub kill: bool,
     pub install_state: state::InstallState,
     pub repair: bool,
+    /// When true (only for `--launch` / `--update-and-relaunch`), the
+    /// Launching page may start the app after an update check. Otherwise the
+    /// user must click Launch explicitly.
+    pub auto_launch: bool,
+    /// When true, open on the animated splash and run a background update
+    /// check (install if needed) without auto-launching the app.
+    pub splash_update: bool,
 }
 
 // ── Internal types ──────────────────────────────────────────────────────────
 
 #[derive(Clone, PartialEq)]
 enum Page {
+    /// Animated splash while checking / downloading / installing updates.
+    Splash,
     /// Already up-to-date — brief splash then auto-launch
     Launching,
     /// First-time or update-available welcome
@@ -71,7 +80,9 @@ struct AppState {
     repair_damaged: usize,
     repair_checked: usize,
     repair_total: usize,
-    // Auto-launch countdown (frames)
+    auto_launch: bool,
+    splash_update: bool,
+    up_to_date_only: bool,
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -101,10 +112,14 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
     } else if config.archive.is_some() {
         // Local archive provided — show install welcome
         Page::Welcome
-    } else if has_current {
-        // Already installed — check for updates in the background, but
-        // show the Launching page (will auto-launch after brief check)
+    } else if config.splash_update {
+        Page::Splash
+    } else if has_current && config.auto_launch {
+        // Runner mode — brief update check then auto-launch when up to date.
         Page::Launching
+    } else if has_current {
+        // Installed — manage updates without starting the app.
+        Page::Welcome
     } else {
         // No install, no archive — show welcome to download
         Page::Welcome
@@ -136,11 +151,19 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
         repair_damaged: 0,
         repair_checked: 0,
         repair_total: 0,
+        auto_launch: config.auto_launch,
+        splash_update: config.splash_update,
+        up_to_date_only: false,
     }));
 
     let icon = load_icon_data();
+    let window_size = if config.splash_update {
+        [400.0, 280.0]
+    } else {
+        [520.0, 400.0]
+    };
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([520.0, 400.0])
+        .with_inner_size(window_size)
         .with_resizable(false)
         .with_maximize_button(false);
     if let Some(icon) = icon {
@@ -161,6 +184,7 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
                 state: state.clone(),
                 launched_check: false,
                 launched_repair: false,
+                splash_started: false,
             }))
         }),
     )
@@ -185,6 +209,8 @@ struct InstallerApp {
     launched_check: bool,
     /// Whether we've kicked off the background repair check
     launched_repair: bool,
+    /// Whether the splash update worker has been started
+    splash_started: bool,
 }
 
 impl eframe::App for InstallerApp {
@@ -194,36 +220,113 @@ impl eframe::App for InstallerApp {
             st.page.clone()
         };
 
+        let splash_active = {
+            let st = self.state.lock().unwrap();
+            st.splash_update
+                && matches!(
+                    st.page,
+                    Page::Splash | Page::Checking | Page::Downloading | Page::Installing
+                )
+        };
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Logo — SVG rendered via egui_extras loader, capped at 80 px tall
-            ui.add_space(16.0);
-            ui.vertical_centered(|ui| {
-                ui.add(
-                    egui::Image::from_bytes("bytes://logo.svg", LOGO_BYTES)
-                        .max_height(80.0)
-                        .maintain_aspect_ratio(true),
-                );
-            });
-            ui.add_space(12.0);
+            if splash_active {
+                self.show_splash(ui, ctx);
+            } else {
+                // Logo — SVG rendered via egui_extras loader, capped at 80 px tall
+                ui.add_space(16.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Image::from_bytes("bytes://logo.svg", LOGO_BYTES)
+                            .max_height(80.0)
+                            .maintain_aspect_ratio(true),
+                    );
+                });
+                ui.add_space(12.0);
 
-            ui.separator();
-            ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
 
-            match page {
-                Page::Launching => self.show_launching(ui, ctx),
-                Page::Welcome => self.show_welcome(ui, ctx),
-                Page::Checking => self.show_checking(ui, ctx),
-                Page::Downloading => self.show_downloading(ui, ctx),
-                Page::Installing => self.show_installing(ui, ctx),
-                Page::Repairing => self.show_repairing(ui, ctx),
-                Page::Complete => self.show_complete(ui, ctx),
-                Page::Error => self.show_error(ui, ctx),
+                match page {
+                    Page::Launching => self.show_launching(ui, ctx),
+                    Page::Welcome => self.show_welcome(ui, ctx),
+                    Page::Checking => self.show_checking(ui, ctx),
+                    Page::Downloading => self.show_downloading(ui, ctx),
+                    Page::Installing => self.show_installing(ui, ctx),
+                    Page::Repairing => self.show_repairing(ui, ctx),
+                    Page::Complete => self.show_complete(ui, ctx),
+                    Page::Error => self.show_error(ui, ctx),
+                    Page::Splash => self.show_splash(ui, ctx),
+                }
             }
         });
     }
 }
 
 impl InstallerApp {
+    // ── Splash (animated logo + background update check) ─────────────────
+
+    fn show_splash(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !self.splash_started {
+            self.splash_started = true;
+            let state = self.state.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || run_splash_update_work(&state, &ctx));
+        }
+
+        let (page, progress_text, download_bytes, download_total, files_extracted, files_total) = {
+            let st = self.state.lock().unwrap();
+            (
+                st.page.clone(),
+                st.progress_text.clone(),
+                st.download_bytes,
+                st.download_total,
+                st.files_extracted,
+                st.files_total,
+            )
+        };
+
+        ui.add_space(24.0);
+        paint_animated_logo(ui, ctx);
+        ui.add_space(20.0);
+
+        ui.vertical_centered(|ui| {
+            let status = if !progress_text.is_empty() {
+                progress_text
+            } else {
+                match page {
+                    Page::Checking => "Checking for updates\u{2026}".to_owned(),
+                    Page::Downloading => "Downloading update\u{2026}".to_owned(),
+                    Page::Installing => "Installing update\u{2026}".to_owned(),
+                    _ => "Preparing\u{2026}".to_owned(),
+                }
+            };
+            ui.label(egui::RichText::new(status).size(15.0));
+
+            ui.add_space(14.0);
+
+            if page == Page::Downloading && download_total > 0 {
+                let frac = download_bytes as f32 / download_total as f32;
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(260.0)
+                        .show_percentage(),
+                );
+            } else if page == Page::Installing && files_total > 0 {
+                let frac = files_extracted as f32 / files_total as f32;
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(260.0)
+                        .show_percentage(),
+                );
+            } else {
+                ui.add(egui::Spinner::new().size(28.0));
+            }
+        });
+
+        ctx.request_repaint();
+    }
+
     // ── Launching page (already installed, checking for updates) ─────────
 
     fn show_launching(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -443,12 +546,13 @@ impl InstallerApp {
     }
 
     fn show_complete(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let (version, repair_mode, progress_text) = {
+        let (version, repair_mode, progress_text, up_to_date_only) = {
             let st = self.state.lock().unwrap();
             (
                 st.target_version.clone(),
                 st.repair_mode,
                 st.progress_text.clone(),
+                st.up_to_date_only,
             )
         };
 
@@ -457,6 +561,10 @@ impl InstallerApp {
                 ui.heading("Repair Complete!");
                 ui.add_space(15.0);
                 ui.label(&progress_text);
+            } else if up_to_date_only {
+                ui.heading(format!("ConquerD v{version}"));
+                ui.add_space(15.0);
+                ui.label("You\u{2019}re on the latest version.");
             } else if version.is_empty() {
                 ui.heading("Installation Complete!");
                 ui.add_space(15.0);
@@ -629,17 +737,25 @@ impl InstallerApp {
 // ── Background: check for updates then launch or show update UI ─────────
 
 fn check_and_maybe_launch(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) {
-    let (repo, nightly, install_state) = {
+    let (repo, nightly, install_state, auto_launch) = {
         let st = app_state.lock().unwrap();
-        (st.repo.clone(), st.nightly, st.install_state.clone())
+        (
+            st.repo.clone(),
+            st.nightly,
+            st.install_state.clone(),
+            st.auto_launch,
+        )
     };
 
-    // Try to check GitHub; if it fails, just launch what we have
+    // Try to check GitHub; on failure runner mode still launches what we have.
     let release = match github::fetch_release(&repo, nightly) {
         Ok(r) => r,
         Err(_) => {
-            // Network error — launch existing version
-            launch_current_and_close(app_state, ctx);
+            if auto_launch {
+                launch_current_and_close(app_state, ctx);
+            } else {
+                show_welcome_page(app_state, ctx);
+            }
             return;
         }
     };
@@ -647,14 +763,21 @@ fn check_and_maybe_launch(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context)
     let needs_update = match github::needs_release_update(&release, &install_state, nightly) {
         Ok(v) => v,
         Err(_) => {
-            launch_current_and_close(app_state, ctx);
+            if auto_launch {
+                launch_current_and_close(app_state, ctx);
+            } else {
+                show_welcome_page(app_state, ctx);
+            }
             return;
         }
     };
 
     if !needs_update {
-        // Up to date — launch immediately
-        launch_current_and_close(app_state, ctx);
+        if auto_launch {
+            launch_current_and_close(app_state, ctx);
+        } else {
+            show_welcome_page(app_state, ctx);
+        }
         return;
     }
 
@@ -664,6 +787,87 @@ fn check_and_maybe_launch(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context)
         st.target_version = release.version.clone();
         st.page = Page::Welcome;
     }
+    ctx.request_repaint();
+}
+
+/// Breathing logo SVG plus orbiting accent dots so the splash feels alive.
+fn paint_animated_logo(ui: &mut egui::Ui, ctx: &egui::Context) {
+    let t = ctx.input(|i| i.time) as f32;
+    let breathe = 1.0 + 0.06 * (t * 2.4).sin();
+
+    ui.vertical_centered(|ui| {
+        let width = 300.0;
+        let height = 88.0 * breathe;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        let center = rect.center();
+        let painter = ui.painter();
+
+        for i in 0..3 {
+            let angle = t * 2.0 + (i as f32) * std::f32::consts::TAU / 3.0;
+            let orbit = egui::vec2(angle.cos() * 118.0, angle.sin() * 28.0);
+            let alpha = (150.0 + 80.0 * (t * 3.5 + i as f32).sin()).clamp(0.0, 255.0) as u8;
+            painter.circle_filled(
+                center + orbit,
+                4.0,
+                egui::Color32::from_rgba_premultiplied(167, 139, 250, alpha),
+            );
+        }
+
+        let logo_rect = rect.shrink2(egui::vec2(12.0, 10.0));
+        let logo = egui::Image::from_bytes("bytes://logo.svg", LOGO_BYTES)
+            .fit_to_exact_size(logo_rect.size());
+        logo.paint_at(ui, logo_rect);
+    });
+}
+
+fn run_splash_update_work(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) {
+    let result = (|| -> anyhow::Result<()> {
+        let (repo, nightly, base_dir) = {
+            let st = app_state.lock().unwrap();
+            (st.repo.clone(), st.nightly, st.base_dir.clone())
+        };
+
+        {
+            let mut st = app_state.lock().unwrap();
+            st.page = Page::Checking;
+            st.progress_text = "Checking for updates\u{2026}".into();
+        }
+        ctx.request_repaint();
+
+        let release = github::fetch_release(&repo, nightly)?;
+        let ist = state::read_state(&base_dir)?;
+        if !github::needs_release_update(&release, &ist, nightly)? {
+            let version = ist.current_version.clone();
+            let mut st = app_state.lock().unwrap();
+            st.target_version = version.clone();
+            st.installed_version = version;
+            st.up_to_date_only = true;
+            st.progress_text.clear();
+            st.page = Page::Complete;
+            return Ok(());
+        }
+
+        run_download_and_install(app_state, ctx)
+    })();
+
+    let mut st = app_state.lock().unwrap();
+    match result {
+        Ok(()) => {
+            if st.page != Page::Complete {
+                st.page = Page::Complete;
+            }
+        }
+        Err(e) => {
+            st.error_message = format!("{e:#}");
+            st.page = Page::Error;
+        }
+    }
+    ctx.request_repaint();
+}
+
+fn show_welcome_page(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) {
+    let mut st = app_state.lock().unwrap();
+    st.page = Page::Welcome;
     ctx.request_repaint();
 }
 

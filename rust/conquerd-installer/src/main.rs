@@ -304,7 +304,7 @@ fn main() -> anyhow::Result<()> {
         if cli.kill {
             state::kill_running_instances();
         }
-        return run_update_and_relaunch(&base_dir, &cli.repo, cli.no_shortcuts, cli.silent);
+        return run_update_and_relaunch(&base_dir, &cli.repo, cli.no_shortcuts, cli.silent, true);
     }
 
     // ── Repair mode ─────────────────────────────────────────────────────
@@ -323,6 +323,8 @@ fn main() -> anyhow::Result<()> {
             kill: cli.kill,
             install_state,
             repair: true,
+            auto_launch: false,
+            splash_update: false,
         });
     }
 
@@ -336,12 +338,10 @@ fn main() -> anyhow::Result<()> {
         return run_silent(&archive, &base_dir, &cli);
     }
 
-    // No local .7z beside the installer — use the headless GitHub
-    // install/update/launch path. The egui UI is only needed for on-disk
-    // archive installs (and --repair); opening it without a local archive
-    // hits the Launching/download flow and has been observed to crash on Win10.
+    // No local .7z beside the installer — check GitHub for updates/install
+    // without launching. Use `--launch` (or shortcuts) to start the app.
     if archive.is_none() {
-        return run_launch(&base_dir, &cli.repo);
+        return run_update_install(&base_dir, &cli.repo, cli.no_shortcuts);
     }
 
     // ── GUI mode (local .7z detected) ───────────────────────────────────
@@ -356,6 +356,8 @@ fn main() -> anyhow::Result<()> {
         kill: cli.kill,
         install_state,
         repair: false,
+        auto_launch: false,
+        splash_update: false,
     })
 }
 
@@ -368,7 +370,7 @@ fn launchable_current_dir(st: &state::InstallState) -> Option<&std::path::Path> 
 fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
     let st = state::read_state(base_dir)?;
     if launchable_current_dir(&st).is_some() {
-        if let Err(e) = run_update_and_relaunch(base_dir, repo, false, true) {
+        if let Err(e) = run_update_and_relaunch(base_dir, repo, false, true, true) {
             log!("Update check/launch failed: {e:#}");
             let fallback_state = state::read_state(base_dir).unwrap_or(st);
             if let Some(dir) = launchable_current_dir(&fallback_state) {
@@ -382,7 +384,7 @@ fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
     }
     // Fresh install without a local .7z — download from GitHub silently.
     log!("No installed version found. Installing from GitHub…");
-    if run_update_and_relaunch(base_dir, repo, false, true).is_ok() {
+    if run_update_and_relaunch(base_dir, repo, false, true, true).is_ok() {
         let after = state::read_state(base_dir)?;
         if launchable_current_dir(&after).is_some() {
             return Ok(());
@@ -392,28 +394,49 @@ fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
         log!("Silent install failed.");
     }
 
-    // Network/manifest/extract failure — last resort UI (may still fail on
-    // some Win10 GPU stacks; check installer.log for the root error).
+    open_installer_gui(base_dir, repo, false, true, false)
+}
+
+/// Check GitHub for updates/install without launching the app.
+fn run_update_install(
+    base_dir: &std::path::Path,
+    repo: &str,
+    no_shortcuts: bool,
+) -> anyhow::Result<()> {
+    log!("Opening update splash…");
+    open_installer_gui(base_dir, repo, no_shortcuts, false, true)
+}
+
+fn open_installer_gui(
+    base_dir: &std::path::Path,
+    repo: &str,
+    no_shortcuts: bool,
+    auto_launch: bool,
+    splash_update: bool,
+) -> anyhow::Result<()> {
     log!("Opening installer UI…");
     let install_state =
         state::read_state(base_dir).unwrap_or_else(|_| state::InstallState::empty());
     gui::run_gui(gui::GuiConfig {
         archive: None,
         base_dir: base_dir.to_path_buf(),
-        no_shortcuts: false,
+        no_shortcuts,
         repo: repo.to_string(),
         kill: false,
         install_state,
         repair: false,
+        auto_launch,
+        splash_update,
     })
 }
 
-/// --update-and-relaunch: check GitHub, install if newer, then launch.
+/// Check GitHub, install if newer, and optionally launch afterward.
 fn run_update_and_relaunch(
     base_dir: &std::path::Path,
     repo: &str,
     no_shortcuts: bool,
     silent: bool,
+    launch_after: bool,
 ) -> anyhow::Result<()> {
     let mut st = state::read_state(base_dir)?;
 
@@ -428,9 +451,10 @@ fn run_update_and_relaunch(
         Ok(r) => r,
         Err(e) => {
             log!("Update check failed: {e:#}");
-            // Launch current version anyway
-            if let Some(dir) = st.current_path() {
-                launch_app(dir)?;
+            if launch_after {
+                if let Some(dir) = st.current_path() {
+                    launch_app(dir)?;
+                }
             }
             return Ok(());
         }
@@ -440,8 +464,10 @@ fn run_update_and_relaunch(
         Ok(v) => v,
         Err(e) => {
             log!("Update check failed: {e:#}");
-            if let Some(dir) = st.current_path() {
-                launch_app(dir)?;
+            if launch_after {
+                if let Some(dir) = st.current_path() {
+                    launch_app(dir)?;
+                }
             }
             return Ok(());
         }
@@ -449,8 +475,10 @@ fn run_update_and_relaunch(
 
     if !needs_update {
         log!("Already up to date (v{}).", st.current_version);
-        if let Some(dir) = st.current_path() {
-            launch_app(dir)?;
+        if launch_after {
+            if let Some(dir) = st.current_path() {
+                launch_app(dir)?;
+            }
         }
         return Ok(());
     }
@@ -516,21 +544,17 @@ fn run_update_and_relaunch(
             shortcuts::create_shortcuts_for_launcher(&installer_in_base)?;
         }
 
-        log!("Updated to v{}. Launching…", release.version);
-        launch_app(&ver_dir)?;
+        if launch_after {
+            log!("Updated to v{}. Launching…", release.version);
+            launch_app(&ver_dir)?;
+        } else {
+            log!("Updated to v{}.", release.version);
+        }
         return Ok(());
     }
 
     // Non-silent: use GUI for the update flow
-    gui::run_gui(gui::GuiConfig {
-        archive: None,
-        base_dir: base_dir.to_path_buf(),
-        no_shortcuts,
-        repo: repo.to_string(),
-        kill: false,
-        install_state: st,
-        repair: false,
-    })
+    open_installer_gui(base_dir, repo, no_shortcuts, launch_after, false)
 }
 
 /// Silent install from a local archive.

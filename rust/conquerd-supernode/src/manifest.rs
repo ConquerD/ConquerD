@@ -2,9 +2,9 @@
 //!
 //! Replaces ad-hoc env-var feature toggles with a single declarative
 //! manifest that lists every capability the supernode wants to host. The
-//! manifest is the source of truth for what gets advertised in the
-//! supernode's `CAPABILITY_ANNOUNCE` and (in a follow-up) what gets
-//! exposed over WebTransport.
+//! manifest declares operator-selected hosted features. Startup code may still
+//! upsert built-in first-party descriptors so relay/quota accounting can
+//! classify core, room, and game traffic when those entries are omitted.
 //!
 //! On-disk shape (`<data_dir>/supernode.toml`):
 //!
