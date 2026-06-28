@@ -30,6 +30,9 @@ pub mod ffi {
         /// Preferred UDP listener port for direct peer-to-peer QUIC.
         #[qproperty(i32, direct_p2p_port)]
         #[qproperty(bool, start_minimized)]
+        /// Hide the window to the system tray instead of quitting when it is
+        /// closed or minimized. Only takes effect when a tray icon is available.
+        #[qproperty(bool, minimize_to_tray)]
         #[qproperty(bool, push_to_talk)]
         #[qproperty(bool, noise_suppression)]
         #[qproperty(bool, voice_activation)]
@@ -105,6 +108,8 @@ struct SettingsSnapshot {
     direct_p2p_port: i32,
     #[serde(default)]
     start_minimized: bool,
+    #[serde(default)]
+    minimize_to_tray: bool,
     #[serde(default)]
     push_to_talk: bool,
     #[serde(default = "default_true")]
@@ -214,6 +219,7 @@ impl Default for SettingsSnapshot {
             direct_p2p_enabled: true,
             direct_p2p_port: default_direct_p2p_port(),
             start_minimized: false,
+            minimize_to_tray: false,
             push_to_talk: false,
             noise_suppression: true,
             voice_activation: false,
@@ -259,6 +265,7 @@ pub struct SettingsModelRust {
     direct_p2p_enabled: bool,
     direct_p2p_port: i32,
     start_minimized: bool,
+    minimize_to_tray: bool,
     push_to_talk: bool,
     noise_suppression: bool,
     voice_activation: bool,
@@ -301,6 +308,7 @@ impl Default for SettingsModelRust {
             direct_p2p_enabled: s.direct_p2p_enabled,
             direct_p2p_port: s.direct_p2p_port,
             start_minimized: s.start_minimized,
+            minimize_to_tray: s.minimize_to_tray,
             push_to_talk: s.push_to_talk,
             noise_suppression: s.noise_suppression,
             voice_activation: s.voice_activation,
@@ -357,6 +365,7 @@ impl ffi::SettingsModel {
             direct_p2p_enabled: r.direct_p2p_enabled,
             direct_p2p_port: r.direct_p2p_port,
             start_minimized: r.start_minimized,
+            minimize_to_tray: r.minimize_to_tray,
             push_to_talk: r.push_to_talk,
             noise_suppression: r.noise_suppression,
             voice_activation: r.voice_activation,
@@ -426,6 +435,7 @@ impl ffi::SettingsModel {
         self.as_mut()
             .set_direct_p2p_port(snap.direct_p2p_port.clamp(1, u16::MAX as i32));
         self.as_mut().set_start_minimized(snap.start_minimized);
+        self.as_mut().set_minimize_to_tray(snap.minimize_to_tray);
         self.as_mut().set_push_to_talk(snap.push_to_talk);
         // Derive noise_suppression from noise_strength.
         let ns_bool = snap.noise_strength != "off";
