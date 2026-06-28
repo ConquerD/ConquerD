@@ -13,7 +13,7 @@ name = "sign-release-manifest"
 path = "src/bin/sign_release_manifest.rs"
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "persistence", "x11", "wayland"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wgpu", "persistence", "x11", "wayland"] }
 egui = "0.31"
 egui_extras = { version = "0.31", features = ["svg"] }
 sevenz-rust = "0.6"

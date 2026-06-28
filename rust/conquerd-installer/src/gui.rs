@@ -17,6 +17,11 @@ pub struct GuiConfig {
     pub kill: bool,
     pub install_state: state::InstallState,
     pub repair: bool,
+    /// Launcher mode (`--launch`): check for updates with a progress UI, apply
+    /// any update automatically, then launch the app and close. When `false`
+    /// (a normal installer run) the UI only ever offers install/update/repair
+    /// actions and never auto-launches the app.
+    pub launcher: bool,
 }
 
 // ── Internal types ──────────────────────────────────────────────────────────
@@ -53,6 +58,8 @@ struct AppState {
     repo: String,
     nightly: bool,
     kill: bool,
+    /// See [`GuiConfig::launcher`].
+    launcher: bool,
     progress_text: String,
     files_extracted: usize,
     files_total: usize,
@@ -98,15 +105,13 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
     let start_page = if config.repair && has_current {
         // Repair mode — go straight to repairing
         Page::Repairing
-    } else if config.archive.is_some() {
-        // Local archive provided — show install welcome
-        Page::Welcome
-    } else if has_current {
-        // Already installed — check for updates in the background, but
-        // show the Launching page (will auto-launch after brief check)
+    } else if config.launcher && has_current {
+        // Launcher (`--launch`) with an existing install — check for updates
+        // on the Launching page, then auto-launch (or auto-update first).
         Page::Launching
     } else {
-        // No install, no archive — show welcome to download
+        // Normal installer run, a local archive, or a first install: show the
+        // welcome page with install/update/repair options. Never auto-launch.
         Page::Welcome
     };
 
@@ -121,6 +126,7 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
         repo: config.repo,
         nightly,
         kill: config.kill,
+        launcher: config.launcher,
         progress_text: String::new(),
         files_extracted: 0,
         files_total: 0,
@@ -138,33 +144,45 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
         repair_total: 0,
     }));
 
-    let icon = load_icon_data();
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([520.0, 400.0])
-        .with_resizable(false)
-        .with_maximize_button(false);
-    if let Some(icon) = icon {
-        viewport = viewport.with_icon(std::sync::Arc::new(icon));
-    }
-    let options = eframe::NativeOptions {
-        viewport,
-        renderer: eframe::Renderer::Wgpu,
-        ..Default::default()
+    // Build and run the native window with a given renderer. Used to retry
+    // with the OpenGL (Glow) backend if Wgpu cannot initialise — some older
+    // Win10 GPU/driver stacks fail to create a Wgpu adapter.
+    let run_with = |renderer: eframe::Renderer| -> Result<(), eframe::Error> {
+        let icon = load_icon_data();
+        let mut viewport = egui::ViewportBuilder::default()
+            .with_inner_size([520.0, 400.0])
+            .with_resizable(false)
+            .with_maximize_button(false);
+        if let Some(icon) = icon {
+            viewport = viewport.with_icon(std::sync::Arc::new(icon));
+        }
+        let options = eframe::NativeOptions {
+            viewport,
+            renderer,
+            ..Default::default()
+        };
+        let state = state.clone();
+        eframe::run_native(
+            "ConquerD Installer",
+            options,
+            Box::new(move |cc| {
+                egui_extras::install_image_loaders(&cc.egui_ctx);
+                Ok(Box::new(InstallerApp {
+                    state: state.clone(),
+                    launched_check: false,
+                    launched_repair: false,
+                }))
+            }),
+        )
     };
 
-    eframe::run_native(
-        "ConquerD Installer",
-        options,
-        Box::new(move |cc| {
-            egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(InstallerApp {
-                state: state.clone(),
-                launched_check: false,
-                launched_repair: false,
-            }))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
+    match run_with(eframe::Renderer::Wgpu) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("Wgpu renderer failed ({e}); retrying with Glow (OpenGL)\u{2026}");
+            run_with(eframe::Renderer::Glow).map_err(|e2| anyhow::anyhow!("GUI error: {e2}"))
+        }
+    }
 }
 
 fn load_icon_data() -> Option<egui::IconData> {
@@ -629,9 +647,14 @@ impl InstallerApp {
 // ── Background: check for updates then launch or show update UI ─────────
 
 fn check_and_maybe_launch(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) {
-    let (repo, nightly, install_state) = {
+    let (repo, nightly, install_state, launcher) = {
         let st = app_state.lock().unwrap();
-        (st.repo.clone(), st.nightly, st.install_state.clone())
+        (
+            st.repo.clone(),
+            st.nightly,
+            st.install_state.clone(),
+            st.launcher,
+        )
     };
 
     // Try to check GitHub; if it fails, just launch what we have
@@ -658,19 +681,71 @@ fn check_and_maybe_launch(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context)
         return;
     }
 
-    // Update available — switch to Welcome page with update info
+    // Update available.
     {
         let mut st = app_state.lock().unwrap();
         st.target_version = release.version.clone();
-        st.page = Page::Welcome;
     }
     ctx.request_repaint();
+
+    if launcher {
+        // Launcher mode: apply the update automatically (with the download
+        // progress bar), then launch and close.
+        match run_download_and_install(app_state, ctx) {
+            Ok(()) => launch_current_and_close(app_state, ctx),
+            Err(e) => {
+                let mut st = app_state.lock().unwrap();
+                st.error_message = format!("{e:#}");
+                st.page = Page::Error;
+                ctx.request_repaint();
+            }
+        }
+    } else {
+        // Installer mode: surface the update on the Welcome page for the user.
+        let mut st = app_state.lock().unwrap();
+        st.page = Page::Welcome;
+        ctx.request_repaint();
+    }
 }
 
 fn launch_current_and_close(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context) {
-    let st = app_state.lock().unwrap();
-    if let Some(dir) = st.install_state.current_path() {
-        let _ = crate::launch_app(dir);
+    let dir = {
+        let st = app_state.lock().unwrap();
+        st.install_state.current_path().map(|p| p.to_path_buf())
+    };
+
+    if let Some(dir) = dir {
+        if let Err(e) = crate::launch_app(&dir) {
+            // The installed copy failed its pre-launch integrity check (or
+            // could not be spawned). Self-heal by reinstalling from the
+            // network, then launch the repaired copy.
+            eprintln!("Launch failed ({e:#}); reinstalling to repair…");
+            {
+                let mut st = app_state.lock().unwrap();
+                st.page = Page::Downloading;
+                st.progress_text = "Repairing installation\u{2026}".into();
+            }
+            ctx.request_repaint();
+
+            match run_download_and_install(app_state, ctx) {
+                Ok(()) => {
+                    let dir2 = {
+                        let st = app_state.lock().unwrap();
+                        st.install_state.current_path().map(|p| p.to_path_buf())
+                    };
+                    if let Some(d) = dir2 {
+                        let _ = crate::launch_app(&d);
+                    }
+                }
+                Err(e2) => {
+                    let mut st = app_state.lock().unwrap();
+                    st.error_message = format!("{e2:#}");
+                    st.page = Page::Error;
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
     }
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
 }

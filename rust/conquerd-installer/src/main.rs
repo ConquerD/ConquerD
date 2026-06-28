@@ -323,6 +323,7 @@ fn main() -> anyhow::Result<()> {
             kill: cli.kill,
             install_state,
             repair: true,
+            launcher: false,
         });
     }
 
@@ -336,15 +337,12 @@ fn main() -> anyhow::Result<()> {
         return run_silent(&archive, &base_dir, &cli);
     }
 
-    // No local .7z beside the installer — use the headless GitHub
-    // install/update/launch path. The egui UI is only needed for on-disk
-    // archive installs (and --repair); opening it without a local archive
-    // hits the Launching/download flow and has been observed to crash on Win10.
-    if archive.is_none() {
-        return run_launch(&base_dir, &cli.repo);
-    }
-
-    // ── GUI mode (local .7z detected) ───────────────────────────────────
+    // ── Normal invocation (double-click, no `--launch`) ─────────────────
+    // Show the installer UI with install / update / repair options. We do
+    // NOT check-and-launch here — auto-launching the app is reserved for
+    // `--launch` (the installed shortcut). The GUI offers a "Download &
+    // Install" action that fetches the latest release from GitHub when no
+    // local .7z is present alongside the installer.
     let install_state =
         state::read_state(&base_dir).unwrap_or_else(|_| state::InstallState::empty());
 
@@ -356,6 +354,7 @@ fn main() -> anyhow::Result<()> {
         kill: cli.kill,
         install_state,
         repair: false,
+        launcher: false,
     })
 }
 
@@ -364,22 +363,58 @@ fn launchable_current_dir(st: &state::InstallState) -> Option<&std::path::Path> 
         .filter(|dir| state::find_exe(dir).is_some())
 }
 
-/// --launch: check for updates, then run the latest installed version.
+/// --launch: the installed shortcut's entry point. Shows a small UI that
+/// checks for updates (with a progress bar while downloading), then launches
+/// the latest installed version.
+///
+/// Falls back to a fully headless update/launch if the UI cannot start (e.g.
+/// an unsupported GPU stack), and self-heals a broken install by reinstalling
+/// when the pre-launch integrity check fails.
 fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
     let st = state::read_state(base_dir)?;
+
+    // Primary path: the launcher UI (check → download with progress → launch).
+    let gui_result = gui::run_gui(gui::GuiConfig {
+        archive: None,
+        base_dir: base_dir.to_path_buf(),
+        no_shortcuts: false,
+        repo: repo.to_string(),
+        kill: false,
+        install_state: st.clone(),
+        repair: false,
+        launcher: true,
+    });
+    if gui_result.is_ok() {
+        return Ok(());
+    }
+    log!(
+        "Launcher UI unavailable ({:#}); falling back to headless update/launch.",
+        gui_result.unwrap_err()
+    );
+
+    // ── Headless fallback ────────────────────────────────────────────────
     if launchable_current_dir(&st).is_some() {
         if let Err(e) = run_update_and_relaunch(base_dir, repo, false, true) {
             log!("Update check/launch failed: {e:#}");
-            let fallback_state = state::read_state(base_dir).unwrap_or(st);
+            let fallback_state = state::read_state(base_dir).unwrap_or_else(|_| st.clone());
             if let Some(dir) = launchable_current_dir(&fallback_state) {
-                log!("Launching installed version after update failure.");
-                launch_app(dir)?;
-                return Ok(());
+                match launch_app(dir) {
+                    Ok(()) => {
+                        log!("Launched installed version after update failure.");
+                        return Ok(());
+                    }
+                    Err(le) => {
+                        // Integrity check or spawn failed — recover by reinstalling.
+                        log!("Direct launch failed ({le:#}); forcing clean reinstall…");
+                        return force_reinstall_and_launch(base_dir, repo);
+                    }
+                }
             }
             return Err(e);
         }
         return Ok(());
     }
+
     // Fresh install without a local .7z — download from GitHub silently.
     log!("No installed version found. Installing from GitHub…");
     if run_update_and_relaunch(base_dir, repo, false, true).is_ok() {
@@ -391,21 +426,9 @@ fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
     } else {
         log!("Silent install failed.");
     }
-
-    // Network/manifest/extract failure — last resort UI (may still fail on
-    // some Win10 GPU stacks; check installer.log for the root error).
-    log!("Opening installer UI…");
-    let install_state =
-        state::read_state(base_dir).unwrap_or_else(|_| state::InstallState::empty());
-    gui::run_gui(gui::GuiConfig {
-        archive: None,
-        base_dir: base_dir.to_path_buf(),
-        no_shortcuts: false,
-        repo: repo.to_string(),
-        kill: false,
-        install_state,
-        repair: false,
-    })
+    Err(anyhow::anyhow!(
+        "Could not launch or install ConquerD; see installer.log for details."
+    ))
 }
 
 /// --update-and-relaunch: check GitHub, install if newer, then launch.
@@ -415,7 +438,7 @@ fn run_update_and_relaunch(
     no_shortcuts: bool,
     silent: bool,
 ) -> anyhow::Result<()> {
-    let mut st = state::read_state(base_dir)?;
+    let st = state::read_state(base_dir)?;
 
     let nightly = github::resolve_nightly_channel(base_dir);
     let source = if nightly {
@@ -458,64 +481,7 @@ fn run_update_and_relaunch(
     log!("Updating to v{}…", release.version);
 
     if silent {
-        // Download, extract, update state, launch — all non-interactive
-        let temp = std::env::temp_dir().join(&release.archive_name);
-        github::download_file(&release.archive_url, &temp, |_, _| {})?;
-
-        let archive_sha256 = if !release.sha256_url.is_empty() {
-            let expected = github::fetch_sha256(&release.sha256_url)?;
-            github::verify_download(&temp, &expected)?;
-            expected
-        } else {
-            String::new()
-        };
-
-        // Cross-check against the release manifest when available.
-        if !release.manifest_url.is_empty() {
-            let raw_json = github::fetch_release_manifest(&release.manifest_url)
-                .with_context(|| format!("Failed to fetch {}", release.manifest_url))?;
-            let archive_hash = extract::hash_file(&temp)?;
-            release_manifest::verify_archive_hash(
-                &raw_json,
-                nightly,
-                &release.version,
-                github::current_platform_id(),
-                &archive_hash,
-            )?;
-            log!(
-                "Release manifest verified for {}.",
-                if nightly {
-                    format!("nightly ({})", github::current_platform_id())
-                } else {
-                    format!("v{}", release.version)
-                }
-            );
-        } else if nightly {
-            bail!("Nightly install requires releases_manifest.json");
-        }
-
-        let ver_dir = state::version_dir(base_dir, &release.version);
-        std::fs::create_dir_all(&ver_dir)?;
-        extract::extract_7z(&temp, &ver_dir)?;
-
-        // Remove old versions
-        let old: Vec<_> = st.old_versions().into_iter().cloned().collect();
-        for old_ver in &old {
-            let _ = std::fs::remove_dir_all(&old_ver.path);
-            st.remove_version(&old_ver.version);
-        }
-
-        st.add_version(&release.version, &ver_dir);
-        st.set_channel(nightly);
-        st.archive_sha256 = archive_sha256;
-        state::write_state(base_dir, &st)?;
-        state::self_copy(base_dir, nightly)?;
-
-        if !no_shortcuts {
-            let installer_in_base = state::installer_path(base_dir, nightly);
-            shortcuts::create_shortcuts_for_launcher(&installer_in_base)?;
-        }
-
+        let ver_dir = install_release_silent(base_dir, &release, nightly, no_shortcuts)?;
         log!("Updated to v{}. Launching…", release.version);
         launch_app(&ver_dir)?;
         return Ok(());
@@ -530,7 +496,108 @@ fn run_update_and_relaunch(
         kill: false,
         install_state: st,
         repair: false,
+        launcher: false,
     })
+}
+
+/// Download, verify, extract, and record a release without any UI, returning
+/// the versioned install directory.
+///
+/// The install manifest is written from the **actually-extracted** files (not
+/// the build-time manifest bundled in the archive). The archive itself is
+/// already integrity-checked against the signed `releases_manifest.json`, so
+/// the per-install manifest's only job is the extract→exec TOCTOU guard in
+/// [`launch_app`]; recording the real on-disk hashes keeps that check
+/// consistent with what was installed (a code-signed exe, for example, hashes
+/// differently than the unsigned build artefact the bundled manifest records).
+fn install_release_silent(
+    base_dir: &std::path::Path,
+    release: &github::ReleaseInfo,
+    nightly: bool,
+    no_shortcuts: bool,
+) -> anyhow::Result<PathBuf> {
+    let mut st = state::read_state(base_dir)?;
+
+    let temp = std::env::temp_dir().join(&release.archive_name);
+    github::download_file(&release.archive_url, &temp, |_, _| {})?;
+
+    let archive_sha256 = if !release.sha256_url.is_empty() {
+        let expected = github::fetch_sha256(&release.sha256_url)?;
+        github::verify_download(&temp, &expected)?;
+        expected
+    } else {
+        String::new()
+    };
+
+    // Cross-check the downloaded archive against the signed release manifest.
+    if !release.manifest_url.is_empty() {
+        let raw_json = github::fetch_release_manifest(&release.manifest_url)
+            .with_context(|| format!("Failed to fetch {}", release.manifest_url))?;
+        let archive_hash = extract::hash_file(&temp)?;
+        release_manifest::verify_archive_hash(
+            &raw_json,
+            nightly,
+            &release.version,
+            github::current_platform_id(),
+            &archive_hash,
+        )?;
+        log!(
+            "Release manifest verified for {}.",
+            if nightly {
+                format!("nightly ({})", github::current_platform_id())
+            } else {
+                format!("v{}", release.version)
+            }
+        );
+    } else if nightly {
+        bail!("Nightly install requires releases_manifest.json");
+    }
+
+    let ver_dir = state::version_dir(base_dir, &release.version);
+    std::fs::create_dir_all(&ver_dir)?;
+    let extracted = extract::extract_7z(&temp, &ver_dir)?;
+
+    // Record the manifest from the freshly extracted files so the pre-launch
+    // integrity check verifies against what is genuinely on disk.
+    let manifest_path = ver_dir.join("manifest.json");
+    manifest::write_manifest(&ver_dir, &extracted, &manifest_path)?;
+
+    // Remove old versions
+    let old: Vec<_> = st.old_versions().into_iter().cloned().collect();
+    for old_ver in &old {
+        let _ = std::fs::remove_dir_all(&old_ver.path);
+        st.remove_version(&old_ver.version);
+    }
+
+    st.add_version(&release.version, &ver_dir);
+    st.set_channel(nightly);
+    st.archive_sha256 = archive_sha256;
+    state::write_state(base_dir, &st)?;
+    state::self_copy(base_dir, nightly)?;
+
+    if !no_shortcuts {
+        let installer_in_base = state::installer_path(base_dir, nightly);
+        shortcuts::create_shortcuts_for_launcher(&installer_in_base)?;
+    }
+
+    Ok(ver_dir)
+}
+
+/// Force a clean reinstall from the network and launch — recovery path for
+/// when the installed copy fails its pre-launch integrity check. Unlike the
+/// normal update flow this re-downloads regardless of the "already up to date"
+/// check, because the on-disk binary is known-bad.
+fn force_reinstall_and_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
+    let nightly = github::resolve_nightly_channel(base_dir);
+    let release = github::fetch_release(repo, nightly)?;
+    log!(
+        "Reinstalling v{} to repair a failed integrity check…",
+        release.version
+    );
+    let ver_dir = install_release_silent(base_dir, &release, nightly, false)?;
+    log!("Reinstalled v{}. Launching…", release.version);
+    launch_app(&ver_dir)?;
+    Ok(())
 }
 
 /// Silent install from a local archive.
