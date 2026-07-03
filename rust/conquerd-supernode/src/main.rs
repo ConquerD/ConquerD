@@ -827,10 +827,7 @@ impl SupernodeState {
             .as_ref()
             .map(|l| l.connected_peer_ids().into_iter().collect())
             .unwrap_or_default();
-        let peer_versions = link
-            .as_ref()
-            .map(|l| l.peer_versions())
-            .unwrap_or_default();
+        let peer_versions = link.as_ref().map(|l| l.peer_versions()).unwrap_or_default();
         let self_id = membership
             .self_member()
             .map(|m| m.identity_pub.trim_end_matches('=').to_string())
@@ -848,10 +845,7 @@ impl SupernodeState {
                         Some(env!("CONQUERD_SOURCE_HASH").to_string()),
                     )
                 } else {
-                    peer_versions
-                        .get(norm_id)
-                        .cloned()
-                        .unwrap_or((None, None))
+                    peer_versions.get(norm_id).cloned().unwrap_or((None, None))
                 };
                 serde_json::json!({
                     "identity_pub": m.identity_pub,

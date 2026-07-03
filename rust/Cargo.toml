@@ -13,3 +13,8 @@ resolver = "2"
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
+
+# wayland-scanner 0.31.10 (crates.io) pins quick-xml ^0.39; RUSTSEC-2026-0195 needs >=0.41.
+# Thin fork until Smithay ships a release with the bumped dep.
+[patch.crates-io]
+wayland-scanner = { path = "patches/wayland-scanner" }

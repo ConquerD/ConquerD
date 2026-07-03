@@ -526,7 +526,11 @@ impl ClusterLink {
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
         self.state.write().peers.insert(
             member_id.clone(),
-            PeerLink { tx, version: None, source_hash: None },
+            PeerLink {
+                tx,
+                version: None,
+                source_hash: None,
+            },
         );
 
         // Greet with our cluster id so a misconfigured peer is detected early.
