@@ -157,11 +157,7 @@ jobs:
 
       - name: Install Qt 6 (base + WebEngine for in-app supernode portal)
         shell: pwsh
-        run: |
-          pip install aqtinstall
-          # WebEngine pulls in WebChannel + Positioning; windeployqt fails if they are missing.
-          aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt `
-            --modules qtwebengine qtwebchannel qtpositioning
+        run: pwsh scripts/install_qt_windows.ps1
 
       - name: Set build metadata
         id: meta

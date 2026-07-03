@@ -127,7 +127,7 @@ if ($env:CONQUERD_NO_WEBENGINE -ne "1" -and (Test-Path $_weProbe)) {
         Write-Error @"
 CI/release builds require Qt WebEngine for the in-app supernode portal.
 Install the module, e.g.:
-  aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt --modules qtwebengine qtwebchannel qtpositioning
+  pwsh scripts/install_qt_windows.ps1
 "@
     }
 }
