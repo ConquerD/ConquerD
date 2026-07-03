@@ -147,6 +147,23 @@ jobs:
             rust/target
           key: windows-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
 
+      - name: Cache Opus DNN model weights
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            rust/conquerd-opus/opus/dnn/lace_data.c
+            rust/conquerd-opus/opus/dnn/nolace_data.c
+            rust/conquerd-opus/opus/dnn/fargan_data.c
+            rust/conquerd-opus/opus/dnn/pitchdnn_data.c
+            rust/conquerd-opus/opus/dnn/plc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_enc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_dec_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_stats_data.c
+            rust/conquerd-opus/opus/dnn/bbwenet_data.c
+            rust/conquerd-opus/opus/dnn/lossgen_data.c
+            rust/conquerd-opus/opus/dnn/models
+          key: opus-dnn-a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e
+
       - name: Fetch Opus DNN model weights
         shell: pwsh
         run: pwsh scripts/fetch_opus_weights.ps1
@@ -303,6 +320,23 @@ jobs:
             rust/target
           key: macos-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
 
+      - name: Cache Opus DNN model weights
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            rust/conquerd-opus/opus/dnn/lace_data.c
+            rust/conquerd-opus/opus/dnn/nolace_data.c
+            rust/conquerd-opus/opus/dnn/fargan_data.c
+            rust/conquerd-opus/opus/dnn/pitchdnn_data.c
+            rust/conquerd-opus/opus/dnn/plc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_enc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_dec_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_stats_data.c
+            rust/conquerd-opus/opus/dnn/bbwenet_data.c
+            rust/conquerd-opus/opus/dnn/lossgen_data.c
+            rust/conquerd-opus/opus/dnn/models
+          key: opus-dnn-a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e
+
       - name: Fetch Opus DNN model weights
         run: bash scripts/fetch_opus_weights.sh
 
@@ -396,6 +430,23 @@ jobs:
             ~/.cargo/git
             rust/target
           key: linux-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Cache Opus DNN model weights
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            rust/conquerd-opus/opus/dnn/lace_data.c
+            rust/conquerd-opus/opus/dnn/nolace_data.c
+            rust/conquerd-opus/opus/dnn/fargan_data.c
+            rust/conquerd-opus/opus/dnn/pitchdnn_data.c
+            rust/conquerd-opus/opus/dnn/plc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_enc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_dec_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_stats_data.c
+            rust/conquerd-opus/opus/dnn/bbwenet_data.c
+            rust/conquerd-opus/opus/dnn/lossgen_data.c
+            rust/conquerd-opus/opus/dnn/models
+          key: opus-dnn-a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e
 
       - name: Fetch Opus DNN model weights
         run: bash scripts/fetch_opus_weights.sh

@@ -12,9 +12,9 @@
 #
 # What this script does:
 #   1. Skips extraction if the sentinel `lace_data.c` already exists (idempotent).
-#   2. Downloads the tarball and verifies its SHA-256.
-#   3. Extracts the C data files into `rust/conquerd-opus/opus/` so cmake
-#      compiles them into libopus as static C arrays.
+#   2. Uses a bundled tarball in rust/conquerd-opus/assets/ when present (optional).
+#   3. Otherwise downloads from media.xiph.org with retries (DNS flakes on GHA macOS).
+#   4. Verifies SHA-256 and extracts into the opus source tree.
 #
 # Usage (from the repository root):
 #   bash scripts/fetch_opus_weights.sh
@@ -27,9 +27,12 @@ set -euo pipefail
 # The hash is the SHA-256 of the tarball itself (it is embedded in the URL).
 DNN_HASH="a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e"
 DNN_URL="https://media.xiph.org/opus/models/opus_data-${DNN_HASH}.tar.gz"
+DOWNLOAD_ATTEMPTS="${OPUS_DNN_DOWNLOAD_ATTEMPTS:-5}"
+DOWNLOAD_RETRY_DELAY_SEC="${OPUS_DNN_DOWNLOAD_RETRY_DELAY_SEC:-20}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPUS_SRC="$SCRIPT_DIR/../rust/conquerd-opus/opus"
+BUNDLED_TAR="$SCRIPT_DIR/../rust/conquerd-opus/assets/opus_data-${DNN_HASH}.tar.gz"
 SENTINEL="$OPUS_SRC/dnn/lace_data.c"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -50,6 +53,38 @@ verify_sha256() {
     fi
 }
 
+download_tarball() {
+    local dest="$1"
+    local attempt
+    for ((attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++)); do
+        echo "  Download attempt ${attempt}/${DOWNLOAD_ATTEMPTS}..."
+        if command -v curl &>/dev/null; then
+            if curl -fsSL \
+                --connect-timeout 30 \
+                --max-time 900 \
+                --retry 3 \
+                --retry-delay 5 \
+                --retry-all-errors \
+                "$DNN_URL" -o "$dest"; then
+                return 0
+            fi
+        elif wget -q "$DNN_URL" -O "$dest"; then
+            return 0
+        else
+            :
+        fi
+        if (( attempt < DOWNLOAD_ATTEMPTS )); then
+            echo "  Download failed; retrying in ${DOWNLOAD_RETRY_DELAY_SEC}s..."
+            sleep "$DOWNLOAD_RETRY_DELAY_SEC"
+        fi
+    done
+    echo "  ERROR: could not download Opus DNN tarball after ${DOWNLOAD_ATTEMPTS} attempts."
+    echo "  URL: $DNN_URL"
+    echo "  media.xiph.org DNS/network flakes are common on GitHub Actions macOS runners;"
+    echo "  CI caches extracted dnn/ files cross-platform so later jobs can skip this step."
+    return 1
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 echo "conquerd-opus: checking Opus DNN model data files..."
 
@@ -64,18 +99,18 @@ if [[ ! -d "$OPUS_SRC" ]]; then
     exit 1
 fi
 
-echo "  Downloading tarball from Xiph media server..."
-echo "  URL: $DNN_URL"
-
 TMP_TAR="$(mktemp --suffix=.tar.gz 2>/dev/null || mktemp /tmp/conquerd_opus.XXXXXX)"
 
 cleanup() { rm -f "$TMP_TAR"; }
 trap cleanup EXIT
 
-if command -v curl &>/dev/null; then
-    curl -fsSL "$DNN_URL" -o "$TMP_TAR"
+if [[ -f "$BUNDLED_TAR" ]]; then
+    echo "  Using bundled tarball: $BUNDLED_TAR"
+    cp "$BUNDLED_TAR" "$TMP_TAR"
 else
-    wget -q "$DNN_URL" -O "$TMP_TAR"
+    echo "  Downloading tarball from Xiph media server..."
+    echo "  URL: $DNN_URL"
+    download_tarball "$TMP_TAR"
 fi
 
 echo "  Verifying SHA-256..."
@@ -97,4 +132,3 @@ fi
 echo "  Extraction complete."
 echo "conquerd-opus: DNN model data files ready."
 echo "  You can now build with:  cargo build -p conquerd-client --features qt-ui"
-
