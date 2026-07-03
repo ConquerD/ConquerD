@@ -1,0 +1,53 @@
+[defaults]
+version = "nightly"
+access_mode = "open"
+user = "conquerd"
+install_root = "/opt/conquerd"
+data_root = "/var/lib/conquerd"
+release_repo = "ConquerD/ConquerD"
+privilege = "sudo"
+firewall = "ufw"
+
+[defaults.supernode]
+listen_bind = "0.0.0.0"
+identity_file = "identity.json"
+allow_public_rooms = false
+allow_private_rooms = true
+
+[[host]]
+name = "edge-1"
+ssh = "conquerd@203.0.113.10"
+
+[[host.instance]]
+id = "a"
+public_host = "edge1.example.net"
+relay_port = 3478
+ws_port = 34935
+web_port = 8443
+features = [
+    "core.chat.v1",
+    "room.chat.v1",
+    { id = "room.audio.sfu", enabled = true, params = { allow_private_rooms = true, allow_public_rooms = false } },
+    "room.file.v1",
+    "web.host.h3.v1",
+    "web.host.app.v1",
+]
+
+[[host]]
+name = "edge-2"
+ssh = "root@198.51.100.7"
+
+[[host.instance]]
+id = "a"
+public_host = "edge2.example.net"
+relay_port = 3578
+ws_port = 35035
+web_port = 8543
+features = [
+    "core.chat.v1",
+    "room.chat.v1",
+    { id = "room.audio.sfu", enabled = true, params = { allow_private_rooms = true, allow_public_rooms = false } },
+    "room.file.v1",
+    "web.host.h3.v1",
+    "web.host.app.v1",
+]
