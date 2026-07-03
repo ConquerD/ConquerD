@@ -126,6 +126,8 @@ pub enum ConnectionEvent {
         cert_fingerprint: String,
         /// True when the supernode advertises `room.audio.sfu` (SFU room hosting).
         sfu_enabled: bool,
+        /// True when the supernode's SFU policy allows public room creation.
+        public_rooms_enabled: bool,
     },
     /// Supernode requires a portal visit before granting relay access.
     RelayPaymentRequired {
@@ -140,6 +142,17 @@ pub enum ConnectionEvent {
     },
     /// Supernode acknowledged a room we created (`SfuRoomCreated`).
     RoomCreated {
+        supernode_id: String,
+        room_id: String,
+        room_name: String,
+        room_type: String,
+        invite_token: String,
+    },
+    /// A self-contained room invite (`conquerd://room#…`) was pasted and its
+    /// host supernode is now connected — the UI should enter the room. The
+    /// `invite_token` has already been persisted to the room store so the
+    /// normal join path validates it automatically.
+    RoomInviteReady {
         supernode_id: String,
         room_id: String,
         room_name: String,
@@ -302,6 +315,17 @@ pub enum ConnectionCommand {
     /// Generate an invite URL from the transport layer so it can advertise
     /// the real local QUIC listener.
     GenerateInvite {
+        reply_tx: std_mpsc::Sender<Option<String>>,
+    },
+    /// Generate a self-contained room invite URL (`conquerd://room#…`) that
+    /// embeds the host supernode's signaling address alongside the room and
+    /// token, so a joiner on any (or no) supernode can paste it and connect.
+    GenerateRoomInvite {
+        supernode_id: String,
+        room_id: String,
+        room_name: String,
+        room_type: String,
+        invite_token: String,
         reply_tx: std_mpsc::Sender<Option<String>>,
     },
     /// Send a file to a peer.

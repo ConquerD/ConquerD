@@ -2,6 +2,8 @@
 // Standalone Rust supernode binary: QUIC relay + SFU + WebSocket signaling + in-app portal (web.host.app.v1).
 
 mod access;
+mod cluster;
+mod cluster_link;
 mod config;
 mod crypto;
 mod handshake;
@@ -211,6 +213,14 @@ struct SupernodeState {
     web_cert_fingerprint: Option<String>,
     /// Which SFU room types peers may materialize (`room.audio.sfu` params).
     sfu_room_policy: manifest::SfuRoomCreationPolicy,
+    /// This node's cluster membership, when an `[cluster]` section is configured.
+    /// `None` ⇒ standalone supernode.
+    cluster: Option<cluster::ClusterMembership>,
+    /// Live intra-cluster transport (set after startup when clustering is on).
+    cluster_link: RwLock<Option<Arc<cluster_link::ClusterLink>>>,
+    /// Dedup of replicated room messages (by `message_id`) to guard against
+    /// duplicate delivery across cluster links.
+    replication_seen: RwLock<cluster_link::SeenCache>,
 }
 
 /// A pending hole-punch registration waiting for both peers.
@@ -221,6 +231,118 @@ struct PunchRegistration {
 }
 
 impl SupernodeState {
+    /// Replicate a locally-received room chat to cluster peers that have local
+    /// subscribers for the room. No-op when standalone. Loop-safe: peers deliver
+    /// the frame locally and never re-replicate it.
+    fn replicate_room_chat(&self, room_id: &str, msg: &SignalingMessage, raw: &str) {
+        let Some(link) = self.cluster_link.read().clone() else {
+            return;
+        };
+        let message_id = msg
+            .payload
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        link.replicate(room_id, message_id, raw);
+    }
+
+    /// Deliver a room chat replicated from another cluster member to this node's
+    /// local recipients. Deduped by `message_id`; never re-replicated.
+    fn deliver_replicated_chat(&self, room_id: &str, message_id: &str, raw: &str) {
+        if !self.replication_seen.write().insert_new(message_id) {
+            return; // already delivered
+        }
+        let Some(ref sfu) = self.sfu else {
+            return;
+        };
+        let recipients = sfu.read().get_chat_recipients(room_id);
+        for peer in &recipients {
+            if self
+                .features
+                .gate_through_feature("room.chat.v1", peer, raw.len())
+            {
+                self.signaling.send_to_peer(peer, raw);
+            }
+        }
+    }
+
+    /// Broadcast a room-membership grant to cluster peers so any member admits
+    /// `allowed_peer` after a client fails over. No-op when standalone.
+    fn replicate_room_grant(&self, room_id: &str, room_name: &str, room_type: &str, peer: &str) {
+        if let Some(link) = self.cluster_link.read().clone() {
+            link.replicate_room_grant(room_id, room_name, room_type, peer);
+        }
+    }
+
+    /// Apply a room grant replicated from another cluster member: materialize the
+    /// room locally if absent and authorize the peer. Idempotent.
+    fn apply_room_grant(&self, room_id: &str, room_name: &str, room_type: &str, peer: &str) {
+        let Some(ref sfu) = self.sfu else {
+            return;
+        };
+        let rtype = match room_type {
+            "public" => sfu::RoomType::Public,
+            _ => sfu::RoomType::Private,
+        };
+        let mut s = sfu.write();
+        // creator "" → no implicit creator privileges; access is via the
+        // explicit allow below, mirroring the granting node's ACL.
+        s.create_room(Some(room_id), room_name, rtype, "");
+        s.allow_peer(room_id, peer);
+    }
+
+    /// Broadcast a client-authorization grant to cluster peers so any member
+    /// accepts this client after a failover. No-op when standalone.
+    fn replicate_peer_auth(&self, identity_pub: &str) {
+        let Some(link) = self.cluster_link.read().clone() else {
+            return;
+        };
+        let handle = self
+            .peer_store
+            .read()
+            .get_peer(identity_pub)
+            .map(|p| p.handle.clone())
+            .unwrap_or_default();
+        link.replicate_peer_auth(identity_pub, &handle);
+    }
+
+    /// Apply a client-authorization grant replicated from another member: trust
+    /// the peer (peer store + relay allow-list + access grant) so this node
+    /// accepts the client if it fails over here. Idempotent.
+    fn apply_peer_auth(&self, identity_pub: &str, handle: &str) {
+        {
+            let mut store = self.peer_store.write();
+            if !store.is_trusted(identity_pub) {
+                let peer_id = crate::crypto::b64url_decode(identity_pub)
+                    .map(|b| crate::crypto::derive_peer_id(&b))
+                    .unwrap_or_default();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64();
+                store.add_peer(peer_store::PeerRecord {
+                    peer_id,
+                    identity_pub: identity_pub.to_string(),
+                    relay_hints: vec![],
+                    handle: handle.to_string(),
+                    blocked: false,
+                    revoked: false,
+                    auto_connect: false,
+                    is_supernode: false,
+                    transcript_hash: String::new(),
+                    created_at: now,
+                    last_seen_at: now,
+                    quic_port: 0,
+                });
+                let _ = store.save();
+            }
+        }
+        if let Some(ref relay) = self.relay {
+            relay.allow_peer(identity_pub);
+        }
+        self.access_controller.on_peer_granted(identity_pub);
+    }
+
     /// Send a signed message to a peer via signaling.
     fn send_signed(&self, target: &str, msg_type: MessageType, payload: serde_json::Value) {
         let msg = SignalingMessage::new(msg_type, &self.identity.public_id(), payload)
@@ -269,6 +391,17 @@ impl SupernodeState {
             obj.insert("wt_url".into(), json!(format!("https://{}:{}", host, port)));
             if let Some(ref fp) = self.web_cert_fingerprint {
                 obj.insert("cert_fingerprint".into(), json!(fp));
+            }
+        }
+        // Advertise the signed cluster roster so a client can fail over to any
+        // member. Signed by this node's identity, which the client already
+        // trusts over the Ed25519-verified SUPERNODE_INFO channel.
+        if let Some(ref cluster) = self.cluster {
+            if let Ok(desc) = serde_json::to_value(cluster.sign(&self.identity)) {
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("cluster".into(), desc);
             }
         }
         payload
@@ -344,6 +477,10 @@ impl SupernodeState {
         // Always advertise capabilities so peers can negotiate features
         // independently of whether relay access has been granted.
         self.announce_capabilities_to(identity_pub);
+
+        // Replicate this client's trust to cluster peers so it can fail over to
+        // any member. Idempotent on the receiving side; no-op when standalone.
+        self.replicate_peer_auth(identity_pub);
 
         if self.access_controller.check_access(identity_pub) {
             self.issue_relay_ticket(identity_pub);
@@ -680,6 +817,59 @@ impl SupernodeState {
         result
     }
 
+    /// Cluster information for the portal. Returns `null` when standalone.
+    pub(crate) fn cluster_stats(&self) -> serde_json::Value {
+        let Some(membership) = &self.cluster else {
+            return serde_json::Value::Null;
+        };
+        let link = self.cluster_link.read();
+        let connected_ids: std::collections::HashSet<String> = link
+            .as_ref()
+            .map(|l| l.connected_peer_ids().into_iter().collect())
+            .unwrap_or_default();
+        let peer_versions = link
+            .as_ref()
+            .map(|l| l.peer_versions())
+            .unwrap_or_default();
+        let self_id = membership
+            .self_member()
+            .map(|m| m.identity_pub.trim_end_matches('=').to_string())
+            .unwrap_or_default();
+        let members: Vec<serde_json::Value> = membership
+            .self_member()
+            .into_iter()
+            .chain(membership.peers())
+            .map(|m| {
+                let norm_id = m.identity_pub.trim_end_matches('=');
+                let is_self = norm_id == self_id;
+                let (version, source_hash) = if is_self {
+                    (
+                        Some(APP_VERSION.to_string()),
+                        Some(env!("CONQUERD_SOURCE_HASH").to_string()),
+                    )
+                } else {
+                    peer_versions
+                        .get(norm_id)
+                        .cloned()
+                        .unwrap_or((None, None))
+                };
+                serde_json::json!({
+                    "identity_pub": m.identity_pub,
+                    "is_self": is_self,
+                    "connected": is_self || connected_ids.contains(norm_id),
+                    "version": version,
+                    "source_hash": source_hash,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "cluster_id": membership.cluster_id(),
+            "member_count": membership.member_count(),
+            "connected_peers": connected_ids.len(),
+            "members": members,
+        })
+    }
+
     /// Collect stats for /health and /api/stats.
     pub(crate) fn collect_stats(&self) -> serde_json::Value {
         let mut features = vec![];
@@ -710,6 +900,10 @@ impl SupernodeState {
         // Merge portal config so the browser-side HTML can read it.
         if let Some(obj) = value.as_object_mut() {
             obj.insert("portal".into(), self.portal_config());
+            let cluster = self.cluster_stats();
+            if !cluster.is_null() {
+                obj.insert("cluster".into(), cluster);
+            }
         }
         value
     }
@@ -813,11 +1007,20 @@ fn sfu_audio_opus_byte_count(msg: &SignalingMessage) -> usize {
 }
 
 /// Payload byte count for `SfuChat` inbound quota accounting.
+///
+/// Prefer opaque `ciphertext` (E2E envelope) over legacy plaintext `body` so the
+/// supernode never needs to parse message content for quota.
 fn sfu_chat_byte_count(msg: &SignalingMessage) -> usize {
     msg.payload
-        .get("body")
+        .get("ciphertext")
         .and_then(|v| v.as_str())
         .map(str::len)
+        .or_else(|| {
+            msg.payload
+                .get("body")
+                .and_then(|v| v.as_str())
+                .map(str::len)
+        })
         .unwrap_or(0)
 }
 
@@ -1012,14 +1215,8 @@ impl SignalingHandler for SupernodeHandler {
                 self.handle_punch_register(&msg);
             }
             MessageType::ChatMessage => {
-                // Log chat (supernode acts as relay)
-                if let Some(body) = msg.payload.get("body").and_then(|v| v.as_str()) {
-                    info!(
-                        "[chat] {}: {}",
-                        &msg.sender[..12.min(msg.sender.len())],
-                        body
-                    );
-                }
+                // Peer-targeted relay only — do not log or inspect payload fields;
+                // content may be E2E-encrypted inside `encrypted_signal` envelopes.
             }
             MessageType::TrustRequest | MessageType::TrustAccept => {
                 // Clients send these to the supernode (target=supernode_id) with the
@@ -1560,6 +1757,10 @@ impl SupernodeHandler {
                 self.state.signaling.send_to_peer(peer, raw);
             }
         }
+        // Fan the same opaque frame out to cluster peers that host members of
+        // this room, so a member attached to a different supernode still
+        // receives it. No-op when standalone.
+        self.state.replicate_room_chat(room_id, msg, raw);
     }
 
     fn handle_sfu_subscribe(&self, msg: &SignalingMessage) {
@@ -1673,6 +1874,10 @@ impl SupernodeHandler {
 
         if created_new && is_private {
             let _ = sfu.write().allow_peer(&room_id_out, &msg.sender);
+            // Replicate the room + creator grant so other cluster members can
+            // admit this peer if it later attaches to them.
+            self.state
+                .replicate_room_grant(&room_id_out, &room_name_out, "private", &msg.sender);
         }
 
         let invite_token = if created_new && is_private {
@@ -1719,6 +1924,18 @@ impl SupernodeHandler {
             .read()
             .get_room(room_id)
             .map(|r| (r.room_name.clone(), r.room_type, r.participant_count()));
+
+        // Replicate the accepted grant so any cluster member admits this peer.
+        if valid {
+            if let Some((ref name, rtype, _)) = room_info {
+                let type_str = match rtype {
+                    sfu::RoomType::Public => "public",
+                    sfu::RoomType::Private => "private",
+                };
+                self.state
+                    .replicate_room_grant(room_id, name, type_str, &msg.sender);
+            }
+        }
 
         if let Some((name, rtype, count)) = room_info {
             self.state.send_signed(
@@ -1892,6 +2109,29 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Cluster membership: validate the operator-declared roster against this
+    // node's identity. An invalid roster disables clustering (run standalone)
+    // rather than failing startup.
+    let cluster =
+        manifest
+            .cluster
+            .clone()
+            .and_then(|cfg| match cfg.validate(&identity.public_id()) {
+                Ok(()) => {
+                    let membership = cluster::ClusterMembership::new(cfg, &identity.public_id());
+                    info!(
+                        "Cluster '{}' enabled with {} member(s)",
+                        membership.cluster_id(),
+                        membership.member_count()
+                    );
+                    Some(membership)
+                }
+                Err(e) => {
+                    warn!("Ignoring invalid [cluster] config (running standalone): {e}");
+                    None
+                }
+            });
+
     let state: Arc<SupernodeState> =
         Arc::new_cyclic(|_weak: &std::sync::Weak<SupernodeState>| SupernodeState {
             config: config.clone(),
@@ -1910,7 +2150,63 @@ async fn main() -> anyhow::Result<()> {
             web_bridge: BrowserBridge::new(),
             web_cert_fingerprint,
             sfu_room_policy: manifest::sfu_room_creation_policy(&features),
+            cluster,
+            cluster_link: RwLock::new(None),
+            replication_seen: RwLock::new(cluster_link::SeenCache::new(4096)),
         });
+
+    // Bring up the intra-cluster link when clustering is enabled and this node
+    // has a cluster_addr to bind. Callbacks hold a Weak<SupernodeState> so the
+    // link doesn't keep the state alive.
+    if let Some(membership) = state.cluster.clone() {
+        let weak = Arc::downgrade(&state);
+        let on_replicate: cluster_link::OnReplicateFn = {
+            let weak = weak.clone();
+            Arc::new(move |m: cluster_link::ReplicatedMsg| {
+                if let Some(state) = weak.upgrade() {
+                    state.deliver_replicated_chat(&m.room_id, &m.message_id, &m.raw);
+                }
+            })
+        };
+        let on_room_grant: cluster_link::OnRoomGrantFn = {
+            let weak = weak.clone();
+            Arc::new(move |g: cluster_link::RoomGrant| {
+                if let Some(state) = weak.upgrade() {
+                    state.apply_room_grant(&g.room_id, &g.room_name, &g.room_type, &g.allowed_peer);
+                }
+            })
+        };
+        let on_peer_auth: cluster_link::OnPeerAuthFn = {
+            let weak = weak.clone();
+            Arc::new(move |g: cluster_link::PeerAuthGrant| {
+                if let Some(state) = weak.upgrade() {
+                    state.apply_peer_auth(&g.identity_pub, &g.handle);
+                }
+            })
+        };
+        let local_rooms: cluster_link::LocalRoomsFn = {
+            let weak = weak.clone();
+            Arc::new(move || {
+                weak.upgrade()
+                    .and_then(|s| s.sfu.as_ref().map(|sfu| sfu.read().subscribed_room_ids()))
+                    .unwrap_or_default()
+            })
+        };
+        let link = cluster_link::ClusterLink::new(
+            identity.clone(),
+            membership,
+            on_replicate,
+            on_room_grant,
+            on_peer_auth,
+        );
+        match link.start(local_rooms).await {
+            Ok(port) => {
+                info!("Cluster link started on port {port}");
+                *state.cluster_link.write() = Some(link);
+            }
+            Err(e) => warn!("Cluster link not started: {e}"),
+        }
+    }
 
     // Install the `web.host.app.v1` bidi-stream hook on the relay so the
     // embedded Chromium view in the desktop client can fetch

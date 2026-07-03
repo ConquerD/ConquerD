@@ -77,6 +77,123 @@ pub(super) fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
     Some((host.to_owned(), port))
 }
 
+/// Wire-schema version of the self-contained room invite payload. Bump on any
+/// breaking change to [`build_room_invite_url`] / [`parse_room_invite`] and add
+/// migration handling in the parser.
+pub(super) const ROOM_INVITE_SCHEMA: u32 = 1;
+
+/// URL-level freshness guard for a shared room invite (24h). The supernode's
+/// own token TTL is authoritative; this just stops stale links from dialing.
+const ROOM_INVITE_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Decoded fields of a `conquerd://room#…` invite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RoomInvitePayload {
+    pub supernode_id: String,
+    pub supernode_hint: String,
+    pub room_id: String,
+    pub room_name: String,
+    pub room_type: String,
+    pub invite_token: String,
+    pub expires_at: u64,
+}
+
+/// A pasted room invite awaiting its host supernode's WebSocket to connect.
+#[derive(Debug, Clone)]
+pub(super) struct RoomInviteEntry {
+    pub room_id: String,
+    pub room_name: String,
+    pub room_type: String,
+    pub invite_token: String,
+}
+
+/// Build a self-contained room invite URL: `conquerd://room#<base64url(JSON)>`.
+///
+/// Kept as a free function (separate from the `ConnectionManager` state) so the
+/// wire format can be round-trip tested in isolation. See the golden field test
+/// in `tests.rs`; any field rename here must update that test in lock-step.
+pub(super) fn build_room_invite_url(
+    supernode_id: &str,
+    supernode_hint: &str,
+    room_id: &str,
+    room_name: &str,
+    room_type: &str,
+    invite_token: &str,
+    expires_at: u64,
+) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let payload = serde_json::json!({
+        "v": ROOM_INVITE_SCHEMA,
+        "supernode_id": supernode_id,
+        "supernode_hint": supernode_hint,
+        "room_id": room_id,
+        "room_name": room_name,
+        "room_type": room_type,
+        "invite_token": invite_token,
+        "expires_at": expires_at,
+    });
+    let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+    format!("conquerd://room#{encoded}")
+}
+
+/// Parse the base64url fragment of a `conquerd://room#…` invite (the part after
+/// `room#`). Returns an error string suitable for `emit_invite_failed`.
+pub(super) fn parse_room_invite(encoded: &str) -> Result<RoomInvitePayload, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    if encoded.len() > 262_144 {
+        return Err(format!("room invite too large ({} bytes)", encoded.len()));
+    }
+    let json_bytes = URL_SAFE_NO_PAD
+        .decode(encoded.trim_end_matches('='))
+        .map_err(|e| format!("base64 decode error: {e}"))?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&json_bytes).map_err(|e| format!("JSON parse error: {e}"))?;
+
+    // Unknown future schema: refuse rather than silently misinterpret.
+    if let Some(v) = payload.get("v").and_then(Value::as_u64) {
+        if v > ROOM_INVITE_SCHEMA as u64 {
+            return Err(format!("unsupported room invite version {v}"));
+        }
+    }
+
+    let get = |k: &str| {
+        payload
+            .get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let supernode_id = get("supernode_id");
+    let room_id = get("room_id");
+    if supernode_id.is_empty() {
+        return Err("room invite missing supernode_id".into());
+    }
+    if room_id.is_empty() {
+        return Err("room invite missing room_id".into());
+    }
+    // `room_type` is additive within v1; invites minted before it existed were
+    // always private, so that's the back-compat default.
+    let room_type = match payload.get("room_type").and_then(Value::as_str) {
+        Some(t) if !t.is_empty() => t.to_owned(),
+        _ => "private".to_owned(),
+    };
+    Ok(RoomInvitePayload {
+        supernode_id,
+        supernode_hint: get("supernode_hint"),
+        room_id,
+        room_name: get("room_name"),
+        room_type,
+        invite_token: get("invite_token"),
+        expires_at: payload
+            .get("expires_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
 fn saved_quic_port_path() -> std::path::PathBuf {
     Identity::default_key_dir().join(QUIC_PORT_FILE)
 }
@@ -158,6 +275,17 @@ pub struct ConnectionManager {
     peers: HashMap<String, PeerConnection>,
     quic_peer_aliases: HashMap<String, String>,
     supernodes: HashMap<String, SupernodeSession>,
+    /// Verified cluster siblings of each connected supernode (supernode id →
+    /// sibling members), learned from the signed roster in `SUPERNODE_INFO`.
+    /// Used as failover attach points when a supernode becomes unreachable.
+    cluster_members: HashMap<String, Vec<crate::cluster::ClusterMember>>,
+    /// Sibling sessions we opened for failover, awaiting connect to replay a
+    /// room join: sibling supernode id → room id.
+    pending_failover_rejoin: HashMap<String, String>,
+    /// Supernodes we've already initiated cluster failover away from, so the
+    /// per-retry `WsDisconnected` storm doesn't spawn duplicate attempts.
+    /// Cleared when that supernode reconnects.
+    failover_in_progress: HashSet<String>,
 
     /// Quinn QUIC endpoint (lazily created on first use).
     quic_endpoint: Option<quinn::Endpoint>,
@@ -202,6 +330,10 @@ pub struct ConnectionManager {
     /// `supernode_id:room_id` keys waiting for private-room invite validation
     /// before sending the count-producing `SfuJoin`.
     pending_private_room_joins: HashSet<String>,
+    /// Pasted room invites (`conquerd://room#…`) whose host supernode is still
+    /// connecting. Keyed by supernode identity_pub; drained on `WsConnected`
+    /// to emit [`ConnectionEvent::RoomInviteReady`] once the link is up.
+    pending_room_invite_entries: HashMap<String, RoomInviteEntry>,
     /// Consecutive room-audio relay-datagram send failures. After a few in a
     /// row we stop trying the relay each frame and use WS for a cooldown.
     room_relay_fail_streak: u32,
@@ -272,6 +404,9 @@ impl ConnectionManager {
             peers: HashMap::new(),
             quic_peer_aliases: HashMap::new(),
             supernodes: HashMap::new(),
+            cluster_members: HashMap::new(),
+            pending_failover_rejoin: HashMap::new(),
+            failover_in_progress: HashSet::new(),
             quic_endpoint: None,
             internal_tx,
             internal_rx,
@@ -289,6 +424,7 @@ impl ConnectionManager {
             transport_stats: HashMap::new(),
             pending_materialize: HashSet::new(),
             pending_private_room_joins: HashSet::new(),
+            pending_room_invite_entries: HashMap::new(),
             relay_signaling_tx,
             relay_signaling_rx,
             room_relay_fail_streak: 0,
@@ -555,6 +691,22 @@ impl ConnectionManager {
                         ConnectionCommand::GenerateInvite { reply_tx } => {
                             let _ = reply_tx.send(self.generate_invite_url());
                         }
+                        ConnectionCommand::GenerateRoomInvite {
+                            supernode_id,
+                            room_id,
+                            room_name,
+                            room_type,
+                            invite_token,
+                            reply_tx,
+                        } => {
+                            let _ = reply_tx.send(self.generate_room_invite_url(
+                                &supernode_id,
+                                &room_id,
+                                &room_name,
+                                &room_type,
+                                &invite_token,
+                            ));
+                        }
                         ConnectionCommand::SendFile { peer_id, rel_path, data, purpose } => {
                             let old = self.file_mgr.get_old_data(&rel_path);
                             let old_ref: Option<&[u8]> = old.as_deref();
@@ -701,6 +853,92 @@ impl ConnectionManager {
         );
     }
 
+    /// Store the verified cluster siblings of `supernode_id` for failover. The
+    /// roster has already been signature-checked against `supernode_id`.
+    fn record_cluster_members(
+        &mut self,
+        supernode_id: &str,
+        members: &[crate::cluster::ClusterMember],
+    ) {
+        if members.is_empty() {
+            self.cluster_members.remove(supernode_id);
+            return;
+        }
+        self.cluster_members
+            .insert(supernode_id.to_owned(), members.to_vec());
+        // Log the resolved failover attach points, reusing the same ws scheme as
+        // the supernode we're connected to.
+        let scheme = self
+            .supernodes
+            .get(supernode_id)
+            .and_then(|sn| sn.ws_url.split("://").next())
+            .unwrap_or("ws")
+            .to_owned();
+        let urls = self.cluster_failover_ws_urls(supernode_id, &scheme);
+        debug!(
+            "cluster: {} failover attach point(s) for supernode {}: {:?}",
+            urls.len(),
+            &supernode_id[..12.min(supernode_id.len())],
+            urls
+        );
+    }
+
+    /// Ordered WebSocket failover URLs for `supernode_id`'s verified siblings,
+    /// excluding any sibling we already have a session with. Pure read of the
+    /// stored, verified roster — the basis for live failover reconnection.
+    fn cluster_failover_ws_urls(&self, supernode_id: &str, scheme: &str) -> Vec<String> {
+        self.cluster_failover_targets(supernode_id, scheme)
+            .into_iter()
+            .map(|(_, url)| url)
+            .collect()
+    }
+
+    /// Verified `(sibling_identity_pub, ws_url)` failover targets for
+    /// `supernode_id`, excluding siblings we already have a session with.
+    fn cluster_failover_targets(&self, supernode_id: &str, scheme: &str) -> Vec<(String, String)> {
+        let Some(members) = self.cluster_members.get(supernode_id) else {
+            return Vec::new();
+        };
+        members
+            .iter()
+            .map(|m| (m.identity_pub.trim_end_matches('=').to_owned(), m))
+            .filter(|(id, _)| !self.supernodes.contains_key(id))
+            .filter_map(|(id, m)| m.ws_url(scheme).map(|url| (id, url)))
+            .collect()
+    }
+
+    /// When the supernode hosting our current room is lost, open a session to a
+    /// verified cluster sibling and queue a room-join replay for when it
+    /// connects. Guarded so the per-retry disconnect storm triggers this once.
+    async fn maybe_failover_to_cluster(&mut self, lost_supernode: &str, room_id: &str) {
+        if room_id.is_empty() || self.failover_in_progress.contains(lost_supernode) {
+            return;
+        }
+        let scheme = self
+            .supernodes
+            .get(lost_supernode)
+            .and_then(|sn| sn.ws_url.split("://").next())
+            .unwrap_or("ws")
+            .to_owned();
+        let Some((sibling_id, ws_url)) = self
+            .cluster_failover_targets(lost_supernode, &scheme)
+            .into_iter()
+            .next()
+        else {
+            return; // no verified sibling to fail over to
+        };
+        info!(
+            "Cluster failover: supernode {} lost — attaching to sibling {} at {} to resume room",
+            &lost_supernode[..12.min(lost_supernode.len())],
+            &sibling_id[..12.min(sibling_id.len())],
+            ws_url
+        );
+        self.failover_in_progress.insert(lost_supernode.to_owned());
+        self.pending_failover_rejoin
+            .insert(sibling_id.clone(), room_id.to_owned());
+        self.connect_supernode_ws(sibling_id, ws_url).await;
+    }
+
     /// Resolve a signaling `target` to a `supernodes` session key (`identity_pub`).
     fn resolve_supernode_ws_target(&self, target: &str) -> Option<String> {
         if self.supernodes.contains_key(target) {
@@ -799,9 +1037,10 @@ impl ConnectionManager {
                 // forwards peer-targeted messages to the destination if it is
                 // also connected there (see signaling.rs "Relay to target").
                 // The recipient still verifies signature + replay + blocked
-                // sender end-to-end, so relaying through a supernode does not
-                // weaken the trust model — the supernode is a dumb forwarder
-                // that cannot forge or read intent beyond routing.
+                // sender. For paired peers the relayed payload is wrapped in an
+                // `EncryptedSignal` envelope (see `maybe_wrap_for_relay`), so the
+                // supernode sees only opaque ciphertext + routing metadata; it
+                // can neither read nor forge the 1:1 content.
                 let relay_available = self.supernodes.values().any(|sn| sn.connected);
                 if !relay_available {
                     warn!(
@@ -914,6 +1153,16 @@ impl ConnectionManager {
             }
         };
 
+        // For the supernode-relay fallback, wrap peer-targeted messages in a
+        // signed `EncryptedSignal` envelope so the relaying supernode cannot
+        // read the payload. The direct-QUIC lane (below) is already private and
+        // always uses the plaintext `json`; `relay_json` is used only on the
+        // supernode-WS relay routes. Falls back to plaintext when no pairwise
+        // key is derivable (supernode target, not-yet-paired peer, broadcast).
+        let relay_json = self
+            .maybe_wrap_for_relay(&msg, &json)
+            .unwrap_or_else(|| json.clone());
+
         // Route: QUIC direct > relay WS > supernode WS fallback
         if let Some(target) = &msg.target.clone() {
             // Clone the sender so we don't hold a borrow of `self.peers`
@@ -1012,7 +1261,12 @@ impl ConnectionManager {
         if chat_attempt.is_some() {
             let mut delivered_any = false;
             for sn in self.supernodes.values() {
-                if sn.connected && sn.send_tx.try_send(WsMessage::Text(json.clone())).is_ok() {
+                if sn.connected
+                    && sn
+                        .send_tx
+                        .try_send(WsMessage::Text(relay_json.clone()))
+                        .is_ok()
+                {
                     delivered_any = true;
                 }
             }
@@ -1030,18 +1284,73 @@ impl ConnectionManager {
             return;
         }
 
-        // Non-chat untargeted messages: first connected supernode that accepts.
-        // (Chat is handled above and always returns, so it never reaches here.)
+        // Non-chat messages that missed QUIC: first connected supernode that
+        // accepts. Peer-targeted ones (e.g. file chunks, call control) ride the
+        // encrypted `relay_json`; genuinely untargeted broadcasts fall back to
+        // plaintext `json` (no pairwise key), which `relay_json` already equals.
         for sn in self.supernodes.values() {
             if sn.connected {
                 // If this supernode's outbound queue is full or closed, try
                 // the next connected supernode rather than dropping silently.
-                if sn.send_tx.try_send(WsMessage::Text(json.clone())).is_ok() {
+                if sn
+                    .send_tx
+                    .try_send(WsMessage::Text(relay_json.clone()))
+                    .is_ok()
+                {
                     return;
                 }
             }
         }
         warn!("No connected path to deliver message {:?}", msg_type);
+    }
+
+    /// Wrap a signed, peer-targeted `inner` message in a signed
+    /// `EncryptedSignal` envelope for the supernode-relay fallback, so the
+    /// relaying supernode routes by envelope `target` only and never sees the
+    /// payload. `inner_json` is the already-serialized plaintext form (reused to
+    /// avoid re-serializing).
+    ///
+    /// Returns `None` (caller falls back to plaintext) when there is no pairwise
+    /// key to use: the message is untargeted, the target is a supernode (the
+    /// intended recipient), the peer is not yet in the local store, or `inner`
+    /// is itself an envelope.
+    fn maybe_wrap_for_relay(&self, inner: &SignalingMessage, inner_json: &str) -> Option<String> {
+        if inner.msg_type == MessageType::EncryptedSignal {
+            return None;
+        }
+        let target = inner.target.as_ref()?;
+        let peer_identity_pub = {
+            let store = self.peer_store.read();
+            // Never encrypt toward a supernode — it is the recipient, not a relay.
+            if store.is_supernode_id(target) {
+                return None;
+            }
+            store
+                .get(target)
+                .or_else(|| store.get_by_identity(target))
+                .map(|r| r.identity_pub.clone())?
+        };
+        if peer_identity_pub.is_empty() {
+            return None;
+        }
+        let key = self
+            .identity
+            .derive_pairwise_relay_key(&peer_identity_pub)
+            .ok()?;
+        let ciphertext = crate::crypto::encrypt_blob(&key, inner_json.as_bytes()).ok()?;
+        let ciphertext_b64 = crate::crypto::b64url_encode(&ciphertext);
+
+        let mut env =
+            SignalingMessage::new(MessageType::EncryptedSignal, self.identity.public_id());
+        // Route by the same target the plaintext message would have used.
+        env.target = inner.target.clone();
+        env.payload
+            .insert("ciphertext".to_owned(), Value::String(ciphertext_b64));
+        let canonical = env.canonical_bytes().ok()?;
+        let sig = self.identity.sign(&canonical);
+        use base64::Engine;
+        env.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(&sig));
+        env.to_json().ok()
     }
 
     // -- QUIC direct connect ------------------------------------------------
@@ -1318,6 +1627,8 @@ impl ConnectionManager {
                     "Supernode {} WebSocket connected",
                     &peer_id[..8.min(peer_id.len())]
                 );
+                // This node came back — allow a future failover away from it.
+                self.failover_in_progress.remove(&peer_id);
                 let _ = self
                     .event_tx
                     .try_send(ConnectionEvent::SupernodeConnected(peer_id.clone()));
@@ -1327,6 +1638,26 @@ impl ConnectionManager {
                 self.send_supernode_info_request(&peer_id).await;
                 // Tell the supernode our build attestation (reproducible build ID).
                 self.send_build_attestation(&peer_id).await;
+                // If we opened this session to fail over from a lost cluster
+                // member, resume the room here now that it's connected. The
+                // sibling already trusts us (client-auth was replicated) and has
+                // the room ACL (room-grant replication).
+                if let Some(room_id) = self.pending_failover_rejoin.remove(&peer_id) {
+                    info!(
+                        "Cluster failover: resuming room {} on sibling {}",
+                        &room_id[..12.min(room_id.len())],
+                        &peer_id[..12.min(peer_id.len())]
+                    );
+                    self.current_supernode_id = peer_id.clone();
+                    self.current_room_id = room_id.clone();
+                    self.send_room_join(&peer_id, &room_id).await;
+                    self.ensure_room_relay(&peer_id).await;
+                }
+                // A pasted room invite was waiting on this supernode to connect —
+                // now enter the room via the normal (token-validated) join path.
+                if let Some(entry) = self.pending_room_invite_entries.remove(&peer_id) {
+                    self.emit_room_invite_ready(&peer_id, &entry);
+                }
             }
             InternalEvent::WsDisconnected { peer_id } => {
                 if let Some(sn) = self.supernodes.get_mut(&peer_id) {
@@ -1338,10 +1669,16 @@ impl ConnectionManager {
                 // Clearing here ensures subsequent SendRoomAudio / SFU ops
                 // do not keep targeting the lost host while other supernodes
                 // or direct sessions remain usable.
-                if self.current_supernode_id == peer_id {
+                // Capture the room this supernode was hosting before we clear it,
+                // so we can replay it on a cluster sibling below.
+                let lost_room = if self.current_supernode_id == peer_id {
+                    let room = self.current_room_id.clone();
                     self.current_room_id.clear();
                     self.current_supernode_id.clear();
-                }
+                    room
+                } else {
+                    String::new()
+                };
                 // Quota / replay / capability cleanup for the supernode id
                 // (room.* features key quotas and replay on the supernode id
                 // as "peer"/sender, just like direct peers use their id).
@@ -1356,7 +1693,12 @@ impl ConnectionManager {
                 self.quic_relays.remove(&peer_id);
                 let _ = self
                     .event_tx
-                    .try_send(ConnectionEvent::SupernodeDisconnected(peer_id));
+                    .try_send(ConnectionEvent::SupernodeDisconnected(peer_id.clone()));
+                // Clustered supernode lost while hosting our room → fail over to a
+                // verified sibling and resume there. No-op if not clustered.
+                if !lost_room.is_empty() {
+                    self.maybe_failover_to_cluster(&peer_id, &lost_room).await;
+                }
             }
             InternalEvent::WsSignalingMessage { supernode_id, msg } => {
                 self.handle_inbound_from_supernode(supernode_id, msg).await;
@@ -2409,6 +2751,77 @@ impl ConnectionManager {
             return;
         }
         match msg.msg_type {
+            // Supernode-relay E2E envelope: decrypt with the pairwise key derived
+            // from our identity + the envelope sender's identity (`msg.sender`),
+            // then re-dispatch the inner message through the full pipeline (its
+            // own signature, freshness, replay, trust, and quota checks all run
+            // again). Only the two paired peers can decrypt; a forged or foreign
+            // envelope fails decryption and is dropped. The outer envelope has
+            // already passed signature/freshness/replay above.
+            MessageType::EncryptedSignal => {
+                let Some(ciphertext_b64) = msg.payload.get("ciphertext").and_then(Value::as_str)
+                else {
+                    warn!(
+                        "[signaling] EncryptedSignal from {} missing ciphertext — dropped",
+                        &msg.sender[..8.min(msg.sender.len())],
+                    );
+                    return;
+                };
+                let key = match self.identity.derive_pairwise_relay_key(&msg.sender) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        warn!(
+                            "[signaling] EncryptedSignal from {} — key derivation failed: {e}",
+                            &msg.sender[..8.min(msg.sender.len())],
+                        );
+                        return;
+                    }
+                };
+                let Ok(ciphertext) = crate::crypto::b64url_decode(ciphertext_b64) else {
+                    warn!(
+                        "[signaling] EncryptedSignal from {} — malformed ciphertext — dropped",
+                        &msg.sender[..8.min(msg.sender.len())],
+                    );
+                    return;
+                };
+                let Ok(inner_bytes) = crate::crypto::decrypt_blob(&key, &ciphertext) else {
+                    warn!(
+                        "[signaling] EncryptedSignal from {} — could not decrypt (not a paired peer?) — dropped",
+                        &msg.sender[..8.min(msg.sender.len())],
+                    );
+                    return;
+                };
+                let Some(inner) = std::str::from_utf8(&inner_bytes)
+                    .ok()
+                    .and_then(|s| SignalingMessage::from_json(s).ok())
+                else {
+                    warn!(
+                        "[signaling] EncryptedSignal from {} — inner payload not a valid message — dropped",
+                        &msg.sender[..8.min(msg.sender.len())],
+                    );
+                    return;
+                };
+                // Depth guard: a single layer only — never unwrap a nested envelope.
+                if inner.msg_type == MessageType::EncryptedSignal {
+                    warn!(
+                        "[signaling] nested EncryptedSignal from {} — dropped",
+                        &msg.sender[..8.min(msg.sender.len())],
+                    );
+                    return;
+                }
+                // The envelope author must be the inner message's author; this
+                // stops a paired peer from relaying a third party's signed
+                // message wrapped under their own envelope.
+                if inner.sender != msg.sender {
+                    warn!(
+                        "[signaling] EncryptedSignal inner/outer sender mismatch from {} — dropped",
+                        &msg.sender[..8.min(msg.sender.len())],
+                    );
+                    return;
+                }
+                Box::pin(self.handle_inbound_inner(inner, quic_peer_id, inbound_supernode_id))
+                    .await;
+            }
             MessageType::Pong => {
                 debug!("Pong from {}", msg.sender);
             }
@@ -2807,6 +3220,21 @@ impl ConnectionManager {
                         })
                     })
                     .unwrap_or(false);
+                let public_rooms_enabled = msg
+                    .payload
+                    .get("capabilities")
+                    .and_then(Value::as_array)
+                    .and_then(|caps| {
+                        caps.iter().find(|c| {
+                            c.get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| id == "room.audio.sfu")
+                        })
+                    })
+                    .and_then(|cap| cap.get("params"))
+                    .and_then(|p| p.get("allow_public_rooms"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let mut wt_url = msg
                     .payload
                     .get("wt_url")
@@ -2865,7 +3293,34 @@ impl ConnectionManager {
                         wt_url,
                         cert_fingerprint,
                         sfu_enabled,
+                        public_rooms_enabled,
                     });
+
+                // Clustered supernode: parse + verify the signed sibling roster.
+                // The signature must bind the roster to this supernode (which we
+                // already trust), so a relay cannot inject bogus failover targets.
+                if let Some(desc_val) = msg.payload.get("cluster") {
+                    match serde_json::from_value::<crate::cluster::SignedClusterDescriptor>(
+                        desc_val.clone(),
+                    ) {
+                        Ok(desc) => match desc.verified_members(&msg.sender) {
+                            Some(members) => {
+                                info!(
+                                    "Supernode {} is in cluster '{}' with {} sibling member(s)",
+                                    &msg.sender[..12.min(msg.sender.len())],
+                                    desc.cluster_id,
+                                    members.len()
+                                );
+                                self.record_cluster_members(&msg.sender, &members);
+                            }
+                            None => warn!(
+                                "Ignoring cluster roster from {} — signature/signer check failed",
+                                &msg.sender[..12.min(msg.sender.len())]
+                            ),
+                        },
+                        Err(e) => debug!("Malformed cluster descriptor in SUPERNODE_INFO: {e}"),
+                    }
+                }
             }
             MessageType::RelayPaymentRequired => {
                 let portal_url = msg
@@ -3515,6 +3970,49 @@ impl ConnectionManager {
         Some(format!("conquerd://invite#{encoded}"))
     }
 
+    /// Build a self-contained room invite URL for a room hosted on
+    /// `supernode_id`. Returns `None` if we don't know a signaling address for
+    /// that supernode (so we can fall back to sharing the bare token).
+    fn generate_room_invite_url(
+        &self,
+        supernode_id: &str,
+        room_id: &str,
+        room_name: &str,
+        room_type: &str,
+        invite_token: &str,
+    ) -> Option<String> {
+        if supernode_id.is_empty() || room_id.is_empty() {
+            return None;
+        }
+        // Prefer the live session's ws_url; fall back to a persisted relay hint
+        // (e.g. the room was created earlier this session but the socket churned).
+        let supernode_hint = self
+            .supernodes
+            .get(supernode_id)
+            .map(|sn| sn.ws_url.clone())
+            .or_else(|| {
+                self.peer_store
+                    .read()
+                    .get(supernode_id)
+                    .and_then(|r| r.relay_hints.first().cloned())
+            })
+            .filter(|h| !h.is_empty())?;
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + ROOM_INVITE_TTL_SECS;
+        Some(build_room_invite_url(
+            supernode_id,
+            &supernode_hint,
+            room_id,
+            room_name,
+            room_type,
+            invite_token,
+            expires_at,
+        ))
+    }
+
     fn emit_invite_failed(&self, reason: impl Into<String>) {
         let reason = reason.into();
         warn!("AcceptInvite: {reason}");
@@ -3579,17 +4077,127 @@ impl ConnectionManager {
         }
     }
 
+    /// Accept a pasted self-contained room invite: connect to the embedded
+    /// host supernode (if not already), then hand the room off to the UI to
+    /// join. `encoded` is the base64url fragment after `room#`.
+    async fn handle_accept_room_invite(&mut self, encoded: &str) {
+        let payload = match parse_room_invite(encoded) {
+            Ok(p) => p,
+            Err(e) => {
+                self.emit_invite_failed(e);
+                return;
+            }
+        };
+
+        if payload.expires_at != 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if payload.expires_at < now {
+                self.emit_invite_failed("room invite expired");
+                return;
+            }
+        }
+
+        let RoomInvitePayload {
+            supernode_id,
+            supernode_hint,
+            room_id,
+            room_name,
+            room_type,
+            invite_token,
+            ..
+        } = payload;
+
+        info!(
+            "Accepting room invite for room {} on supernode {}",
+            &room_id[..12.min(room_id.len())],
+            &supernode_id[..8.min(supernode_id.len())]
+        );
+
+        // Persist the host supernode so the room-store join path (which resolves
+        // the supernode via the peer store) can find it, and so it survives a
+        // restart / shows in the Nodes tab. Mirrors the supernode-invite path.
+        if !supernode_hint.is_empty() {
+            let mut store = self.peer_store.write();
+            store.grandfather_supernode_ws_hint_sharing(&supernode_hint);
+            store.upsert_from_invite(crate::peer_store::PeerRecord {
+                peer_id: supernode_id.clone(),
+                identity_pub: supernode_id.clone(),
+                relay_hints: vec![supernode_hint.clone()],
+                is_supernode: true,
+                supernode_from_invite: true,
+                created_at: unix_now_f64(),
+                last_seen_at: unix_now_f64(),
+                ..Default::default()
+            });
+            let _ = store.save();
+        }
+
+        let entry = RoomInviteEntry {
+            room_id,
+            room_name,
+            room_type,
+            invite_token,
+        };
+
+        let connected = self
+            .supernodes
+            .get(&supernode_id)
+            .map(|sn| sn.connected)
+            .unwrap_or(false);
+
+        if connected {
+            // Link is already up — enter the room immediately.
+            self.emit_room_invite_ready(&supernode_id, &entry);
+        } else {
+            // Stash until WsConnected fires; open the session if we have no
+            // task for this supernode yet.
+            if !self.supernodes.contains_key(&supernode_id) {
+                if supernode_hint.is_empty() {
+                    self.emit_invite_failed("room invite missing supernode address");
+                    return;
+                }
+                self.connect_supernode_ws(supernode_id.clone(), supernode_hint.clone())
+                    .await;
+            }
+            self.pending_room_invite_entries.insert(supernode_id, entry);
+        }
+    }
+
+    fn emit_room_invite_ready(&self, supernode_id: &str, entry: &RoomInviteEntry) {
+        let _ = self.event_tx.try_send(ConnectionEvent::RoomInviteReady {
+            supernode_id: supernode_id.to_owned(),
+            room_id: entry.room_id.clone(),
+            room_name: entry.room_name.clone(),
+            room_type: entry.room_type.clone(),
+            invite_token: entry.invite_token.clone(),
+        });
+    }
+
     async fn handle_accept_invite(&mut self, invite_url: String) {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
         const SCHEME: &str = "conquerd://";
-        if !invite_url.starts_with(SCHEME) {
+        let Some(rest) = invite_url.strip_prefix(SCHEME) else {
             self.emit_invite_failed(format!("invalid scheme in '{invite_url}'"));
             return;
-        }
+        };
 
-        let encoded = &invite_url[SCHEME.len()..];
+        // Invite URLs carry an optional `action#` prefix before the base64url
+        // fragment: `conquerd://invite#<b64>`, `conquerd://room#<b64>`, or the
+        // bare legacy `conquerd://<b64>`. Split it off so the payload decodes.
+        let (action, encoded) = match rest.split_once('#') {
+            Some((action, payload)) => (action, payload),
+            None => ("", rest),
+        };
+
+        if action == "room" {
+            self.handle_accept_room_invite(encoded).await;
+            return;
+        }
 
         if encoded.len() > 262_144 {
             self.emit_invite_failed(format!("invite URL too large ({} bytes)", encoded.len()));

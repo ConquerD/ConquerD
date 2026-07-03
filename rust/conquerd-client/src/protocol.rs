@@ -367,6 +367,21 @@ mod tests {
     }
 
     #[test]
+    fn signed_message_survives_json_roundtrip_bit_exact() {
+        // Regression guard: serde_json's default f64 parser is not
+        // round-trip-accurate, which shifted a signed message's timestamp by
+        // 1 ULP on `from_json` and broke Ed25519 verification for ~10% of
+        // high-precision timestamps. The `float_roundtrip` feature must keep
+        // `canonical_bytes()` stable across a serialize → parse cycle.
+        for _ in 0..50_000 {
+            let m = SignalingMessage::new(MessageType::ChatMessage, "s".to_owned());
+            let m2 = SignalingMessage::from_json(&m.to_json().unwrap()).unwrap();
+            assert_eq!(m.timestamp, m2.timestamp);
+            assert_eq!(m.canonical_bytes().unwrap(), m2.canonical_bytes().unwrap());
+        }
+    }
+
+    #[test]
     fn is_fresh_accepts_current_timestamp() {
         let msg = msg_with_timestamp(now_secs());
         assert!(msg.is_fresh(FRESHNESS_WINDOW_SECS));

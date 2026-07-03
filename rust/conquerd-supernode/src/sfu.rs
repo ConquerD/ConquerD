@@ -485,6 +485,16 @@ impl SFURoomManager {
         self.audio_forward_targets(room_id, sender, SFURoom::now_secs())
     }
 
+    /// Room ids with at least one local participant or text subscriber. Used to
+    /// advertise this node's interests to cluster peers for replication routing.
+    pub fn subscribed_room_ids(&self) -> Vec<String> {
+        self.rooms
+            .iter()
+            .filter(|(_, r)| !r.is_unused())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Get all peers who should receive text chat (participants + subscribers).
     pub fn get_chat_recipients(&self, room_id: &str) -> Vec<String> {
         self.rooms

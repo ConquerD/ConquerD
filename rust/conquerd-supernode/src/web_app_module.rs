@@ -176,6 +176,15 @@ impl WebAppHostModule {
                     let json = state.wt_url_json();
                     return self.send_json(send, peer_id, 200, &json).await;
                 }
+                "/api/cluster" => {
+                    let json = state.cluster_stats();
+                    if json.is_null() {
+                        return self
+                            .send_json(send, peer_id, 200, &serde_json::json!({"clustered": false}))
+                            .await;
+                    }
+                    return self.send_json(send, peer_id, 200, &json).await;
+                }
                 _ => {}
             }
         }

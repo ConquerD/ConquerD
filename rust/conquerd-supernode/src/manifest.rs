@@ -71,6 +71,12 @@ pub struct SupernodeManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_mode: Option<String>,
 
+    /// Optional `[cluster]` section: link this supernode with others into one
+    /// logical node. Absent ⇒ standalone. Additive (no schema bump): older
+    /// builds that don't know the field ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<crate::cluster::ClusterConfig>,
+
     /// Declared features. Order is preserved on round-trip.
     #[serde(default, rename = "feature")]
     pub features: Vec<FeatureEntry>,
@@ -417,6 +423,45 @@ mod tests {
         assert_eq!(m.features.len(), 1);
         assert_eq!(m.features[0].id, "core.chat.v1");
         assert!(m.features[0].enabled);
+    }
+
+    #[test]
+    fn parses_optional_cluster_section() {
+        let toml = r#"
+            schema_version = 1
+            [[feature]]
+            id = "room.chat.v1"
+
+            [cluster]
+            cluster_id = "acme-us"
+
+            [[cluster.member]]
+            identity_pub = "NODE_A"
+            relay_addr = "a.example:3478"
+            ws_addr = "a.example:34935"
+
+            [[cluster.member]]
+            identity_pub = "NODE_B"
+            relay_addr = "b.example:3478"
+            web_port = 8443
+        "#;
+        let m = SupernodeManifest::from_toml_str(toml).unwrap();
+        let cluster = m.cluster.expect("cluster section present");
+        assert_eq!(cluster.cluster_id, "acme-us");
+        assert_eq!(cluster.members.len(), 2);
+        assert_eq!(cluster.members[0].identity_pub, "NODE_A");
+        assert_eq!(
+            cluster.members[0].ws_addr.as_deref(),
+            Some("a.example:34935")
+        );
+        assert_eq!(cluster.members[1].web_port, Some(8443));
+    }
+
+    #[test]
+    fn cluster_section_absent_by_default() {
+        let toml = "schema_version = 1\n[[feature]]\nid = \"core.chat.v1\"\n";
+        let m = SupernodeManifest::from_toml_str(toml).unwrap();
+        assert!(m.cluster.is_none());
     }
 
     #[test]

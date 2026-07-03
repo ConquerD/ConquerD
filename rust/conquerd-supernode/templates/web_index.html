@@ -90,6 +90,10 @@
     }
     .badge.connected { background: #1a3a20; color: var(--green); }
     .badge.relay    { background: #1a2a3a; color: var(--accent); }
+    .badge.self     { background: #1e1a3a; color: var(--purple); }
+    .badge.offline  { background: #2d1a1a; color: var(--red); }
+    .card-value.purple { color: var(--purple); }
+    #cluster-section { display: none; }
     .games-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -143,10 +147,6 @@
     <!-- Stat cards -->
     <div class="grid" id="stat-cards">
       <div class="card">
-        <div class="card-label">Connected Peers</div>
-        <div class="card-value green" id="stat-peers">—</div>
-      </div>
-      <div class="card">
         <div class="card-label">Uptime</div>
         <div class="card-value accent" id="stat-uptime">—</div>
       </div>
@@ -158,17 +158,21 @@
         <div class="card-label">My Peer ID</div>
         <div class="card-value" id="stat-my-id" style="font-size:11px;word-break:break-all;">—</div>
       </div>
+      <div class="card" id="stat-cluster-card" style="display:none">
+        <div class="card-label">Cluster Peers</div>
+        <div class="card-value purple" id="stat-cluster-peers">—</div>
+      </div>
     </div>
 
-    <!-- Peer list -->
-    <section>
-      <h2>Connected Peers</h2>
+    <!-- Cluster members (hidden when standalone) -->
+    <section id="cluster-section">
+      <h2>Cluster — <span id="cluster-id-display" style="color:var(--text);text-transform:none;letter-spacing:normal"></span></h2>
       <table>
         <thead>
-          <tr><th>Peer ID</th><th>Mode</th><th>Connected</th></tr>
+          <tr><th>Status</th><th>Node</th><th>Version</th><th>Hash</th></tr>
         </thead>
-        <tbody id="peers-tbody">
-          <tr><td colspan="3" style="color:var(--muted)">Loading…</td></tr>
+        <tbody id="cluster-tbody">
+          <tr><td colspan="4" style="color:var(--muted)">Loading…</td></tr>
         </tbody>
       </table>
     </section>
@@ -267,23 +271,17 @@
 
     async function refresh() {
       try {
-        const [statsRaw, peersRaw, cfgRaw] = await Promise.allSettled([
+        const [statsRaw, cfgRaw] = await Promise.allSettled([
           conquerdFetch("/api/stats"),
-          conquerdFetch("/api/peers"),
           conquerdFetch("/api/config"),
         ]);
 
         if (statsRaw.status === "fulfilled") {
           const s = await statsRaw.value.json().catch(() => ({}));
-          el("stat-peers").textContent  = s.connected_peers  ?? "—";
           el("stat-uptime").textContent = fmtUptime(s.uptime_secs);
           el("stat-rooms").textContent  = s.active_rooms     ?? "—";
           if (s.version) el("footer-version").textContent = `Conquerd ${s.version}`;
-        }
-
-        if (peersRaw.status === "fulfilled") {
-          const peers = await peersRaw.value.json().catch(() => []);
-          renderPeers(Array.isArray(peers) ? peers : (peers.peers || []));
+          renderCluster(s.cluster);
         }
 
         if (cfgRaw.status === "fulfilled") {
@@ -294,20 +292,33 @@
       }
     }
 
-    function renderPeers(peers) {
-      const tbody = el("peers-tbody");
-      if (!peers.length) {
-        tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted)">No peers connected</td></tr>`;
+    function renderCluster(c) {
+      const section = el("cluster-section");
+      const card = el("stat-cluster-card");
+      if (!c || !c.cluster_id) {
+        section.style.display = "none";
+        card.style.display = "none";
         return;
       }
-      tbody.innerHTML = peers.map(p => {
-        const mode = p.via_relay ? badge("relay", "relay") : badge("direct", "connected");
-        const since = p.connected_since ? new Date(p.connected_since * 1000).toLocaleTimeString() : "—";
-        const shortId = (p.peer_id || "").slice(0, 16) + "…";
+      section.style.display = "block";
+      card.style.display = "block";
+      const peerMembers = (c.member_count || 1) - 1;
+      el("stat-cluster-peers").textContent = `${c.connected_peers ?? 0} / ${peerMembers}`;
+      el("cluster-id-display").textContent = c.cluster_id;
+      const tbody = el("cluster-tbody");
+      tbody.innerHTML = (c.members || []).map(m => {
+        let statusBadge;
+        if (m.is_self)        statusBadge = badge("self",   "self");
+        else if (m.connected) statusBadge = badge("linked", "connected");
+        else                  statusBadge = badge("offline","offline");
+        const shortId = (m.identity_pub || "").slice(0, 16) + "…";
+        const version = m.version ?? "—";
+        const shortHash = m.source_hash ? m.source_hash.slice(0, 12) + "…" : "—";
         return `<tr>
-          <td title="${p.peer_id || ''}">${shortId}</td>
-          <td>${mode}</td>
-          <td>${since}</td>
+          <td>${statusBadge}</td>
+          <td title="${m.identity_pub || ""}">${shortId}</td>
+          <td>${version}</td>
+          <td title="${m.source_hash || ""}">${shortHash}</td>
         </tr>`;
       }).join("");
     }

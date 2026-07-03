@@ -261,6 +261,34 @@ pub mod ffi {
             invite_token: QString,
         );
 
+        /// Build a self-contained room invite URL (`conquerd://room#…`) that
+        /// embeds the host supernode's address, the room, and (for private
+        /// rooms) the token — so a joiner on any (or no) supernode can paste it.
+        /// The room's type and invite token are looked up from the local room
+        /// store; `room_name` is a fallback for rooms not yet in the store.
+        /// Also stores the URL in `invite_url` so it can be shown in the popup.
+        /// Returns an empty string if the host supernode address is unknown.
+        #[qinvokable]
+        #[rust_name = "generate_room_invite"]
+        fn generateRoomInvite(
+            self: Pin<&mut AppBridge>,
+            supernode_id: &QString,
+            room_id: &QString,
+            room_name: &QString,
+        ) -> QString;
+
+        /// Emitted when a pasted room invite's host supernode has connected and
+        /// the room is ready to enter. The token is already persisted, so the
+        /// normal join path validates it.
+        #[qsignal]
+        #[rust_name = "room_invite_ready"]
+        fn roomInviteReady(
+            self: Pin<&mut AppBridge>,
+            supernode_id: QString,
+            room_id: QString,
+            room_name: QString,
+        );
+
         /// Hide an SFU room from the local Rooms sidebar (not deleted on the supernode).
         #[qinvokable]
         #[rust_name = "remove_room"]
@@ -926,6 +954,31 @@ fn request_invite_url(rust: &AppBridgeRust) -> Option<String> {
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     tx.try_send(ConnectionCommand::GenerateInvite { reply_tx })
         .ok()?;
+    reply_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .ok()
+        .flatten()
+}
+
+fn request_room_invite_url(
+    rust: &AppBridgeRust,
+    supernode_id: String,
+    room_id: String,
+    room_name: String,
+    room_type: String,
+    invite_token: String,
+) -> Option<String> {
+    let tx = rust.conn_cmd_tx.as_ref()?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    tx.try_send(ConnectionCommand::GenerateRoomInvite {
+        supernode_id,
+        room_id,
+        room_name,
+        room_type,
+        invite_token,
+        reply_tx,
+    })
+    .ok()?;
     reply_rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .ok()
@@ -1663,6 +1716,50 @@ impl ffi::AppBridge {
         let url = format!("conquerd://invite#{encoded}");
         self.as_mut().set_invite_url(QString::from(url.as_str()));
         QString::from(url.as_str())
+    }
+
+    fn generate_room_invite(
+        mut self: Pin<&mut Self>,
+        supernode_id: &QString,
+        room_id: &QString,
+        room_name: &QString,
+    ) -> QString {
+        let sid = self
+            .rust()
+            .resolve_supernode_node_id_str(&supernode_id.to_string())
+            .unwrap_or_else(|| supernode_id.to_string());
+        let rid = room_id.to_string();
+
+        // Pull the room's type + invite token from the local store. Rooms we
+        // created/joined are recorded there; a room the user only discovered in
+        // the sidebar may not be, so fall back to a tokenless public invite.
+        let stored = self
+            .rust()
+            .room_store
+            .as_ref()
+            .and_then(|rs| rs.read().get(&sid, &rid).cloned());
+        let room_type = stored
+            .as_ref()
+            .map(|e| e.room_type.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "public".to_owned());
+        let invite_token = stored
+            .as_ref()
+            .map(|e| e.invite_token.clone())
+            .unwrap_or_default();
+        let name = stored
+            .as_ref()
+            .map(|e| e.room_name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| room_name.to_string());
+
+        match request_room_invite_url(self.rust(), sid, rid, name, room_type, invite_token) {
+            Some(url) => {
+                self.as_mut().set_invite_url(QString::from(url.as_str()));
+                QString::from(url.as_str())
+            }
+            None => QString::default(),
+        }
     }
 
     fn copy_to_clipboard(self: Pin<&mut Self>, text: &QString) {
@@ -4278,6 +4375,7 @@ fn dispatch_event(
             wt_url,
             cert_fingerprint,
             sfu_enabled,
+            public_rooms_enabled,
         } => {
             // Cache the WebTransport base URL and cert fingerprint so
             // /_conquerd/ctx.json can expose them to game pages loaded via
@@ -4308,6 +4406,7 @@ fn dispatch_event(
                     "homepage_url": homepage_url,
                     "title": title,
                     "sfu_enabled": sfu_enabled,
+                    "public_rooms_enabled": public_rooms_enabled,
                 }])
                 .to_string();
                 bridge
@@ -4358,6 +4457,38 @@ fn dispatch_event(
                     QString::from(room_name.as_str()),
                     QString::from(room_type.as_str()),
                     QString::from(invite_token.as_str()),
+                );
+            });
+        }
+        ConnectionEvent::RoomInviteReady {
+            supernode_id,
+            room_id,
+            room_name,
+            room_type,
+            invite_token,
+        } => {
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let canon = bridge
+                    .rust()
+                    .resolve_supernode_node_id_str(&supernode_id)
+                    .unwrap_or(supernode_id);
+                // Persist as a room we did not create, carrying the token, so
+                // join_room()'s invite path validates it for private rooms
+                // (and a plain join is used for public ones).
+                remember_room_in_store(
+                    &bridge.rust().room_store,
+                    &canon,
+                    &room_id,
+                    &room_name,
+                    &room_type,
+                    "",
+                    false,
+                    &invite_token,
+                );
+                bridge.as_mut().room_invite_ready(
+                    QString::from(canon.as_str()),
+                    QString::from(room_id.as_str()),
+                    QString::from(room_name.as_str()),
                 );
             });
         }

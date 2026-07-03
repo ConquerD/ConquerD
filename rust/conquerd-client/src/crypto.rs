@@ -228,6 +228,62 @@ pub fn derive_invite_session_key(
     Ok((session_key, transcript_hash))
 }
 
+// ---------------------------------------------------------------------------
+// Pairwise relay key (deterministic, identity-derived)
+// ---------------------------------------------------------------------------
+
+/// Domain-separation label for the supernode-relay pairwise key.
+const PAIRWISE_RELAY_KEY_INFO: &[u8] = b"conquerd-pairwise-relay-v1";
+
+/// Derive a deterministic 32-byte symmetric key shared by exactly two peers,
+/// from their long-term Ed25519 identity keys via X25519 (the standard
+/// Ed25519→Montgomery birational map) + HKDF-SHA256.
+///
+/// `our_scalar_bytes` is `SigningKey::to_scalar_bytes()` (our clamped X25519
+/// secret scalar); `peer_identity_pub_b64` is the peer's base64url Ed25519
+/// public key (`PeerRecord.identity_pub`). Both peers compute the same value
+/// regardless of direction because the DH is symmetric and the two identity
+/// strings are sorted into the HKDF `info`, binding the key to the unordered
+/// pair.
+///
+/// Used to encrypt `EncryptedSignal` envelopes on the supernode-relay fallback
+/// path so the relaying supernode cannot read 1:1 chat/file/call payloads.
+///
+/// Note: this is identity-static (no forward secrecy); compromise of an
+/// identity key exposes past relayed ciphertext an attacker happened to store.
+/// Acceptable for the ephemeral relay-fallback path; FS is future work.
+pub fn derive_pairwise_relay_key(
+    our_scalar_bytes: &[u8; 32],
+    our_identity_pub_b64: &str,
+    peer_identity_pub_b64: &str,
+) -> Result<[u8; 32]> {
+    let peer_pk_bytes = b64url_decode(peer_identity_pub_b64)?;
+    let peer_arr: [u8; 32] = peer_pk_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| ClientError::Crypto("peer identity key must be 32 bytes".into()))?;
+    let peer_vk = VerifyingKey::from_bytes(&peer_arr)
+        .map_err(|e| ClientError::Crypto(format!("invalid peer identity key: {e}")))?;
+    let peer_montgomery = peer_vk.to_montgomery().to_bytes();
+
+    let secret = StaticSecret::from(*our_scalar_bytes);
+    let public = PublicKey::from(peer_montgomery);
+    let shared = secret.diffie_hellman(&public);
+
+    // Bind the key to the unordered pair of identities.
+    let mut ids = [our_identity_pub_b64, peer_identity_pub_b64];
+    ids.sort_unstable();
+    let mut info =
+        Vec::with_capacity(PAIRWISE_RELAY_KEY_INFO.len() + ids[0].len() + ids[1].len() + 2);
+    info.extend_from_slice(PAIRWISE_RELAY_KEY_INFO);
+    info.push(b'|');
+    info.extend_from_slice(ids[0].as_bytes());
+    info.push(b'|');
+    info.extend_from_slice(ids[1].as_bytes());
+
+    hkdf_derive_key(shared.as_bytes(), &info)
+}
+
 pub fn b64url_decode(s: &str) -> Result<Vec<u8>> {
     // Try with padding first, then without
     URL_SAFE
@@ -424,6 +480,27 @@ mod tests {
         let k1 = hkdf_derive_key(&seed, b"conquerd-store/peers/v1").unwrap();
         let k2 = hkdf_derive_key(&seed, b"conquerd-store/chat/v1").unwrap();
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn pairwise_relay_key_is_symmetric_and_pair_bound() {
+        use ed25519_dalek::SigningKey;
+        let a = SigningKey::generate(&mut OsRng);
+        let b = SigningKey::generate(&mut OsRng);
+        let c = SigningKey::generate(&mut OsRng);
+        let a_pub = URL_SAFE.encode(a.verifying_key().as_bytes());
+        let b_pub = URL_SAFE.encode(b.verifying_key().as_bytes());
+        let c_pub = URL_SAFE.encode(c.verifying_key().as_bytes());
+
+        // Both directions derive the same key.
+        let k_ab = derive_pairwise_relay_key(&a.to_scalar_bytes(), &a_pub, &b_pub).unwrap();
+        let k_ba = derive_pairwise_relay_key(&b.to_scalar_bytes(), &b_pub, &a_pub).unwrap();
+        assert_eq!(k_ab, k_ba);
+        assert_eq!(k_ab.len(), 32);
+
+        // A different pair yields a different key.
+        let k_ac = derive_pairwise_relay_key(&a.to_scalar_bytes(), &a_pub, &c_pub).unwrap();
+        assert_ne!(k_ab, k_ac);
     }
 
     #[test]

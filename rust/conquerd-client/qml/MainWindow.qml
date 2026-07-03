@@ -195,6 +195,7 @@ ApplicationWindow {
                         homepage_url: node.homepage_url || "",
                         title: node.title || "",
                         sfu_enabled: node.sfu_enabled || false,
+                        public_rooms_enabled: node.public_rooms_enabled || false,
                         rooms_json: "[]"
                     })
                 }
@@ -283,6 +284,8 @@ ApplicationWindow {
                     nodeListModel.setProperty(keep, "connected", true)
                 if (!keepEntry.sfu_enabled && entry.sfu_enabled)
                     nodeListModel.setProperty(keep, "sfu_enabled", true)
+                if (!keepEntry.public_rooms_enabled && entry.public_rooms_enabled)
+                    nodeListModel.setProperty(keep, "public_rooms_enabled", true)
                 if (!keepEntry.title && entry.title)
                     nodeListModel.setProperty(keep, "title", entry.title)
                 if (!keepEntry.homepage_url && entry.homepage_url)
@@ -343,6 +346,7 @@ ApplicationWindow {
                 homepage_url: "",
                 title: "",
                 sfu_enabled: false,
+                public_rooms_enabled: false,
                 rooms_json: roomsJson
             })
         }
@@ -710,14 +714,17 @@ ApplicationWindow {
                             nodeListModel.setProperty(nodeIdx, "title", p.title)
                         if (p.sfu_enabled !== undefined && p.sfu_enabled !== null)
                             nodeListModel.setProperty(nodeIdx, "sfu_enabled", p.sfu_enabled)
+                        if (p.public_rooms_enabled !== undefined && p.public_rooms_enabled !== null)
+                            nodeListModel.setProperty(nodeIdx, "public_rooms_enabled", p.public_rooms_enabled)
                     } else {
                         nodeListModel.append({
-                            node_id:      canon,
-                            connected:    p.connected || false,
-                            homepage_url: p.homepage_url || "",
-                            title:        p.title || "",
-                            sfu_enabled:  p.sfu_enabled || false,
-                            rooms_json:   "[]"
+                            node_id:              canon,
+                            connected:            p.connected || false,
+                            homepage_url:         p.homepage_url || "",
+                            title:                p.title || "",
+                            sfu_enabled:          p.sfu_enabled || false,
+                            public_rooms_enabled: p.public_rooms_enabled || false,
+                            rooms_json:           "[]"
                         })
                     }
                 }
@@ -872,15 +879,28 @@ ApplicationWindow {
             root.voiceSupernodeId = supernodeId
             navIndex = 1
             if (roomType === "private" && inviteToken !== "") {
-                backend.copyToClipboard(inviteToken)
+                // Prefer a self-contained invite URL (embeds the supernode
+                // address) so recipients on any/no supernode can just paste it;
+                // fall back to the bare token if the URL can't be built.
+                var inviteUrl = backend.generateRoomInvite(supernodeId, roomId, roomName)
+                backend.copyToClipboard(inviteUrl !== "" ? inviteUrl : inviteToken)
                 if (trayIcon.available) {
                     trayIcon.showMessage(
                         qsTr("Private room created"),
-                        qsTr("Invite token copied to clipboard."),
+                        inviteUrl !== ""
+                            ? qsTr("Invite link copied to clipboard.")
+                            : qsTr("Invite token copied to clipboard."),
                         Platform.SystemTrayIcon.Information,
                         5000)
                 }
             }
+        }
+        function onRoomInviteReady(supernodeId, roomId, roomName) {
+            roomPanel.switchToRoom(roomName, roomId, supernodeId)
+            backend.joinRoomWithVoice(supernodeId, roomId)
+            root.voiceRoomName = roomName
+            root.voiceSupernodeId = supernodeId
+            navIndex = 1
         }
     }
 
@@ -1012,7 +1032,9 @@ ApplicationWindow {
                     ToolTip.text: "Copy to clipboard"
                     ToolTip.visible: hovered
                     onClicked: {
-                        backend.copyInvite()
+                        // Copy exactly the link shown (peer or room invite),
+                        // rather than minting a fresh peer invite.
+                        backend.copyToClipboard(backend.invite_url)
                         invitePopup.visible = false
                     }
                 }
@@ -1146,6 +1168,25 @@ ApplicationWindow {
                                 navIndex = 1
                             }
                         }
+                        MenuItem {
+                            text: qsTr("Copy Room Invite")
+                            onTriggered: {
+                                var url = backend.generateRoomInvite(
+                                    roomContextMenu.targetSupernodeId,
+                                    roomContextMenu.targetRoomId,
+                                    roomContextMenu.targetRoomName)
+                                if (url !== "") {
+                                    backend.copyToClipboard(url)
+                                    invitePopup.visible = true
+                                } else if (trayIcon.available) {
+                                    trayIcon.showMessage(
+                                        qsTr("Room invite"),
+                                        qsTr("Couldn't build the invite — connect to the room's supernode first."),
+                                        Platform.SystemTrayIcon.Warning,
+                                        5000)
+                                }
+                            }
+                        }
                         MenuSeparator {
                             visible: roomContextMenu.targetCanRemove
                         }
@@ -1163,10 +1204,11 @@ ApplicationWindow {
                         property string targetNodeId: ""
                         property bool targetConnected: false
                         property bool targetSfuEnabled: false
+                        property bool targetPublicRoomsEnabled: false
 
                         MenuItem {
                             text: qsTr("Create Public Room…")
-                            enabled: nodeContextMenu.targetConnected && nodeContextMenu.targetSfuEnabled
+                            enabled: nodeContextMenu.targetConnected && nodeContextMenu.targetSfuEnabled && nodeContextMenu.targetPublicRoomsEnabled
                             onTriggered: createRoomDialog.openForNode(
                                 nodeContextMenu.targetNodeId, "public")
                         }
@@ -1218,6 +1260,7 @@ ApplicationWindow {
                             required property string node_id
                             required property bool connected
                             required property bool sfu_enabled
+                            required property bool public_rooms_enabled
                             required property string title
                             required property string rooms_json
 
@@ -1288,6 +1331,7 @@ ApplicationWindow {
                                                 nodeContextMenu.targetNodeId = roomGroup.node_id
                                                 nodeContextMenu.targetConnected = roomGroup.connected
                                                 nodeContextMenu.targetSfuEnabled = roomGroup.sfu_enabled
+                                                nodeContextMenu.targetPublicRoomsEnabled = roomGroup.public_rooms_enabled
                                                 nodeContextMenu.popup()
                                             } else {
                                                 console.log("[portal] node avatar clicked node_id=" + roomGroup.node_id)

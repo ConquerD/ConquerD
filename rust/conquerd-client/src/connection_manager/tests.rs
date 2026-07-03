@@ -1,5 +1,8 @@
 use super::internal::{host_from_url, is_loopback_or_wildcard, rewrite_loopback_wt_url};
-use super::manager::{parse_quic_lan_hint, peer_quic_endpoint};
+use super::manager::{
+    build_room_invite_url, parse_quic_lan_hint, parse_room_invite, peer_quic_endpoint,
+    RoomInvitePayload, ROOM_INVITE_SCHEMA,
+};
 use super::ConnectionManager;
 
 #[test]
@@ -56,6 +59,90 @@ fn host_from_url_variants() {
         Some("2001:db8::1")
     );
     assert_eq!(host_from_url(""), None);
+}
+
+#[test]
+fn room_invite_url_round_trips() {
+    let url = build_room_invite_url(
+        "supernode-identity-pub",
+        "wss://relay.example:443/sig",
+        "room-abc",
+        "Team Standup",
+        "private",
+        "f4052efe6d931922582f2f4ef4cec47f",
+        1_800_000_000,
+    );
+    assert!(url.starts_with("conquerd://room#"), "url = {url}");
+    let encoded = url.strip_prefix("conquerd://room#").unwrap();
+    assert_eq!(
+        parse_room_invite(encoded).unwrap(),
+        RoomInvitePayload {
+            supernode_id: "supernode-identity-pub".into(),
+            supernode_hint: "wss://relay.example:443/sig".into(),
+            room_id: "room-abc".into(),
+            room_name: "Team Standup".into(),
+            room_type: "private".into(),
+            invite_token: "f4052efe6d931922582f2f4ef4cec47f".into(),
+            expires_at: 1_800_000_000,
+        }
+    );
+}
+
+/// Invites minted before `room_type` existed (and any with it blank) default to
+/// private — the only kind that existed then — so the token path still runs.
+#[test]
+fn room_invite_defaults_room_type_to_private() {
+    let bare = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        br#"{"v":1,"supernode_id":"s","room_id":"r"}"#,
+    );
+    assert_eq!(parse_room_invite(&bare).unwrap().room_type, "private");
+}
+
+/// Wire-format field stability guard for the room invite payload.
+///
+/// If you rename a field, keep the JSON key stable and update this list; a real
+/// wire change must bump `ROOM_INVITE_SCHEMA` and add migration in
+/// `parse_room_invite`.
+#[test]
+fn room_invite_wire_fields_are_stable() {
+    let url = build_room_invite_url("sn", "wss://h:443", "r", "n", "private", "tok", 42);
+    let encoded = url.strip_prefix("conquerd://room#").unwrap();
+    let json_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded).unwrap();
+    let obj: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+    for key in [
+        "v",
+        "supernode_id",
+        "supernode_hint",
+        "room_id",
+        "room_name",
+        "room_type",
+        "invite_token",
+        "expires_at",
+    ] {
+        assert!(
+            obj.get(key).is_some(),
+            "room invite wire field missing or renamed: `{key}`"
+        );
+    }
+    assert_eq!(obj["v"].as_u64(), Some(ROOM_INVITE_SCHEMA as u64));
+}
+
+#[test]
+fn room_invite_rejects_missing_required_fields() {
+    // Missing supernode_id.
+    let bad = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        br#"{"v":1,"room_id":"r"}"#,
+    );
+    assert!(parse_room_invite(&bad).is_err());
+    // Unknown future schema version is refused.
+    let future = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        br#"{"v":999,"supernode_id":"s","room_id":"r"}"#,
+    );
+    assert!(parse_room_invite(&future).is_err());
 }
 
 #[test]
@@ -177,4 +264,76 @@ fn verify_inbound_signature_rejects_stale_and_future_timestamps() {
     assert!(!ConnectionManager::verify_inbound_signature_for_test(
         &signed(now + MAX_AGE + 1.0)
     ));
+}
+
+/// End-to-end guard for the supernode-relay `EncryptedSignal` envelope: two
+/// paired peers derive the same pairwise key, the wrapped wire form leaks no
+/// plaintext, and the inner message survives the round-trip with its own
+/// signature intact. Mirrors the format produced by `maybe_wrap_for_relay`
+/// and consumed by the inbound `EncryptedSignal` arm.
+#[test]
+fn encrypted_signal_envelope_round_trips_and_hides_plaintext() {
+    use crate::crypto::{b64url_decode, b64url_encode, decrypt_blob, encrypt_blob};
+    use crate::identity::Identity;
+    use crate::protocol::{MessageType, SignalingMessage};
+    use base64::Engine;
+    use serde_json::Value;
+
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+
+    // Alice builds + signs an inner ChatMessage targeted at Bob.
+    let mut inner = SignalingMessage::new(MessageType::ChatMessage, alice.public_id());
+    inner.target = Some(bob.public_id());
+    inner
+        .payload
+        .insert("body".into(), Value::String("secret hi".into()));
+    inner
+        .payload
+        .insert("message_id".into(), Value::String("m1".into()));
+    let canonical = inner.canonical_bytes().unwrap();
+    inner.signature =
+        Some(base64::engine::general_purpose::URL_SAFE.encode(alice.sign(&canonical)));
+    let inner_json = inner.to_json().unwrap();
+
+    // Alice wraps it for the relay (same steps as `maybe_wrap_for_relay`).
+    let key_a = alice.derive_pairwise_relay_key(&bob.public_id()).unwrap();
+    let ct = encrypt_blob(&key_a, inner_json.as_bytes()).unwrap();
+    let mut env = SignalingMessage::new(MessageType::EncryptedSignal, alice.public_id());
+    env.target = Some(bob.public_id());
+    env.payload
+        .insert("ciphertext".into(), Value::String(b64url_encode(&ct)));
+    let env_canon = env.canonical_bytes().unwrap();
+    env.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(alice.sign(&env_canon)));
+
+    // The relayed wire form exposes neither the inner type nor its content.
+    assert_eq!(env.msg_type, MessageType::EncryptedSignal);
+    assert!(!env.payload.contains_key("body"));
+    let env_wire = env.to_json().unwrap();
+    assert!(!env_wire.contains("secret hi"));
+    assert!(!env_wire.contains("chat_message"));
+    // The envelope itself is signature-valid + fresh (supernode relays it as-is).
+    assert!(ConnectionManager::verify_inbound_signature_for_test(&env));
+
+    // Bob derives the identical key, decrypts, and recovers the inner message.
+    let key_b = bob.derive_pairwise_relay_key(&alice.public_id()).unwrap();
+    assert_eq!(key_a, key_b);
+    let ct_b = b64url_decode(env.payload.get("ciphertext").unwrap().as_str().unwrap()).unwrap();
+    let recovered = decrypt_blob(&key_b, &ct_b).unwrap();
+    let inner2 = SignalingMessage::from_json(std::str::from_utf8(&recovered).unwrap()).unwrap();
+    assert_eq!(inner2.msg_type, MessageType::ChatMessage);
+    assert_eq!(
+        inner2.payload.get("body").unwrap().as_str().unwrap(),
+        "secret hi"
+    );
+    assert_eq!(inner2.sender, alice.public_id());
+    // Inner signature still verifies after the round-trip (defense in depth).
+    assert!(ConnectionManager::verify_inbound_signature_for_test(
+        &inner2
+    ));
+
+    // A third party who is not the paired peer cannot decrypt.
+    let eve = Identity::generate();
+    let eve_key = eve.derive_pairwise_relay_key(&alice.public_id()).unwrap();
+    assert!(decrypt_blob(&eve_key, &ct_b).is_err());
 }

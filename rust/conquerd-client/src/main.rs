@@ -22,6 +22,7 @@ mod avatar_config;
 mod banner;
 mod call_controller;
 mod chat_store;
+mod cluster;
 mod connection_fallback;
 mod connection_manager;
 mod crypto;
@@ -615,6 +616,7 @@ async fn handle_event(
         | ConnectionEvent::EndpointUpdated { .. }
         | ConnectionEvent::RoomListReceived { .. }
         | ConnectionEvent::RoomCreated { .. }
+        | ConnectionEvent::RoomInviteReady { .. }
         | ConnectionEvent::PresenceUpdated { .. }
         | ConnectionEvent::InviteAccepted { .. }
         | ConnectionEvent::InviteFailed { .. }

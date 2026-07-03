@@ -38,7 +38,13 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: serde_json's default parser is not round-trip-accurate for
+# f64, so a signed message's timestamp could shift by 1 ULP on `from_json`,
+# changing `canonical_bytes()` on the receiver and breaking Ed25519 signature
+# verification (~10% of high-precision timestamps). This makes the parser
+# bit-exact so re-canonicalized signatures always match. The supernode gets the
+# same guarantee via serde_json's `arbitrary_precision`.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # Utilities
 base64 = "0.22"

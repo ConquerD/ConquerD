@@ -857,7 +857,7 @@ fn cleanup_stale_peers(state: &Arc<RwLock<RelayState>>, features: &FeatureRegist
 /// Extract peer_id from client TLS certificate CN.
 /// The client's self-signed cert has CN = hex(ed25519_pub_bytes).
 /// We convert to base64url to match the identity format used in the allowed set.
-fn extract_peer_id(conn: &quinn::Connection) -> anyhow::Result<String> {
+pub(crate) fn extract_peer_id(conn: &quinn::Connection) -> anyhow::Result<String> {
     let identity = conn
         .peer_identity()
         .ok_or_else(|| anyhow::anyhow!("no peer certificate"))?;
@@ -911,7 +911,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Build a quinn server config with a self-signed cert.
 /// Requests client certificates (accepted without CA verification)
 /// so we can extract peer_id from the client cert CN.
-fn build_quinn_server_config(
+pub(crate) fn build_quinn_server_config(
     identity_pub_id: &str,
 ) -> anyhow::Result<(ServerConfig, CertificateDer<'static>)> {
     let mut params = rcgen::CertificateParams::new(vec![])?;
@@ -1000,6 +1000,86 @@ impl ClientCertVerifier for AcceptAllClientCerts {
             rustls::SignatureScheme::RSA_PKCS1_SHA512,
         ]
     }
+}
+
+/// Server-certificate verifier that accepts any self-signed certificate.
+/// Used by the dialing side of an intra-cluster link; the peer is authenticated
+/// by its cert CN (`extract_peer_id`) checked against the cluster roster, and by
+/// requiring Ed25519-signed cluster messages — not by a CA chain.
+#[derive(Debug)]
+pub(crate) struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+}
+
+/// Build a quinn client config that presents a self-signed Ed25519 cert whose
+/// CN is the **hex** encoding of `own_identity_pub_bytes` — the form
+/// [`extract_peer_id`] decodes on the accepting side. Reused by the
+/// intra-cluster link dialer.
+pub(crate) fn build_quinn_client_config(
+    own_identity_pub_bytes: &[u8],
+) -> anyhow::Result<quinn::ClientConfig> {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)?;
+    let cn_hex = hex::encode(own_identity_pub_bytes);
+    let mut params = rcgen::CertificateParams::new(vec![])?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn_hex);
+    let cert = params.self_signed(&key_pair)?;
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_client_auth_cert(vec![cert_der], key_der)?;
+    client_crypto.alpn_protocols = vec![b"conquerd/1".to_vec()];
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(IDLE_TIMEOUT_S).try_into().unwrap(),
+    ));
+    transport.keep_alive_interval(Some(Duration::from_secs(KEEPALIVE_INTERVAL_S)));
+
+    let mut cfg = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
+    ));
+    cfg.transport_config(Arc::new(transport));
+    Ok(cfg)
 }
 
 #[cfg(test)]

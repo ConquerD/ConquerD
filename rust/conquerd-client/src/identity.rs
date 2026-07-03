@@ -122,6 +122,15 @@ impl Identity {
         hkdf_derive_key(&seed, info.as_bytes())
     }
 
+    /// Derive the deterministic pairwise key shared with `peer_identity_pub_b64`
+    /// (a base64url Ed25519 public key), used to encrypt `EncryptedSignal`
+    /// envelopes on the supernode-relay fallback path. See
+    /// [`crate::crypto::derive_pairwise_relay_key`].
+    pub fn derive_pairwise_relay_key(&self, peer_identity_pub_b64: &str) -> Result<[u8; 32]> {
+        let scalar = self.signing.to_scalar_bytes();
+        crate::crypto::derive_pairwise_relay_key(&scalar, &self.public_id(), peer_identity_pub_b64)
+    }
+
     // -- persistence --------------------------------------------------------
 
     /// Default key directory: `~/.conquerd`
