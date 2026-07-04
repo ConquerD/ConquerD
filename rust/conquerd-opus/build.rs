@@ -33,8 +33,9 @@ fn main() {
     // is self-verifying.
     let dnn_enabled = env::var("CARGO_FEATURE_DNN").is_ok();
     if dnn_enabled {
-        let sentinel = opus_src.join("dnn").join("lace_data.c");
-        if !sentinel.exists() {
+        let sentinel_c = opus_src.join("dnn").join("lace_data.c");
+        let sentinel_h = opus_src.join("dnn").join("fargan_data.h");
+        if !sentinel_c.exists() || !sentinel_h.exists() {
             panic!(
                 "\n\
                  DNN model data files not found in `rust/conquerd-opus/opus/dnn/`.\n\
@@ -48,6 +49,7 @@ fn main() {
             );
         }
         println!("cargo:rerun-if-changed=opus/dnn/lace_data.c");
+        println!("cargo:rerun-if-changed=opus/dnn/fargan_data.h");
         println!("cargo:rerun-if-changed=opus/dnn/nolace_data.c");
     }
 

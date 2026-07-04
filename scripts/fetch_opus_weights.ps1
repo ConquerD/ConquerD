@@ -17,6 +17,19 @@ $SCRIPT_DIR = $PSScriptRoot
 $OPUS_SRC = Join-Path $SCRIPT_DIR '..\rust\conquerd-opus\opus'
 $BUNDLED_TAR = Join-Path $SCRIPT_DIR "..\rust\conquerd-opus\assets\opus_data-$DNN_HASH.tar.gz"
 $SENTINEL = Join-Path $OPUS_SRC 'dnn\lace_data.c'
+$TAR_LIST = Join-Path $OPUS_SRC 'tar_list.txt'
+
+function Test-DnnFilesComplete {
+    if (-not (Test-Path $TAR_LIST)) { return $false }
+    foreach ($line in Get-Content $TAR_LIST) {
+        $relpath = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($relpath)) { continue }
+        if (-not (Test-Path (Join-Path $OPUS_SRC ($relpath -replace '/', '\')))) {
+            return $false
+        }
+    }
+    return $true
+}
 
 function Verify-Sha256 ([string]$Path, [string]$Expected) {
     $actual = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLower()
@@ -44,8 +57,8 @@ function Download-WithRetries ([string]$Url, [string]$Dest) {
 
 Write-Host 'conquerd-opus: checking Opus DNN model data files...'
 
-if (Test-Path $SENTINEL) {
-    Write-Host "  Already present ($SENTINEL) - nothing to do."
+if (Test-DnnFilesComplete) {
+    Write-Host '  All DNN data files from tar_list.txt already present - nothing to do.'
     exit 0
 }
 

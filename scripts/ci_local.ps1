@@ -29,7 +29,7 @@
     Skip cargo-audit (requires no network / advisory-db fetch).
 
 .PARAMETER SkipOpusFetch
-    Skip scripts/fetch_opus_weights.ps1 (safe when dnn/ sentinel already exists).
+    Skip scripts/fetch_opus_weights.ps1 (safe when all tar_list.txt dnn files exist).
 #>
 
 [CmdletBinding()]

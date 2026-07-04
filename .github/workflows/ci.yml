@@ -51,17 +51,28 @@ jobs:
         with:
           path: |
             rust/conquerd-opus/opus/dnn/lace_data.c
+            rust/conquerd-opus/opus/dnn/lace_data.h
             rust/conquerd-opus/opus/dnn/nolace_data.c
+            rust/conquerd-opus/opus/dnn/nolace_data.h
             rust/conquerd-opus/opus/dnn/fargan_data.c
+            rust/conquerd-opus/opus/dnn/fargan_data.h
             rust/conquerd-opus/opus/dnn/pitchdnn_data.c
+            rust/conquerd-opus/opus/dnn/pitchdnn_data.h
             rust/conquerd-opus/opus/dnn/plc_data.c
+            rust/conquerd-opus/opus/dnn/plc_data.h
+            rust/conquerd-opus/opus/dnn/dred_rdovae_constants.h
             rust/conquerd-opus/opus/dnn/dred_rdovae_enc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_enc_data.h
             rust/conquerd-opus/opus/dnn/dred_rdovae_dec_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_dec_data.h
             rust/conquerd-opus/opus/dnn/dred_rdovae_stats_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_stats_data.h
             rust/conquerd-opus/opus/dnn/bbwenet_data.c
+            rust/conquerd-opus/opus/dnn/bbwenet_data.h
             rust/conquerd-opus/opus/dnn/lossgen_data.c
+            rust/conquerd-opus/opus/dnn/lossgen_data.h
             rust/conquerd-opus/opus/dnn/models
-          key: opus-dnn-a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e
+          key: opus-dnn-tarlist-a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e
 
       - name: Fetch Opus DNN model weights
         run: bash scripts/fetch_opus_weights.sh
@@ -147,17 +158,28 @@ jobs:
         with:
           path: |
             rust/conquerd-opus/opus/dnn/lace_data.c
+            rust/conquerd-opus/opus/dnn/lace_data.h
             rust/conquerd-opus/opus/dnn/nolace_data.c
+            rust/conquerd-opus/opus/dnn/nolace_data.h
             rust/conquerd-opus/opus/dnn/fargan_data.c
+            rust/conquerd-opus/opus/dnn/fargan_data.h
             rust/conquerd-opus/opus/dnn/pitchdnn_data.c
+            rust/conquerd-opus/opus/dnn/pitchdnn_data.h
             rust/conquerd-opus/opus/dnn/plc_data.c
+            rust/conquerd-opus/opus/dnn/plc_data.h
+            rust/conquerd-opus/opus/dnn/dred_rdovae_constants.h
             rust/conquerd-opus/opus/dnn/dred_rdovae_enc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_enc_data.h
             rust/conquerd-opus/opus/dnn/dred_rdovae_dec_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_dec_data.h
             rust/conquerd-opus/opus/dnn/dred_rdovae_stats_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_stats_data.h
             rust/conquerd-opus/opus/dnn/bbwenet_data.c
+            rust/conquerd-opus/opus/dnn/bbwenet_data.h
             rust/conquerd-opus/opus/dnn/lossgen_data.c
+            rust/conquerd-opus/opus/dnn/lossgen_data.h
             rust/conquerd-opus/opus/dnn/models
-          key: opus-dnn-a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e
+          key: opus-dnn-tarlist-a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e
 
       - name: Fetch Opus DNN model weights
         shell: pwsh

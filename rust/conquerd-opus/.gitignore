@@ -3,15 +3,26 @@
 # They are not tracked by the xiph/opus git repo and must not be committed here.
 # Run scripts/fetch_opus_weights.ps1 / .sh to populate them.
 opus/dnn/lace_data.c
+opus/dnn/lace_data.h
 opus/dnn/nolace_data.c
+opus/dnn/nolace_data.h
 opus/dnn/fargan_data.c
+opus/dnn/fargan_data.h
 opus/dnn/pitchdnn_data.c
+opus/dnn/pitchdnn_data.h
 opus/dnn/plc_data.c
+opus/dnn/plc_data.h
+opus/dnn/dred_rdovae_constants.h
 opus/dnn/dred_rdovae_enc_data.c
+opus/dnn/dred_rdovae_enc_data.h
 opus/dnn/dred_rdovae_dec_data.c
+opus/dnn/dred_rdovae_dec_data.h
 opus/dnn/dred_rdovae_stats_data.c
+opus/dnn/dred_rdovae_stats_data.h
 opus/dnn/bbwenet_data.c
+opus/dnn/bbwenet_data.h
 opus/dnn/lossgen_data.c
+opus/dnn/lossgen_data.h
 opus/dnn/models/
 
 # Git submodule build artifacts

@@ -33,9 +33,22 @@ DOWNLOAD_RETRY_DELAY_SEC="${OPUS_DNN_DOWNLOAD_RETRY_DELAY_SEC:-20}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPUS_SRC="$SCRIPT_DIR/../rust/conquerd-opus/opus"
 BUNDLED_TAR="$SCRIPT_DIR/../rust/conquerd-opus/assets/opus_data-${DNN_HASH}.tar.gz"
+TAR_LIST="$OPUS_SRC/tar_list.txt"
 SENTINEL="$OPUS_SRC/dnn/lace_data.c"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+dnn_files_complete() {
+    [[ -f "$TAR_LIST" ]] || return 1
+    local relpath
+    while IFS= read -r relpath || [[ -n "$relpath" ]]; do
+        relpath="${relpath//$'\r'/}"
+        [[ -z "$relpath" ]] && continue
+        if [[ ! -e "$OPUS_SRC/$relpath" ]]; then
+            return 1
+        fi
+    done < "$TAR_LIST"
+    return 0
+}
 verify_sha256() {
     local file="$1"
     local expected="$2"
@@ -88,8 +101,8 @@ download_tarball() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 echo "conquerd-opus: checking Opus DNN model data files..."
 
-if [[ -f "$SENTINEL" ]]; then
-    echo "  Already present ($SENTINEL) — nothing to do."
+if dnn_files_complete; then
+    echo "  All DNN data files from tar_list.txt already present — nothing to do."
     exit 0
 fi
 
