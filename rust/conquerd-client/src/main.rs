@@ -30,6 +30,7 @@ mod error;
 mod feature_trust;
 mod file_transfer;
 mod github_updater;
+mod group_key;
 mod identity;
 #[cfg(feature = "qt-ui")]
 mod metrics;

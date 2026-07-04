@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::avatar_config::AvatarConfig as PeerAvatarConfig;
 use crate::feature_trust::{FeatureTrustGate, FeatureTrustStore, TrustDecision};
 use crate::file_transfer::{FileTransferManager, TransferEvent};
+use crate::group_key::GroupKeySource;
 use crate::identity::Identity;
 use crate::peer_store::PeerStore;
 use crate::protocol::{MessageType, SignalingMessage};
@@ -346,6 +347,14 @@ pub struct ConnectionManager {
     relay_signaling_tx: mpsc::UnboundedSender<RelaySignalingInbound>,
     /// Receiver side of [`Self::relay_signaling_tx`], polled in the run loop.
     relay_signaling_rx: mpsc::UnboundedReceiver<RelaySignalingInbound>,
+    /// Group keying for E2E-encrypted room audio. Temporary deterministic impl
+    /// until Part A's sender-keys group keying lands (swaps in behind the
+    /// [`GroupKeySource`] trait, no call-site change). See [`crate::group_key`].
+    group_keys: Arc<dyn GroupKeySource>,
+    /// Monotonic per-send sequence for E2E room-audio frames, bound into the
+    /// GCM AAD (`conv_id ‖ sender ‖ sequence`) and carried as the envelope
+    /// `seq` field so the receiver can reconstruct the AAD.
+    room_audio_seq: u64,
 }
 
 impl ConnectionManager {
@@ -429,6 +438,8 @@ impl ConnectionManager {
             relay_signaling_rx,
             room_relay_fail_streak: 0,
             room_relay_cooldown_frames: 0,
+            group_keys: Arc::new(crate::group_key::TmpDeterministicGroupKey),
+            room_audio_seq: 0,
         };
         (cmd_tx, event_rx, mgr.run_inner())
     }
@@ -2072,13 +2083,42 @@ impl ConnectionManager {
         let room_id = self.current_room_id.clone();
         let supernode_id = self.current_supernode_id.clone();
         use base64::Engine;
-        let audio_b64 = base64::engine::general_purpose::URL_SAFE.encode(&opus_data);
+
+        // E2E-seal the Opus frame under the room's group key: the base64 `audio`
+        // field carries `[epoch][nonce][aesgcm(opus)]` instead of plaintext
+        // Opus, with `AAD = room_id ‖ sender ‖ seq`. The relay still forwards
+        // the signed envelope blind. If no group key is available (should not
+        // happen in a joined room), fall back to cleartext so audio is never
+        // silently dropped — the receiver auto-detects the format via `e2e`.
+        let seq = self.room_audio_seq;
+        let (audio_bytes, e2e_seq) = match crate::group_key::seal_voice_frame(
+            self.group_keys.as_ref(),
+            &room_id,
+            &sender,
+            seq,
+            &opus_data,
+        ) {
+            Some(sealed) => {
+                self.room_audio_seq = self.room_audio_seq.wrapping_add(1);
+                (sealed, Some(seq))
+            }
+            None => {
+                warn!("[room.audio.sfu] no group key for room; sending cleartext frame");
+                (opus_data, None)
+            }
+        };
+        let audio_b64 = base64::engine::general_purpose::URL_SAFE.encode(&audio_bytes);
         let mut msg = SignalingMessage::new(MessageType::SfuAudio, sender);
         msg.target = Some(supernode_id.clone());
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id));
         msg.payload
             .insert("audio".to_owned(), Value::String(audio_b64));
+        if let Some(seq) = e2e_seq {
+            msg.payload.insert("e2e".to_owned(), Value::Bool(true));
+            msg.payload
+                .insert("seq".to_owned(), Value::Number(seq.into()));
+        }
 
         // Fast path: relay datagram (no TCP head-of-line blocking), unless we're
         // in a WS cooldown after repeated relay failures (anti-thrash). The Arc
@@ -3100,25 +3140,67 @@ impl ConnectionManager {
                     .get("audio")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if let Ok(opus_data) = base64::engine::general_purpose::URL_SAFE.decode(audio_b64) {
-                    if !opus_data.is_empty() {
-                        if !self.check_inbound_feature_quota(
-                            "room.audio.sfu",
-                            &msg.sender,
-                            opus_data.len(),
-                        ) {
+                let Ok(raw) = base64::engine::general_purpose::URL_SAFE.decode(audio_b64) else {
+                    return;
+                };
+                if raw.is_empty() {
+                    return;
+                }
+                // When the sender marked the frame E2E, `raw` is the sealed
+                // `[epoch][nonce][aesgcm(opus)]`; open it under the room group
+                // key, reconstructing `AAD = room_id ‖ sender ‖ seq` from the
+                // (signature-authenticated) envelope. `e2e`/`seq` absent →
+                // legacy cleartext Opus (interop / pre-E2E peers).
+                let is_e2e = msg
+                    .payload
+                    .get("e2e")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let opus_data = if is_e2e {
+                    let room_id = msg
+                        .payload
+                        .get("room_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let seq = msg
+                        .payload
+                        .get("seq")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(u64::MAX);
+                    match crate::group_key::open_voice_frame(
+                        self.group_keys.as_ref(),
+                        room_id,
+                        &msg.sender,
+                        seq,
+                        &raw,
+                    ) {
+                        Some(opus) => opus,
+                        None => {
                             debug!(
-                                "[room.audio.sfu] inbound quota exceeded for {}; dropping frame",
+                                "[room.audio.sfu] failed to open E2E frame from {}; dropping",
                                 &msg.sender[..8.min(msg.sender.len())]
                             );
                             return;
                         }
-                        let _ = self.event_tx.try_send(ConnectionEvent::SfuAudioReceived {
-                            peer_id: msg.sender.clone(),
-                            opus_data,
-                        });
                     }
+                } else {
+                    raw
+                };
+                if opus_data.is_empty() {
+                    return;
                 }
+                if !self.check_inbound_feature_quota("room.audio.sfu", &msg.sender, opus_data.len())
+                {
+                    debug!(
+                        "[room.audio.sfu] inbound quota exceeded for {}; dropping frame",
+                        &msg.sender[..8.min(msg.sender.len())]
+                    );
+                    return;
+                }
+                let _ = self.event_tx.try_send(ConnectionEvent::SfuAudioReceived {
+                    peer_id: msg.sender.clone(),
+                    opus_data,
+                });
             }
             MessageType::RelayGranted => {
                 let ticket = msg
