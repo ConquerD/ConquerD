@@ -18,10 +18,17 @@ Dialog {
     property string targetSupernodeId: ""
     // "public" or "private" — drives title and the createRoom wire shape.
     property string roomType: "public"
+    // When set, the new room nests under this room in the Space tree (sub-room).
+    property string parentRoomId: ""
+    // Display name of the parent room, shown as a subtitle.
+    property string parentRoomName: ""
 
     readonly property bool supernodePreset: targetSupernodeId !== ""
+    readonly property bool isSubRoom: parentRoomId !== ""
 
-    title: roomType === "private" ? qsTr("Create Private Room") : qsTr("Create Public Room")
+    title: isSubRoom
+        ? qsTr("Create Sub-room")
+        : (roomType === "private" ? qsTr("Create Private Room") : qsTr("Create Public Room"))
     modal: true
     standardButtons: Dialog.Ok | Dialog.Cancel
     closePolicy: Dialog.CloseOnEscape
@@ -33,6 +40,17 @@ Dialog {
     function openForNode(supernodeId, type) {
         targetSupernodeId = supernodeId || ""
         roomType = (type === "private") ? "private" : "public"
+        parentRoomId = ""
+        parentRoomName = ""
+        open()
+    }
+
+    // Open to create a sub-room nested under `parentId` on `supernodeId`.
+    function openForParent(supernodeId, type, parentId, parentName) {
+        targetSupernodeId = supernodeId || ""
+        roomType = (type === "private") ? "private" : "public"
+        parentRoomId = parentId || ""
+        parentRoomName = parentName || ""
         open()
     }
 
@@ -52,7 +70,10 @@ Dialog {
                 ? (nodeListModel.get(supernodeBox.currentIndex).node_id || "")
                 : "")
         if (snId === "") return
-        backend.createRoom(snId, name, roomType)
+        if (isSubRoom)
+            backend.createSubRoom(snId, name, roomType, parentRoomId)
+        else
+            backend.createRoom(snId, name, roomType)
     }
 
     background: Rectangle {
@@ -78,6 +99,15 @@ Dialog {
     contentItem: ColumnLayout {
         id: contentColumn
         spacing: Theme.spacingMd
+
+        Text {
+            visible: root.isSubRoom
+            text: qsTr("Nested under “%1”.").arg(root.parentRoomName || root.parentRoomId)
+            color: Theme.muted
+            font.pixelSize: Theme.fontSizeCaption
+            wrapMode: Text.Wrap
+            Layout.fillWidth: true
+        }
 
         Text {
             visible: roomType === "private"

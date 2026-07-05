@@ -572,6 +572,23 @@ impl SFURoomManager {
             .map(|r| r.generate_invite_token(created_by, 1))
     }
 
+    /// Generate an invite token **only if** `requester` is the room's creator.
+    ///
+    /// This is the owner-only invite policy — the safe default that closes the
+    /// unchecked-minting hole where any authenticated peer could mint a valid
+    /// token for any room. Rooms with no creator (the default/anonymous rooms)
+    /// never mint through this path. A future `invite_policy` field can widen
+    /// this to `members` without changing callers.
+    pub fn generate_invite_token_checked(&mut self, room_id: &str, requester: &str) -> InviteMint {
+        let Some(room) = self.rooms.get_mut(room_id) else {
+            return InviteMint::RoomNotFound;
+        };
+        if room.creator_id.is_empty() || room.creator_id != requester {
+            return InviteMint::NotAuthorized;
+        }
+        InviteMint::Ok(room.generate_invite_token(requester, 1))
+    }
+
     /// Stats snapshot.
     pub(crate) fn stats(&self) -> SFUStats {
         SFUStats {
@@ -589,6 +606,18 @@ impl SFURoomManager {
                 .collect(),
         }
     }
+}
+
+/// Outcome of an owner-checked invite-mint request
+/// ([`SFURoomManager::generate_invite_token_checked`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum InviteMint {
+    /// Minted successfully; carries the token.
+    Ok(String),
+    /// No such room on this node.
+    RoomNotFound,
+    /// The requester is not authorized to mint for this room (owner-only).
+    NotAuthorized,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -620,6 +649,48 @@ mod tests {
         assert!(!mgr.is_chat_sender("r1", "outsider"));
         assert!(mgr.subscribe("listener", "r1"));
         assert!(mgr.is_chat_sender("r1", "listener"));
+    }
+
+    #[test]
+    fn invite_mint_is_owner_only() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("priv"), "Private", RoomType::Private, "owner-pub")
+            .expect("room");
+
+        // The creator mints successfully.
+        match mgr.generate_invite_token_checked("priv", "owner-pub") {
+            InviteMint::Ok(tok) => assert!(!tok.is_empty()),
+            other => panic!("owner should mint, got {other:?}"),
+        }
+
+        // A non-creator is refused (the §6.1 hole).
+        assert_eq!(
+            mgr.generate_invite_token_checked("priv", "someone-else"),
+            InviteMint::NotAuthorized
+        );
+
+        // Unknown room is reported distinctly.
+        assert_eq!(
+            mgr.generate_invite_token_checked("nope", "owner-pub"),
+            InviteMint::RoomNotFound
+        );
+    }
+
+    #[test]
+    fn invite_mint_rejects_creatorless_rooms() {
+        let mut mgr = SFURoomManager::new();
+        // The default room has no creator — nobody may mint for it.
+        assert_eq!(
+            mgr.generate_invite_token_checked(DEFAULT_ROOM_ID, "anyone"),
+            InviteMint::NotAuthorized
+        );
+        // Anonymous room (empty creator) likewise.
+        mgr.create_room(Some("anon"), "Anon", RoomType::Public, "")
+            .expect("room");
+        assert_eq!(
+            mgr.generate_invite_token_checked("anon", "anyone"),
+            InviteMint::NotAuthorized
+        );
     }
 
     #[test]

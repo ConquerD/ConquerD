@@ -47,6 +47,10 @@ const MAX_JITTER_DEPTH: usize = 12;
 const JITTER_GROW_RATIO: f64 = 0.05;
 const JITTER_SHRINK_RATIO: f64 = 0.005;
 const JITTER_SHRINK_STREAK: u32 = 5;
+/// Room ABR: only treat underruns above this window ratio as congestion. Higher
+/// than the jitter shrink threshold so sporadic PLC across several speakers
+/// does not pin the loss EMA in the mid band.
+const ROOM_ABR_UNDERRUN_SIGNAL_PCT: f32 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Audio pipeline
@@ -1358,10 +1362,11 @@ impl CallController {
     /// (to claw back latency), staying within [`MIN_JITTER_DEPTH`]..=
     /// [`MAX_JITTER_DEPTH`]. No-op when adaptation is disabled (user pinned a
     /// depth), audio is idle, or no frames played this window.
+    ///
+    /// Does **not** reset the window counters — the caller does that once, after
+    /// [`Self::adapt_room_bitrate`] has also consumed them.
     fn adapt_jitter_buffer(&mut self) {
         if !self.jitter_adaptive || self.audio.is_none() || self.playout_frames == 0 {
-            self.playout_frames = 0;
-            self.playout_underruns = 0;
             return;
         }
         let (depth, streak) = next_jitter_depth(
@@ -1381,49 +1386,50 @@ impl CallController {
         }
         self.jitter_depth = depth;
         self.jitter_low_streak = streak;
+    }
 
-        // V11: Room/relay calls don't produce per-peer QUIC transport stats,
-        // so `UpdateNetworkQuality` is never sent on that path and the ABR loop
-        // sits idle. Synthesise a loss signal from jitter-buffer underruns:
-        // underruns are a direct symptom of the same network degradation that
-        // would normally drive bitrate reduction.
-        if self.room_mode {
-            // Skip ABR during the warmup window — underruns while the jitter
-            // buffer is still filling are expected and are not congestion.
-            if self.abr_warmup_ticks > 0 {
-                self.abr_warmup_ticks -= 1;
-            } else {
-                let underrun_pct =
-                    self.playout_underruns as f32 * 100.0 / self.playout_frames as f32;
-                if underrun_pct > 0.5 {
-                    // Meaningful underrun signal — blend into the loss EMA.
-                    self.net_loss_ema = self.net_loss_ema * 0.7 + underrun_pct * 0.3;
-                } else {
-                    // Low underruns: recover the EMA toward 0. Factor 0.70 (vs the
-                    // previous 0.85) brings EMA from 10% to below 4% in ~3 clean
-                    // ticks (6 s) instead of ~6 ticks (12 s).
-                    self.net_loss_ema = (self.net_loss_ema * 0.70).max(0.0);
-                }
-                let new_bps = next_bitrate(
-                    self.outgoing_bitrate_bps,
-                    self.bitrate_ceiling_bps,
-                    self.net_loss_ema,
-                );
-                if new_bps != self.outgoing_bitrate_bps {
-                    self.outgoing_bitrate_bps = new_bps;
-                    if let Some(p) = &self.audio {
-                        p.set_outgoing_bitrate(new_bps);
-                    }
-                    debug!(
-                        "Room ABR → {} bps (relay loss proxy EMA {:.1}%)",
-                        new_bps, self.net_loss_ema
-                    );
-                }
-            }
+    /// Adapt the outgoing bitrate for room/relay calls from the jitter-buffer
+    /// underrun proxy, on the 2 s metrics tick alongside
+    /// [`Self::adapt_jitter_buffer`].
+    ///
+    /// V11: Room/relay calls don't produce per-peer QUIC transport stats, so
+    /// `UpdateNetworkQuality` is never sent on that path and the ABR loop would
+    /// otherwise sit idle. Underruns are a direct symptom of the same network
+    /// degradation that would normally drive bitrate reduction.
+    ///
+    /// Deliberately **independent of `jitter_adaptive`**: pinning the jitter
+    /// depth must not freeze the bitrate (and thus block recovery). Gated only
+    /// on room mode, live audio, and a window with playout this tick.
+    fn adapt_room_bitrate(&mut self) {
+        if !self.room_mode || self.audio.is_none() || self.playout_frames == 0 {
+            return;
         }
-
-        self.playout_frames = 0;
-        self.playout_underruns = 0;
+        // Skip ABR during the warmup window — underruns while the jitter buffer
+        // is still filling are expected and are not congestion.
+        if self.abr_warmup_ticks > 0 {
+            self.abr_warmup_ticks -= 1;
+            return;
+        }
+        self.net_loss_ema = update_room_loss_ema(
+            self.net_loss_ema,
+            self.playout_underruns,
+            self.playout_frames,
+        );
+        let new_bps = next_room_bitrate(
+            self.outgoing_bitrate_bps,
+            self.bitrate_ceiling_bps,
+            self.net_loss_ema,
+        );
+        if new_bps != self.outgoing_bitrate_bps {
+            self.outgoing_bitrate_bps = new_bps;
+            if let Some(p) = &self.audio {
+                p.set_outgoing_bitrate(new_bps);
+            }
+            debug!(
+                "Room ABR → {} bps (relay loss proxy EMA {:.1}%)",
+                new_bps, self.net_loss_ema
+            );
+        }
     }
 
     fn handle_start_mic_test(&mut self) {
@@ -1516,9 +1522,15 @@ impl CallController {
                     }
                 }
                 _ = metrics_tick.tick() => {
-                    // Retune the jitter buffer from this window's underruns
-                    // (covers room audio too, which isn't tracked in `peers`).
+                    // Retune the jitter buffer and the room bitrate from this
+                    // window's underruns (covers room audio, which isn't tracked
+                    // in `peers`), then clear the window counters once. Room ABR
+                    // is independent of jitter-depth adaptation so it keeps
+                    // recovering even when the user has pinned the jitter depth.
                     self.adapt_jitter_buffer();
+                    self.adapt_room_bitrate();
+                    self.playout_frames = 0;
+                    self.playout_underruns = 0;
                     // Emit per-peer audio metrics snapshot.
                     if self.state != CallState::Idle && !self.peers.is_empty() {
                         let peers: Vec<serde_json::Value> = self.peers.values().map(|s| {
@@ -1825,6 +1837,41 @@ fn next_bitrate(current: u32, ceiling: u32, loss_pct: f32) -> u32 {
         current
     } else {
         (current as f32 * 1.08) as u32 + 1_000
+    };
+    target.clamp(
+        MIN_OUTGOING_BITRATE_BPS,
+        ceiling.max(MIN_OUTGOING_BITRATE_BPS),
+    )
+}
+
+/// Update the smoothed loss EMA for room/relay calls from jitter-buffer
+/// underruns. A zero-underrun window decays quickly so recovery is not blocked
+/// after a transient spike; only sustained underrun ratios feed congestion.
+fn update_room_loss_ema(current_ema: f32, playout_underruns: u64, playout_frames: u64) -> f32 {
+    if playout_frames == 0 {
+        return current_ema;
+    }
+    if playout_underruns == 0 {
+        return (current_ema * 0.50).max(0.0);
+    }
+    let underrun_pct = playout_underruns as f32 * 100.0 / playout_frames as f32;
+    if underrun_pct > ROOM_ABR_UNDERRUN_SIGNAL_PCT {
+        current_ema * 0.7 + underrun_pct * 0.3
+    } else {
+        (current_ema * 0.65).max(0.0)
+    }
+}
+
+/// Room/relay ABR decision. Like [`next_bitrate`] but recovers slowly in the
+/// 4–10% mid band instead of holding indefinitely — the underrun proxy often
+/// lingers there after the jitter buffer has already absorbed the spike.
+fn next_room_bitrate(current: u32, ceiling: u32, loss_pct: f32) -> u32 {
+    let target = if loss_pct > 10.0 {
+        (current as f32 * 0.8) as u32
+    } else if loss_pct > 4.0 {
+        (current as f32 * 1.04) as u32 + 500
+    } else {
+        (current as f32 * 1.10) as u32 + 1_000
     };
     target.clamp(
         MIN_OUTGOING_BITRATE_BPS,
@@ -2485,15 +2532,15 @@ mod tests {
         let a = [30000i16];
         let out = mix_pcm_frames(&[&a, &a, &a], 1.0);
         assert_eq!(out.len(), 1);
-        assert!(
-            out[0] > 30000 && out[0] <= i16::MAX,
-            "saturates near +full scale, got {}",
-            out[0]
-        );
+        // Summing 3×30000 then saturating must land above a single input (proof
+        // it didn't wrap to a small/negative value) and near +full scale. The
+        // `<= i16::MAX` bound is guaranteed by the output type, so a positive
+        // lower bound is the meaningful check.
+        assert!(out[0] > 30000, "saturates near +full scale, got {}", out[0]);
         let neg = [-30000i16];
         let out_neg = mix_pcm_frames(&[&neg, &neg, &neg], 1.0);
         assert!(
-            out_neg[0] < -30000 && out_neg[0] >= i16::MIN,
+            out_neg[0] < -30000,
             "saturates near -full scale, got {}",
             out_neg[0]
         );
@@ -2610,5 +2657,48 @@ mod tests {
             next_bitrate(MIN_OUTGOING_BITRATE_BPS, 128_000, 50.0),
             MIN_OUTGOING_BITRATE_BPS
         );
+    }
+
+    // ── Room ABR (update_room_loss_ema / next_room_bitrate) ─────────────────
+
+    #[test]
+    fn room_loss_ema_decays_fast_on_zero_underruns() {
+        let ema = update_room_loss_ema(12.0, 0, 400);
+        assert!(
+            ema < 6.5,
+            "zero-underrun window should halve EMA, got {ema}"
+        );
+    }
+
+    #[test]
+    fn room_loss_ema_ignores_sporadic_underruns() {
+        // 2 PLC fills in a 400-frame window = 0.5% — below the 1% signal gate.
+        let ema = update_room_loss_ema(8.0, 2, 400);
+        assert!(
+            ema < 8.0,
+            "sporadic underruns should decay, not hold, got {ema}"
+        );
+    }
+
+    #[test]
+    fn room_loss_ema_rises_on_sustained_underruns() {
+        let ema = update_room_loss_ema(2.0, 20, 400);
+        assert!(ema > 2.0, "5% underrun window should raise EMA, got {ema}");
+    }
+
+    #[test]
+    fn room_bitrate_recovers_in_mid_loss_band() {
+        let out = next_room_bitrate(64_000, 128_000, 6.0);
+        assert!(
+            out > 64_000,
+            "room ABR should ramp in 4-10% band, got {out}"
+        );
+        assert!(out <= 128_000);
+    }
+
+    #[test]
+    fn room_bitrate_still_backs_off_under_heavy_loss() {
+        let out = next_room_bitrate(128_000, 128_000, 15.0);
+        assert_eq!(out, (128_000f32 * 0.8) as u32);
     }
 }

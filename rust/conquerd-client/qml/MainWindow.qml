@@ -130,6 +130,112 @@ ApplicationWindow {
         return isNaN(n) ? 0 : Math.max(0, n)
     }
 
+    // Collapsed room subtrees, keyed `node_id:room_id`. Reassigned (not mutated)
+    // on toggle so the `roomsTree` bindings re-evaluate.
+    property var collapsedRooms: ({})
+
+    function toggleRoomCollapse(nodeId, roomId) {
+        var key = nodeId + ":" + roomId
+        var next = {}
+        for (var k in root.collapsedRooms)
+            if (root.collapsedRooms.hasOwnProperty(k)) next[k] = root.collapsedRooms[k]
+        if (next[key]) delete next[key]
+        else next[key] = true
+        root.collapsedRooms = next
+    }
+
+    // Flatten a node's room list into Space-tree order: DFS pre-order so each
+    // parent is immediately followed by its descendants. Each emitted item gains:
+    //   tree_depth   — nesting depth (0 = top-level)
+    //   has_children — whether it has sub-rooms (shows the expand/collapse toggle)
+    //   collapsed    — whether it is currently collapsed
+    //   guide_cols   — per-column connector codes for the tree lines:
+    //                  0 = blank, 1 = pass-through │, 2 = └ (last child), 3 = ├
+    // A room is top-level when its `parent_id` is "" or points outside the list
+    // (the Server node / a legacy room). Collapsed subtrees are traversed (to
+    // mark them seen) but not emitted. Cycle- and self-parent-guarded.
+    function roomTreeOrder(rooms, nodeId, collapsed) {
+        if (!Array.isArray(rooms)) return []
+        var byId = {}
+        var i
+        for (i = 0; i < rooms.length; i++)
+            if (rooms[i] && rooms[i].room_id) byId[rooms[i].room_id] = rooms[i]
+
+        var childrenOf = {}
+        var roots = []
+        for (i = 0; i < rooms.length; i++) {
+            var r = rooms[i]
+            if (!r || !r.room_id) continue
+            var pid = r.parent_id || ""
+            if (pid !== "" && pid !== r.room_id && byId.hasOwnProperty(pid)) {
+                if (!childrenOf[pid]) childrenOf[pid] = []
+                childrenOf[pid].push(r)
+            } else {
+                roots.push(r)
+            }
+        }
+
+        // Explicit stack (avoids recursion); reverse-push keeps display order.
+        // Each frame carries `isLast` (last among siblings, for └ vs ├),
+        // `passLines` (ancestor vertical-line flags), and `visible` (false under
+        // a collapsed ancestor — still traversed to mark seen, not emitted).
+        var out = []
+        var seen = {}
+        var stack = []
+        var s
+        for (s = roots.length - 1; s >= 0; s--)
+            stack.push({ room: roots[s], depth: 0, isLast: (s === roots.length - 1),
+                         passLines: [], visible: true })
+        var guard = 0
+        while (stack.length > 0 && guard < 8192) {
+            guard++
+            var top = stack.pop()
+            var rr = top.room
+            if (seen[rr.room_id]) continue // guard against duplicate visits
+            seen[rr.room_id] = true
+            var kids = childrenOf[rr.room_id]
+            var hasKids = !!(kids && kids.length)
+            var isCollapsed = hasKids && collapsed
+                && collapsed[nodeId + ":" + rr.room_id] === true
+            if (top.visible) {
+                var cols = []
+                for (var k = 0; k < top.depth - 1; k++)
+                    cols.push(top.passLines[k] ? 1 : 0)
+                if (top.depth > 0) cols.push(top.isLast ? 2 : 3)
+                var item = {}
+                for (var kk in rr) if (rr.hasOwnProperty(kk)) item[kk] = rr[kk]
+                item.tree_depth = top.depth
+                item.has_children = hasKids
+                item.collapsed = isCollapsed
+                item.guide_cols = cols
+                out.push(item)
+            }
+            if (hasKids) {
+                var childVisible = top.visible && !isCollapsed
+                var childPass = top.passLines.concat([!top.isLast])
+                for (var c = kids.length - 1; c >= 0; c--)
+                    stack.push({ room: kids[c], depth: top.depth + 1,
+                                 isLast: (c === kids.length - 1),
+                                 passLines: childPass, visible: childVisible })
+            }
+        }
+        // Safety net: never hide a room. Anything genuinely unreachable (e.g. a
+        // malformed parent cycle) is appended flat at the top level.
+        for (i = 0; i < rooms.length; i++) {
+            if (rooms[i] && rooms[i].room_id && !seen[rooms[i].room_id]) {
+                seen[rooms[i].room_id] = true
+                var orphan = {}
+                for (var ok in rooms[i]) if (rooms[i].hasOwnProperty(ok)) orphan[ok] = rooms[i][ok]
+                orphan.tree_depth = 0
+                orphan.has_children = false
+                orphan.collapsed = false
+                orphan.guide_cols = []
+                out.push(orphan)
+            }
+        }
+        return out
+    }
+
     function roomVoiceCount(room) {
         if (room.voice_count !== undefined && room.voice_count !== null)
             return root.numericRoomCount(room.voice_count)
@@ -237,6 +343,10 @@ ApplicationWindow {
                 continue
             if (j === "count_known" && v === false && existing.count_known === true)
                 continue
+            // Keep a known Space parent when a supernode-sourced update (which
+            // has no tree metadata) would otherwise blank it out.
+            if (j === "parent_id" && v === "" && existing.parent_id)
+                continue
             merged[j] = v
         }
         return merged
@@ -323,7 +433,10 @@ ApplicationWindow {
                 unknown_peers: root.roomUnknownPeerCount(r, voiceCount, knownPeers),
                 count_known: countKnown,
                 creator_id: r.creator_id || "",
-                is_default: r.is_default === true || r.room_id === "default"
+                is_default: r.is_default === true || r.room_id === "default",
+                // Space-tree parent (carried from the local store) for sidebar
+                // indent. Supernode-sourced rooms omit it → "" → top-level.
+                parent_id: r.parent_id || ""
             })
         }
 
@@ -1187,6 +1300,23 @@ ApplicationWindow {
                                 }
                             }
                         }
+                        MenuSeparator {}
+                        MenuItem {
+                            text: qsTr("Create Public Sub-room…")
+                            onTriggered: createRoomDialog.openForParent(
+                                roomContextMenu.targetSupernodeId,
+                                "public",
+                                roomContextMenu.targetRoomId,
+                                roomContextMenu.targetRoomName)
+                        }
+                        MenuItem {
+                            text: qsTr("Create Private Sub-room…")
+                            onTriggered: createRoomDialog.openForParent(
+                                roomContextMenu.targetSupernodeId,
+                                "private",
+                                roomContextMenu.targetRoomId,
+                                roomContextMenu.targetRoomName)
+                        }
                         MenuSeparator {
                             visible: roomContextMenu.targetCanRemove
                         }
@@ -1272,8 +1402,15 @@ ApplicationWindow {
                                 }
                             }
 
+                            // Rooms flattened into Space-tree order (parent →
+                            // children, collapsed subtrees omitted), each with
+                            // tree_depth / has_children / collapsed / guide_cols.
+                            readonly property var roomsTree:
+                                root.roomTreeOrder(roomGroup.rooms, roomGroup.node_id,
+                                                   root.collapsedRooms)
+
                             readonly property real groupHeight:
-                                Math.max(48, roomGroup.rooms.length * 48) + Theme.spacingSm
+                                Math.max(48, roomGroup.roomsTree.length * 48) + Theme.spacingSm
 
                             visible: backend.isKnownSupernode(roomGroup.node_id)
                             width: roomsListView.width
@@ -1358,7 +1495,9 @@ ApplicationWindow {
                                     }
 
                                     Repeater {
-                                        model: roomGroup.rooms
+                                        // Tree-ordered (parent → children) so the
+                                        // list reads top-down as a proper tree.
+                                        model: roomGroup.roomsTree
 
                                         delegate: ItemDelegate {
                                             id: roomDelegate
@@ -1378,6 +1517,18 @@ ApplicationWindow {
                                                     : Math.max(0, roomDelegate.voice_count - roomDelegate.knownPeers.length)
                                             required property string creator_id
                                             required property bool is_default
+                                            // Space-tree metadata from roomTreeOrder.
+                                            required property int tree_depth
+                                            required property bool has_children
+                                            required property bool collapsed
+                                            required property var guide_cols
+
+                                            // Width of one tree-guide column / indent step.
+                                            readonly property int treeStep: Theme.spacingLg
+                                            // Space-tree indent: one step (a "tab")
+                                            // to the right per nesting level.
+                                            readonly property int treeIndent:
+                                                roomDelegate.tree_depth * roomDelegate.treeStep
 
                                             width: roomColumn.width
                                             height: 48
@@ -1450,14 +1601,102 @@ ApplicationWindow {
                                                 }
                                             }
 
+                                            // Tree connector lines, drawn in the
+                                            // indent gutter. One cell per depth
+                                            // column; codes from `guide_cols`:
+                                            // 1 = │ pass-through, 2 = └ (last),
+                                            // 3 = ├ (has following sibling).
+                                            Row {
+                                                id: treeGuides
+                                                anchors.left: parent.left
+                                                anchors.top: parent.top
+                                                anchors.bottom: parent.bottom
+                                                width: roomDelegate.treeIndent
+                                                visible: roomDelegate.tree_depth > 0
+
+                                                Repeater {
+                                                    model: roomDelegate.guide_cols
+                                                    delegate: Item {
+                                                        id: guideCell
+                                                        property int code: modelData
+                                                        width: roomDelegate.treeStep
+                                                        height: treeGuides.height
+
+                                                        // Vertical: full for │/├, top-half for └.
+                                                        Rectangle {
+                                                            width: 1
+                                                            color: Theme.divider
+                                                            x: Math.floor(guideCell.width / 2)
+                                                            y: 0
+                                                            height: (guideCell.code === 1 || guideCell.code === 3)
+                                                                ? guideCell.height
+                                                                : (guideCell.code === 2 ? guideCell.height / 2 : 0)
+                                                            visible: guideCell.code !== 0
+                                                        }
+                                                        // Horizontal elbow into the row for ├ / └.
+                                                        Rectangle {
+                                                            height: 1
+                                                            color: Theme.divider
+                                                            x: Math.floor(guideCell.width / 2)
+                                                            y: Math.floor(guideCell.height / 2)
+                                                            width: (guideCell.code === 2 || guideCell.code === 3)
+                                                                ? guideCell.width / 2
+                                                                : 0
+                                                            visible: guideCell.code === 2 || guideCell.code === 3
+                                                        }
+                                                    }
+                                                }
+                                            }
+
                                             ColumnLayout {
                                                 anchors.verticalCenter: parent.verticalCenter
                                                 anchors.left: parent.left
                                                 anchors.right: parent.right
+                                                anchors.leftMargin: roomDelegate.treeIndent
                                                 spacing: Theme.spacingXs
 
                                                 RowLayout {
                                                     Layout.fillWidth: true
+
+                                                    // Expand/collapse toggle (only
+                                                    // for rooms that have sub-rooms).
+                                                    // An SVG caret rotated in place —
+                                                    // right when collapsed, down when
+                                                    // expanded — so it never depends on
+                                                    // the UI font having a triangle char.
+                                                    Item {
+                                                        Layout.preferredWidth: 14
+                                                        Layout.preferredHeight: 14
+                                                        Layout.alignment: Qt.AlignVCenter
+
+                                                        Image {
+                                                            id: chevron
+                                                            anchors.centerIn: parent
+                                                            width: 10
+                                                            height: 10
+                                                            sourceSize.width: 20
+                                                            sourceSize.height: 20
+                                                            fillMode: Image.PreserveAspectFit
+                                                            smooth: true
+                                                            visible: roomDelegate.has_children
+                                                            source: "qrc:/qt/qml/ConquerD/Client/icons/chevron.svg"
+                                                            // collapsed → points right (0°);
+                                                            // expanded → points down (90°).
+                                                            rotation: roomDelegate.collapsed ? 0 : 90
+                                                            Behavior on rotation {
+                                                                NumberAnimation { duration: Theme.animNormal }
+                                                            }
+                                                        }
+
+                                                        MouseArea {
+                                                            anchors.fill: parent
+                                                            anchors.margins: -3
+                                                            enabled: roomDelegate.has_children
+                                                            cursorShape: Qt.PointingHandCursor
+                                                            onClicked: root.toggleRoomCollapse(
+                                                                roomGroup.node_id, roomDelegate.room_id)
+                                                        }
+                                                    }
 
                                                     Label {
                                                         Layout.fillWidth: true

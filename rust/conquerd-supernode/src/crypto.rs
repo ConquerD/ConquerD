@@ -32,6 +32,34 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(sha256(data))
 }
 
+/// Verify an Ed25519 signature against `data` using the raw 32-byte public key.
+/// Returns `false` on any malformed input. Mirrors the client's `ed25519_verify`
+/// so `space.rs` verifies byte-identically across crates.
+pub fn ed25519_verify(public_key_bytes: &[u8], signature_bytes: &[u8], data: &[u8]) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let Ok(pk_arr): Result<&[u8; 32], _> = public_key_bytes.try_into() else {
+        return false;
+    };
+    let Ok(pk) = VerifyingKey::from_bytes(pk_arr) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; 64], _> = signature_bytes.try_into() else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+    pk.verify(data, &sig).is_ok()
+}
+
+/// Sign `data` with a 32-byte Ed25519 seed, returning the 64-byte signature.
+/// `None` if `seed` is not 32 bytes. Used by `space.rs` tests (owner signing).
+#[allow(dead_code)]
+pub fn ed25519_sign(seed: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    use ed25519_dalek::{Signer, SigningKey};
+    let arr: [u8; 32] = seed.try_into().ok()?;
+    let signing_key = SigningKey::from_bytes(&arr);
+    Some(signing_key.sign(data).to_bytes().to_vec())
+}
+
 /// Derive peer_id from Ed25519 public key bytes (SHA-256 hex).
 pub fn derive_peer_id(pub_key_bytes: &[u8]) -> String {
     sha256_hex(pub_key_bytes)

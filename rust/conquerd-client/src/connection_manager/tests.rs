@@ -71,6 +71,9 @@ fn room_invite_url_round_trips() {
         "private",
         "f4052efe6d931922582f2f4ef4cec47f",
         1_800_000_000,
+        "",
+        "",
+        "",
     );
     assert!(url.starts_with("conquerd://room#"), "url = {url}");
     let encoded = url.strip_prefix("conquerd://room#").unwrap();
@@ -84,8 +87,56 @@ fn room_invite_url_round_trips() {
             room_type: "private".into(),
             invite_token: "f4052efe6d931922582f2f4ef4cec47f".into(),
             expires_at: 1_800_000_000,
+            space_root: String::new(),
+            space_proof: String::new(),
+            space_grant: String::new(),
         }
     );
+}
+
+/// Space proof-based admission fields survive the invite round-trip as nested
+/// JSON objects, so a joiner can forward them to the supernode for verification.
+#[test]
+fn room_invite_carries_space_fields() {
+    let root = r#"{"schema":1,"space_id":"srv0","epoch":3,"root_hash":"ab","node_count":2,"issued_at":9,"signer":"OWNER","signature":"SIG"}"#;
+    let proof = r#"{"schema":1,"node":{"node_id":"r","parent_id":"srv0","kind":"room","name":"R","node_type":"public","owner_pub":"OWNER","invite_policy":"","inherit":false,"key_commit":""},"leaf_index":0,"path":[],"epoch":3}"#;
+    let grant = r#"{"schema":1,"node_id":"r","epoch":3,"grantee_pub":"BEE","expires_at":0,"signature":"GSIG"}"#;
+    let url = build_room_invite_url(
+        "sn",
+        "wss://h:443",
+        "r",
+        "R",
+        "public",
+        "",
+        0,
+        root,
+        proof,
+        grant,
+    );
+    let encoded = url.strip_prefix("conquerd://room#").unwrap();
+    let got = parse_room_invite(encoded).unwrap();
+    // Re-parse the extracted JSON text and compare structurally (key order may
+    // differ after the round-trip, but the fields — and thus signatures — match).
+    let as_val = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+    assert_eq!(as_val(&got.space_root), as_val(root));
+    assert_eq!(as_val(&got.space_proof), as_val(proof));
+    assert_eq!(as_val(&got.space_grant), as_val(grant));
+
+    // An invite without space fields yields empty strings (not "null").
+    let plain = build_room_invite_url(
+        "sn",
+        "wss://h:443",
+        "r",
+        "R",
+        "public",
+        "tok",
+        0,
+        "",
+        "",
+        "",
+    );
+    let plain_got = parse_room_invite(plain.strip_prefix("conquerd://room#").unwrap()).unwrap();
+    assert!(plain_got.space_root.is_empty() && plain_got.space_proof.is_empty());
 }
 
 /// Invites minted before `room_type` existed (and any with it blank) default to
@@ -106,7 +157,18 @@ fn room_invite_defaults_room_type_to_private() {
 /// `parse_room_invite`.
 #[test]
 fn room_invite_wire_fields_are_stable() {
-    let url = build_room_invite_url("sn", "wss://h:443", "r", "n", "private", "tok", 42);
+    let url = build_room_invite_url(
+        "sn",
+        "wss://h:443",
+        "r",
+        "n",
+        "private",
+        "tok",
+        42,
+        "",
+        "",
+        "",
+    );
     let encoded = url.strip_prefix("conquerd://room#").unwrap();
     let json_bytes =
         base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded).unwrap();

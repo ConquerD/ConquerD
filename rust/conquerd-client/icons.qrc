@@ -26,6 +26,7 @@
         <file alias="icons/save.svg">qml/icons/save.svg</file>
         <file alias="icons/play.svg">qml/icons/play.svg</file>
         <file alias="icons/plus.svg">qml/icons/plus.svg</file>
+        <file alias="icons/chevron.svg">qml/icons/chevron.svg</file>
         <file alias="icons/globe.svg">qml/icons/globe.svg</file>
         <file alias="icons/chain.svg">qml/icons/chain.svg</file>
         <file alias="icons/send.svg">qml/icons/send.svg</file>

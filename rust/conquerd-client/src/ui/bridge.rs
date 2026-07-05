@@ -249,6 +249,19 @@ pub mod ffi {
             room_type: &QString,
         );
 
+        /// Create a room nested under `parent_room_id` in the Space tree. Behaves
+        /// like `createRoom` on the wire (the SFU namespace is flat); the parent
+        /// is remembered client-side and applied when the room is adopted.
+        #[qinvokable]
+        #[rust_name = "create_sub_room"]
+        fn createSubRoom(
+            self: Pin<&mut AppBridge>,
+            supernode_id: &QString,
+            room_name: &QString,
+            room_type: &QString,
+            parent_room_id: &QString,
+        );
+
         /// Emitted when the supernode acknowledges a room we created.
         #[qsignal]
         #[rust_name = "room_created"]
@@ -884,6 +897,11 @@ pub struct AppBridgeRust {
     /// Local room hide-list (sidebar removals do not touch the supernode).
     room_store: Option<Arc<RwLock<crate::room_store::RoomStore>>>,
 
+    /// Pending sub-room parents, keyed `supernode_id:room_name`. Set by
+    /// `create_sub_room` and consumed in the `RoomCreated` handler to nest the
+    /// new room under the parent room in the Space tree. Client-side only.
+    pending_sub_room_parent: std::collections::HashMap<String, String>,
+
     /// Currently selected peer (for per-peer chat loading).
     selected_peer_id: String,
 
@@ -969,6 +987,11 @@ fn request_room_invite_url(
     invite_token: String,
 ) -> Option<String> {
     let tx = rust.conn_cmd_tx.as_ref()?;
+    // Attach a Space inclusion proof + current signed root so the invite admits
+    // roster-free by proof (and materializes the room on any cluster member). A
+    // shareable link has no known grantee, so no grant — private rooms still gate
+    // entry on the legacy token, which now validates against the materialized room.
+    let (space_root, space_proof) = build_space_invite_fields(rust, &supernode_id, &room_id);
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     tx.try_send(ConnectionCommand::GenerateRoomInvite {
         supernode_id,
@@ -976,6 +999,9 @@ fn request_room_invite_url(
         room_name,
         room_type,
         invite_token,
+        space_root,
+        space_proof,
+        space_grant: String::new(),
         reply_tx,
     })
     .ok()?;
@@ -983,6 +1009,35 @@ fn request_room_invite_url(
         .recv_timeout(std::time::Duration::from_secs(2))
         .ok()
         .flatten()
+}
+
+/// Build `(space_root_json, space_proof_json)` for a room from the owner's local
+/// Space, or `("","")` if we don't own a Space for it. The root is freshly signed
+/// with the owner identity so it carries the current epoch the proof is built at.
+fn build_space_invite_fields(
+    rust: &AppBridgeRust,
+    supernode_id: &str,
+    room_id: &str,
+) -> (String, String) {
+    let (Some(rs), Some(identity)) = (rust.room_store.as_ref(), rust.identity.as_ref()) else {
+        return (String::new(), String::new());
+    };
+    let space_id = crate::room_store::RoomStore::space_id_for(&rust.my_public_id, supernode_id);
+    let Some(space) = rs.read().get_space(&space_id) else {
+        return (String::new(), String::new());
+    };
+    let Some(proof) = space.prove(room_id) else {
+        return (String::new(), String::new());
+    };
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let root = space.signed_root(issued_at, |b| identity.sign(b));
+    (
+        serde_json::to_string(&root).unwrap_or_default(),
+        serde_json::to_string(&proof).unwrap_or_default(),
+    )
 }
 
 impl Default for AppBridgeRust {
@@ -1014,6 +1069,7 @@ impl Default for AppBridgeRust {
             peer_store: None,
             chat_store: None,
             room_store: None,
+            pending_sub_room_parent: std::collections::HashMap::new(),
             selected_peer_id: String::new(),
             current_supernode_id: String::new(),
             current_room_id: String::new(),
@@ -2434,6 +2490,34 @@ impl ffi::AppBridge {
         room_name: &QString,
         room_type: &QString,
     ) {
+        self.create_room_impl(supernode_id, room_name, room_type, "");
+    }
+
+    fn create_sub_room(
+        self: Pin<&mut Self>,
+        supernode_id: &QString,
+        room_name: &QString,
+        room_type: &QString,
+        parent_room_id: &QString,
+    ) {
+        self.create_room_impl(
+            supernode_id,
+            room_name,
+            room_type,
+            &parent_room_id.to_string(),
+        );
+    }
+
+    /// Shared room-create path. `parent_room_id` (empty for a top-level room) is
+    /// stashed by `supernode_id:room_name` so the `RoomCreated` handler nests the
+    /// new room under that parent in the Space tree.
+    fn create_room_impl(
+        mut self: Pin<&mut Self>,
+        supernode_id: &QString,
+        room_name: &QString,
+        room_type: &QString,
+        parent_room_id: &str,
+    ) {
         let Some(sid) = self
             .rust()
             .resolve_supernode_node_id_str(&supernode_id.to_string())
@@ -2447,6 +2531,12 @@ impl ffi::AppBridge {
         };
         if name.trim().is_empty() {
             return;
+        }
+        if !parent_room_id.is_empty() {
+            self.as_mut()
+                .rust_mut()
+                .pending_sub_room_parent
+                .insert(format!("{sid}:{name}"), parent_room_id.to_owned());
         }
         if let Some(ref tx) = self.rust().conn_cmd_tx {
             let _ = tx.try_send(ConnectionCommand::CreateRoom {
@@ -3558,6 +3648,10 @@ fn local_rooms_json_for_supernode(
                     "room_name": e.room_name,
                     "room_type": e.room_type,
                     "creator_id": e.creator_id,
+                    // Space tree linkage: parent node id (a room id, the Server
+                    // node id, or "" for legacy flat rooms). Drives sidebar indent.
+                    "parent_id": e.parent_id,
+                    "space_id": e.space_id,
                 })
             })
             .collect(),
@@ -3580,17 +3674,50 @@ fn room_has_count(room: &serde_json::Value) -> bool {
         .is_some()
 }
 
+/// Non-empty string value of `obj[key]`, else `None`.
+fn nonempty_str_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 fn merge_room_entry(existing: &mut serde_json::Value, incoming: &serde_json::Value) {
     let old_count = room_count_from_json(existing);
+    // Client-only Space-tree fields the remote SFU list never carries. Snapshot
+    // them from `existing` (the local side) as owned values *before* we overwrite
+    // it, so nested sub-rooms keep their parent linkage — otherwise the sidebar
+    // tree flattens once the room also appears in the supernode's room list.
+    let keep_parent = nonempty_str_field(existing, "parent_id");
+    let keep_space = nonempty_str_field(existing, "space_id");
     let mut merged = incoming.clone();
-    if !room_has_count(incoming) {
-        if let Some(obj) = merged.as_object_mut() {
+    if let Some(obj) = merged.as_object_mut() {
+        if !room_has_count(incoming) {
             obj.insert(
                 "member_count".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(old_count)),
             );
             if let Some(ids) = existing.get("participant_ids") {
                 obj.insert("participant_ids".to_owned(), ids.clone());
+            }
+        }
+        let parent_missing = obj
+            .get("parent_id")
+            .and_then(|v| v.as_str())
+            .is_none_or(str::is_empty);
+        if parent_missing {
+            if let Some(p) = keep_parent {
+                obj.insert("parent_id".to_owned(), serde_json::Value::String(p));
+            }
+        }
+        let space_missing = obj
+            .get("space_id")
+            .and_then(|v| v.as_str())
+            .is_none_or(str::is_empty);
+        if space_missing {
+            if let Some(s) = keep_space {
+                obj.insert("space_id".to_owned(), serde_json::Value::String(s));
             }
         }
     }
@@ -4442,6 +4569,54 @@ fn dispatch_event(
                     true,
                     &invite_token,
                 );
+                // Layer-1 Space tree: adopt the room we just created into our
+                // Space and sign a new epoch root. If this create was launched as
+                // a sub-room (a pending parent was stashed by `create_sub_room`,
+                // keyed by supernode:room_name), nest it under that parent room;
+                // otherwise it nests directly under the Server node. Stamps the
+                // stored entry's space_id/parent_id so the sidebar can indent it.
+                // Best-effort — a signing/persist hiccup must not block creation.
+                let parent_node_id = {
+                    let mut r = bridge.as_mut().rust_mut();
+                    r.pending_sub_room_parent
+                        .remove(&format!("{canon}:{room_name}"))
+                        .unwrap_or_default()
+                };
+                if let (Some(rs), Some(identity)) = (
+                    bridge.rust().room_store.clone(),
+                    bridge.rust().identity.clone(),
+                ) {
+                    let issued_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    match rs.write().adopt_room_into_space(
+                        &my_public_id,
+                        &canon,
+                        &room_id,
+                        &room_name,
+                        &room_type,
+                        &parent_node_id,
+                        issued_at,
+                        |b| identity.sign(b),
+                    ) {
+                        Ok(root) => {
+                            // Announce the new signed root to the host supernode
+                            // (authenticated room-set sync): it verifies, stores
+                            // the highest epoch, and cluster-gossips it so any
+                            // member can later admit joiners by proof.
+                            if let Some(tx) = bridge.rust().conn_cmd_tx.as_ref() {
+                                if let Ok(root_json) = serde_json::to_string(&root) {
+                                    let _ = tx.try_send(ConnectionCommand::AnnounceSpaceRoot {
+                                        supernode_id: canon.clone(),
+                                        root_json,
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => warn!("space adopt_room_into_space error: {e}"),
+                    }
+                }
                 bridge
                     .as_mut()
                     .set_session_banner(QString::from(banner.as_str()));

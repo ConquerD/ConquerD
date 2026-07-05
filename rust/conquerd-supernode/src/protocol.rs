@@ -160,6 +160,10 @@ pub enum MessageType {
     SfuFileComplete,
     #[serde(rename = "sfu_audio")]
     SfuAudio,
+    /// Owner announces a signed Space root; the supernode verifies, stores, and
+    /// cluster-gossips it (authenticated room-set sync).
+    #[serde(rename = "space_root_announce")]
+    SpaceRootAnnounce,
     #[serde(rename = "sfu_room_create")]
     SfuRoomCreate,
     #[serde(rename = "sfu_room_created")]

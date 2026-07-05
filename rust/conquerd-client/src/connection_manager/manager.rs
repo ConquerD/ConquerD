@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::avatar_config::AvatarConfig as PeerAvatarConfig;
 use crate::feature_trust::{FeatureTrustGate, FeatureTrustStore, TrustDecision};
 use crate::file_transfer::{FileTransferManager, TransferEvent};
-use crate::group_key::GroupKeySource;
+use crate::group_key::{GroupKeySource, SenderKeysGroup};
 use crate::identity::Identity;
 use crate::peer_store::PeerStore;
 use crate::protocol::{MessageType, SignalingMessage};
@@ -97,6 +97,12 @@ pub(super) struct RoomInvitePayload {
     pub room_type: String,
     pub invite_token: String,
     pub expires_at: u64,
+    /// Space-tree proof-based admission (SPACE-MERKLE-DESIGN §4.4), each a JSON
+    /// object as text; empty when the inviter didn't include one. Carried to the
+    /// joiner, who forwards them on `SfuJoin` for the supernode to verify.
+    pub space_root: String,
+    pub space_proof: String,
+    pub space_grant: String,
 }
 
 /// A pasted room invite awaiting its host supernode's WebSocket to connect.
@@ -113,6 +119,7 @@ pub(super) struct RoomInviteEntry {
 /// Kept as a free function (separate from the `ConnectionManager` state) so the
 /// wire format can be round-trip tested in isolation. See the golden field test
 /// in `tests.rs`; any field rename here must update that test in lock-step.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_room_invite_url(
     supernode_id: &str,
     supernode_hint: &str,
@@ -121,10 +128,13 @@ pub(super) fn build_room_invite_url(
     room_type: &str,
     invite_token: &str,
     expires_at: u64,
+    space_root: &str,
+    space_proof: &str,
+    space_grant: &str,
 ) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "v": ROOM_INVITE_SCHEMA,
         "supernode_id": supernode_id,
         "supernode_hint": supernode_hint,
@@ -134,6 +144,22 @@ pub(super) fn build_room_invite_url(
         "invite_token": invite_token,
         "expires_at": expires_at,
     });
+    // Embed the Space fields as nested JSON objects (not strings) when present,
+    // so the joiner deserializes them straight into the space types. The owner
+    // signatures are over the struct fields, so a JSON round-trip is safe.
+    if let Some(obj) = payload.as_object_mut() {
+        for (key, text) in [
+            ("space_root", space_root),
+            ("space_proof", space_proof),
+            ("space_grant", space_grant),
+        ] {
+            if !text.is_empty() {
+                if let Ok(v) = serde_json::from_str::<Value>(text) {
+                    obj.insert(key.to_owned(), v);
+                }
+            }
+        }
+    }
     let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
     format!("conquerd://room#{encoded}")
 }
@@ -181,6 +207,14 @@ pub(super) fn parse_room_invite(encoded: &str) -> Result<RoomInvitePayload, Stri
         Some(t) if !t.is_empty() => t.to_owned(),
         _ => "private".to_owned(),
     };
+    // Space fields: extract the nested objects back to JSON text ("" = absent).
+    let get_obj = |k: &str| {
+        payload
+            .get(k)
+            .filter(|v| v.is_object())
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    };
     Ok(RoomInvitePayload {
         supernode_id,
         supernode_hint: get("supernode_hint"),
@@ -192,6 +226,9 @@ pub(super) fn parse_room_invite(encoded: &str) -> Result<RoomInvitePayload, Stri
             .get("expires_at")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        space_root: get_obj("space_root"),
+        space_proof: get_obj("space_proof"),
+        space_grant: get_obj("space_grant"),
     })
 }
 
@@ -347,14 +384,24 @@ pub struct ConnectionManager {
     relay_signaling_tx: mpsc::UnboundedSender<RelaySignalingInbound>,
     /// Receiver side of [`Self::relay_signaling_tx`], polled in the run loop.
     relay_signaling_rx: mpsc::UnboundedReceiver<RelaySignalingInbound>,
-    /// Group keying for E2E-encrypted room audio. Temporary deterministic impl
-    /// until Part A's sender-keys group keying lands (swaps in behind the
-    /// [`GroupKeySource`] trait, no call-site change). See [`crate::group_key`].
-    group_keys: Arc<dyn GroupKeySource>,
+    /// Sender-keys group keying for E2E room audio + room chat. The owner
+    /// generates/rotates epoch keys and seals them to members over `SfuGroupKey`;
+    /// members install received keys. See [`crate::group_key`].
+    group_keys: SenderKeysGroup,
+    /// Rooms we created (`supernode_id:room_id`) — we are the group-key owner for
+    /// these and drive distribution/rotation from membership changes.
+    created_rooms: HashSet<String>,
+    /// Last-seen member set per owned room (`supernode_id:room_id` → member
+    /// public_ids, excluding self), used to diff joins/leaves for rekeying.
+    room_group_members: HashMap<String, HashSet<String>>,
     /// Monotonic per-send sequence for E2E room-audio frames, bound into the
     /// GCM AAD (`conv_id ‖ sender ‖ sequence`) and carried as the envelope
     /// `seq` field so the receiver can reconstruct the AAD.
     room_audio_seq: u64,
+    /// Space proof-based admission creds carried by a pasted room invite, keyed
+    /// by `room_id`, attached to the next `SfuJoin` for that room. JSON text
+    /// `(space_root, space_proof, space_grant)`; `""` for any absent field.
+    pending_join_space_creds: HashMap<String, (String, String, String)>,
 }
 
 impl ConnectionManager {
@@ -438,8 +485,11 @@ impl ConnectionManager {
             relay_signaling_rx,
             room_relay_fail_streak: 0,
             room_relay_cooldown_frames: 0,
-            group_keys: Arc::new(crate::group_key::TmpDeterministicGroupKey),
+            group_keys: SenderKeysGroup::new(),
+            created_rooms: HashSet::new(),
+            room_group_members: HashMap::new(),
             room_audio_seq: 0,
+            pending_join_space_creds: HashMap::new(),
         };
         (cmd_tx, event_rx, mgr.run_inner())
     }
@@ -620,6 +670,9 @@ impl ConnectionManager {
                         ConnectionCommand::SendRoomAudio { opus_data } => {
                             self.send_room_audio(opus_data).await;
                         }
+                        ConnectionCommand::AnnounceSpaceRoot { supernode_id, root_json } => {
+                            self.send_space_root_announce(&supernode_id, &root_json).await;
+                        }
                         ConnectionCommand::SendTyping { peer_id, is_typing } => {
                             self.send_typing(&peer_id, is_typing).await;
                         }
@@ -708,6 +761,9 @@ impl ConnectionManager {
                             room_name,
                             room_type,
                             invite_token,
+                            space_root,
+                            space_proof,
+                            space_grant,
                             reply_tx,
                         } => {
                             let _ = reply_tx.send(self.generate_room_invite_url(
@@ -716,6 +772,9 @@ impl ConnectionManager {
                                 &room_name,
                                 &room_type,
                                 &invite_token,
+                                &space_root,
+                                &space_proof,
+                                &space_grant,
                             ));
                         }
                         ConnectionCommand::SendFile { peer_id, rel_path, data, purpose } => {
@@ -1364,6 +1423,110 @@ impl ConnectionManager {
         env.to_json().ok()
     }
 
+    // -- E2E room group-key distribution (owner side) -----------------------
+
+    /// Seal `inner` into an `EncryptedSignal` envelope addressed to `member_pub`
+    /// (a room member's public_id, which *is* their Ed25519 identity key), using
+    /// the deterministic pairwise key. Unlike [`Self::maybe_wrap_for_relay`] this
+    /// does not consult the peer store, so it works for room members we have no
+    /// prior relationship with. The supernode routes the envelope by `target` and
+    /// never sees the sealed group key. Returns the signed envelope to dispatch.
+    fn seal_signal_to_member(
+        &self,
+        inner: &SignalingMessage,
+        member_pub: &str,
+    ) -> Option<SignalingMessage> {
+        let inner_json = inner.to_json().ok()?;
+        let key = self.identity.derive_pairwise_relay_key(member_pub).ok()?;
+        let ciphertext = crate::crypto::encrypt_blob(&key, inner_json.as_bytes()).ok()?;
+        let ciphertext_b64 = crate::crypto::b64url_encode(&ciphertext);
+        let mut env =
+            SignalingMessage::new(MessageType::EncryptedSignal, self.identity.public_id());
+        env.target = Some(member_pub.to_owned());
+        env.payload
+            .insert("ciphertext".to_owned(), Value::String(ciphertext_b64));
+        Some(env)
+    }
+
+    /// Owner: seal the group key for `(room_id, epoch)` to each member and send
+    /// it (inside an `EncryptedSignal` envelope) so the supernode forwards it
+    /// blind. `members` must already exclude ourselves.
+    async fn distribute_group_key(
+        &mut self,
+        room_id: &str,
+        epoch: u8,
+        key: &[u8; 32],
+        members: &[String],
+    ) {
+        let sender = self.identity.public_id();
+        let key_b64 = crate::crypto::b64url_encode(key);
+        for member in members {
+            let mut inner = SignalingMessage::new(MessageType::SfuGroupKey, sender.clone());
+            inner
+                .payload
+                .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
+            inner
+                .payload
+                .insert("epoch".to_owned(), Value::Number((epoch as u64).into()));
+            inner
+                .payload
+                .insert("key".to_owned(), Value::String(key_b64.clone()));
+            if let Some(env) = self.seal_signal_to_member(&inner, member) {
+                self.dispatch_outbound(env).await;
+            } else {
+                warn!(
+                    "[group-key] could not seal group key to {}",
+                    &member[..8.min(member.len())]
+                );
+            }
+        }
+    }
+
+    /// Owner: reconcile the group key against the current room membership.
+    /// Generates the first epoch, rotates on any departure (forward secrecy /
+    /// PCS), or seals the current epoch to newly-added members. No-op unless we
+    /// own `room_id`. `members` is the authoritative set from the supernode.
+    async fn owner_sync_group_key(
+        &mut self,
+        supernode_id: &str,
+        room_id: &str,
+        members: &[String],
+    ) {
+        let room_key = format!("{supernode_id}:{room_id}");
+        if !self.created_rooms.contains(&room_key) {
+            return;
+        }
+        let me = self.identity.public_id();
+        let new: HashSet<String> = members.iter().filter(|m| **m != me).cloned().collect();
+        let old = self
+            .room_group_members
+            .get(&room_key)
+            .cloned()
+            .unwrap_or_default();
+        let removed = old.difference(&new).count() > 0;
+        let added: Vec<String> = new.difference(&old).cloned().collect();
+
+        if !self.group_keys.has_key(room_id) {
+            // First keying: generate epoch 0 and seal to everyone present.
+            let (epoch, key) = self.group_keys.new_owner_epoch(room_id);
+            let all: Vec<String> = new.iter().cloned().collect();
+            self.distribute_group_key(room_id, epoch, &key, &all).await;
+        } else if removed {
+            // A member left → rotate for forward secrecy and reseal to the rest.
+            let (epoch, key) = self.group_keys.rotate(room_id);
+            let all: Vec<String> = new.iter().cloned().collect();
+            self.distribute_group_key(room_id, epoch, &key, &all).await;
+        } else if !added.is_empty() {
+            // Pure join(s) → seal the current epoch to the newcomers only.
+            let epoch = self.group_keys.current_epoch(room_id);
+            if let Some(key) = self.group_keys.epoch_key(room_id, epoch) {
+                self.distribute_group_key(room_id, epoch, &key, &added)
+                    .await;
+            }
+        }
+        self.room_group_members.insert(room_key, new);
+    }
+
     // -- QUIC direct connect ------------------------------------------------
 
     async fn connect_direct_quic(&mut self, peer_id: &str, host: &str, port: u16) {
@@ -1872,6 +2035,36 @@ impl ConnectionManager {
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
         msg.payload
             .insert("peer_id".to_owned(), Value::String(sender));
+        // Attach Space proof-based admission creds carried by the invite we used
+        // to reach this room (single-use), so the supernode can admit + materialize
+        // it by proof on any cluster member. Absent → legacy ACL applies.
+        if let Some((root, proof, grant)) = self.pending_join_space_creds.remove(room_id) {
+            for (key, text) in [
+                ("space_root", root),
+                ("space_proof", proof),
+                ("space_grant", grant),
+            ] {
+                if !text.is_empty() {
+                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        msg.payload.insert(key.to_owned(), v);
+                    }
+                }
+            }
+        }
+        self.dispatch_outbound(msg).await;
+    }
+
+    /// Announce a signed Space root to `supernode_id` (authenticated room-set
+    /// sync). `root_json` is a serialized `SignedSpaceRoot`; the supernode
+    /// verifies + stores + cluster-gossips it.
+    async fn send_space_root_announce(&mut self, supernode_id: &str, root_json: &str) {
+        let Ok(root) = serde_json::from_str::<Value>(root_json) else {
+            return;
+        };
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::SpaceRootAnnounce, sender);
+        msg.target = Some(supernode_id.to_owned());
+        msg.payload.insert("root".to_owned(), root);
         self.dispatch_outbound(msg).await;
     }
 
@@ -2086,39 +2279,33 @@ impl ConnectionManager {
 
         // E2E-seal the Opus frame under the room's group key: the base64 `audio`
         // field carries `[epoch][nonce][aesgcm(opus)]` instead of plaintext
-        // Opus, with `AAD = room_id ‖ sender ‖ seq`. The relay still forwards
-        // the signed envelope blind. If no group key is available (should not
-        // happen in a joined room), fall back to cleartext so audio is never
-        // silently dropped — the receiver auto-detects the format via `e2e`.
+        // Opus, with `AAD = room_id ‖ sender ‖ seq`. The relay forwards the
+        // signed envelope blind. With real sender keys, no key means we haven't
+        // been keyed into the room yet (or are mid-rekey) — drop the frame
+        // rather than leak plaintext; a 20 ms gap is inaudible and keying is
+        // near-instant at join.
         let seq = self.room_audio_seq;
-        let (audio_bytes, e2e_seq) = match crate::group_key::seal_voice_frame(
-            self.group_keys.as_ref(),
+        let Some(sealed) = crate::group_key::seal_voice_frame(
+            &self.group_keys,
             &room_id,
             &sender,
             seq,
             &opus_data,
-        ) {
-            Some(sealed) => {
-                self.room_audio_seq = self.room_audio_seq.wrapping_add(1);
-                (sealed, Some(seq))
-            }
-            None => {
-                warn!("[room.audio.sfu] no group key for room; sending cleartext frame");
-                (opus_data, None)
-            }
+        ) else {
+            debug!("[room.audio.sfu] no group key for room yet; dropping frame");
+            return;
         };
-        let audio_b64 = base64::engine::general_purpose::URL_SAFE.encode(&audio_bytes);
+        self.room_audio_seq = self.room_audio_seq.wrapping_add(1);
+        let audio_b64 = base64::engine::general_purpose::URL_SAFE.encode(&sealed);
         let mut msg = SignalingMessage::new(MessageType::SfuAudio, sender);
         msg.target = Some(supernode_id.clone());
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id));
         msg.payload
             .insert("audio".to_owned(), Value::String(audio_b64));
-        if let Some(seq) = e2e_seq {
-            msg.payload.insert("e2e".to_owned(), Value::Bool(true));
-            msg.payload
-                .insert("seq".to_owned(), Value::Number(seq.into()));
-        }
+        msg.payload.insert("e2e".to_owned(), Value::Bool(true));
+        msg.payload
+            .insert("seq".to_owned(), Value::Number(seq.into()));
 
         // Fast path: relay datagram (no TCP head-of-line blocking), unless we're
         // in a WS cooldown after repeated relay failures (anti-thrash). The Arc
@@ -2209,12 +2396,36 @@ impl ConnectionManager {
         message_id: &str,
     ) {
         let sender = self.identity.public_id();
-        let mut msg = SignalingMessage::new(MessageType::SfuChat, sender);
+        let mut msg = SignalingMessage::new(MessageType::SfuChat, sender.clone());
         msg.target = Some(supernode_id.to_owned());
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
-        msg.payload
-            .insert("body".to_owned(), Value::String(body.to_owned()));
+        // E2E-seal the body under the room group key (`AAD = room_id ‖ sender ‖
+        // message_id`), carrying `nonce ‖ aesgcm(body)` in `body` plus `e2e`/
+        // `epoch`. If we have no key yet (race right after join), fall back to
+        // cleartext so the message isn't lost — the receiver auto-detects.
+        match crate::group_key::seal_chat_body(
+            &self.group_keys,
+            room_id,
+            &sender,
+            message_id,
+            body.as_bytes(),
+        ) {
+            Some((epoch, sealed)) => {
+                msg.payload.insert(
+                    "body".to_owned(),
+                    Value::String(crate::crypto::b64url_encode(&sealed)),
+                );
+                msg.payload.insert("e2e".to_owned(), Value::Bool(true));
+                msg.payload
+                    .insert("epoch".to_owned(), Value::Number((epoch as u64).into()));
+            }
+            None => {
+                warn!("[room.chat] no group key for room yet; sending cleartext body");
+                msg.payload
+                    .insert("body".to_owned(), Value::String(body.to_owned()));
+            }
+        }
         msg.payload.insert(
             "sender_handle".to_owned(),
             Value::String(sender_handle.to_owned()),
@@ -3004,6 +3215,41 @@ impl ConnectionManager {
                     }
                 }
             }
+            MessageType::SfuGroupKey => {
+                // A room group key sealed to us by the room owner. This arm only
+                // runs after the outer `EncryptedSignal` was decrypted with our
+                // pairwise key (see the `EncryptedSignal` handler), so the key
+                // material never reached the supernode in the clear. We install
+                // it keyed by `(room_id, epoch)`; a wrong/hostile key only breaks
+                // our own decrypt (a DoS a room peer could already cause), not
+                // confidentiality. Owner authenticity hardens with Space grants.
+                let room_id = msg
+                    .payload
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let epoch = msg.payload.get("epoch").and_then(Value::as_u64);
+                let key_b64 = msg.payload.get("key").and_then(Value::as_str);
+                if let (false, Some(epoch), Some(key_b64)) = (room_id.is_empty(), epoch, key_b64) {
+                    match crate::crypto::b64url_decode(key_b64) {
+                        Ok(bytes) if bytes.len() == 32 => {
+                            let mut key = [0u8; 32];
+                            key.copy_from_slice(&bytes);
+                            self.group_keys.install(room_id, epoch as u8, key);
+                            debug!(
+                                "[group-key] installed epoch {} for room {} from {}",
+                                epoch,
+                                &room_id[..8.min(room_id.len())],
+                                &msg.sender[..8.min(msg.sender.len())]
+                            );
+                        }
+                        _ => warn!(
+                            "[group-key] malformed key from {}",
+                            &msg.sender[..8.min(msg.sender.len())]
+                        ),
+                    }
+                }
+            }
             MessageType::SfuMembers => {
                 let room_id = msg
                     .payload
@@ -3021,6 +3267,10 @@ impl ConnectionManager {
                             .collect()
                     })
                     .unwrap_or_default();
+                // Owner: reconcile the room group key against this authoritative
+                // member set (first keying / rotate-on-leave / seal-to-newcomer).
+                self.owner_sync_group_key(&msg.sender, &room_id, &members)
+                    .await;
                 let _ = self.event_tx.try_send(ConnectionEvent::RoomMembersChanged {
                     supernode_id: msg.sender.clone(),
                     room_id,
@@ -3040,6 +3290,19 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or(&msg.sender)
                     .to_owned();
+                // Owner: seal the current epoch key to the newcomer.
+                let room_key = format!("{}:{}", msg.sender, room_id);
+                if self.created_rooms.contains(&room_key) {
+                    let mut set = self
+                        .room_group_members
+                        .get(&room_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    set.insert(peer_id.clone());
+                    let members: Vec<String> = set.into_iter().collect();
+                    self.owner_sync_group_key(&msg.sender, &room_id, &members)
+                        .await;
+                }
                 let _ = self.event_tx.try_send(ConnectionEvent::RoomPeerJoined {
                     supernode_id: msg.sender.clone(),
                     room_id,
@@ -3059,6 +3322,20 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or(&msg.sender)
                     .to_owned();
+                // Owner: a departure → rotate the epoch key and reseal to those
+                // who remain (forward secrecy + post-compromise security).
+                let room_key = format!("{}:{}", msg.sender, room_id);
+                if self.created_rooms.contains(&room_key) {
+                    let mut set = self
+                        .room_group_members
+                        .get(&room_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    set.remove(&peer_id);
+                    let members: Vec<String> = set.into_iter().collect();
+                    self.owner_sync_group_key(&msg.sender, &room_id, &members)
+                        .await;
+                }
                 let _ = self.event_tx.try_send(ConnectionEvent::RoomPeerLeft {
                     supernode_id: msg.sender.clone(),
                     room_id,
@@ -3072,7 +3349,7 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or("default")
                     .to_owned();
-                let body = msg
+                let raw_body = msg
                     .payload
                     .get("body")
                     .and_then(Value::as_str)
@@ -3090,6 +3367,48 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                // E2E: when `e2e`, `body` is `b64(nonce ‖ aesgcm(body))` sealed
+                // under the room group key with `AAD = room_id ‖ sender ‖
+                // message_id`. Decrypt before surfacing; drop on failure. Absent
+                // `e2e` → legacy cleartext (interop).
+                let is_e2e = msg
+                    .payload
+                    .get("e2e")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let body = if is_e2e {
+                    let epoch = msg
+                        .payload
+                        .get("epoch")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(u64::MAX);
+                    let sealed = match crate::crypto::b64url_decode(&raw_body) {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    };
+                    let plaintext = epoch.try_into().ok().and_then(|e: u8| {
+                        crate::group_key::open_chat_body(
+                            &self.group_keys,
+                            &room_id,
+                            &msg.sender,
+                            &message_id,
+                            e,
+                            &sealed,
+                        )
+                    });
+                    match plaintext.and_then(|p| String::from_utf8(p).ok()) {
+                        Some(s) => s,
+                        None => {
+                            debug!(
+                                "[room.chat.v1] failed to open E2E body from {}; dropping",
+                                &msg.sender[..8.min(msg.sender.len())]
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    raw_body
+                };
                 if !body.is_empty() {
                     // Enforce the room.chat.v1 per-sender inbound quota,
                     // symmetric with the outbound gate in dispatch_outbound
@@ -3168,7 +3487,7 @@ impl ConnectionManager {
                         .and_then(Value::as_u64)
                         .unwrap_or(u64::MAX);
                     match crate::group_key::open_voice_frame(
-                        self.group_keys.as_ref(),
+                        &self.group_keys,
                         room_id,
                         &msg.sender,
                         seq,
@@ -3498,6 +3817,12 @@ impl ConnectionManager {
                 } else {
                     self.current_supernode_id = supernode_id.clone();
                     self.current_room_id = room_id.clone();
+                    // We created this room → we own its group key. Start a fresh
+                    // epoch; it is sealed to members as they appear (SfuMembers).
+                    let room_key = format!("{supernode_id}:{room_id}");
+                    self.created_rooms.insert(room_key.clone());
+                    self.room_group_members.remove(&room_key);
+                    self.group_keys.forget(&room_id);
                     self.send_room_join(&supernode_id, &room_id).await;
                     // Join ack (SfuMembers) + supernode broadcast_room_list carry
                     // authoritative counts; an immediate list request can race and
@@ -4055,6 +4380,7 @@ impl ConnectionManager {
     /// Build a self-contained room invite URL for a room hosted on
     /// `supernode_id`. Returns `None` if we don't know a signaling address for
     /// that supernode (so we can fall back to sharing the bare token).
+    #[allow(clippy::too_many_arguments)]
     fn generate_room_invite_url(
         &self,
         supernode_id: &str,
@@ -4062,6 +4388,9 @@ impl ConnectionManager {
         room_name: &str,
         room_type: &str,
         invite_token: &str,
+        space_root: &str,
+        space_proof: &str,
+        space_grant: &str,
     ) -> Option<String> {
         if supernode_id.is_empty() || room_id.is_empty() {
             return None;
@@ -4092,6 +4421,9 @@ impl ConnectionManager {
             room_type,
             invite_token,
             expires_at,
+            space_root,
+            space_proof,
+            space_grant,
         ))
     }
 
@@ -4189,8 +4521,19 @@ impl ConnectionManager {
             room_name,
             room_type,
             invite_token,
+            space_root,
+            space_proof,
+            space_grant,
             ..
         } = payload;
+
+        // Stash any Space proof-based admission creds from the invite; they are
+        // attached (single-use) to the SfuJoin for this room so the supernode can
+        // admit + materialize it by proof on any cluster member.
+        if !space_proof.is_empty() {
+            self.pending_join_space_creds
+                .insert(room_id.clone(), (space_root, space_proof, space_grant));
+        }
 
         info!(
             "Accepting room invite for room {} on supernode {}",

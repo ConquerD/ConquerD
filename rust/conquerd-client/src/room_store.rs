@@ -43,6 +43,15 @@ pub struct RoomEntry {
     pub invite_token: String,
     #[serde(default)]
     pub is_creator: bool,
+    /// Space tree fields (Layer 1). `""` = legacy flat room (no Space).
+    #[serde(default)]
+    pub space_id: String,
+    /// Parent node id in the Space; `""` = top-level / legacy.
+    #[serde(default)]
+    pub parent_id: String,
+    /// Owner-controlled invite policy: `""` (inherit) | `"owner"` | `"members"`.
+    #[serde(default)]
+    pub invite_policy: String,
 }
 
 fn default_room_type() -> String {
@@ -59,6 +68,9 @@ impl RoomEntry {
             creator_id: String::new(),
             invite_token: String::new(),
             is_creator: false,
+            space_id: String::new(),
+            parent_id: String::new(),
+            invite_policy: String::new(),
         }
     }
 
@@ -95,6 +107,10 @@ struct StoreData {
     rooms: Vec<RoomEntry>,
     #[serde(default)]
     deleted_ids: Vec<String>,
+    /// Owner-held Space trees (Layer 1), keyed on disk by insertion order.
+    /// Additive `#[serde(default)]` field — no schema bump per the file's rule.
+    #[serde(default)]
+    spaces: Vec<crate::space::Space>,
 }
 
 fn default_schema() -> u32 {
@@ -114,6 +130,8 @@ pub struct RoomStore {
     key: [u8; 32],
     rooms: HashMap<String, RoomEntry>,
     deleted_ids: HashSet<String>,
+    /// Owner-held Space trees keyed by `space_id`.
+    spaces: HashMap<String, crate::space::Space>,
 }
 
 impl RoomStore {
@@ -135,6 +153,7 @@ impl RoomStore {
             key,
             rooms: HashMap::new(),
             deleted_ids: HashSet::new(),
+            spaces: HashMap::new(),
         };
         store.load()?;
         Ok(store)
@@ -169,6 +188,9 @@ impl RoomStore {
         for id in data.deleted_ids {
             self.deleted_ids.insert(id);
         }
+        for space in data.spaces {
+            self.spaces.insert(space.space_id.clone(), space);
+        }
         Ok(())
     }
 
@@ -185,6 +207,11 @@ impl RoomStore {
                 v
             },
             deleted_ids: self.deleted_ids.iter().cloned().collect(),
+            spaces: {
+                let mut v: Vec<crate::space::Space> = self.spaces.values().cloned().collect();
+                v.sort_by(|a, b| a.space_id.cmp(&b.space_id));
+                v
+            },
         };
         let plaintext = serde_json::to_vec(&data)
             .map_err(|e| crate::error::ClientError::Store(e.to_string()))?;
@@ -194,6 +221,87 @@ impl RoomStore {
         }
         std::fs::write(&self.file_path, &envelope).map_err(crate::error::ClientError::Io)?;
         Ok(())
+    }
+
+    // -- Space tree (Layer 1) ----------------------------------------------
+
+    /// The `space_id` (Server node id) for a Space owned by `owner_pub` on
+    /// `supernode_id`. Deterministic, so a room can be adopted before its Space
+    /// exists in the store.
+    pub fn space_id_for(owner_pub: &str, supernode_id: &str) -> String {
+        crate::space::derive_node_id("", owner_pub, supernode_id)
+    }
+
+    /// A snapshot of an owned Space by id, if present.
+    pub fn get_space(&self, space_id: &str) -> Option<crate::space::Space> {
+        self.spaces.get(space_id).cloned()
+    }
+
+    /// All owned Spaces (sorted by id), for building invite proofs / roots.
+    pub fn all_spaces(&self) -> Vec<crate::space::Space> {
+        let mut v: Vec<crate::space::Space> = self.spaces.values().cloned().collect();
+        v.sort_by(|a, b| a.space_id.cmp(&b.space_id));
+        v
+    }
+
+    /// Adopt `room_id` as a Room node in the owner's Space for `supernode_id`,
+    /// creating the Space (Server root) on first use. The room leaf's `node_id`
+    /// is the existing `room_id` (design §3.3) so live room state and sidebar
+    /// keys don't churn.
+    ///
+    /// `parent_node_id` selects where the room nests: `""` → directly under the
+    /// Server node (a top-level room); otherwise the given node id (a nested
+    /// sub-room under another room). Bumps the epoch, re-signs the root with
+    /// `sign` (e.g. `|b| identity.sign(b)`), persists, stamps the stored
+    /// `RoomEntry`, and returns the new signed root.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt_room_into_space(
+        &mut self,
+        owner_pub: &str,
+        supernode_id: &str,
+        room_id: &str,
+        room_name: &str,
+        room_type: &str,
+        parent_node_id: &str,
+        issued_at: u64,
+        sign: impl Fn(&[u8]) -> Vec<u8>,
+    ) -> Result<crate::space::SignedSpaceRoot> {
+        let space_id = Self::space_id_for(owner_pub, supernode_id);
+        // Empty / self-referential parent → nest directly under the Server node.
+        let parent_id = if parent_node_id.is_empty() || parent_node_id == room_id {
+            space_id.clone()
+        } else {
+            parent_node_id.to_owned()
+        };
+        let space = self
+            .spaces
+            .entry(space_id.clone())
+            .or_insert_with(|| crate::space::Space::new_server(owner_pub, supernode_id));
+        let node_type = if room_type.eq_ignore_ascii_case("private") {
+            "private"
+        } else {
+            "public"
+        };
+        space.upsert_node(crate::space::SpaceNode {
+            node_id: room_id.to_owned(),
+            parent_id: parent_id.clone(),
+            kind: "room".to_owned(),
+            name: room_name.to_owned(),
+            node_type: node_type.to_owned(),
+            owner_pub: owner_pub.to_owned(),
+            invite_policy: String::new(),
+            inherit: false,
+            key_commit: String::new(),
+        });
+        let root = space.signed_root(issued_at, sign);
+        // Stamp the stored RoomEntry (if it exists) so the sidebar can render
+        // the nesting: `space_id` = the tree, `parent_id` = Server or parent room.
+        if let Some(entry) = self.rooms.get_mut(&Self::entry_key(supernode_id, room_id)) {
+            entry.space_id = space_id.clone();
+            entry.parent_id = parent_id;
+        }
+        self.save()?;
+        Ok(root)
     }
 
     // -- CRUD ---------------------------------------------------------------
@@ -244,6 +352,19 @@ impl RoomStore {
             }
             if m.invite_token.is_empty() {
                 m.invite_token = existing.invite_token.clone();
+            }
+            // Preserve client-only Space-tree fields: the supernode room list
+            // (synced via `sync_saved_rooms_from_list`) carries none of these, so
+            // without this a sub-room's parent linkage would be wiped on the next
+            // room-list update and the sidebar tree would flatten.
+            if m.space_id.is_empty() {
+                m.space_id = existing.space_id.clone();
+            }
+            if m.parent_id.is_empty() {
+                m.parent_id = existing.parent_id.clone();
+            }
+            if m.invite_policy.is_empty() {
+                m.invite_policy = existing.invite_policy.clone();
             }
             m.is_creator = m.is_creator || existing.is_creator;
             m
@@ -542,6 +663,33 @@ mod tests {
     }
 
     #[test]
+    fn upsert_preserves_space_tree_fields() {
+        // A sub-room whose parent linkage lives only in the local store must not
+        // be wiped when the supernode room list re-syncs a parent-less entry.
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+
+        let mut nested = RoomEntry::new("child", "Closet").with_supernode("sn-a");
+        nested.space_id = "space-1".to_owned();
+        nested.parent_id = "parent-room".to_owned();
+        nested.invite_policy = "members".to_owned();
+        store.add(nested).unwrap();
+
+        // Simulates `sync_saved_rooms_from_list`: a fresh entry from the remote
+        // room list with no Space fields.
+        store
+            .upsert(RoomEntry::new("child", "Closet").with_supernode("sn-a"))
+            .unwrap();
+
+        let e = store.get("sn-a", "child").unwrap();
+        assert_eq!(e.parent_id, "parent-room", "parent_id must survive re-sync");
+        assert_eq!(e.space_id, "space-1");
+        assert_eq!(e.invite_policy, "members");
+    }
+
+    #[test]
     fn normalize_supernode_ids_rekeys_hex_peer_id_to_identity_pub() {
         let dir = tempdir().unwrap();
         let id = make_identity();
@@ -618,6 +766,9 @@ mod tests {
             creator_id: "creator-abc".into(),
             invite_token: "tok123".into(),
             is_creator: true,
+            space_id: "space-abc".into(),
+            parent_id: "parent-abc".into(),
+            invite_policy: "owner".into(),
         };
         let json = serde_json::to_value(&entry).unwrap();
         let obj = json.as_object().unwrap();
@@ -629,6 +780,9 @@ mod tests {
             "creator_id",
             "invite_token",
             "is_creator",
+            "space_id",
+            "parent_id",
+            "invite_policy",
         ];
         for key in required {
             assert!(
@@ -636,6 +790,125 @@ mod tests {
                 "RoomEntry wire field missing or renamed: `{key}`"
             );
         }
+    }
+
+    #[test]
+    fn spaces_round_trip_and_adopt_room() {
+        use crate::crypto::ed25519_sign;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let key = SigningKey::generate(&mut OsRng);
+        let owner = crate::crypto::b64url_encode(key.verifying_key().as_bytes());
+
+        let root = {
+            let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+            // The room entry exists first (as created rooms are remembered),
+            // then it is adopted into the Space and stamped.
+            store
+                .add(RoomEntry::new("room-1", "General").with_supernode("sn-a"))
+                .unwrap();
+            let root = store
+                .adopt_room_into_space(
+                    &owner,
+                    "sn-a",
+                    "room-1",
+                    "General",
+                    "public",
+                    "",
+                    100,
+                    |b| ed25519_sign(&key.to_bytes(), b).unwrap(),
+                )
+                .unwrap();
+            assert!(root.verify());
+            assert_eq!(root.space_id, RoomStore::space_id_for(&owner, "sn-a"));
+            // A top-level room (empty parent) is stamped with the Server node.
+            let entry = store.get("sn-a", "room-1").expect("entry present");
+            assert_eq!(entry.space_id, root.space_id);
+            assert_eq!(entry.parent_id, root.space_id);
+            root
+        };
+
+        // Reopen: the Space persisted and rebuilds to the same root/proofs.
+        let store = RoomStore::open(&id, Some(&path)).unwrap();
+        let space = store.get_space(&root.space_id).expect("space persisted");
+        assert_eq!(space.root_hash(), root.root_hash);
+        let proof = space.prove("room-1").expect("room node present");
+        assert!(proof.verify_against(&root));
+        // The stamp survived the round-trip.
+        assert_eq!(store.get("sn-a", "room-1").unwrap().space_id, root.space_id);
+    }
+
+    #[test]
+    fn adopt_nested_sub_room_parents_to_room() {
+        use crate::crypto::ed25519_sign;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let key = SigningKey::generate(&mut OsRng);
+        let owner = crate::crypto::b64url_encode(key.verifying_key().as_bytes());
+        let sign = |b: &[u8]| ed25519_sign(&key.to_bytes(), b).unwrap();
+
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+        store
+            .add(RoomEntry::new("parent-room", "Lobby").with_supernode("sn-a"))
+            .unwrap();
+        store
+            .add(RoomEntry::new("child-room", "Closet").with_supernode("sn-a"))
+            .unwrap();
+
+        // Parent room nests under the Server node.
+        let r1 = store
+            .adopt_room_into_space(
+                &owner,
+                "sn-a",
+                "parent-room",
+                "Lobby",
+                "public",
+                "",
+                1,
+                &sign,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get("sn-a", "parent-room").unwrap().parent_id,
+            r1.space_id
+        );
+
+        // Child room nests under the parent room's node id, not the Server.
+        let r2 = store
+            .adopt_room_into_space(
+                &owner,
+                "sn-a",
+                "child-room",
+                "Closet",
+                "private",
+                "parent-room",
+                2,
+                &sign,
+            )
+            .unwrap();
+        let child = store.get("sn-a", "child-room").unwrap();
+        assert_eq!(child.parent_id, "parent-room");
+        assert_eq!(child.space_id, r2.space_id);
+
+        // Both rooms are provable leaves of the same signed root.
+        let space = store.get_space(&r2.space_id).unwrap();
+        assert!(space.prove("parent-room").unwrap().verify_against(&r2));
+        assert!(space.prove("child-room").unwrap().verify_against(&r2));
+        // The child leaf records the parent linkage in the tree itself.
+        let child_node = space
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "child-room")
+            .unwrap();
+        assert_eq!(child_node.parent_id, "parent-room");
     }
 
     #[test]

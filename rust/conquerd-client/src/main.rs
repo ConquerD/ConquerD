@@ -51,6 +51,7 @@ mod room_manager;
 mod room_store;
 mod session_state;
 mod sfu_client;
+mod space;
 #[cfg(feature = "qt-ui")]
 mod taskbar_badge;
 #[cfg(feature = "qt-ui")]

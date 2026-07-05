@@ -326,6 +326,12 @@ pub enum ConnectionCommand {
         room_name: String,
         room_type: String,
         invite_token: String,
+        /// Space-tree proof-based admission fields (JSON text; empty = omit),
+        /// built by the owner from its Space (root/proof, + grant for a known
+        /// grantee). Embedded in the invite for roster-free admission.
+        space_root: String,
+        space_proof: String,
+        space_grant: String,
         reply_tx: std_mpsc::Sender<Option<String>>,
     },
     /// Send a file to a peer.
@@ -368,6 +374,13 @@ pub enum ConnectionCommand {
     /// Used as a WebSocket fallback when direct QUIC is unavailable.
     SendRoomAudio {
         opus_data: Vec<u8>,
+    },
+    /// Announce a freshly-signed Space root to `supernode_id`, which verifies,
+    /// stores the highest epoch, and cluster-gossips it (authenticated room-set
+    /// sync). `root_json` is a serialized `SignedSpaceRoot`.
+    AnnounceSpaceRoot {
+        supernode_id: String,
+        root_json: String,
     },
     /// Fetch an in-app portal asset (`web.host.app.v1`) from a supernode
     /// over the cached QUIC relay connection. The reply is delivered on

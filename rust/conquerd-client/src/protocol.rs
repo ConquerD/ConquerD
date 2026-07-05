@@ -104,6 +104,13 @@ pub enum MessageType {
     SfuFileComplete,
     SfuAudio,
 
+    // E2E room group-key distribution (sealed per member; supernode forwards blind)
+    SfuGroupKey,
+
+    // Space Merkle tree: owner announces a signed root to its supernode, which
+    // stores + cluster-gossips it (authenticated room-set sync).
+    SpaceRootAnnounce,
+
     // Room creation
     SfuRoomCreate,
     SfuRoomCreated,
@@ -200,6 +207,8 @@ impl MessageType {
             Self::SfuFileChunk => "sfu_file_chunk",
             Self::SfuFileComplete => "sfu_file_complete",
             Self::SfuAudio => "sfu_audio",
+            Self::SfuGroupKey => "sfu_group_key",
+            Self::SpaceRootAnnounce => "space_root_announce",
             Self::SfuRoomCreate => "sfu_room_create",
             Self::SfuRoomCreated => "sfu_room_created",
             Self::SfuRoomInvite => "sfu_room_invite",

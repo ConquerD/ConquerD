@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 use crate::cluster::ClusterMembership;
 use crate::identity::Identity;
 use crate::relay::{build_quinn_client_config, build_quinn_server_config, extract_peer_id};
+use crate::space::SignedSpaceRoot;
 
 /// Reconnect backoff bounds for dialing a peer member.
 const DIAL_BACKOFF_START: Duration = Duration::from_secs(1);
@@ -86,6 +87,10 @@ pub enum ClusterMsgKind {
         build_id: String,
         source_hash: String,
     },
+    /// A verified signed Space root to reconcile (authenticated room-set sync).
+    /// Sent on change; receivers keep the highest epoch per `(space_id, signer)`
+    /// after re-verifying the owner signature.
+    SpaceRoot { root: SignedSpaceRoot },
 }
 
 impl ClusterMsg {
@@ -200,6 +205,8 @@ pub type OnReplicateFn = Arc<dyn Fn(ReplicatedMsg) + Send + Sync>;
 pub type OnRoomGrantFn = Arc<dyn Fn(RoomGrant) + Send + Sync>;
 /// Applies a replicated client-authorization grant (trust the peer).
 pub type OnPeerAuthFn = Arc<dyn Fn(PeerAuthGrant) + Send + Sync>;
+/// Accepts a gossiped signed Space root (store highest epoch per space).
+pub type OnSpaceRootFn = Arc<dyn Fn(SignedSpaceRoot) + Send + Sync>;
 
 /// Per-member outbound channel + version info.
 struct PeerLink {
@@ -242,6 +249,7 @@ pub struct ClusterLink {
     on_replicate: OnReplicateFn,
     on_room_grant: OnRoomGrantFn,
     on_peer_auth: OnPeerAuthFn,
+    on_space_root: OnSpaceRootFn,
     /// Set in [`ClusterLink::start`]; lets a freshly-established link advertise
     /// this node's current subscriptions immediately instead of waiting for the
     /// periodic refresh.
@@ -259,6 +267,7 @@ impl ClusterLink {
         on_replicate: OnReplicateFn,
         on_room_grant: OnRoomGrantFn,
         on_peer_auth: OnPeerAuthFn,
+        on_space_root: OnSpaceRootFn,
     ) -> Arc<Self> {
         Arc::new(Self {
             identity,
@@ -267,6 +276,7 @@ impl ClusterLink {
             on_replicate,
             on_room_grant,
             on_peer_auth,
+            on_space_root,
             local_rooms: RwLock::new(None),
             shutdown: Arc::new(Notify::new()),
             server_endpoint: RwLock::new(None),
@@ -337,6 +347,16 @@ impl ClusterLink {
                 identity_pub: identity_pub.to_string(),
                 handle: handle.to_string(),
             },
+            &self.identity,
+        );
+        self.send_to_all_peers(&msg.encode_frame());
+    }
+
+    /// Broadcast a verified signed Space root to all peer members (authenticated
+    /// room-set sync). Every member re-verifies and keeps the highest epoch.
+    pub fn replicate_space_root(&self, root: &SignedSpaceRoot) {
+        let msg = ClusterMsg::signed(
+            ClusterMsgKind::SpaceRoot { root: root.clone() },
             &self.identity,
         );
         self.send_to_all_peers(&msg.encode_frame());
@@ -683,6 +703,9 @@ impl ClusterLink {
                     peer.source_hash = Some(source_hash);
                 }
             }
+            ClusterMsgKind::SpaceRoot { root } => {
+                (self.on_space_root)(root);
+            }
         }
     }
 }
@@ -801,9 +824,17 @@ mod tests {
         let on_a: OnReplicateFn = Arc::new(|_| {});
         let no_grant: OnRoomGrantFn = Arc::new(|_| {});
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
+        let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
-        let link_a = ClusterLink::new(id_a, mem_a, on_a, no_grant.clone(), no_auth.clone());
-        let link_b = ClusterLink::new(id_b, mem_b, on_b, no_grant, no_auth);
+        let link_a = ClusterLink::new(
+            id_a,
+            mem_a,
+            on_a,
+            no_grant.clone(),
+            no_auth.clone(),
+            no_root.clone(),
+        );
+        let link_b = ClusterLink::new(id_b, mem_b, on_b, no_grant, no_auth, no_root);
 
         // Only B has a local subscriber for "room1".
         let a_rooms: LocalRoomsFn = Arc::new(Vec::new);
@@ -875,9 +906,17 @@ mod tests {
         let no_repl: OnReplicateFn = Arc::new(|_| {});
         let no_grant: OnRoomGrantFn = Arc::new(|_| {});
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
+        let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
-        let link_a = ClusterLink::new(id_a, mem_a, no_repl.clone(), no_grant, no_auth.clone());
-        let link_b = ClusterLink::new(id_b, mem_b, no_repl, on_grant_b, no_auth);
+        let link_a = ClusterLink::new(
+            id_a,
+            mem_a,
+            no_repl.clone(),
+            no_grant,
+            no_auth.clone(),
+            no_root.clone(),
+        );
+        let link_b = ClusterLink::new(id_b, mem_b, no_repl, on_grant_b, no_auth, no_root);
 
         let rooms: LocalRoomsFn = Arc::new(Vec::new);
         link_a.start(rooms.clone()).await.expect("link A start");
@@ -934,9 +973,17 @@ mod tests {
         let no_repl: OnReplicateFn = Arc::new(|_| {});
         let no_grant: OnRoomGrantFn = Arc::new(|_| {});
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
+        let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
-        let link_a = ClusterLink::new(id_a, mem_a, no_repl.clone(), no_grant.clone(), no_auth);
-        let link_b = ClusterLink::new(id_b, mem_b, no_repl, no_grant, on_auth_b);
+        let link_a = ClusterLink::new(
+            id_a,
+            mem_a,
+            no_repl.clone(),
+            no_grant.clone(),
+            no_auth,
+            no_root.clone(),
+        );
+        let link_b = ClusterLink::new(id_b, mem_b, no_repl, no_grant, on_auth_b, no_root);
 
         let rooms: LocalRoomsFn = Arc::new(Vec::new);
         link_a.start(rooms.clone()).await.expect("link A start");

@@ -15,6 +15,7 @@ mod relay;
 mod sfu;
 mod sfu_module;
 mod signaling;
+mod space;
 mod stats;
 mod ticket;
 mod web_app_module;
@@ -221,6 +222,78 @@ struct SupernodeState {
     /// Dedup of replicated room messages (by `message_id`) to guard against
     /// duplicate delivery across cluster links.
     replication_seen: RwLock<cluster_link::SeenCache>,
+    /// Highest verified Space root per `space_id` (authenticated room-set sync).
+    /// Populated from client `SpaceRootAnnounce`, cluster `SpaceRoot` gossip, and
+    /// client-carried roots on join. Used by proof-based admission.
+    space_roots: RwLock<SpaceRootStore>,
+}
+
+/// Highest verified [`space::SignedSpaceRoot`] per `space_id`. `space_id` embeds
+/// the owner (`derive_node_id("", owner_pub, …)`), so it is effectively bound to
+/// one signer; we still pin the signer and refuse epoch regression (monotonic,
+/// equivocation containment — SPACE-MERKLE-DESIGN §8).
+#[derive(Default)]
+struct SpaceRootStore {
+    roots: HashMap<String, space::SignedSpaceRoot>,
+}
+
+impl SpaceRootStore {
+    /// Accept `root` iff it verifies and is strictly newer than what we hold for
+    /// its space (or first-seen), bound to the same signer. Returns whether it
+    /// was newly stored (idempotent for equal/older epochs).
+    fn accept(&mut self, root: space::SignedSpaceRoot) -> bool {
+        if !root.verify() {
+            return false;
+        }
+        if let Some(existing) = self.roots.get(&root.space_id) {
+            if existing.signer != root.signer || root.epoch <= existing.epoch {
+                return false;
+            }
+        }
+        self.roots.insert(root.space_id.clone(), root);
+        true
+    }
+
+    fn get(&self, space_id: &str) -> Option<space::SignedSpaceRoot> {
+        self.roots.get(space_id).cloned()
+    }
+}
+
+/// Pure proof-based admission decision (no side effects) — does the presented
+/// `proof` (+ `grant` for private nodes) admit `sender` to `room_id` against the
+/// current signed `root`? `now` is unix seconds (grant expiry). Extracted so the
+/// security matrix is unit-testable without a full `SupernodeState`.
+///
+/// - proof must be for exactly `room_id` and verify against `root` (which pins
+///   the epoch → current-epoch-only admission);
+/// - **public** node: the proof alone admits;
+/// - **private** node: additionally an owner-signed grant bound to this peer,
+///   not expired, whose epoch is already active (`≤ root.epoch`).
+fn space_admission_ok(
+    root: &space::SignedSpaceRoot,
+    proof: &space::SpaceInclusionProof,
+    grant: Option<&space::SpaceGrant>,
+    sender: &str,
+    room_id: &str,
+    now: u64,
+) -> bool {
+    if proof.node.node_id != room_id || !proof.verify_against(root) {
+        return false;
+    }
+    if proof.node.node_type != "private" {
+        return true; // public node — proof-only admission
+    }
+    let Some(grant) = grant else {
+        return false;
+    };
+    if !grant.verify(&root.signer)
+        || grant.node_id != room_id
+        || grant.grantee_pub.trim_end_matches('=') != sender.trim_end_matches('=')
+        || grant.epoch > root.epoch
+    {
+        return false;
+    }
+    grant.expires_at == 0 || now <= grant.expires_at
 }
 
 /// A pending hole-punch registration waiting for both peers.
@@ -289,6 +362,106 @@ impl SupernodeState {
         // explicit allow below, mirroring the granting node's ACL.
         s.create_room(Some(room_id), room_name, rtype, "");
         s.allow_peer(room_id, peer);
+    }
+
+    /// Verify + store a signed Space root (highest epoch per space), and — if it
+    /// was newly accepted — cluster-gossip it to peer members. Returns whether it
+    /// was newly stored. Used by the owner announce path and by client-carried
+    /// roots on join.
+    fn accept_and_gossip_space_root(&self, root: space::SignedSpaceRoot) -> bool {
+        let gossip = root.clone();
+        let accepted = self.space_roots.write().accept(root);
+        if accepted {
+            if let Some(link) = self.cluster_link.read().clone() {
+                link.replicate_space_root(&gossip);
+            }
+        }
+        accepted
+    }
+
+    /// Coexist proof-based admission (SPACE-MERKLE-DESIGN §5). If `payload`
+    /// carries space fields that verify against the current signed root for the
+    /// space, authorize `sender`, materialize the room from the proven node, and
+    /// return `true`. Returns `false` to fall through to the legacy token/ACL
+    /// path — absence or verification failure just means "not admitted by proof",
+    /// never an outright denial.
+    fn try_space_admission(
+        &self,
+        sender: &str,
+        room_id: &str,
+        payload: &serde_json::Value,
+    ) -> bool {
+        // Inclusion proof for exactly this room.
+        let Some(proof) = payload
+            .get("space_proof")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<space::SpaceInclusionProof>(v).ok())
+        else {
+            return false;
+        };
+        if proof.node.node_id != room_id {
+            return false;
+        }
+        // A client always carries its current signed root (MTC "fallback
+        // certificate", §5) so admission never blocks on gossip propagation.
+        // Accept it (verify + highest-epoch), then verify the proof against the
+        // CURRENT held root — enforcing current-epoch-only admission (revocation
+        // = exclusion, §8): a stale proof against a superseded root is rejected.
+        let Some(carried) = payload
+            .get("space_root")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<space::SignedSpaceRoot>(v).ok())
+        else {
+            return false;
+        };
+        let space_id = carried.space_id.clone();
+        self.accept_and_gossip_space_root(carried);
+        let Some(root) = self.space_roots.read().get(&space_id) else {
+            return false;
+        };
+        if !proof.verify_against(&root) {
+            return false;
+        }
+
+        // The proof shows the room provably exists in the signed Space, so
+        // **materialize** it from the proven node if absent (§5.1: a proof is an
+        // equally authoritative description) — even when entry is still gated by
+        // the legacy token below. This is the roster-free existence guarantee:
+        // any cluster member the joiner reaches can now serve/validate the room.
+        let rtype = if proof.node.node_type == "private" {
+            "private"
+        } else {
+            "public"
+        };
+        if let Some(ref sfu) = self.sfu {
+            let rt = if rtype == "private" {
+                sfu::RoomType::Private
+            } else {
+                sfu::RoomType::Public
+            };
+            sfu.write()
+                .create_room(Some(room_id), &proof.node.name, rt, "");
+        }
+
+        // Admission decision: public → proof-only; private → owner-signed grant
+        // bound to this peer. Only on a full pass do we allow + replicate.
+        let grant = payload
+            .get("space_grant")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<space::SpaceGrant>(v).ok());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if !space_admission_ok(&root, &proof, grant.as_ref(), sender, room_id, now) {
+            // Materialized but not admitted by proof (e.g. private room via a
+            // shareable link carrying no grant) → fall through to the token path,
+            // which can now validate against the just-materialized room.
+            return false;
+        }
+        self.apply_room_grant(room_id, &proof.node.name, rtype, sender);
+        self.replicate_room_grant(room_id, &proof.node.name, rtype, sender);
+        true
     }
 
     /// Broadcast a client-authorization grant to cluster peers so any member
@@ -1205,6 +1378,9 @@ impl SignalingHandler for SupernodeHandler {
             MessageType::SfuRoomInviteGenerate => {
                 self.handle_sfu_invite_generate(&msg);
             }
+            MessageType::SpaceRootAnnounce => {
+                self.handle_space_root_announce(&msg);
+            }
             MessageType::PunchRegister => {
                 self.handle_punch_register(&msg);
             }
@@ -1531,6 +1707,12 @@ impl SupernodeHandler {
             .get("room_id")
             .and_then(|v| v.as_str())
             .unwrap_or(sfu::DEFAULT_ROOM_ID);
+
+        // Proof-based admission (coexist): if the join carries a valid Space
+        // proof (+ grant for private nodes), authorize + materialize the room
+        // before the ACL check below. A no-op when absent → legacy ACL applies.
+        self.state
+            .try_space_admission(&msg.sender, room_id, &msg.payload);
 
         let (ok, members) = sfu.write().join_room(&msg.sender, room_id);
         if !ok {
@@ -1911,16 +2093,23 @@ impl SupernodeHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let valid = sfu
-            .write()
-            .validate_room_invite(room_id, token, &msg.sender);
+        // Proof-based admission first (coexist): it materializes + allows +
+        // replicates on its own. Otherwise fall back to the legacy token.
+        let by_proof = self
+            .state
+            .try_space_admission(&msg.sender, room_id, &msg.payload);
+        let valid = by_proof
+            || sfu
+                .write()
+                .validate_room_invite(room_id, token, &msg.sender);
         let room_info = sfu
             .read()
             .get_room(room_id)
             .map(|r| (r.room_name.clone(), r.room_type, r.participant_count()));
 
         // Replicate the accepted grant so any cluster member admits this peer.
-        if valid {
+        // The proof path already replicated inside `try_space_admission`.
+        if valid && !by_proof {
             if let Some((ref name, rtype, _)) = room_info {
                 let type_str = match rtype {
                     sfu::RoomType::Public => "public",
@@ -1961,26 +2150,75 @@ impl SupernodeHandler {
             .get("room_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if let Some(token) = sfu.write().generate_invite_token(room_id, &msg.sender) {
-            info!(
-                "[sfu] Generated invite token for room {} requested by {}",
-                &room_id[..12.min(room_id.len())],
-                &msg.sender[..12.min(msg.sender.len())],
-            );
-            self.state.send_signed(
-                &msg.sender,
-                MessageType::SfuRoomInviteResult,
-                json!({"room_id": room_id, "accepted": true, "invite_token": token}),
-            );
-        } else {
-            warn!(
-                "[sfu] Invite generate failed for room {} — room not found",
-                &room_id[..12.min(room_id.len())],
-            );
-            self.state.send_signed(
-                &msg.sender,
-                MessageType::SfuRoomInviteResult,
-                json!({"room_id": room_id, "accepted": false, "reason": "room_not_found"}),
+        // Owner-only invite minting: only the room's creator may mint a token.
+        // Closes the hole where any authenticated peer could mint an invite for
+        // any room and add themselves (SPACE-MERKLE-DESIGN §6.1).
+        fn short(s: &str) -> &str {
+            &s[..12.min(s.len())]
+        }
+        match sfu
+            .write()
+            .generate_invite_token_checked(room_id, &msg.sender)
+        {
+            sfu::InviteMint::Ok(token) => {
+                info!(
+                    "[sfu] Generated invite token for room {} requested by owner {}",
+                    short(room_id),
+                    short(&msg.sender),
+                );
+                self.state.send_signed(
+                    &msg.sender,
+                    MessageType::SfuRoomInviteResult,
+                    json!({"room_id": room_id, "accepted": true, "invite_token": token}),
+                );
+            }
+            sfu::InviteMint::NotAuthorized => {
+                warn!(
+                    "[sfu] Invite generate denied for room {} — {} is not the room creator",
+                    short(room_id),
+                    short(&msg.sender),
+                );
+                self.state.send_signed(
+                    &msg.sender,
+                    MessageType::SfuRoomInviteResult,
+                    json!({"room_id": room_id, "accepted": false, "reason": "not_room_creator"}),
+                );
+            }
+            sfu::InviteMint::RoomNotFound => {
+                warn!(
+                    "[sfu] Invite generate failed for room {} — room not found",
+                    short(room_id),
+                );
+                self.state.send_signed(
+                    &msg.sender,
+                    MessageType::SfuRoomInviteResult,
+                    json!({"room_id": room_id, "accepted": false, "reason": "room_not_found"}),
+                );
+            }
+        }
+    }
+
+    /// The owner announces a signed Space root. Verify the owner signature,
+    /// store the highest epoch, and cluster-gossip it so any member can later
+    /// admit by proof against it (authenticated room-set sync, §8).
+    fn handle_space_root_announce(&self, msg: &SignalingMessage) {
+        let Some(root) = msg
+            .payload
+            .get("root")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<space::SignedSpaceRoot>(v).ok())
+        else {
+            return;
+        };
+        // The announcer must be the root's signer (owner) — a peer can't push
+        // someone else's root here (gossip re-verifies the signature anyway).
+        if root.signer.trim_end_matches('=') != msg.sender.trim_end_matches('=') {
+            return;
+        }
+        if self.state.accept_and_gossip_space_root(root) {
+            debug!(
+                "[space] accepted root from owner {}",
+                &msg.sender[..12.min(msg.sender.len())]
             );
         }
     }
@@ -2147,6 +2385,7 @@ async fn main() -> anyhow::Result<()> {
             cluster,
             cluster_link: RwLock::new(None),
             replication_seen: RwLock::new(cluster_link::SeenCache::new(4096)),
+            space_roots: RwLock::new(SpaceRootStore::default()),
         });
 
     // Bring up the intra-cluster link when clustering is enabled and this node
@@ -2178,6 +2417,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             })
         };
+        let on_space_root: cluster_link::OnSpaceRootFn = {
+            let weak = weak.clone();
+            Arc::new(move |root: space::SignedSpaceRoot| {
+                if let Some(state) = weak.upgrade() {
+                    // Gossip is full-mesh: accept (verify + highest-epoch) but do
+                    // not re-forward — the origin already broadcast to all peers.
+                    state.space_roots.write().accept(root);
+                }
+            })
+        };
         let local_rooms: cluster_link::LocalRoomsFn = {
             let weak = weak.clone();
             Arc::new(move || {
@@ -2192,6 +2441,7 @@ async fn main() -> anyhow::Result<()> {
             on_replicate,
             on_room_grant,
             on_peer_auth,
+            on_space_root,
         );
         match link.start(local_rooms).await {
             Ok(port) => {
@@ -2854,5 +3104,228 @@ mod build_feature_registry_tests {
                 "room.file.v1".to_string(),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod space_admission_tests {
+    use super::*;
+    use crate::crypto::{b64url_encode, ed25519_sign};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    /// Owner + a Space with one public and one private room, plus a fresh signed
+    /// root. Returns (owner_pub, sign_closure-ready key, Space, root).
+    fn fixture() -> (String, SigningKey, space::Space, space::SignedSpaceRoot) {
+        let key = SigningKey::generate(&mut OsRng);
+        let owner = b64url_encode(key.verifying_key().as_bytes());
+        let mut sp = space::Space::new_server(&owner, "srv");
+        for (name, ntype) in [("Public", "public"), ("Secret", "private")] {
+            let id = space::derive_node_id(&sp.space_id, &owner, name);
+            sp.upsert_node(space::SpaceNode {
+                node_id: id,
+                parent_id: sp.space_id.clone(),
+                kind: "room".to_owned(),
+                name: name.to_owned(),
+                node_type: ntype.to_owned(),
+                owner_pub: owner.clone(),
+                invite_policy: String::new(),
+                inherit: false,
+                key_commit: String::new(),
+            });
+        }
+        let root = sp.signed_root(1000, |b| ed25519_sign(&key.to_bytes(), b).unwrap());
+        (owner, key, sp, root)
+    }
+
+    fn room_id(sp: &space::Space, name: &str) -> String {
+        sp.nodes
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap()
+            .node_id
+            .clone()
+    }
+
+    #[test]
+    fn space_root_store_keeps_highest_epoch_and_rejects_regression() {
+        let (_owner, key, mut sp, root0) = fixture();
+        let mut store = SpaceRootStore::default();
+        assert!(store.accept(root0.clone()), "first root accepted");
+        assert!(!store.accept(root0.clone()), "same epoch not re-accepted");
+
+        // Newer epoch accepted; then the older one is refused.
+        sp.upsert_node(space::SpaceNode {
+            node_id: space::derive_node_id(&sp.space_id, &sp.owner_pub, "New"),
+            parent_id: sp.space_id.clone(),
+            kind: "room".to_owned(),
+            name: "New".to_owned(),
+            node_type: "public".to_owned(),
+            owner_pub: sp.owner_pub.clone(),
+            invite_policy: String::new(),
+            inherit: false,
+            key_commit: String::new(),
+        });
+        let root1 = sp.signed_root(1001, |b| ed25519_sign(&key.to_bytes(), b).unwrap());
+        assert!(root1.epoch > root0.epoch);
+        assert!(store.accept(root1.clone()));
+        assert!(!store.accept(root0), "older epoch refused after newer seen");
+        assert_eq!(store.get(&sp.space_id).unwrap().epoch, root1.epoch);
+    }
+
+    #[test]
+    fn space_root_store_refuses_unsigned_and_cross_signer() {
+        let (_o, _k, _sp, mut root) = fixture();
+        let mut store = SpaceRootStore::default();
+        root.signature = "AAAA".to_owned(); // broken sig
+        assert!(!store.accept(root), "unsigned/invalid root refused");
+
+        // A different signer cannot displace an accepted space_id.
+        let (_o2, key2, _sp2, mut root2) = fixture();
+        let (_o3, _k3, sp3, good) = fixture();
+        let mut store2 = SpaceRootStore::default();
+        assert!(store2.accept(good.clone()));
+        // Forge a higher-epoch root for the SAME space_id but a different signer.
+        root2.space_id = good.space_id.clone();
+        root2.epoch = good.epoch + 5;
+        let attacker = b64url_encode(key2.verifying_key().as_bytes());
+        root2.signer = attacker;
+        // (signature won't verify for the tampered fields anyway)
+        assert!(!store2.accept(root2), "cross-signer takeover refused");
+        assert_eq!(store2.get(&sp3.space_id).unwrap().epoch, good.epoch);
+    }
+
+    #[test]
+    fn public_room_admits_by_proof_only() {
+        let (_owner, _key, sp, root) = fixture();
+        let rid = room_id(&sp, "Public");
+        let proof = sp.prove(&rid).unwrap();
+        assert!(space_admission_ok(&root, &proof, None, "any-peer", &rid, 0));
+    }
+
+    #[test]
+    fn private_room_requires_valid_grant_for_this_peer() {
+        let (owner, key, sp, root) = fixture();
+        let rid = room_id(&sp, "Secret");
+        let proof = sp.prove(&rid).unwrap();
+        let peer = "peer-b-pub";
+
+        // No grant → refused.
+        assert!(!space_admission_ok(&root, &proof, None, peer, &rid, 0));
+
+        // Valid grant for this peer → admitted.
+        let grant = sp.grant(&rid, peer, 0, |b| ed25519_sign(&key.to_bytes(), b).unwrap());
+        assert!(space_admission_ok(
+            &root,
+            &proof,
+            Some(&grant),
+            peer,
+            &rid,
+            0
+        ));
+
+        // Grant for a *different* peer → refused (replay by a third party).
+        assert!(!space_admission_ok(
+            &root,
+            &proof,
+            Some(&grant),
+            "someone-else",
+            &rid,
+            0
+        ));
+
+        // Grant signed by a non-owner → refused.
+        let attacker = SigningKey::generate(&mut OsRng);
+        let forged = sp.grant(&rid, peer, 0, |b| {
+            ed25519_sign(&attacker.to_bytes(), b).unwrap()
+        });
+        assert!(!space_admission_ok(
+            &root,
+            &proof,
+            Some(&forged),
+            peer,
+            &rid,
+            0
+        ));
+
+        // Expired grant → refused.
+        let expiring = sp.grant(&rid, peer, 500, |b| {
+            ed25519_sign(&key.to_bytes(), b).unwrap()
+        });
+        assert!(space_admission_ok(
+            &root,
+            &proof,
+            Some(&expiring),
+            peer,
+            &rid,
+            499
+        ));
+        assert!(!space_admission_ok(
+            &root,
+            &proof,
+            Some(&expiring),
+            peer,
+            &rid,
+            501
+        ));
+
+        // Grant for a different node id → refused.
+        let other = sp.grant("other-room", peer, 0, |b| {
+            ed25519_sign(&key.to_bytes(), b).unwrap()
+        });
+        assert!(!space_admission_ok(
+            &root,
+            &proof,
+            Some(&other),
+            peer,
+            &rid,
+            0
+        ));
+        let _ = owner;
+    }
+
+    #[test]
+    fn proof_for_wrong_room_or_stale_root_is_refused() {
+        let (_owner, key, mut sp, root0) = fixture();
+        let rid = room_id(&sp, "Public");
+        let proof0 = sp.prove(&rid).unwrap();
+
+        // Proof node id must equal the room being joined.
+        assert!(!space_admission_ok(
+            &root0,
+            &proof0,
+            None,
+            "peer",
+            "different-room",
+            0
+        ));
+
+        // After the Space changes (new epoch), the OLD proof no longer verifies
+        // against the NEW root → current-epoch-only admission.
+        sp.upsert_node(space::SpaceNode {
+            node_id: space::derive_node_id(&sp.space_id, &sp.owner_pub, "Extra"),
+            parent_id: sp.space_id.clone(),
+            kind: "room".to_owned(),
+            name: "Extra".to_owned(),
+            node_type: "public".to_owned(),
+            owner_pub: sp.owner_pub.clone(),
+            invite_policy: String::new(),
+            inherit: false,
+            key_commit: String::new(),
+        });
+        let root1 = sp.signed_root(1002, |b| ed25519_sign(&key.to_bytes(), b).unwrap());
+        assert!(!space_admission_ok(&root1, &proof0, None, "peer", &rid, 0));
+        // A fresh proof against the new root admits again.
+        let proof1 = sp.prove(&rid).unwrap();
+        assert!(space_admission_ok(&root1, &proof1, None, "peer", &rid, 0));
+    }
+
+    #[test]
+    fn tampered_proof_node_is_refused() {
+        let (_owner, _key, sp, root) = fixture();
+        let rid = room_id(&sp, "Public");
+        let mut proof = sp.prove(&rid).unwrap();
+        proof.node.name = "Renamed".to_owned(); // leaf no longer matches the root
+        assert!(!space_admission_ok(&root, &proof, None, "peer", &rid, 0));
     }
 }
