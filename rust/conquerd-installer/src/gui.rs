@@ -36,9 +36,9 @@ pub struct GuiConfig {
     pub kill: bool,
     pub install_state: state::InstallState,
     pub repair: bool,
-    /// When true (only for `--launch` / `--update-and-relaunch`), the
-    /// Launching page may start the app after an update check. Otherwise the
-    /// user must click Launch explicitly.
+    /// When true (`--launch` / `--update-and-relaunch` GUI path): check for
+    /// updates on the Launching page, prompt before installing, show progress
+    /// during download/install, and launch when up to date or after skip.
     pub auto_launch: bool,
     /// When true, open on the animated splash and run a background update
     /// check (install if needed) without auto-launching the app.
@@ -54,8 +54,10 @@ pub struct GuiConfig {
 enum Page {
     /// Animated splash while checking / downloading / installing updates.
     Splash,
-    /// Already up-to-date — brief splash then auto-launch
+    /// `--launch` runner: checking for updates before launch.
     Launching,
+    /// `--launch` runner: update available — user chooses update or skip.
+    LaunchPrompt,
     /// First-time or update-available welcome
     Welcome,
     Checking,
@@ -142,7 +144,7 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
     } else if config.splash_update {
         Page::Splash
     } else if has_current && config.auto_launch {
-        // Runner mode — brief update check then auto-launch when up to date.
+        // Runner mode — check for updates, then prompt or launch.
         Page::Launching
     } else if has_current {
         // Installed — manage updates without starting the app.
@@ -190,7 +192,7 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
     }));
 
     let icon = load_icon_data();
-    let window_size = if config.splash_update {
+    let window_size = if config.splash_update || config.auto_launch {
         [400.0, 280.0]
     } else {
         [520.0, 400.0]
@@ -256,11 +258,11 @@ impl eframe::App for InstallerApp {
 
         let splash_active = {
             let st = self.state.lock().unwrap();
-            st.splash_update
-                && matches!(
-                    st.page,
-                    Page::Splash | Page::Checking | Page::Downloading | Page::Installing
-                )
+            let progress_pages = matches!(
+                st.page,
+                Page::Splash | Page::Checking | Page::Downloading | Page::Installing
+            );
+            (st.splash_update || st.auto_launch) && progress_pages
         };
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -283,6 +285,7 @@ impl eframe::App for InstallerApp {
 
                 match page {
                     Page::Launching => self.show_launching(ui, ctx),
+                    Page::LaunchPrompt => self.show_launch_prompt(ui, ctx),
                     Page::Welcome => self.show_welcome(ui, ctx),
                     Page::Checking => self.show_checking(ui, ctx),
                     Page::Downloading => self.show_downloading(ui, ctx),
@@ -301,7 +304,11 @@ impl InstallerApp {
     // ── Splash (animated logo + background update check) ─────────────────
 
     fn show_splash(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if !self.splash_started {
+        let run_auto_splash = {
+            let st = self.state.lock().unwrap();
+            st.splash_update
+        };
+        if run_auto_splash && !self.splash_started {
             self.splash_started = true;
             let state = self.state.clone();
             let ctx = ctx.clone();
@@ -388,6 +395,36 @@ impl InstallerApp {
         }
 
         ctx.request_repaint();
+    }
+
+    // ── Launch prompt (`--launch` when an update is available) ──────────
+
+    fn show_launch_prompt(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (installed_ver, target_ver) = {
+            let st = self.state.lock().unwrap();
+            (st.installed_version.clone(), st.target_version.clone())
+        };
+
+        ui.vertical_centered(|ui| {
+            ui.heading("Update Available");
+            ui.add_space(12.0);
+            ui.label(format!(
+                "A newer version is available: v{installed_ver} \u{2192} v{target_ver}"
+            ));
+            ui.add_space(8.0);
+            ui.label("Install the update now, or launch the version already on disk.");
+            ui.add_space(20.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("   Update   ").clicked() {
+                    self.start_download(ctx);
+                }
+                ui.add_space(10.0);
+                if ui.button("   Skip & Launch   ").clicked() {
+                    launch_current_and_close(&self.state, ctx);
+                }
+            });
+        });
     }
 
     // ── Welcome page ────────────────────────────────────────────────────
@@ -736,7 +773,16 @@ impl InstallerApp {
             let result = run_download_and_install(&state, &ctx);
             let mut st = state.lock().unwrap();
             match result {
-                Ok(()) => st.page = Page::Complete,
+                Ok(()) => {
+                    if st.auto_launch {
+                        if let Some(dir) = st.install_state.current_path() {
+                            let _ = crate::launch_app(dir);
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        st.page = Page::Complete;
+                    }
+                }
                 Err(e) => {
                     st.error_message = format!("{e:#}");
                     st.page = Page::Error;
@@ -925,11 +971,15 @@ fn check_and_maybe_launch(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context)
         return;
     }
 
-    // Update available — switch to Welcome page with update info
+    // Update available — prompt in launch mode, otherwise show Welcome.
     {
         let mut st = app_state.lock().unwrap();
         st.target_version = release.version.clone();
-        st.page = Page::Welcome;
+        st.page = if auto_launch {
+            Page::LaunchPrompt
+        } else {
+            Page::Welcome
+        };
     }
     ctx.request_repaint();
 }
@@ -998,17 +1048,31 @@ fn run_splash_update_work(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context)
             st.progress_text = launcher_msg;
             st.installer_update_available = false;
             st.page = Page::Complete;
+            let launch_after = st.auto_launch;
+            drop(st);
+            if launch_after {
+                launch_current_and_close(app_state, ctx);
+            }
             return Ok(());
         }
 
-        run_download_and_install(app_state, ctx)
+        run_download_and_install(app_state, ctx)?;
+        Ok(())
     })();
 
+    let auto_launch = {
+        let st = app_state.lock().unwrap();
+        st.auto_launch
+    };
     let mut st = app_state.lock().unwrap();
     match result {
         Ok(()) => {
             if st.page != Page::Complete {
                 st.page = Page::Complete;
+            }
+            drop(st);
+            if auto_launch {
+                launch_current_and_close(app_state, ctx);
             }
         }
         Err(e) => {

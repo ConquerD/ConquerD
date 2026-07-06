@@ -380,35 +380,20 @@ fn launchable_current_dir(st: &state::InstallState) -> Option<&std::path::Path> 
         .filter(|dir| state::find_exe(dir).is_some())
 }
 
-/// --launch: check for updates, then run the latest installed version.
+/// `--launch`: show the installer UI, offer an update when one is available,
+/// then launch the installed app (never silently auto-update).
 fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
-    let st = state::read_state(base_dir)?;
-    if launchable_current_dir(&st).is_some() {
-        if let Err(e) = run_update_and_relaunch(base_dir, repo, false, true, true, false) {
-            log!("Update check/launch failed: {e:#}");
-            let fallback_state = state::read_state(base_dir).unwrap_or(st);
-            if let Some(dir) = launchable_current_dir(&fallback_state) {
-                log!("Launching installed version after update failure.");
-                launch_app(dir)?;
-                return Ok(());
-            }
-            return Err(e);
-        }
-        return Ok(());
-    }
-    // Fresh install without a local .7z — download from GitHub silently.
-    log!("No installed version found. Installing from GitHub…");
-    if run_update_and_relaunch(base_dir, repo, false, true, true, false).is_ok() {
-        let after = state::read_state(base_dir)?;
-        if launchable_current_dir(&after).is_some() {
-            return Ok(());
-        }
-        log!("Silent install finished but ConquerD.exe is still missing.");
-    } else {
-        log!("Silent install failed.");
+    let install_state =
+        state::read_state(base_dir).unwrap_or_else(|_| state::InstallState::empty());
+    let has_current = launchable_current_dir(&install_state).is_some();
+    if has_current {
+        log!("Opening launcher UI (update check + launch)…");
+        return open_installer_gui(base_dir, repo, false, true, false, false);
     }
 
-    open_installer_gui(base_dir, repo, false, true, false, false)
+    // First install — splash UI with download/install progress, then launch.
+    log!("No installed version found. Opening installer UI…");
+    open_installer_gui(base_dir, repo, false, true, true, false)
 }
 
 /// Check GitHub for updates/install without launching the app.
