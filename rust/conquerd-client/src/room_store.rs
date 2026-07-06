@@ -304,6 +304,35 @@ impl RoomStore {
         Ok(root)
     }
 
+    /// Stamp Space-tree linkage onto an already-stored room (e.g. from an
+    /// accepted invite's inclusion proof) so the sidebar can nest it under its
+    /// parent. Only overwrites with non-empty values; no-op if the room isn't
+    /// stored or nothing changes. Persists when it does.
+    pub fn set_space_linkage(
+        &mut self,
+        supernode_id: &str,
+        room_id: &str,
+        parent_id: &str,
+        space_id: &str,
+    ) -> Result<()> {
+        let Some(entry) = self.rooms.get_mut(&Self::entry_key(supernode_id, room_id)) else {
+            return Ok(());
+        };
+        let mut changed = false;
+        if !parent_id.is_empty() && entry.parent_id != parent_id {
+            entry.parent_id = parent_id.to_owned();
+            changed = true;
+        }
+        if !space_id.is_empty() && entry.space_id != space_id {
+            entry.space_id = space_id.to_owned();
+            changed = true;
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(())
+    }
+
     // -- CRUD ---------------------------------------------------------------
 
     /// Add or replace a room entry and persist.
@@ -372,6 +401,24 @@ impl RoomStore {
             entry
         };
         self.add(merged)
+    }
+
+    /// Passive-sync variant of [`upsert`] for the supernode's room list.
+    ///
+    /// A room the supernode still lists but the user hid locally must NOT be
+    /// resurrected: [`add`] clears the hide tombstone, so upserting every listed
+    /// room would un-hide them all the moment a room list arrives (e.g. right
+    /// after accepting an invite). When the room is currently hidden this is a
+    /// no-op — the tombstone and stored entry are left untouched. Explicit user
+    /// actions (create / join / accept-invite) still go through [`upsert`] and
+    /// intentionally un-hide.
+    pub fn upsert_from_remote(&mut self, entry: RoomEntry) -> Result<()> {
+        if !entry.supernode_id.is_empty()
+            && self.is_hidden_from_sidebar(&entry.supernode_id, &entry.room_id)
+        {
+            return Ok(());
+        }
+        self.upsert(entry)
     }
 
     /// Remove a room by supernode + id, record as deleted, and persist.
@@ -733,6 +780,73 @@ mod tests {
 
         let store2 = RoomStore::open(&id, Some(&path)).unwrap();
         assert!(store2.is_hidden_from_sidebar("sn-a", "room-1"));
+    }
+
+    #[test]
+    fn upsert_from_remote_does_not_unhide() {
+        // A passive room-list sync must not resurrect a room the user hid: the
+        // regression where accepting an invite pulled a fresh list and un-hid
+        // every previously hidden room.
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+
+        store
+            .add(RoomEntry::new("r1", "Test Room").with_supernode("sn-a"))
+            .unwrap();
+        store.hide_from_sidebar("sn-a", "r1").unwrap();
+        assert!(store.is_hidden_from_sidebar("sn-a", "r1"));
+
+        // Supernode re-lists the room (as `sync_saved_rooms_from_list` does).
+        store
+            .upsert_from_remote(RoomEntry::new("r1", "r1").with_supernode("sn-a"))
+            .unwrap();
+        assert!(
+            store.is_hidden_from_sidebar("sn-a", "r1"),
+            "passive sync must not un-hide a room the user hid"
+        );
+
+        // An explicit re-add / join still un-hides intentionally.
+        store
+            .upsert(RoomEntry::new("r1", "r1").with_supernode("sn-a"))
+            .unwrap();
+        assert!(!store.is_hidden_from_sidebar("sn-a", "r1"));
+    }
+
+    #[test]
+    fn set_space_linkage_stamps_and_nests_invited_room() {
+        // The invite-accept path stamps the room's parent/space from the proof so
+        // the sidebar nests it. Empty values must not clobber an existing stamp.
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+
+        store
+            .add(RoomEntry::new("child", "test").with_supernode("sn-a"))
+            .unwrap();
+        // No-op for an unknown room.
+        store
+            .set_space_linkage("sn-a", "missing", "default", "space-1")
+            .unwrap();
+
+        store
+            .set_space_linkage("sn-a", "child", "default", "space-1")
+            .unwrap();
+        let e = store.get("sn-a", "child").unwrap();
+        assert_eq!(e.parent_id, "default");
+        assert_eq!(e.space_id, "space-1");
+
+        // Empty args leave the existing linkage intact.
+        store.set_space_linkage("sn-a", "child", "", "").unwrap();
+        let e = store.get("sn-a", "child").unwrap();
+        assert_eq!(e.parent_id, "default");
+        assert_eq!(e.space_id, "space-1");
+
+        // Survives a reload.
+        let store2 = RoomStore::open(&id, Some(&path)).unwrap();
+        assert_eq!(store2.get("sn-a", "child").unwrap().parent_id, "default");
     }
 
     #[test]

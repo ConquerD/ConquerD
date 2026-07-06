@@ -112,6 +112,10 @@ pub(super) struct RoomInviteEntry {
     pub room_name: String,
     pub room_type: String,
     pub invite_token: String,
+    /// Space-tree parent node id (from the invite's inclusion proof) and the
+    /// owning Space id (from its signed root). `""` for legacy/flat invites.
+    pub parent_id: String,
+    pub space_id: String,
 }
 
 /// Build a self-contained room invite URL: `conquerd://room#<base64url(JSON)>`.
@@ -4527,6 +4531,25 @@ impl ConnectionManager {
             ..
         } = payload;
 
+        // Pull the Space-tree linkage out of the proof/root before they're moved
+        // into the pending join creds, so the joiner's sidebar can nest the room:
+        // `parent_id` is the room's parent node in the owner's tree (a room id, or
+        // "default"/the Server node for a top-level room); `space_id` names the
+        // owning Space. Absent for legacy flat invites → "".
+        let space_parent_id = serde_json::from_str::<Value>(&space_proof)
+            .ok()
+            .and_then(|v| {
+                v.get("node")
+                    .and_then(|n| n.get("parent_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        let space_tree_id = serde_json::from_str::<Value>(&space_root)
+            .ok()
+            .and_then(|v| v.get("space_id").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_default();
+
         // Stash any Space proof-based admission creds from the invite; they are
         // attached (single-use) to the SfuJoin for this room so the supernode can
         // admit + materialize it by proof on any cluster member.
@@ -4565,6 +4588,8 @@ impl ConnectionManager {
             room_name,
             room_type,
             invite_token,
+            parent_id: space_parent_id,
+            space_id: space_tree_id,
         };
 
         let connected = self
@@ -4598,6 +4623,8 @@ impl ConnectionManager {
             room_name: entry.room_name.clone(),
             room_type: entry.room_type.clone(),
             invite_token: entry.invite_token.clone(),
+            parent_id: entry.parent_id.clone(),
+            space_id: entry.space_id.clone(),
         });
     }
 

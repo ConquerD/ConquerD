@@ -732,7 +732,7 @@ Item {
                             Layout.fillWidth: true
                             model: ["System", "Dark", "Light"]
                             property var values: ["system", "dark", "light"]
-                            currentIndex: root.indexOf(values, root.settings ? root.settings.theme : "system", 0)
+                            currentIndex: root.indexOf(values, root.settings ? root.settings.theme : "dark", 1)
                             onActivated: root.setTheme(values[currentIndex])
                         }
                     }

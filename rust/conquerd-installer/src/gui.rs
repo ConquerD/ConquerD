@@ -7,6 +7,25 @@ use std::sync::{Arc, Mutex};
 const LOGO_BYTES: &[u8] = include_bytes!("../../conquerd-client/qml/icons/logo-full.svg");
 const ICO_BYTES: &[u8] = include_bytes!("../../../assets/conquerd.ico");
 
+/// Match the native client's Discord-dark palette (`Theme.qml`).
+fn apply_dark_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.window_fill = egui::Color32::from_rgb(0x11, 0x12, 0x14);
+    visuals.panel_fill = egui::Color32::from_rgb(0x1E, 0x1F, 0x22);
+    visuals.faint_bg_color = egui::Color32::from_rgb(0x2B, 0x2D, 0x31);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(0x38, 0x3A, 0x40);
+    visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(0xDC, 0xDD, 0xDE);
+    visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(0xDC, 0xDD, 0xDE);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x2B, 0x2D, 0x31);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x38, 0x3A, 0x40);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x38, 0x3A, 0x40);
+    visuals.widgets.open.bg_fill = egui::Color32::from_rgb(0x38, 0x3A, 0x40);
+    visuals.selection.bg_fill = egui::Color32::from_rgba_premultiplied(88, 101, 242, 60);
+    visuals.hyperlink_color = egui::Color32::from_rgb(0x58, 0x65, 0xF2);
+    visuals.override_text_color = Some(egui::Color32::from_rgb(0xDC, 0xDD, 0xDE));
+    ctx.set_visuals(visuals);
+}
+
 // ── Public config passed from main ──────────────────────────────────────────
 
 pub struct GuiConfig {
@@ -193,6 +212,7 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
         "ConquerD Installer",
         options,
         Box::new(move |cc| {
+            apply_dark_theme(&cc.egui_ctx);
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(InstallerApp {
                 state: state.clone(),

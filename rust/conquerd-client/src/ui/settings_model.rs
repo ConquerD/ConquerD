@@ -205,7 +205,7 @@ fn default_voice_bitrate() -> String {
     "ultra".to_string()
 }
 fn default_theme() -> String {
-    "system".to_string()
+    "dark".to_string()
 }
 fn default_attestation_policy() -> String {
     "warn".to_string()

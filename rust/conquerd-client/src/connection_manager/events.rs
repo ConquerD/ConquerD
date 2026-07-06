@@ -158,6 +158,11 @@ pub enum ConnectionEvent {
         room_name: String,
         room_type: String,
         invite_token: String,
+        /// Space-tree parent node id from the invite's inclusion proof, so the
+        /// joiner's sidebar can nest the room. `""` for legacy / flat invites.
+        parent_id: String,
+        /// Owning Space id from the invite's signed root. `""` if absent.
+        space_id: String,
     },
 
     /// A peer sent a presence update.

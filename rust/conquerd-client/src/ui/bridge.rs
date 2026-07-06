@@ -3833,7 +3833,10 @@ fn sync_saved_rooms_from_list(
                 is_creator,
             )
             .with_invite_token(invite_token);
-        if let Err(e) = room_store.upsert(entry) {
+        // `upsert_from_remote` (not `upsert`) so a room the user hid locally is
+        // not resurrected: a plain upsert clears the hide tombstone, which would
+        // un-hide every listed room each time a room list arrives.
+        if let Err(e) = room_store.upsert_from_remote(entry) {
             warn!("room_store sync from list error: {e}");
         }
     }
@@ -4641,6 +4644,8 @@ fn dispatch_event(
             room_name,
             room_type,
             invite_token,
+            parent_id,
+            space_id,
         } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 let canon = bridge
@@ -4660,6 +4665,28 @@ fn dispatch_event(
                     false,
                     &invite_token,
                 );
+                // Stamp the Space-tree linkage carried by the invite proof so the
+                // sidebar nests the room under its parent instead of showing it
+                // flat at the top level.
+                if !parent_id.is_empty() || !space_id.is_empty() {
+                    if let Some(ref rs) = bridge.rust().room_store {
+                        if let Err(e) = rs
+                            .write()
+                            .set_space_linkage(&canon, &room_id, &parent_id, &space_id)
+                        {
+                            warn!("room_store set_space_linkage error: {e}");
+                        }
+                    }
+                }
+                // The room is now in the local store, but the sidebar only
+                // re-renders on `RoomListReceived`, and joining doesn't reliably
+                // push a fresh list back to the joiner. Request one so the newly
+                // accepted room actually appears in the Rooms list.
+                if let Some(ref tx) = bridge.rust().conn_cmd_tx {
+                    let _ = tx.try_send(ConnectionCommand::RequestRoomList {
+                        supernode_id: canon.clone(),
+                    });
+                }
                 bridge.as_mut().room_invite_ready(
                     QString::from(canon.as_str()),
                     QString::from(room_id.as_str()),
