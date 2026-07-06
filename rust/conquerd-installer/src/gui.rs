@@ -24,6 +24,9 @@ pub struct GuiConfig {
     /// When true, open on the animated splash and run a background update
     /// check (install if needed) without auto-launching the app.
     pub splash_update: bool,
+    /// When true, copy this installer into the install dir even if the app is
+    /// already current (`--update-installer`).
+    pub update_installer: bool,
 }
 
 // ── Internal types ──────────────────────────────────────────────────────────
@@ -83,6 +86,11 @@ struct AppState {
     auto_launch: bool,
     splash_update: bool,
     up_to_date_only: bool,
+    /// Running exe differs from `%LOCALAPPDATA%\ConquerD\conquerd-installer.exe`.
+    installer_update_available: bool,
+    /// User opt-in to refresh the installed launcher (checkbox / CLI default).
+    update_installer_too: bool,
+    installer_update_started: bool,
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -127,6 +135,9 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
 
     let installed_version = config.install_state.current_version.clone();
     let nightly = github::is_nightly_installer() || config.install_state.is_nightly_channel();
+    let installer_update_available =
+        state::needs_installer_update(&config.base_dir, nightly).unwrap_or(false);
+    let update_installer_too = config.update_installer || installer_update_available;
 
     let state = Arc::new(Mutex::new(AppState {
         page: start_page,
@@ -154,6 +165,9 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
         auto_launch: config.auto_launch,
         splash_update: config.splash_update,
         up_to_date_only: false,
+        installer_update_available,
+        update_installer_too,
+        installer_update_started: false,
     }));
 
     let icon = load_icon_data();
@@ -363,7 +377,15 @@ impl InstallerApp {
             ui.heading("Welcome to ConquerD");
             ui.add_space(10.0);
 
-            let (base_dir, archive, hash_status, installed_ver, target_ver) = {
+            let (
+                base_dir,
+                archive,
+                hash_status,
+                installed_ver,
+                target_ver,
+                installer_update_available,
+                mut update_installer_too,
+            ) = {
                 let st = self.state.lock().unwrap();
                 (
                     st.base_dir.display().to_string(),
@@ -371,6 +393,8 @@ impl InstallerApp {
                     st.hash_status.clone(),
                     st.installed_version.clone(),
                     st.target_version.clone(),
+                    st.installer_update_available,
+                    st.update_installer_too,
                 )
             };
 
@@ -425,6 +449,19 @@ impl InstallerApp {
                 if matches!(hash_status, HashStatus::Mismatch(_)) {
                     ui.label("Installation blocked due to checksum mismatch.");
                 } else if !installed_ver.is_empty() {
+                    if installer_update_available {
+                        ui.label("A newer launcher was detected (this .exe).");
+                        ui.checkbox(&mut update_installer_too, "Also update installed launcher");
+                        ui.add_space(5.0);
+                        if ui.button("   Update Launcher   ").clicked() {
+                            {
+                                let mut st = self.state.lock().unwrap();
+                                st.update_installer_too = update_installer_too;
+                            }
+                            self.start_installer_update(ctx);
+                        }
+                        ui.add_space(10.0);
+                    }
                     ui.label("This will reinstall ConquerD and create shortcuts.");
                     ui.add_space(20.0);
                     ui.horizontal(|ui| {
@@ -436,6 +473,10 @@ impl InstallerApp {
                             self.start_repair(ctx);
                         }
                     });
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        st.update_installer_too = update_installer_too;
+                    }
                 } else {
                     ui.label("This will install ConquerD and create shortcuts.");
                     ui.add_space(20.0);
@@ -460,8 +501,25 @@ impl InstallerApp {
                     ui.add_space(5.0);
                     ui.label(format!("v{installed_ver} is currently installed."));
                     ui.add_space(5.0);
+                    if installer_update_available {
+                        ui.label("A newer launcher was detected (this .exe).");
+                        ui.checkbox(&mut update_installer_too, "Also update installed launcher");
+                        ui.add_space(5.0);
+                        if ui.button("   Update Launcher   ").clicked() {
+                            {
+                                let mut st = self.state.lock().unwrap();
+                                st.update_installer_too = update_installer_too;
+                            }
+                            self.start_installer_update(ctx);
+                        }
+                        ui.add_space(5.0);
+                    }
                     if ui.button("   Repair Installation   ").clicked() {
                         self.start_repair(ctx);
+                    }
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        st.update_installer_too = update_installer_too;
                     }
                 }
             }
@@ -546,13 +604,22 @@ impl InstallerApp {
     }
 
     fn show_complete(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let (version, repair_mode, progress_text, up_to_date_only) = {
+        let (
+            version,
+            repair_mode,
+            progress_text,
+            up_to_date_only,
+            installer_update_available,
+            mut update_installer_too,
+        ) = {
             let st = self.state.lock().unwrap();
             (
                 st.target_version.clone(),
                 st.repair_mode,
                 st.progress_text.clone(),
                 st.up_to_date_only,
+                st.installer_update_available,
+                st.update_installer_too,
             )
         };
 
@@ -565,6 +632,14 @@ impl InstallerApp {
                 ui.heading(format!("ConquerD v{version}"));
                 ui.add_space(15.0);
                 ui.label("You\u{2019}re on the latest version.");
+                if !progress_text.is_empty() {
+                    ui.add_space(5.0);
+                    ui.label(&progress_text);
+                } else if installer_update_available {
+                    ui.add_space(5.0);
+                    ui.label("The installed launcher can be updated to this copy.");
+                    ui.checkbox(&mut update_installer_too, "Update installed launcher");
+                }
             } else if version.is_empty() {
                 ui.heading("Installation Complete!");
                 ui.add_space(15.0);
@@ -575,6 +650,23 @@ impl InstallerApp {
                 ui.label("ConquerD has been installed successfully.");
             }
             ui.add_space(10.0);
+
+            if installer_update_available && update_installer_too {
+                if ui.button("   Update Launcher   ").clicked() {
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        st.update_installer_too = update_installer_too;
+                    }
+                    self.start_installer_update(ctx);
+                    return;
+                }
+                ui.add_space(5.0);
+            } else {
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.update_installer_too = update_installer_too;
+                }
+            }
 
             if ui.button("   Launch ConquerD   ").clicked() {
                 let st = self.state.lock().unwrap();
@@ -658,6 +750,38 @@ impl InstallerApp {
                     st.page = Page::Error;
                 }
             }
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_installer_update(&self, ctx: &egui::Context) {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.installer_update_started {
+                return;
+            }
+            st.installer_update_started = true;
+            st.page = Page::Installing;
+            st.progress_text = "Updating installed launcher\u{2026}".into();
+        }
+
+        let state = self.state.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = run_installer_self_update(&state, &ctx);
+            let mut st = state.lock().unwrap();
+            match result {
+                Ok(msg) => {
+                    st.installer_update_available = false;
+                    st.progress_text = msg;
+                    st.page = Page::Complete;
+                }
+                Err(e) => {
+                    st.error_message = format!("{e:#}");
+                    st.page = Page::Error;
+                }
+            }
+            st.installer_update_started = false;
             ctx.request_repaint();
         });
     }
@@ -838,11 +962,21 @@ fn run_splash_update_work(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context)
         let ist = state::read_state(&base_dir)?;
         if !github::needs_release_update(&release, &ist, nightly)? {
             let version = ist.current_version.clone();
+            let (update_installer_too, no_shortcuts) = {
+                let st = app_state.lock().unwrap();
+                (st.update_installer_too, st.no_shortcuts)
+            };
+            let mut launcher_msg = String::new();
+            if update_installer_too && state::needs_installer_update(&base_dir, nightly)? {
+                state::update_installed_launcher(&base_dir, nightly, !no_shortcuts)?;
+                launcher_msg = "Installed launcher updated.".into();
+            }
             let mut st = app_state.lock().unwrap();
             st.target_version = version.clone();
             st.installed_version = version;
             st.up_to_date_only = true;
-            st.progress_text.clear();
+            st.progress_text = launcher_msg;
+            st.installer_update_available = false;
             st.page = Page::Complete;
             return Ok(());
         }
@@ -877,6 +1011,25 @@ fn launch_current_and_close(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Contex
         let _ = crate::launch_app(dir);
     }
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
+// ── Background: refresh only the installed launcher copy ──────────────────
+
+fn run_installer_self_update(
+    app_state: &Arc<Mutex<AppState>>,
+    ctx: &egui::Context,
+) -> anyhow::Result<String> {
+    let (base_dir, nightly, no_shortcuts) = {
+        let st = app_state.lock().unwrap();
+        (st.base_dir.clone(), st.nightly, st.no_shortcuts)
+    };
+    {
+        let mut st = app_state.lock().unwrap();
+        st.progress_text = "Copying launcher\u{2026}".into();
+    }
+    ctx.request_repaint();
+    state::update_installed_launcher(&base_dir, nightly, !no_shortcuts)?;
+    Ok("Installed launcher updated.".into())
 }
 
 // ── Background: download from GitHub, then install ──────────────────────

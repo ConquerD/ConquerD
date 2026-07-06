@@ -193,6 +193,42 @@ pub fn installer_path(base_dir: &Path, nightly: bool) -> PathBuf {
     base_dir.join(installer_exe_name(nightly))
 }
 
+/// True when the running installer binary differs from the copy in `base_dir`
+/// (or no installed copy exists). Used to offer a launcher-only update when the
+/// client app is already current.
+pub fn needs_installer_update(base_dir: &Path, nightly: bool) -> Result<bool> {
+    use crate::extract;
+
+    let running = std::env::current_exe().context("Cannot determine own exe path")?;
+    let dest = installer_path(base_dir, nightly);
+    if !dest.exists() {
+        return Ok(true);
+    }
+    if let (Ok(a), Ok(b)) = (
+        std::fs::canonicalize(&running),
+        std::fs::canonicalize(&dest),
+    ) {
+        if a == b {
+            return Ok(false);
+        }
+    }
+    Ok(extract::hash_file(&running)? != extract::hash_file(&dest)?)
+}
+
+/// Copy the running installer into `base_dir` and optionally refresh shortcuts
+/// so they continue to target the installed launcher.
+pub fn update_installed_launcher(
+    base_dir: &Path,
+    nightly: bool,
+    refresh_shortcuts: bool,
+) -> Result<()> {
+    self_copy(base_dir, nightly)?;
+    if refresh_shortcuts {
+        crate::shortcuts::create_shortcuts_for_launcher(&installer_path(base_dir, nightly))?;
+    }
+    Ok(())
+}
+
 /// Copy the running installer exe into base_dir if it isn't already there.
 pub fn self_copy(base_dir: &Path, nightly: bool) -> Result<()> {
     let self_exe = std::env::current_exe().context("Cannot determine own exe path")?;
@@ -402,5 +438,24 @@ mod tests {
     #[test]
     fn is_newer_same_version_is_not_newer() {
         assert!(!is_newer("1.0.0", "1.0.0"));
+    }
+
+    // ── needs_installer_update ──────────────────────────────────────────────
+
+    #[test]
+    fn needs_installer_update_when_installed_copy_missing() {
+        let dir = tmp_dir();
+        assert!(needs_installer_update(dir.path(), false).unwrap());
+    }
+
+    #[test]
+    fn needs_installer_update_when_hashes_differ() {
+        let dir = tmp_dir();
+        let dest = installer_path(dir.path(), false);
+        fs::write(&dest, b"old-installer").unwrap();
+        let running = std::env::current_exe().unwrap();
+        let differs = crate::extract::hash_file(&running).unwrap()
+            != crate::extract::hash_file(&dest).unwrap();
+        assert_eq!(needs_installer_update(dir.path(), false).unwrap(), differs);
     }
 }

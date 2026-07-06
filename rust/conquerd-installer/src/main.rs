@@ -120,6 +120,11 @@ struct Cli {
     /// Repair the current installation (verify and re-extract changed/missing files)
     #[arg(long)]
     repair: bool,
+
+    /// Copy this installer into the install directory even when the app is
+    /// already up to date (refreshes the installed launcher and shortcuts).
+    #[arg(long)]
+    update_installer: bool,
 }
 
 fn default_install_dir() -> PathBuf {
@@ -304,7 +309,14 @@ fn main() -> anyhow::Result<()> {
         if cli.kill {
             state::kill_running_instances();
         }
-        return run_update_and_relaunch(&base_dir, &cli.repo, cli.no_shortcuts, cli.silent, true);
+        return run_update_and_relaunch(
+            &base_dir,
+            &cli.repo,
+            cli.no_shortcuts,
+            cli.silent,
+            true,
+            cli.update_installer,
+        );
     }
 
     // ── Repair mode ─────────────────────────────────────────────────────
@@ -325,6 +337,7 @@ fn main() -> anyhow::Result<()> {
             repair: true,
             auto_launch: false,
             splash_update: false,
+            update_installer: cli.update_installer,
         });
     }
 
@@ -341,7 +354,7 @@ fn main() -> anyhow::Result<()> {
     // No local .7z beside the installer — check GitHub for updates/install
     // without launching. Use `--launch` (or shortcuts) to start the app.
     if archive.is_none() {
-        return run_update_install(&base_dir, &cli.repo, cli.no_shortcuts);
+        return run_update_install(&base_dir, &cli.repo, cli.no_shortcuts, cli.update_installer);
     }
 
     // ── GUI mode (local .7z detected) ───────────────────────────────────
@@ -358,6 +371,7 @@ fn main() -> anyhow::Result<()> {
         repair: false,
         auto_launch: false,
         splash_update: false,
+        update_installer: cli.update_installer,
     })
 }
 
@@ -370,7 +384,7 @@ fn launchable_current_dir(st: &state::InstallState) -> Option<&std::path::Path> 
 fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
     let st = state::read_state(base_dir)?;
     if launchable_current_dir(&st).is_some() {
-        if let Err(e) = run_update_and_relaunch(base_dir, repo, false, true, true) {
+        if let Err(e) = run_update_and_relaunch(base_dir, repo, false, true, true, false) {
             log!("Update check/launch failed: {e:#}");
             let fallback_state = state::read_state(base_dir).unwrap_or(st);
             if let Some(dir) = launchable_current_dir(&fallback_state) {
@@ -384,7 +398,7 @@ fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
     }
     // Fresh install without a local .7z — download from GitHub silently.
     log!("No installed version found. Installing from GitHub…");
-    if run_update_and_relaunch(base_dir, repo, false, true, true).is_ok() {
+    if run_update_and_relaunch(base_dir, repo, false, true, true, false).is_ok() {
         let after = state::read_state(base_dir)?;
         if launchable_current_dir(&after).is_some() {
             return Ok(());
@@ -394,7 +408,7 @@ fn run_launch(base_dir: &std::path::Path, repo: &str) -> anyhow::Result<()> {
         log!("Silent install failed.");
     }
 
-    open_installer_gui(base_dir, repo, false, true, false)
+    open_installer_gui(base_dir, repo, false, true, false, false)
 }
 
 /// Check GitHub for updates/install without launching the app.
@@ -402,9 +416,10 @@ fn run_update_install(
     base_dir: &std::path::Path,
     repo: &str,
     no_shortcuts: bool,
+    update_installer: bool,
 ) -> anyhow::Result<()> {
     log!("Opening update splash…");
-    open_installer_gui(base_dir, repo, no_shortcuts, false, true)
+    open_installer_gui(base_dir, repo, no_shortcuts, false, true, update_installer)
 }
 
 fn open_installer_gui(
@@ -413,6 +428,7 @@ fn open_installer_gui(
     no_shortcuts: bool,
     auto_launch: bool,
     splash_update: bool,
+    update_installer: bool,
 ) -> anyhow::Result<()> {
     log!("Opening installer UI…");
     let install_state =
@@ -427,6 +443,7 @@ fn open_installer_gui(
         repair: false,
         auto_launch,
         splash_update,
+        update_installer,
     })
 }
 
@@ -437,6 +454,7 @@ fn run_update_and_relaunch(
     no_shortcuts: bool,
     silent: bool,
     launch_after: bool,
+    update_installer: bool,
 ) -> anyhow::Result<()> {
     let mut st = state::read_state(base_dir)?;
 
@@ -475,6 +493,16 @@ fn run_update_and_relaunch(
 
     if !needs_update {
         log!("Already up to date (v{}).", st.current_version);
+        if update_installer {
+            let nightly = github::resolve_nightly_channel(base_dir);
+            if state::needs_installer_update(base_dir, nightly)? {
+                log!("Updating installed launcher…");
+                state::update_installed_launcher(base_dir, nightly, !no_shortcuts)?;
+                log!("Installed launcher updated.");
+            } else {
+                log!("Installed launcher is already current.");
+            }
+        }
         if launch_after {
             if let Some(dir) = st.current_path() {
                 launch_app(dir)?;
@@ -554,7 +582,14 @@ fn run_update_and_relaunch(
     }
 
     // Non-silent: use GUI for the update flow
-    open_installer_gui(base_dir, repo, no_shortcuts, launch_after, false)
+    open_installer_gui(
+        base_dir,
+        repo,
+        no_shortcuts,
+        launch_after,
+        false,
+        update_installer,
+    )
 }
 
 /// Silent install from a local archive.
