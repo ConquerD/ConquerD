@@ -945,6 +945,11 @@ pub struct AppBridgeRust {
     /// one-peer update that would wipe everyone else from the model).
     room_participant_ids: Vec<String>,
 
+    /// Authoritative SfuMembers snapshots that arrived before the voice rail
+    /// scope was stamped (e.g. the connection manager's eager join on create).
+    /// Key: `supernode_id:room_id`.
+    pending_room_rosters: std::collections::HashMap<String, Vec<String>>,
+
     /// Canonical peer-list keys (`PeerRecord::peer_id`) currently considered online.
     online_peer_ids: HashSet<String>,
     /// Canonical peer-list keys with an active voice session (room or direct call).
@@ -1083,6 +1088,7 @@ impl Default for AppBridgeRust {
             mic_test_active: false,
             room_chat_history: std::collections::HashMap::new(),
             room_participant_ids: Vec::new(),
+            pending_room_rosters: std::collections::HashMap::new(),
             online_peer_ids: HashSet::new(),
             in_call_peer_ids: HashSet::new(),
             direct_connected_peer_ids: HashSet::new(),
@@ -2198,6 +2204,21 @@ impl ffi::AppBridge {
         let use_invite = stored.as_ref().is_some_and(|e| {
             e.room_type == "private" && !e.is_creator && !e.invite_token.is_empty()
         });
+        debug!(
+            "join_room rid={} type={} is_creator={} token_len={} -> {}",
+            rid,
+            stored
+                .as_ref()
+                .map(|e| e.room_type.as_str())
+                .unwrap_or("<none>"),
+            stored.as_ref().map(|e| e.is_creator).unwrap_or(false),
+            stored.as_ref().map(|e| e.invite_token.len()).unwrap_or(0),
+            if use_invite {
+                "JoinRoomWithInvite"
+            } else {
+                "JoinRoom"
+            }
+        );
         if let Some(ref tx) = self.rust().conn_cmd_tx {
             if use_invite {
                 let token = stored
@@ -2311,7 +2332,7 @@ impl ffi::AppBridge {
             let _ = tx.try_send(ConnectionCommand::JoinRoomWithInvite {
                 supernode_id: sid.clone(),
                 room_id: rid.clone(),
-                invite_token: token,
+                invite_token: token.clone(),
             });
         }
         {
@@ -2327,7 +2348,7 @@ impl ffi::AppBridge {
             "private",
             "",
             false,
-            "",
+            &token,
         );
 
         // See join_room: only seed [self] when this join is for the active voice
@@ -2413,8 +2434,8 @@ impl ffi::AppBridge {
         // are routed via the supernode WebSocket instead of direct QUIC.
         if let Some(ref tx) = self.rust().call_cmd_tx {
             let _ = tx.try_send(CallCommand::SetRoomMode {
-                supernode_id: new_sid,
-                room_id: new_rid,
+                supernode_id: new_sid.clone(),
+                room_id: new_rid.clone(),
             });
         }
         // Then start the local audio pipeline.
@@ -2424,6 +2445,24 @@ impl ffi::AppBridge {
                 voice_activation: va,
             });
         }
+
+        // Apply any SfuMembers snapshot that arrived before voice scope was set.
+        let roster_key = room_roster_key(new_sid.as_str(), new_rid.as_str());
+        if let Some(members) = self
+            .as_mut()
+            .rust_mut()
+            .pending_room_rosters
+            .remove(&roster_key)
+        {
+            apply_room_roster_to_bridge(
+                &mut self.as_mut(),
+                &members,
+                new_sid.as_str(),
+                new_rid.as_str(),
+                true,
+            );
+        }
+
         self.as_mut().set_voice_active(true);
     }
 
@@ -3763,6 +3802,78 @@ fn is_active_voice_room(bridge: &AppBridgeRust, supernode_id: &str, room_id: &st
     !rid.is_empty() && sn == supernode_id && rid == room_id
 }
 
+fn room_roster_key(supernode_id: &str, room_id: &str) -> String {
+    format!("{supernode_id}:{room_id}")
+}
+
+fn canon_supernode_id(bridge: &AppBridgeRust, id: &str) -> String {
+    bridge
+        .resolve_supernode_node_id_str(id)
+        .unwrap_or_else(|| id.to_owned())
+}
+
+/// Whether an SFU roster event should update the voice-rail participant cache.
+fn should_apply_room_roster(bridge: &AppBridgeRust, supernode_id: &str, room_id: &str) -> bool {
+    if is_active_voice_room(bridge, supernode_id, room_id) {
+        return true;
+    }
+    // joinRoomWithVoice stamps `voice_*` before join_room, but SfuMembers from
+    // the connection manager's eager join can still land first.
+    if !bridge.voice_room_id.is_empty()
+        && bridge.voice_supernode_id == supernode_id
+        && bridge.voice_room_id == room_id
+    {
+        return true;
+    }
+    bridge.in_room
+        && bridge.current_supernode_id == supernode_id
+        && bridge.current_room_id == room_id
+}
+
+fn apply_room_roster_to_bridge(
+    bridge: &mut Pin<&mut ffi::AppBridge>,
+    members: &[String],
+    supernode_id: &str,
+    room_id: &str,
+    emit_participants: bool,
+) {
+    bridge.as_mut().rust_mut().room_participant_ids = members.to_vec();
+
+    let my_public_id = bridge.rust().my_public_id.clone();
+    let my_peer_id = bridge.rust().my_peer_id.clone();
+    if let Some(ref tx) = bridge.rust().call_cmd_tx {
+        for peer_id in members {
+            if peer_id != &my_public_id {
+                let _ = tx.try_send(CallCommand::InitiatePeer {
+                    peer_id: peer_id.clone(),
+                    host: None,
+                    port: None,
+                });
+            }
+        }
+    }
+
+    let pids = resolved_room_member_pids(bridge.rust(), members);
+    apply_room_member_presence(&mut bridge.as_mut().rust_mut(), &pids);
+
+    if emit_participants {
+        let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
+            room_participants_json(Some(&ps.read()), members, &my_peer_id, &my_public_id)
+        } else {
+            room_participants_json(None, members, &my_peer_id, &my_public_id)
+        };
+        bridge
+            .as_mut()
+            .participants_updated(QString::from(json.as_str()));
+    }
+
+    if let Some(patch) = room_voice_sidebar_patch(bridge.rust(), supernode_id, room_id, members) {
+        bridge
+            .as_mut()
+            .sfu_rooms_updated(QString::from(patch.as_str()));
+    }
+}
+
 fn merge_room_list_values(
     local: &serde_json::Value,
     remote: &serde_json::Value,
@@ -3832,10 +3943,23 @@ fn sync_saved_rooms_from_list(
                     .map(|e| e.room_name.clone())
             })
             .unwrap_or_else(|| room_id.to_owned());
-        let room_type = room
+        // Only take the remote room_type when it is explicitly present and
+        // non-empty; otherwise keep the stored type. Defaulting an absent value
+        // to "public" here would downgrade a stored *private* room (via upsert's
+        // non-empty-wins merge), flipping join_room off the token/invite path so
+        // the supernode silently denies entry to the private room.
+        let room_type_owned = room
             .get("room_type")
             .and_then(|v| v.as_str())
-            .unwrap_or("public");
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                existing
+                    .map(|e| e.room_type.clone())
+                    .filter(|t| !t.is_empty())
+            })
+            .unwrap_or_else(|| "public".to_owned());
+        let room_type = room_type_owned.as_str();
         let creator_id = room
             .get("creator_id")
             .and_then(|v| v.as_str())
@@ -4789,57 +4913,23 @@ fn dispatch_event(
             members,
         } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
-                    return;
-                };
-                let voice_active =
-                    is_active_voice_room(bridge.rust(), canon.as_str(), room_id.as_str());
-
-                if voice_active {
-                    // Replace the participant cache with the authoritative snapshot.
-                    bridge.as_mut().rust_mut().room_participant_ids = members.clone();
-
-                    // Initiate QUIC audio sessions for all non-self room members so
-                    // direct peer audio works when hole-punch or same-LAN applies.
-                    let my_public_id = bridge.rust().my_public_id.clone();
-                    let my_peer_id = bridge.rust().my_peer_id.clone();
-                    if let Some(ref tx) = bridge.rust().call_cmd_tx {
-                        for peer_id in &members {
-                            if peer_id != &my_public_id {
-                                let _ = tx.try_send(CallCommand::InitiatePeer {
-                                    peer_id: peer_id.clone(),
-                                    host: None,
-                                    port: None,
-                                });
-                            }
-                        }
-                    }
-
-                    {
-                        let pids = resolved_room_member_pids(bridge.rust(), &members);
-                        apply_room_member_presence(&mut bridge.as_mut().rust_mut(), &pids);
-                    }
-                    let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                        room_participants_json(
-                            Some(&ps.read()),
-                            &members,
-                            &my_peer_id,
-                            &my_public_id,
-                        )
-                    } else {
-                        room_participants_json(None, &members, &my_peer_id, &my_public_id)
-                    };
+                let canon = canon_supernode_id(bridge.rust(), &supernode_id);
+                let apply =
+                    should_apply_room_roster(bridge.rust(), canon.as_str(), room_id.as_str());
+                if apply {
+                    apply_room_roster_to_bridge(
+                        &mut bridge,
+                        &members,
+                        canon.as_str(),
+                        room_id.as_str(),
+                        true,
+                    );
+                } else {
                     bridge
                         .as_mut()
-                        .participants_updated(QString::from(json.as_str()));
-                }
-
-                if let Some(patch) =
-                    room_voice_sidebar_patch(bridge.rust(), &canon, &room_id, &members)
-                {
-                    bridge
-                        .as_mut()
-                        .sfu_rooms_updated(QString::from(patch.as_str()));
+                        .rust_mut()
+                        .pending_room_rosters
+                        .insert(room_roster_key(canon.as_str(), room_id.as_str()), members);
                 }
                 emit_peers_updated(bridge.as_mut());
             });
@@ -4850,16 +4940,11 @@ fn dispatch_event(
             peer_id,
         } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
-                    return;
-                };
-                let voice_active =
-                    is_active_voice_room(bridge.rust(), canon.as_str(), room_id.as_str());
+                let canon = canon_supernode_id(bridge.rust(), &supernode_id);
+                let apply =
+                    should_apply_room_roster(bridge.rust(), canon.as_str(), room_id.as_str());
 
-                if voice_active {
-                    // Broadcast own avatar config to the newly-joined room peer so
-                    // they can render our identicon without waiting for a direct
-                    // QUIC PeerConnected event (which may never fire in SFU rooms).
+                if apply {
                     let cfg = bridge.rust().avatar_config_json.clone();
                     if !cfg.is_empty() {
                         if let Some(ref tx) = bridge.rust().conn_cmd_tx {
@@ -4870,7 +4955,6 @@ fn dispatch_event(
                         }
                     }
 
-                    // Add to cache if not already present (idempotent).
                     if !bridge.rust().room_participant_ids.contains(&peer_id) {
                         bridge
                             .as_mut()
@@ -4879,30 +4963,14 @@ fn dispatch_event(
                             .push(peer_id);
                     }
 
-                    // Re-emit the full participant list so the model is never partial.
-                    let my_public_id = bridge.rust().my_public_id.clone();
-                    let my_peer_id = bridge.rust().my_peer_id.clone();
                     let ids = bridge.rust().room_participant_ids.clone();
-                    {
-                        let pids = resolved_room_member_pids(bridge.rust(), &ids);
-                        apply_room_member_presence(&mut bridge.as_mut().rust_mut(), &pids);
-                    }
-                    let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                        room_participants_json(Some(&ps.read()), &ids, &my_peer_id, &my_public_id)
-                    } else {
-                        room_participants_json(None, &ids, &my_peer_id, &my_public_id)
-                    };
-                    bridge
-                        .as_mut()
-                        .participants_updated(QString::from(json.as_str()));
-
-                    if let Some(patch) =
-                        room_voice_sidebar_patch(bridge.rust(), &canon, &room_id, &ids)
-                    {
-                        bridge
-                            .as_mut()
-                            .sfu_rooms_updated(QString::from(patch.as_str()));
-                    }
+                    apply_room_roster_to_bridge(
+                        &mut bridge,
+                        &ids,
+                        canon.as_str(),
+                        room_id.as_str(),
+                        true,
+                    );
                 }
                 emit_peers_updated(bridge.as_mut());
             });
@@ -4913,43 +4981,25 @@ fn dispatch_event(
             peer_id,
         } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
-                    return;
-                };
-                let voice_active =
-                    is_active_voice_room(bridge.rust(), canon.as_str(), room_id.as_str());
+                let canon = canon_supernode_id(bridge.rust(), &supernode_id);
+                let apply =
+                    should_apply_room_roster(bridge.rust(), canon.as_str(), room_id.as_str());
 
-                if voice_active {
+                if apply {
                     bridge
                         .as_mut()
                         .rust_mut()
                         .room_participant_ids
                         .retain(|id| id != &peer_id);
 
-                    // Re-emit the full participant list after removal.
-                    let my_public_id = bridge.rust().my_public_id.clone();
-                    let my_peer_id = bridge.rust().my_peer_id.clone();
                     let ids = bridge.rust().room_participant_ids.clone();
-                    {
-                        let pids = resolved_room_member_pids(bridge.rust(), &ids);
-                        apply_room_member_presence(&mut bridge.as_mut().rust_mut(), &pids);
-                    }
-                    let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                        room_participants_json(Some(&ps.read()), &ids, &my_peer_id, &my_public_id)
-                    } else {
-                        room_participants_json(None, &ids, &my_peer_id, &my_public_id)
-                    };
-                    bridge
-                        .as_mut()
-                        .participants_updated(QString::from(json.as_str()));
-
-                    if let Some(patch) =
-                        room_voice_sidebar_patch(bridge.rust(), &canon, &room_id, &ids)
-                    {
-                        bridge
-                            .as_mut()
-                            .sfu_rooms_updated(QString::from(patch.as_str()));
-                    }
+                    apply_room_roster_to_bridge(
+                        &mut bridge,
+                        &ids,
+                        canon.as_str(),
+                        room_id.as_str(),
+                        true,
+                    );
                 }
                 emit_peers_updated(bridge.as_mut());
             });

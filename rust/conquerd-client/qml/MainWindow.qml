@@ -1036,10 +1036,13 @@ ApplicationWindow {
         z: 100
         onJoinRequested: function(supernodeId, roomId, inviteToken) {
             roomPanel.switchToRoom(roomId, roomId, supernodeId)
+            // Persist + validate the invite token before joinRoomWithVoice runs
+            // join_room (which reads the token from the room store).
             if ((inviteToken || "").trim() !== "")
                 backend.joinRoomWithInvite(supernodeId, roomId, inviteToken)
-            else
-                backend.joinRoom(supernodeId, roomId)
+            backend.joinRoomWithVoice(supernodeId, roomId)
+            root.voiceRoomName = roomId
+            root.voiceSupernodeId = supernodeId
             navIndex = 1
         }
     }

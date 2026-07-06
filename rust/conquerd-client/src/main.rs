@@ -32,6 +32,7 @@ mod file_transfer;
 mod github_updater;
 mod group_key;
 mod identity;
+mod logging;
 #[cfg(feature = "qt-ui")]
 mod metrics;
 mod network_monitor;
@@ -65,7 +66,6 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{error, info};
-use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::call_controller::CallController;
 use crate::chat_store::ChatStore;
@@ -201,13 +201,9 @@ fn run_qt_ui() {
 }
 
 fn main() {
-    // Logging — respects RUST_LOG env var
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("conquerd_client=info,warn")),
-        )
-        .init();
+    // Logging — seeded from the persisted `debug_logging` setting, runtime
+    // reloadable via the Settings toggle; an explicit RUST_LOG always wins.
+    logging::init(logging::load_debug_logging_setting());
 
     info!("conquerd-client {} starting", env!("CARGO_PKG_VERSION"));
 

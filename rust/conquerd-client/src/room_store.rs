@@ -375,6 +375,14 @@ impl RoomStore {
             }
             if m.room_type.is_empty() {
                 m.room_type = existing.room_type.clone();
+            } else if existing.room_type == "private"
+                && m.room_type == "public"
+                && (existing.is_creator || !existing.invite_token.is_empty())
+            {
+                // Passive room-list sync must not downgrade a stored private room
+                // back to public — that flips join_room off the invite path and the
+                // supernode silently denies SfuJoin for non-members.
+                m.room_type = existing.room_type.clone();
             }
             if m.creator_id.is_empty() {
                 m.creator_id = existing.creator_id.clone();
@@ -707,6 +715,39 @@ mod tests {
         assert_eq!(e.creator_id, "creator-x");
         assert_eq!(e.invite_token, "tok");
         assert!(e.is_creator);
+    }
+
+    #[test]
+    fn upsert_does_not_downgrade_private_to_public() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+
+        store
+            .add(
+                RoomEntry::new("priv", "Secret")
+                    .with_type("private")
+                    .with_supernode("sn-a")
+                    .with_invite_token("tok-abc"),
+            )
+            .unwrap();
+
+        // Simulates a remote room-list entry that omits type and defaults to public.
+        store
+            .upsert(
+                RoomEntry::new("priv", "Secret")
+                    .with_type("public")
+                    .with_supernode("sn-a"),
+            )
+            .unwrap();
+
+        let e = store.get("sn-a", "priv").unwrap();
+        assert_eq!(
+            e.room_type, "private",
+            "stored private rooms must not be downgraded to public"
+        );
+        assert_eq!(e.invite_token, "tok-abc");
     }
 
     #[test]

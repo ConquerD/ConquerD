@@ -1716,6 +1716,31 @@ impl SupernodeHandler {
 
         let (ok, members) = sfu.write().join_room(&msg.sender, room_id);
         if !ok {
+            let reason = {
+                let s = sfu.read();
+                match s.get_room(room_id) {
+                    None => "room_absent".to_owned(),
+                    Some(r) => {
+                        let tstr = match r.room_type {
+                            sfu::RoomType::Public => "public",
+                            sfu::RoomType::Private => "private",
+                        };
+                        format!(
+                            "type={} creator_match={} allowed={} count={}",
+                            tstr,
+                            r.creator_id == msg.sender,
+                            r.is_peer_allowed(&msg.sender),
+                            r.participant_count(),
+                        )
+                    }
+                }
+            };
+            tracing::warn!(
+                "SfuJoin DENIED peer={} room={} [{}]",
+                &msg.sender[..12.min(msg.sender.len())],
+                room_id,
+                reason
+            );
             return;
         }
 
@@ -2095,13 +2120,27 @@ impl SupernodeHandler {
 
         // Proof-based admission first (coexist): it materializes + allows +
         // replicates on its own. Otherwise fall back to the legacy token.
+        let has_proof = msg.payload.get("space_proof").is_some();
+        let room_exists = sfu.read().get_room(room_id).is_some();
         let by_proof = self
             .state
             .try_space_admission(&msg.sender, room_id, &msg.payload);
-        let valid = by_proof
-            || sfu
+        let by_token = !by_proof
+            && sfu
                 .write()
                 .validate_room_invite(room_id, token, &msg.sender);
+        let valid = by_proof || by_token;
+        tracing::warn!(
+            "SfuRoomInvite peer={} room={} exists={} has_proof={} token_len={} by_proof={} by_token={} => valid={}",
+            &msg.sender[..12.min(msg.sender.len())],
+            room_id,
+            room_exists,
+            has_proof,
+            token.len(),
+            by_proof,
+            by_token,
+            valid
+        );
         let room_info = sfu
             .read()
             .get_room(room_id)

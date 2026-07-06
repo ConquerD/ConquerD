@@ -78,6 +78,9 @@ pub mod ffi {
         /// Own avatar configuration serialised as a JSON object.
         /// Empty string means "use defaults".
         #[qproperty(QString, avatar_config_json)]
+        /// Verbose (debug-level) logging for troubleshooting. Applied live and
+        /// seeded at next startup; an explicit RUST_LOG env var overrides it.
+        #[qproperty(bool, debug_logging)]
         type SettingsModel = super::SettingsModelRust;
 
         /// Persist settings to disk (JSON).
@@ -172,6 +175,8 @@ struct SettingsSnapshot {
     window_height: i32,
     #[serde(default)]
     avatar_config_json: String,
+    #[serde(default)]
+    debug_logging: bool,
 }
 
 fn default_true() -> bool {
@@ -251,6 +256,7 @@ impl Default for SettingsSnapshot {
             window_width: 0,
             window_height: 0,
             avatar_config_json: String::new(),
+            debug_logging: false,
         }
     }
 }
@@ -297,6 +303,7 @@ pub struct SettingsModelRust {
     window_width: i32,
     window_height: i32,
     avatar_config_json: QString,
+    debug_logging: bool,
 }
 
 impl Default for SettingsModelRust {
@@ -340,6 +347,7 @@ impl Default for SettingsModelRust {
             window_width: s.window_width,
             window_height: s.window_height,
             avatar_config_json: QString::default(),
+            debug_logging: s.debug_logging,
         }
     }
 }
@@ -397,7 +405,10 @@ impl ffi::SettingsModel {
             window_width: r.window_width,
             window_height: r.window_height,
             avatar_config_json: r.avatar_config_json.to_string(),
+            debug_logging: r.debug_logging,
         };
+        // Apply the log-verbosity choice live so it takes effect without a restart.
+        crate::logging::set_debug_logging(snap.debug_logging);
         let path = settings_file();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -487,6 +498,8 @@ impl ffi::SettingsModel {
             .set_attestation_policy(QString::from(snap.attestation_policy.as_str()));
         self.as_mut()
             .set_avatar_config_json(QString::from(snap.avatar_config_json.as_str()));
+        self.as_mut().set_debug_logging(snap.debug_logging);
+        crate::logging::set_debug_logging(snap.debug_logging);
         debug!("Settings loaded from {}", path.display());
     }
 }
