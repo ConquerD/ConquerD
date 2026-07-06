@@ -2238,9 +2238,19 @@ impl ffi::AppBridge {
         // this seed those closures re-emit the empty list that was left by
         // leave_room(), wiping the model before the authoritative SfuMembers
         // round-trip completes — the "join room, avatar missing" race.
+        //
+        // BUT only when this join pertains to the active voice room (or there is
+        // none). `join_room` also runs for chat-context joins of *other* rooms;
+        // reseeding there would wipe the voice rail to [self] with no fresh
+        // SfuMembers for the voice room to follow — stranding the roster so peers
+        // vanish from the rail while audio keeps flowing.
+        let voicing_elsewhere = {
+            let r = self.rust();
+            !r.voice_room_id.is_empty() && (r.voice_room_id != rid || r.voice_supernode_id != sid)
+        };
         let my_public_id = self.rust().my_public_id.clone();
         let my_peer_id = self.rust().my_peer_id.clone();
-        if !my_public_id.is_empty() {
+        if !voicing_elsewhere && !my_public_id.is_empty() {
             self.as_mut().rust_mut().room_participant_ids = vec![my_public_id.clone()];
             let json = if let Some(ps) = self.rust().peer_store.as_ref() {
                 room_participants_json(
@@ -2320,9 +2330,16 @@ impl ffi::AppBridge {
             "",
         );
 
+        // See join_room: only seed [self] when this join is for the active voice
+        // room (or none), so a chat-context invite-join of another room does not
+        // wipe the voice rail's roster.
+        let voicing_elsewhere = {
+            let r = self.rust();
+            !r.voice_room_id.is_empty() && (r.voice_room_id != rid || r.voice_supernode_id != sid)
+        };
         let my_public_id = self.rust().my_public_id.clone();
         let my_peer_id = self.rust().my_peer_id.clone();
-        if !my_public_id.is_empty() {
+        if !voicing_elsewhere && !my_public_id.is_empty() {
             self.as_mut().rust_mut().room_participant_ids = vec![my_public_id.clone()];
             let json = if let Some(ps) = self.rust().peer_store.as_ref() {
                 room_participants_json(
@@ -2379,14 +2396,18 @@ impl ffi::AppBridge {
             }
         }
 
-        // Join signaling for the new room (chat context + voice).
-        self.as_mut().join_room(supernode_id, room_id);
-
+        // Mark this as the active voice room BEFORE join_room. join_room is also
+        // used for chat-context joins of *other* rooms, and its roster seed keys
+        // off `voice_room_id` to avoid wiping this voice roster; setting it first
+        // ensures the seed for a genuine voice entry still runs.
         {
             let mut r = self.as_mut().rust_mut();
             r.voice_supernode_id = new_sid.clone();
             r.voice_room_id = new_rid.clone();
         }
+
+        // Join signaling for the new room (chat context + voice).
+        self.as_mut().join_room(supernode_id, room_id);
 
         // Switch call controller to SFU room audio mode so outbound frames
         // are routed via the supernode WebSocket instead of direct QUIC.
