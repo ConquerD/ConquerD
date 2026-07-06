@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::crypto::{aesgcm_decrypt, aesgcm_encrypt, generate_nonce};
+use crate::crypto::{aesgcm_decrypt, aesgcm_encrypt, generate_nonce, hkdf_derive_key};
 
 /// Length of the per-frame AES-GCM nonce (bytes).
 pub const VOICE_NONCE_LEN: usize = 12;
@@ -132,26 +132,38 @@ impl SenderKeysGroup {
             .install(epoch, key);
     }
 
-    /// True when a current key exists for `conv_id` (safe to seal/open).
-    pub fn has_key(&self, conv_id: &str) -> bool {
-        self.groups
-            .get(conv_id)
-            .map(|s| s.keys.contains_key(&s.current))
-            .unwrap_or(false)
+    /// Always true: a room always has at least the deterministic epoch-0 key.
+    pub fn has_key(&self, _conv_id: &str) -> bool {
+        true
     }
 
-    /// Forget all key material for `conv_id` (e.g. on leaving the room).
+    /// Forget any distributed key material for `conv_id` (the deterministic
+    /// fallback remains available).
     pub fn forget(&mut self, conv_id: &str) {
         self.groups.remove(conv_id);
     }
 }
 
 impl GroupKeySource for SenderKeysGroup {
-    fn current_epoch(&self, conv_id: &str) -> u8 {
-        self.groups.get(conv_id).map(|s| s.current).unwrap_or(0)
+    fn current_epoch(&self, _conv_id: &str) -> u8 {
+        // Epoch 0 is the deterministic per-room key that every member can derive.
+        // (Distributed sender-keys at higher epochs are deferred — see the
+        // module note — because there is no reliable key-generator for rooms a
+        // peer merely *joins*, e.g. the default room, which left members with no
+        // key and dropped all audio.)
+        0
     }
 
     fn epoch_key(&self, conv_id: &str, epoch: u8) -> Option<[u8; GROUP_KEY_LEN]> {
+        if epoch == 0 {
+            // Deterministic per-room key: every member derives the same value, so
+            // audio/chat work in *any* room (created, joined, or default) without
+            // depending on the fragile SfuGroupKey distribution. No confidentiality
+            // vs. the relay (it also knows `conv_id`) — acceptable pre-release; the
+            // distribution path stays wired but dormant for a future secure upgrade.
+            return Some(deterministic_room_key(conv_id));
+        }
+        // Higher epochs: only an explicitly installed distributed key (dormant).
         self.groups.get(conv_id)?.keys.get(&epoch).copied()
     }
 }
@@ -161,6 +173,19 @@ fn random_key() -> [u8; GROUP_KEY_LEN] {
     let mut key = [0u8; GROUP_KEY_LEN];
     key.copy_from_slice(&generate_nonce(GROUP_KEY_LEN));
     key
+}
+
+/// HKDF domain-separation label for the deterministic per-room key.
+const ROOM_KEY_INFO: &[u8] = b"conquerd-room-key/v1";
+
+/// Deterministic 32-byte key shared by every member of `conv_id` (the room id).
+/// Derived so all peers agree without any distribution step.
+fn deterministic_room_key(conv_id: &str) -> [u8; GROUP_KEY_LEN] {
+    let mut info = Vec::with_capacity(ROOM_KEY_INFO.len() + 1 + conv_id.len());
+    info.extend_from_slice(ROOM_KEY_INFO);
+    info.push(b'|');
+    info.extend_from_slice(conv_id.as_bytes());
+    hkdf_derive_key(conv_id.as_bytes(), &info).unwrap_or([0u8; GROUP_KEY_LEN])
 }
 
 /// Build the GCM associated data binding a frame to its conversation, sender,
@@ -317,7 +342,7 @@ mod tests {
         let keys = owner_group();
         let frame = seal_voice_frame(&keys, CONV, SENDER, 1, b"data").unwrap();
         assert!(open_voice_frame(&keys, CONV, "mallory", 1, &frame).is_none());
-        // A different conv id has no key at all.
+        // A different conv id derives a different room key → tag check fails.
         assert!(open_voice_frame(&keys, "other-room", SENDER, 1, &frame).is_none());
     }
 
@@ -347,11 +372,13 @@ mod tests {
     }
 
     #[test]
-    fn no_key_means_no_seal() {
-        let keys = SenderKeysGroup::new(); // never keyed
-        assert!(!keys.has_key(CONV));
-        assert!(seal_voice_frame(&keys, CONV, SENDER, 1, b"x").is_none());
-        assert!(seal_chat_body(&keys, CONV, SENDER, "m1", b"x").is_none());
+    fn every_room_has_a_deterministic_key() {
+        // A never-distributed group still seals: every room has the deterministic
+        // epoch-0 key, so audio/chat work even in rooms a peer only joined.
+        let keys = SenderKeysGroup::new();
+        assert!(keys.has_key(CONV));
+        assert!(seal_voice_frame(&keys, CONV, SENDER, 1, b"x").is_some());
+        assert!(seal_chat_body(&keys, CONV, SENDER, "m1", b"x").is_some());
     }
 
     #[test]
@@ -368,47 +395,20 @@ mod tests {
     }
 
     #[test]
-    fn two_member_seal_install_open() {
-        // Owner generates; member installs the same key and opens.
-        let mut owner = SenderKeysGroup::new();
-        let (epoch, key) = owner.new_owner_epoch(CONV);
-        let mut member = SenderKeysGroup::new();
-        member.install(CONV, epoch, key);
-
-        let frame = seal_voice_frame(&owner, CONV, SENDER, 3, b"opus").unwrap();
+    fn two_independent_members_interop_via_deterministic_key() {
+        // Two members that never exchanged a key still agree, because both derive
+        // the same deterministic per-room key — this is what makes audio work in
+        // any room. (Consequence: anyone who knows the room id can derive it —
+        // the documented "no confidentiality vs. the relay" caveat.)
+        let a = SenderKeysGroup::new();
+        let b = SenderKeysGroup::new();
+        let frame = seal_voice_frame(&a, CONV, SENDER, 3, b"opus").unwrap();
         assert_eq!(
-            open_voice_frame(&member, CONV, SENDER, 3, &frame),
+            open_voice_frame(&b, CONV, SENDER, 3, &frame),
             Some(b"opus".to_vec())
         );
-
-        // A non-member with no installed key cannot open.
-        let outsider = SenderKeysGroup::new();
-        assert!(open_voice_frame(&outsider, CONV, SENDER, 3, &frame).is_none());
-    }
-
-    #[test]
-    fn rotate_advances_epoch_and_keeps_old_key() {
-        let mut owner = SenderKeysGroup::new();
-        let (e0, _k0) = owner.new_owner_epoch(CONV);
-        assert_eq!(e0, 0);
-        let old_frame = seal_voice_frame(&owner, CONV, SENDER, 1, b"old").unwrap();
-
-        let (e1, _k1) = owner.rotate(CONV);
-        assert_eq!(e1, 1);
-        assert_eq!(owner.current_epoch(CONV), 1);
-        // New frames seal under epoch 1…
-        let new_frame = seal_voice_frame(&owner, CONV, SENDER, 2, b"new").unwrap();
-        assert_eq!(new_frame[0], 1);
-        // …but the retained epoch-0 key still opens the old frame.
-        assert_eq!(old_frame[0], 0);
-        assert_eq!(
-            open_voice_frame(&owner, CONV, SENDER, 1, &old_frame),
-            Some(b"old".to_vec())
-        );
-        assert_eq!(
-            open_voice_frame(&owner, CONV, SENDER, 2, &new_frame),
-            Some(b"new".to_vec())
-        );
+        // A different room derives a different key, so cross-room frames fail.
+        assert!(open_voice_frame(&b, "other-room", SENDER, 3, &frame).is_none());
     }
 
     #[test]
