@@ -240,6 +240,8 @@ pub mod ffi {
 
         /// Create and immediately join a new SFU voice room on a supernode.
         /// `room_type` is `"public"` or `"private"` (supernode wire shape).
+        /// `invite_policy` is `"owner"` (default; only the creator/admin can
+        /// mint invite tokens) or `"members"` (any current member can mint).
         #[qinvokable]
         #[rust_name = "create_room"]
         fn createRoom(
@@ -247,6 +249,7 @@ pub mod ffi {
             supernode_id: &QString,
             room_name: &QString,
             room_type: &QString,
+            invite_policy: &QString,
         );
 
         /// Create a room nested under `parent_room_id` in the Space tree. Behaves
@@ -260,6 +263,7 @@ pub mod ffi {
             room_name: &QString,
             room_type: &QString,
             parent_room_id: &QString,
+            invite_policy: &QString,
         );
 
         /// Emitted when the supernode acknowledges a room we created.
@@ -902,6 +906,13 @@ pub struct AppBridgeRust {
     /// new room under the parent room in the Space tree. Client-side only.
     pending_sub_room_parent: std::collections::HashMap<String, String>,
 
+    /// Pending invite-policy choice for a room create in flight, keyed
+    /// `supernode_id:room_name`. Set by `create_room_impl` and consumed in the
+    /// `RoomCreated` handler to persist the creator's chosen policy into
+    /// `RoomStore` (the supernode does not echo it back, and does not persist
+    /// it either — the client must remember it to replay on reconnect).
+    pending_room_invite_policy: std::collections::HashMap<String, String>,
+
     /// Currently selected peer (for per-peer chat loading).
     selected_peer_id: String,
 
@@ -1075,6 +1086,7 @@ impl Default for AppBridgeRust {
             chat_store: None,
             room_store: None,
             pending_sub_room_parent: std::collections::HashMap::new(),
+            pending_room_invite_policy: std::collections::HashMap::new(),
             selected_peer_id: String::new(),
             current_supernode_id: String::new(),
             current_room_id: String::new(),
@@ -2251,6 +2263,7 @@ impl ffi::AppBridge {
             "",
             false,
             "",
+            "",
         );
 
         // Immediately seed room_participant_ids with just the local peer so
@@ -2349,6 +2362,7 @@ impl ffi::AppBridge {
             "",
             false,
             &token,
+            "",
         );
 
         // See join_room: only seed [self] when this join is for the active voice
@@ -2508,6 +2522,7 @@ impl ffi::AppBridge {
             "",
             false,
             "",
+            "",
         );
     }
 
@@ -2549,8 +2564,15 @@ impl ffi::AppBridge {
         supernode_id: &QString,
         room_name: &QString,
         room_type: &QString,
+        invite_policy: &QString,
     ) {
-        self.create_room_impl(supernode_id, room_name, room_type, "");
+        self.create_room_impl(
+            supernode_id,
+            room_name,
+            room_type,
+            "",
+            &invite_policy.to_string(),
+        );
     }
 
     fn create_sub_room(
@@ -2559,24 +2581,30 @@ impl ffi::AppBridge {
         room_name: &QString,
         room_type: &QString,
         parent_room_id: &QString,
+        invite_policy: &QString,
     ) {
         self.create_room_impl(
             supernode_id,
             room_name,
             room_type,
             &parent_room_id.to_string(),
+            &invite_policy.to_string(),
         );
     }
 
     /// Shared room-create path. `parent_room_id` (empty for a top-level room) is
     /// stashed by `supernode_id:room_name` so the `RoomCreated` handler nests the
-    /// new room under that parent in the Space tree.
+    /// new room under that parent in the Space tree. `invite_policy` (`"owner"`
+    /// or `"members"`, empty defaults to `"owner"` supernode-side) is stashed
+    /// the same way so the `RoomCreated` handler can persist the creator's
+    /// chosen policy into `RoomStore` for replay on reconnect.
     fn create_room_impl(
         mut self: Pin<&mut Self>,
         supernode_id: &QString,
         room_name: &QString,
         room_type: &QString,
         parent_room_id: &str,
+        invite_policy: &str,
     ) {
         let Some(sid) = self
             .rust()
@@ -2592,12 +2620,20 @@ impl ffi::AppBridge {
         if name.trim().is_empty() {
             return;
         }
+        let policy = match invite_policy.trim().to_ascii_lowercase().as_str() {
+            "members" => "members",
+            _ => "owner",
+        };
         if !parent_room_id.is_empty() {
             self.as_mut()
                 .rust_mut()
                 .pending_sub_room_parent
                 .insert(format!("{sid}:{name}"), parent_room_id.to_owned());
         }
+        self.as_mut()
+            .rust_mut()
+            .pending_room_invite_policy
+            .insert(format!("{sid}:{name}"), policy.to_owned());
         if let Some(ref tx) = self.rust().conn_cmd_tx {
             let _ = tx.try_send(ConnectionCommand::CreateRoom {
                 supernode_id: sid,
@@ -2606,6 +2642,7 @@ impl ffi::AppBridge {
                 room_id: None,
                 creator_id: None,
                 materialize_only: false,
+                invite_policy: policy.to_owned(),
             });
         }
     }
@@ -3671,6 +3708,7 @@ fn remember_room_in_store(
     creator_id: &str,
     is_creator: bool,
     invite_token: &str,
+    invite_policy: &str,
 ) {
     let Some(rs) = room_store else {
         return;
@@ -3686,7 +3724,8 @@ fn remember_room_in_store(
         })
         .with_supernode(supernode_id)
         .with_creator(creator_id, is_creator)
-        .with_invite_token(invite_token);
+        .with_invite_token(invite_token)
+        .with_invite_policy(invite_policy);
     if let Err(e) = rs.write().upsert(entry) {
         warn!("room_store upsert error: {e}");
     }
@@ -3993,6 +4032,7 @@ fn replay_saved_rooms_on_supernode_connect(
     conn_cmd_tx: &mpsc::Sender<ConnectionCommand>,
     supernode_id: &str,
     my_public_id: &str,
+    identity: Option<&crate::identity::Identity>,
 ) {
     for entry in room_store.list_for_supernode_resolved(peer_store, supernode_id) {
         if entry.room_id == "default" {
@@ -4013,7 +4053,30 @@ fn replay_saved_rooms_on_supernode_connect(
             room_id: Some(entry.room_id.clone()),
             creator_id: Some(creator_id),
             materialize_only: true,
+            invite_policy: entry.invite_policy.clone(),
         });
+    }
+    // Periodic Space-root re-broadcast (SPACE-MERKLE-DESIGN §8, open item 3):
+    // reconnect is the one guaranteed convergence point (the supernode may have
+    // restarted and lost its in-memory `SpaceRootStore`), so re-announce our
+    // owned Space root here rather than only on room create/adopt. Best-effort —
+    // no identity, no Space owned for this supernode, or a signing hiccup must
+    // not block the reconnect flow.
+    if let Some(identity) = identity {
+        let space_id = crate::room_store::RoomStore::space_id_for(my_public_id, supernode_id);
+        if let Some(space) = room_store.get_space(&space_id) {
+            let issued_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let root = space.signed_root(issued_at, |b| identity.sign(b));
+            if let Ok(root_json) = serde_json::to_string(&root) {
+                let _ = conn_cmd_tx.try_send(ConnectionCommand::AnnounceSpaceRoot {
+                    supernode_id: supernode_id.to_owned(),
+                    root_json,
+                });
+            }
+        }
     }
 }
 
@@ -4602,6 +4665,7 @@ fn dispatch_event(
                         tx,
                         &canon,
                         &my_public_id,
+                        bridge.rust().identity.as_deref(),
                     );
                 }
             });
@@ -4707,6 +4771,12 @@ fn dispatch_event(
                     return;
                 };
                 let my_public_id = bridge.rust().my_public_id.clone();
+                let invite_policy = {
+                    let mut r = bridge.as_mut().rust_mut();
+                    r.pending_room_invite_policy
+                        .remove(&format!("{canon}:{room_name}"))
+                        .unwrap_or_default()
+                };
                 remember_room_in_store(
                     &bridge.rust().room_store,
                     &canon,
@@ -4716,6 +4786,7 @@ fn dispatch_event(
                     &my_public_id,
                     true,
                     &invite_token,
+                    &invite_policy,
                 );
                 // Layer-1 Space tree: adopt the room we just created into our
                 // Space and sign a new epoch root. If this create was launched as
@@ -4809,6 +4880,7 @@ fn dispatch_event(
                     "",
                     false,
                     &invite_token,
+                    "",
                 );
                 // Stamp the Space-tree linkage carried by the invite proof so the
                 // sidebar nests the room under its parent instead of showing it

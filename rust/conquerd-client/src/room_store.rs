@@ -94,6 +94,15 @@ impl RoomEntry {
         self.invite_token = token.into();
         self
     }
+
+    /// Set the room's invite-mint policy (`"owner"` or `"members"`). Empty
+    /// stays empty (interpreted as "unset" — the supernode defaults to
+    /// `"owner"`); any non-`"members"` value is left as-is here (normalization
+    /// to a known value happens supernode-side).
+    pub fn with_invite_policy(mut self, policy: impl Into<String>) -> Self {
+        self.invite_policy = policy.into();
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------

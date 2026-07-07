@@ -370,6 +370,9 @@ pub enum ConnectionCommand {
         creator_id: Option<String>,
         /// When true, do not auto-join on `SfuRoomCreated` (replay only).
         materialize_only: bool,
+        /// Invite-mint policy: `"owner"` (default) or `"members"`. Empty is
+        /// treated as unset (supernode defaults to `"owner"`).
+        invite_policy: String,
     },
     /// Tear down a trusted supernode session and stop WS auto-reconnect.
     RemoveSupernode {

@@ -56,6 +56,7 @@ Dialog {
 
     onOpened: {
         roomNameField.text = ""
+        membersCanInviteSwitch.checked = false
         if (!supernodePreset)
             supernodeBox.currentIndex = 0
         roomNameField.forceActiveFocus()
@@ -70,10 +71,12 @@ Dialog {
                 ? (nodeListModel.get(supernodeBox.currentIndex).node_id || "")
                 : "")
         if (snId === "") return
+        var invitePolicy = (roomType === "private" && membersCanInviteSwitch.checked)
+            ? "members" : "owner"
         if (isSubRoom)
-            backend.createSubRoom(snId, name, roomType, parentRoomId)
+            backend.createSubRoom(snId, name, roomType, parentRoomId, invitePolicy)
         else
-            backend.createRoom(snId, name, roomType)
+            backend.createRoom(snId, name, roomType, invitePolicy)
     }
 
     background: Rectangle {
@@ -116,6 +119,35 @@ Dialog {
             font.pixelSize: Theme.fontSizeCaption
             wrapMode: Text.Wrap
             Layout.fillWidth: true
+        }
+
+        RowLayout {
+            visible: roomType === "private"
+            Layout.fillWidth: true
+            spacing: Theme.spacingSm
+
+            ColumnLayout {
+                spacing: 2
+                Layout.fillWidth: true
+
+                Text {
+                    text: qsTr("Members can invite")
+                    color: Theme.text
+                    font.pixelSize: Theme.fontSizeBody
+                }
+                Text {
+                    text: qsTr("Let any current member mint invite tokens, not just you.")
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeCaption
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                }
+            }
+
+            Switch {
+                id: membersCanInviteSwitch
+                checked: false
+            }
         }
 
         ColumnLayout {

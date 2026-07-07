@@ -42,6 +42,17 @@ pub enum RoomType {
     Private,
 }
 
+/// Normalize a client-supplied invite-policy string to a known value.
+/// Anything other than exactly `"members"` (including absent/empty/garbled
+/// input) normalizes to the safe `"owner"` default.
+pub fn normalize_invite_policy(policy: &str) -> String {
+    if policy == "members" {
+        "members".to_owned()
+    } else {
+        "owner".to_owned()
+    }
+}
+
 /// Decaying activity score for one speaker, used to pick the room's top-K
 /// active talkers without the supernode ever decoding the (opaque) Opus audio.
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +78,12 @@ pub struct SFURoom {
     pub room_name: String,
     pub room_type: RoomType,
     pub creator_id: String,
+    /// Invite-mint policy: `"owner"` (only `creator_id` may mint — the safe
+    /// default) or `"members"` (any current participant, chat subscriber,
+    /// already-`allow`ed peer, or the creator may mint). Normalized at
+    /// creation time via [`normalize_invite_policy`]; unknown/absent values
+    /// fall back to `"owner"`.
+    pub invite_policy: String,
     /// identity_pub → participant index
     participants: HashMap<String, u8>,
     /// Active-speaker tracking: sender → decaying activity score.
@@ -104,6 +121,7 @@ impl SFURoom {
             room_name: room_name.to_string(),
             room_type,
             creator_id: creator_id.to_string(),
+            invite_policy: "owner".to_string(),
             participants: HashMap::new(),
             speaker_scores: HashMap::new(),
             active_speakers: Vec::new(),
@@ -149,6 +167,19 @@ impl SFURoom {
             || self.allowed.contains(peer_id)
             || self.creator_id == peer_id
             || self.participants.contains_key(peer_id)
+    }
+
+    /// Whether `peer_id` counts as a "member" of this room for the
+    /// `"members"` invite-policy widening: the creator, an already-`allow`ed
+    /// peer, a voice participant, or a text-chat subscriber. Deliberately
+    /// distinct from [`Self::is_peer_allowed`] (which also admits anyone to a
+    /// *public* room) — invite-minting eligibility is about actual membership,
+    /// not room visibility.
+    pub fn is_invite_eligible_member(&self, peer_id: &str) -> bool {
+        self.creator_id == peer_id
+            || self.allowed.contains(peer_id)
+            || self.participants.contains_key(peer_id)
+            || self.subscribers.contains(peer_id)
     }
 
     #[allow(dead_code)]
@@ -353,14 +384,30 @@ impl SFURoomManager {
         mgr
     }
 
-    /// Create or return an existing peer-materialized room.
-    /// Returns `(room, created_new)`.
+    /// Create or return an existing peer-materialized room, with the safe
+    /// `"owner"` invite policy. Returns `(room, created_new)`.
     pub fn create_room(
         &mut self,
         room_id: Option<&str>,
         room_name: &str,
         room_type: RoomType,
         creator_id: &str,
+    ) -> Option<(&SFURoom, bool)> {
+        self.create_room_with_policy(room_id, room_name, room_type, creator_id, "owner")
+    }
+
+    /// Create or return an existing peer-materialized room with an explicit
+    /// invite policy (`"owner"` or `"members"`; anything else normalizes to
+    /// the safe `"owner"` default — see [`normalize_invite_policy`]). Returns
+    /// `(room, created_new)`. An already-existing room's policy is not
+    /// overwritten by a later create/materialize call.
+    pub fn create_room_with_policy(
+        &mut self,
+        room_id: Option<&str>,
+        room_name: &str,
+        room_type: RoomType,
+        creator_id: &str,
+        invite_policy: &str,
     ) -> Option<(&SFURoom, bool)> {
         let id = room_id
             .map(String::from)
@@ -369,6 +416,7 @@ impl SFURoomManager {
             return self.rooms.get(&id).map(|r| (r, false));
         }
         let mut room = SFURoom::new(&id, room_name, room_type, creator_id);
+        room.invite_policy = normalize_invite_policy(invite_policy);
         room.mark_unused_if_empty();
         info!("Materialized SFU room: {} ({})", room_name, &id);
         self.rooms.insert(id.clone(), room);
@@ -572,18 +620,25 @@ impl SFURoomManager {
             .map(|r| r.generate_invite_token(created_by, 1))
     }
 
-    /// Generate an invite token **only if** `requester` is the room's creator.
+    /// Generate an invite token if `requester` is authorized under the room's
+    /// [`SFURoom::invite_policy`]: the creator always qualifies; under
+    /// `"members"`, any current participant, chat subscriber, or already-
+    /// `allow`ed peer also qualifies (see [`SFURoom::is_invite_eligible_member`]).
     ///
-    /// This is the owner-only invite policy — the safe default that closes the
-    /// unchecked-minting hole where any authenticated peer could mint a valid
-    /// token for any room. Rooms with no creator (the default/anonymous rooms)
-    /// never mint through this path. A future `invite_policy` field can widen
-    /// this to `members` without changing callers.
+    /// This closes the unchecked-minting hole where any authenticated peer
+    /// could mint a valid token for any room. Rooms with no creator (the
+    /// default/anonymous rooms) never mint through this path regardless of
+    /// policy — there is no owner to have set one.
     pub fn generate_invite_token_checked(&mut self, room_id: &str, requester: &str) -> InviteMint {
         let Some(room) = self.rooms.get_mut(room_id) else {
             return InviteMint::RoomNotFound;
         };
-        if room.creator_id.is_empty() || room.creator_id != requester {
+        if room.creator_id.is_empty() {
+            return InviteMint::NotAuthorized;
+        }
+        let authorized = room.creator_id == requester
+            || (room.invite_policy == "members" && room.is_invite_eligible_member(requester));
+        if !authorized {
             return InviteMint::NotAuthorized;
         }
         InviteMint::Ok(room.generate_invite_token(requester, 1))
@@ -691,6 +746,70 @@ mod tests {
             mgr.generate_invite_token_checked("anon", "anyone"),
             InviteMint::NotAuthorized
         );
+    }
+
+    #[test]
+    fn invite_mint_members_policy_allows_participants_and_subscribers() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room_with_policy(
+            Some("priv"),
+            "Private",
+            RoomType::Private,
+            "owner-pub",
+            "members",
+        )
+        .expect("room");
+
+        // Owner still mints under "members".
+        match mgr.generate_invite_token_checked("priv", "owner-pub") {
+            InviteMint::Ok(tok) => assert!(!tok.is_empty()),
+            other => panic!("owner should mint, got {other:?}"),
+        }
+
+        // A voice participant qualifies under "members".
+        mgr.allow_peer("priv", "talker");
+        mgr.join_room("talker", "priv");
+        match mgr.generate_invite_token_checked("priv", "talker") {
+            InviteMint::Ok(tok) => assert!(!tok.is_empty()),
+            other => panic!("participant should mint under members policy, got {other:?}"),
+        }
+
+        // A chat-only subscriber also qualifies.
+        mgr.allow_peer("priv", "listener");
+        mgr.subscribe("listener", "priv");
+        match mgr.generate_invite_token_checked("priv", "listener") {
+            InviteMint::Ok(tok) => assert!(!tok.is_empty()),
+            other => panic!("subscriber should mint under members policy, got {other:?}"),
+        }
+
+        // A total outsider still cannot mint.
+        assert_eq!(
+            mgr.generate_invite_token_checked("priv", "outsider"),
+            InviteMint::NotAuthorized
+        );
+    }
+
+    #[test]
+    fn invite_mint_owner_policy_still_rejects_non_creator_members() {
+        let mut mgr = SFURoomManager::new();
+        // Default/omitted policy normalizes to "owner" via `create_room`.
+        mgr.create_room(Some("priv"), "Private", RoomType::Private, "owner-pub")
+            .expect("room");
+        mgr.allow_peer("priv", "talker");
+        mgr.join_room("talker", "priv");
+        // Even a joined participant cannot mint under the "owner" policy.
+        assert_eq!(
+            mgr.generate_invite_token_checked("priv", "talker"),
+            InviteMint::NotAuthorized
+        );
+    }
+
+    #[test]
+    fn normalize_invite_policy_defaults_unknown_values_to_owner() {
+        assert_eq!(normalize_invite_policy("members"), "members");
+        assert_eq!(normalize_invite_policy("owner"), "owner");
+        assert_eq!(normalize_invite_policy(""), "owner");
+        assert_eq!(normalize_invite_policy("garbage"), "owner");
     }
 
     #[test]

@@ -199,6 +199,10 @@ pub struct PeerAuthGrant {
 
 /// Fetches the `room_id`s this node currently has local subscribers for.
 pub type LocalRoomsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+/// Fetches the currently-held signed Space roots (one per `space_id`) so they
+/// can be periodically re-gossiped (§8 periodic re-broadcast) for members that
+/// missed the on-change gossip or joined the cluster later.
+pub type LocalSpaceRootsFn = Arc<dyn Fn() -> Vec<SignedSpaceRoot> + Send + Sync>;
 /// Consumes a replicated room message (delivers to local subscribers).
 pub type OnReplicateFn = Arc<dyn Fn(ReplicatedMsg) + Send + Sync>;
 /// Applies a replicated room-membership grant to the local SFU.
@@ -254,6 +258,9 @@ pub struct ClusterLink {
     /// this node's current subscriptions immediately instead of waiting for the
     /// periodic refresh.
     local_rooms: RwLock<Option<LocalRoomsFn>>,
+    /// Set in [`ClusterLink::start`]; source of truth for the periodic Space-root
+    /// re-gossip (and the initial advertise on a freshly-established link).
+    local_space_roots: RwLock<Option<LocalSpaceRootsFn>>,
     /// Fired by [`ClusterLink::shutdown`] to stop all background loops.
     shutdown: Arc<Notify>,
     /// The accept-side endpoint, retained so shutdown can close it.
@@ -278,6 +285,7 @@ impl ClusterLink {
             on_peer_auth,
             on_space_root,
             local_rooms: RwLock::new(None),
+            local_space_roots: RwLock::new(None),
             shutdown: Arc::new(Notify::new()),
             server_endpoint: RwLock::new(None),
         })
@@ -392,8 +400,14 @@ impl ClusterLink {
     }
 
     /// Start the cluster endpoint: bind the local `cluster_addr`, accept inbound
-    /// links, dial peer members, and periodically advertise local subscriptions.
-    pub async fn start(self: &Arc<Self>, local_rooms: LocalRoomsFn) -> anyhow::Result<u16> {
+    /// links, dial peer members, and periodically advertise local subscriptions
+    /// and currently-held Space roots.
+    pub async fn start(
+        self: &Arc<Self>,
+        local_rooms: LocalRoomsFn,
+        local_space_roots: LocalSpaceRootsFn,
+    ) -> anyhow::Result<u16> {
+        *self.local_space_roots.write() = Some(Arc::clone(&local_space_roots));
         let bind: SocketAddr = self
             .my_cluster_addr()
             .ok_or_else(|| anyhow::anyhow!("this node has no cluster_addr configured"))?;
@@ -447,7 +461,10 @@ impl ClusterLink {
             });
         }
 
-        // Periodic subscription advertisement.
+        // Periodic subscription + Space-root re-advertisement. Roots are
+        // otherwise only gossiped on-change (`replicate_space_root`), so a
+        // member that missed that gossip (or joined the cluster later) would
+        // never converge without this (SPACE-MERKLE-DESIGN §8, open item 3).
         {
             let this = Arc::clone(self);
             let shutdown = Arc::clone(&self.shutdown);
@@ -455,7 +472,12 @@ impl ClusterLink {
                 let mut interval = tokio::time::interval(SUBSCRIPTION_REFRESH);
                 loop {
                     tokio::select! {
-                        _ = interval.tick() => this.broadcast_subscriptions(&local_rooms()),
+                        _ = interval.tick() => {
+                            this.broadcast_subscriptions(&local_rooms());
+                            for root in local_space_roots() {
+                                this.replicate_space_root(&root);
+                            }
+                        }
                         _ = shutdown.notified() => break,
                     }
                 }
@@ -585,6 +607,19 @@ impl ClusterLink {
                 &self.identity,
             );
             let _ = send.write_all(&subs.encode_frame()).await;
+        }
+
+        // Advertise our currently-held Space roots immediately too, so a member
+        // that just joined the cluster converges without waiting up to
+        // `SUBSCRIPTION_REFRESH` for the periodic re-gossip.
+        let local_space_roots = self.local_space_roots.read().clone();
+        if let Some(local_space_roots) = local_space_roots {
+            for root in local_space_roots() {
+                let msg = ClusterMsg::signed(ClusterMsgKind::SpaceRoot { root }, &self.identity);
+                if send.write_all(&msg.encode_frame()).await.is_err() {
+                    break;
+                }
+            }
         }
 
         // Writer task: drain the outbound channel onto the stream.
@@ -848,8 +883,14 @@ mod tests {
         let a_rooms: LocalRoomsFn = Arc::new(Vec::new);
         let b_rooms: LocalRoomsFn = Arc::new(|| vec!["room1".to_string()]);
 
-        link_a.start(a_rooms).await.expect("link A start");
-        link_b.start(b_rooms).await.expect("link B start");
+        link_a
+            .start(a_rooms, Arc::new(Vec::new))
+            .await
+            .expect("link A start");
+        link_b
+            .start(b_rooms, Arc::new(Vec::new))
+            .await
+            .expect("link B start");
 
         // Once the link is up and B's subscription has reached A, A's replicate
         // routes the frame to B. Retry to absorb connect/propagation latency.
@@ -927,8 +968,14 @@ mod tests {
         let link_b = ClusterLink::new(id_b, mem_b, no_repl, on_grant_b, no_auth, no_root);
 
         let rooms: LocalRoomsFn = Arc::new(Vec::new);
-        link_a.start(rooms.clone()).await.expect("link A start");
-        link_b.start(rooms).await.expect("link B start");
+        link_a
+            .start(rooms.clone(), Arc::new(Vec::new))
+            .await
+            .expect("link A start");
+        link_b
+            .start(rooms, Arc::new(Vec::new))
+            .await
+            .expect("link B start");
 
         let mut delivered = false;
         for _ in 0..100 {
@@ -946,6 +993,92 @@ mod tests {
             assert_eq!(got[0].room_type, "private");
             assert_eq!(got[0].allowed_peer, "peerX");
         }
+        link_a.shutdown();
+        link_b.shutdown();
+    }
+
+    /// SPACE-MERKLE-DESIGN §8 open item 3: a freshly-established cluster link
+    /// advertises the owner's currently-held Space roots immediately (not just
+    /// on-change via `replicate_space_root`), so a member that joins the
+    /// cluster later converges without waiting for a client resend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_node_cluster_advertises_space_root_on_link_establish() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+        let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
+        let (a_addr, b_addr) = reserve_two_addrs();
+
+        let mk = |id: &str, addr: &str| crate::cluster::ClusterMember {
+            identity_pub: id.to_string(),
+            relay_addr: addr.to_string(),
+            cluster_addr: Some(addr.to_string()),
+            ws_addr: None,
+            web_port: None,
+        };
+        let cfg = crate::cluster::ClusterConfig {
+            cluster_id: "test".into(),
+            members: vec![mk(&a_pub, &a_addr), mk(&b_pub, &b_addr)],
+        };
+        let mem_a = ClusterMembership::new(cfg.clone(), &a_pub);
+        let mem_b = ClusterMembership::new(cfg, &b_pub);
+
+        // A owns one signed Space root, advertised via `local_space_roots`.
+        let owner = Identity::generate();
+        let space = crate::space::Space::new_server(&owner.public_id(), "srv");
+        let root = space.signed_root(1000, |b| owner.sign(b).to_vec());
+        let a_roots: LocalSpaceRootsFn = {
+            let root = root.clone();
+            Arc::new(move || vec![root.clone()])
+        };
+
+        // B records roots it receives.
+        let received = Arc::new(parking_lot::Mutex::new(Vec::<SignedSpaceRoot>::new()));
+        let on_root_b: OnSpaceRootFn = {
+            let r = received.clone();
+            Arc::new(move |root| r.lock().push(root))
+        };
+        let no_repl: OnReplicateFn = Arc::new(|_| {});
+        let no_grant: OnRoomGrantFn = Arc::new(|_| {});
+        let no_auth: OnPeerAuthFn = Arc::new(|_| {});
+        let no_root: OnSpaceRootFn = Arc::new(|_| {});
+
+        let link_a = ClusterLink::new(
+            id_a,
+            mem_a,
+            no_repl.clone(),
+            no_grant.clone(),
+            no_auth.clone(),
+            no_root,
+        );
+        let link_b = ClusterLink::new(id_b, mem_b, no_repl, no_grant, no_auth, on_root_b);
+
+        let rooms: LocalRoomsFn = Arc::new(Vec::new);
+        link_a
+            .start(rooms.clone(), a_roots)
+            .await
+            .expect("link A start");
+        link_b
+            .start(rooms, Arc::new(Vec::new))
+            .await
+            .expect("link B start");
+
+        let mut delivered = false;
+        for _ in 0..100 {
+            if !received.lock().is_empty() {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            delivered,
+            "B never received A's Space root on link establish"
+        );
+        assert_eq!(received.lock()[0].space_id, root.space_id);
+        assert_eq!(received.lock()[0].epoch, root.epoch);
+
         link_a.shutdown();
         link_b.shutdown();
     }
@@ -994,8 +1127,14 @@ mod tests {
         let link_b = ClusterLink::new(id_b, mem_b, no_repl, no_grant, on_auth_b, no_root);
 
         let rooms: LocalRoomsFn = Arc::new(Vec::new);
-        link_a.start(rooms.clone()).await.expect("link A start");
-        link_b.start(rooms).await.expect("link B start");
+        link_a
+            .start(rooms.clone(), Arc::new(Vec::new))
+            .await
+            .expect("link A start");
+        link_b
+            .start(rooms, Arc::new(Vec::new))
+            .await
+            .expect("link B start");
 
         let mut delivered = false;
         for _ in 0..100 {

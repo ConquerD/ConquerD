@@ -303,6 +303,20 @@ pub(super) fn peer_quic_endpoint(record: &crate::peer_store::PeerRecord) -> Opti
         .or_else(|| (record.quic_port != 0).then(|| ("127.0.0.1".to_owned(), record.quic_port)))
 }
 
+/// Parameters for `send_room_create`, bundled into one struct to keep the
+/// function under clippy's argument-count lint — every field maps 1:1 to a
+/// `SfuRoomCreate` wire field or a client-only replay/materialize flag, so
+/// there is no natural way to shrink the field count further.
+struct RoomCreateRequest<'a> {
+    supernode_id: &'a str,
+    room_name: &'a str,
+    room_type: &'a str,
+    room_id: Option<&'a str>,
+    creator_id: Option<&'a str>,
+    materialize_only: bool,
+    invite_policy: &'a str,
+}
+
 /// The central connection manager.
 ///
 /// Call [`ConnectionManager::run`] in a tokio task to drive all I/O. The
@@ -823,15 +837,17 @@ impl ConnectionManager {
                             room_id,
                             creator_id,
                             materialize_only,
+                            invite_policy,
                         } => {
-                            self.send_room_create(
-                                &supernode_id,
-                                &room_name,
-                                &room_type,
-                                room_id.as_deref(),
-                                creator_id.as_deref(),
+                            self.send_room_create(RoomCreateRequest {
+                                supernode_id: &supernode_id,
+                                room_name: &room_name,
+                                room_type: &room_type,
+                                room_id: room_id.as_deref(),
+                                creator_id: creator_id.as_deref(),
                                 materialize_only,
-                            )
+                                invite_policy: &invite_policy,
+                            })
                             .await;
                         }
                     }
@@ -2115,15 +2131,16 @@ impl ConnectionManager {
         self.dispatch_outbound(msg).await;
     }
 
-    async fn send_room_create(
-        &mut self,
-        supernode_id: &str,
-        room_name: &str,
-        room_type: &str,
-        room_id: Option<&str>,
-        creator_id: Option<&str>,
-        materialize_only: bool,
-    ) {
+    async fn send_room_create(&mut self, req: RoomCreateRequest<'_>) {
+        let RoomCreateRequest {
+            supernode_id,
+            room_name,
+            room_type,
+            room_id,
+            creator_id,
+            materialize_only,
+            invite_policy,
+        } = req;
         let normalized = match room_type.trim().to_ascii_lowercase().as_str() {
             "private" => "private",
             _ => "public",
@@ -2148,6 +2165,12 @@ impl ConnectionManager {
         if let Some(cid) = creator_id.filter(|s| !s.is_empty()) {
             msg.payload
                 .insert("creator_id".to_owned(), Value::String(cid.to_owned()));
+        }
+        if !invite_policy.is_empty() {
+            msg.payload.insert(
+                "invite_policy".to_owned(),
+                Value::String(invite_policy.to_owned()),
+            );
         }
         info!(
             "[cm] SfuRoomCreate: supernode={} name={room_name} type={normalized} materialize_only={materialize_only}",
@@ -4989,15 +5012,70 @@ impl ConnectionManager {
             .get("chunk_index")
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize;
-        let data = msg
+        let raw_data = msg
             .payload
             .get("data")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let probe = vec![0u8; data.len()];
+        let probe = vec![0u8; raw_data.len()];
         if !self.gate_through_feature("room.file.v1", &msg.sender, &probe) {
             return;
         }
+        // E2E: when `e2e`, `data` is `base64(nonce ‖ aesgcm(data))` sealed
+        // under the room group key with `AAD = room_id ‖ sender ‖
+        // transfer_id ‖ chunk_index`. Decrypt and re-encode as plain base64
+        // (the format `FileTransferManager::on_chunk_received` expects)
+        // before handing off; drop on failure. Absent `e2e` → legacy
+        // cleartext (interop).
+        let is_e2e = msg
+            .payload
+            .get("e2e")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let data_owned;
+        let data: &str = if is_e2e {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let room_id = msg
+                .payload
+                .get("room_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
+            let epoch = msg
+                .payload
+                .get("epoch")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            let Ok(sealed) = b64.decode(raw_data) else {
+                return;
+            };
+            let plaintext = epoch.try_into().ok().and_then(|e: u8| {
+                crate::group_key::open_file_chunk(
+                    &self.group_keys,
+                    room_id,
+                    &msg.sender,
+                    &tid,
+                    idx as u64,
+                    e,
+                    &sealed,
+                )
+            });
+            match plaintext {
+                Some(p) => {
+                    data_owned = b64.encode(p);
+                    data_owned.as_str()
+                }
+                None => {
+                    debug!(
+                        "[room.file.v1] failed to open E2E chunk from {}; dropping",
+                        &msg.sender[..8.min(msg.sender.len())]
+                    );
+                    return;
+                }
+            }
+        } else {
+            raw_data
+        };
         let evs = self.room_file_mgr.on_chunk_received(&tid, idx, data);
         self.dispatch_room_transfer_events(evs, "", "").await;
     }
@@ -5103,6 +5181,56 @@ impl ConnectionManager {
                     };
                     payload.insert("room_id".into(), Value::String(room_id.to_owned()));
                     let sender = self.identity.public_id();
+                    // E2E-seal the chunk `data` under the room group key
+                    // (`AAD = room_id ‖ sender ‖ transfer_id ‖ chunk_index`),
+                    // mirroring `room.chat.v1` body sealing. Falls back to
+                    // cleartext if no key is available yet (race right after
+                    // join) so the transfer isn't lost — the receiver
+                    // auto-detects via the `e2e` flag.
+                    if room_msg_type == MessageType::SfuFileChunk {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD;
+                        let transfer_id = payload
+                            .get("transfer_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let chunk_index = payload
+                            .get("chunk_index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        if let Some(raw) = payload
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .and_then(|s| b64.decode(s).ok())
+                        {
+                            match crate::group_key::seal_file_chunk(
+                                &self.group_keys,
+                                room_id,
+                                &sender,
+                                &transfer_id,
+                                chunk_index,
+                                &raw,
+                            ) {
+                                Some((epoch, sealed)) => {
+                                    payload.insert(
+                                        "data".to_owned(),
+                                        Value::String(b64.encode(&sealed)),
+                                    );
+                                    payload.insert("e2e".to_owned(), Value::Bool(true));
+                                    payload.insert(
+                                        "epoch".to_owned(),
+                                        Value::Number((epoch as u64).into()),
+                                    );
+                                }
+                                None => {
+                                    warn!(
+                                        "[room.file.v1] no group key for room yet; sending cleartext chunk"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let mut msg = SignalingMessage::new(room_msg_type, sender);
                     msg.target = Some(supernode_id.to_owned());
                     msg.payload = payload.into_iter().collect();

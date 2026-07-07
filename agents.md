@@ -80,7 +80,7 @@ Working style:
 
 ### 5. QA/Testing Agent
 Responsibilities:
-- Run unit and integration tests and targeted manual checks (539 Rust unit tests; 114 in `conquerd-features`).
+- Run unit and integration tests and targeted manual checks (613 Rust unit tests; 114 in `conquerd-features`).
 - Stress race-prone flows (rapid connect/disconnect, duplicate signaling).
 - Validate trusted-peer persistence and UI synchronization.
 - Cover QUIC relay path and WebSocket membership signaling for room audio.
@@ -151,7 +151,7 @@ This section captures implementation locations and invariants that agents must r
   - `src/ui/bridge.rs` + models: `AppBridge` QObject and QML-facing state (`connection_mode`, `call_duration_secs`, `missed_calls`, `mic_level`, etc.).
   - `src/peer_store.rs`: trusted-peer persistence (`is_supernode`, `supernode_from_invite`, `relay_hints`); `supernodes()` vs `list_non_supernode_peers()` split drives Rooms vs Peers (see supernode detection invariant below).
   - `src/avatar_config.rs`: compiled unconditionally (so `peer_store.rs` can hold `Option<AvatarConfig>` even without `qt-ui`); `settings.avatar_config_json` qproperty lives on `SettingsModel`.
-  - `src/chat_store.rs`: per-peer `trim_by_age` / `trim_by_count` / `purge_all`; `keyring_delete_aes_key` for identity lock.
+  - `src/chat_store.rs`: per-peer `trim_by_age` / `trim_by_count` / `purge_all` (identity lock also drops the AES key via `keyring_delete_aes_key` in `identity.rs`).
   - `src/room_store.rs`: client-owned encrypted room definitions (`my_rooms.dat`), keyed by `(supernode_id, room_id)`; sidebar hide list; replay source for `SfuRoomCreate` on supernode connect. **Never** persist room definitions on the supernode.
   - `src/identity.rs`: Ed25519 + OS keyring integration.
   - `ConnectionManager` (`src/connection_manager/` module — `mod.rs`, `manager.rs`, `internal.rs`, `quic.rs`, `ws.rs`, `events.rs`, `tests.rs`): direct QUIC + relay client paths; outbound `core.chat.v1` / `core.file.v1` must call `gate_through_feature`; audio datagrams must use the quota-checked send helpers.
@@ -188,21 +188,22 @@ Supernodes are **untrusted for content**. They assist NAT traversal, WS/QUIC rel
 | Supernode may see (routing metadata) | Supernode must NOT see (application content) |
 |---|---|
 | Peer `public_id`, room id, relay peer indices | Chat message bodies |
-| WS/QUIC connection timing, byte volumes | Opus/audio payloads (decodable without a content key) |
-| Ed25519 signatures + message `type` on the wire | File chunk plaintext |
+| WS/QUIC connection timing, byte volumes | Opus/audio payloads (E2E-sealed under the room sender key) |
+| Ed25519 signatures + message `type` on the wire | File chunk bytes (E2E-sealed under the room sender key) |
 | Room membership rosters (who joined/left) | Room content keys or session keys |
 | `SfuRoomCreate` room name/type (ephemeral, not persisted) | Decrypted `game.relay.v1` / bespoke datagram payloads |
 
 **Opaque today (correct):**
 - `game.relay.v1` — raw datagram fan-out; supernode never parses inner bytes (`webtransport.rs`, `relay.rs`).
 - QUIC relay datagram forwarding — inner channel tag + payload forwarded verbatim (`wire.rs`).
-- `EncryptedSignal` — pass-through relay type exists on the WS path (`MessageType::EncryptedSignal` in `conquerd-supernode/src/main.rs`); intended envelope for E2E ciphertext.
+- `EncryptedSignal` — pass-through relay type on the WS path (`MessageType::EncryptedSignal` in `conquerd-supernode/src/main.rs`); the envelope for direct 1:1 E2E ciphertext and the sealed `SfuGroupKey` distribution.
+- `SfuAudio` / `room.audio.sfu` — Opus frames are E2E-sealed as `[epoch:u8][nonce:12][AES-256-GCM(opus)]` (AAD = conv_id ‖ sender ‖ seq) under a per-room sender key; the supernode fans out verbatim and cannot decode. Active-speaker selection uses frame arrival only, never decode (`sfu.rs`).
+- `SfuChat` / `room.chat.v1` — the `body` is E2E-sealed as `nonce ‖ AES-256-GCM(body)` (AAD = conv_id ‖ sender ‖ message_id) under the same per-room sender key. Quota helpers prefer the opaque `ciphertext` length (`sfu_chat_byte_count` in `main.rs`).
+- `SfuFile*` / `room.file.v1` — each chunk's `data` is E2E-sealed as `nonce ‖ AES-256-GCM(data)` (AAD = conv_id ‖ sender ‖ transfer_id ‖ chunk_index) under the same per-room sender key (`group_key::seal_file_chunk` / `open_file_chunk`); falls back to cleartext only when no group key is available yet (race right after join), auto-detected via the `e2e` flag. `SfuFileOffer` / `SfuFileComplete` metadata (size, sha256, rel_path) stays cleartext — it is not content.
+- Room sender keying: the room **owner** generates a per-epoch key and seals it to each member inside an `EncryptedSignal` carrying an inner `SfuGroupKey` (supernode forwards blind); rotates on member-leave (FS/PCS). Codec + `SenderKeysGroup` in `group_key.rs`; wired in `connection_manager/manager.rs`. **v1 caveats:** any paired room peer can push a bogus `SfuGroupKey` (DoS on decrypt, not a confidentiality break — hardens with Space grants); `epoch` is `u8` (wraps after 256 rotations/session).
 
-**Signed but not yet opaque (P3 — must not regress):**
-- `ChatMessage` / `SfuChat` — JSON `body` field is plaintext on the wire today; supernode WS relay and SFU broadcast can read it. Quota helpers must prefer opaque `ciphertext` length when present (`sfu_chat_byte_count` in `main.rs`).
-- `SfuAudio` / `core.audio.opus` — Opus frames are signed but not encrypted; a relay operator can decode audio. Active-speaker selection uses frame arrival only, not decode (`sfu.rs`).
-- `SfuFile*` / `core.file.v1` — chunk `data` is base64 on the WS/SFU path.
-- Invite handshake derives an X25519/HKDF `session_key` (`crypto.rs` / `handshake.rs`) but clients currently discard it — wire-up `EncryptedSignal` + per-room content keys before claiming E2E confidentiality through supernodes.
+**Signed but not yet opaque (must not regress):**
+- Invite handshake derives an X25519/HKDF `session_key` (`crypto.rs` / `handshake.rs`); direct 1:1 relay uses a pairwise key (see the E2E backlog note), and room content uses the `SenderKeysGroup` per-room key.
 
 **Supernode operator prohibitions (code review checklist):**
 - Never `info!` / `debug!` payload fields (`body`, `audio`, `data`, file names).
@@ -210,11 +211,7 @@ Supernodes are **untrusted for content**. They assist NAT traversal, WS/QUIC rel
 - Quota accounting uses wire-byte or `ciphertext` length — not decrypted content.
 - Membership gates (`is_chat_sender`, `audio_forward_targets`) use sender id + room id only.
 
-**Target E2E shape (P3 implementation):**
-1. Store pairwise `session_key` after invite handshake on both peers.
-2. Wrap supernode-relayed P2P payloads in `encrypted_signal` (AES-256-GCM over the signed inner JSON; AAD binds `sender` + `target` + `timestamp`).
-3. Generate a per-room `content_key` on create (in `RoomStore`); distribute to joiners via pairwise-encrypted envelopes; encrypt all `SfuChat` / `SfuAudio` / `SfuFile*` content fields before SFU fan-out.
-4. Direct QUIC P2P may remain signed-only (no supernode on path) unless users opt into pairwise encryption there too.
+All room-content types (`SfuChat`, `SfuAudio`, `SfuFile*`) are now E2E-sealed under the per-room `SenderKeysGroup` key — the room-content opacity gap is closed. Direct QUIC P2P may remain signed-only (no supernode on path) unless users opt into pairwise encryption there too.
 
 ### Build Gotchas (Agent-Relevant)
 - **Two Cargo workspaces — fmt both when unsure**: `rust/` (features, supernode, installer, opus) and `rust/conquerd-client/` (desktop client). `scripts/ci_local.ps1` runs `cargo fmt --all -- --check` in each. Touching only one crate still requires fmt in that crate's workspace root.
@@ -259,7 +256,7 @@ if !state.features.bind_module("x.vendor.thing", m.clone()) {
 - `register_module` adds descriptor + module in one step (errors on duplicate id).
 - `bind_module(id, m)` attaches a module to a descriptor that the supernode manifest already loaded — preferred for first-party modules so operators retain manifest control.
 - `dispatch_message(id, source, payload)` is the single inbound entry point used by all transports (QUIC peer, QUIC relay, WebTransport). The runtime enforces auth tier + quota before calling the module; returns `false` silently if the quota bucket is exhausted.
-- `dispatch_invoke_datagram(id, source, params)` is the invoke entry point (from `CAPABILITY_INVOKE`). Returns `ModuleError::Internal("quota exceeded")` if over limit.
+- `dispatch_invoke_datagram(id, peer, params, tags)` is the invoke entry point (from `CAPABILITY_INVOKE`). Returns `ModuleError::Internal` (e.g. `"datagram quota exceeded"`) if over limit.
 
 ### Supernode capability surface
 
@@ -358,9 +355,9 @@ Supernode-hosted modules (multi-party; require a connected supernode):
 
 | Capability ID | Kind | Auth | Notes |
 |---|---|---|---|
-| `room.audio.sfu` | datagram | room-member | Ephemeral SFU voice in supernode memory (`sfu.rs`); idle-GC after 900 s empty; definitions owned by clients (`room_store.rs`). Transport: prefers an unreliable **QUIC relay datagram** (`ROOM_AUDIO_TAG`, no TCP head-of-line blocking) when the sender holds a relay session, else falls back to base64-in-JSON `SfuAudio` over the WebSocket signaling path. Frames are **Ed25519-signed** (receivers verify identically on both paths); **not yet E2E-encrypted** — see [Supernode Opacity](#supernode-opacity-agent-contract). The supernode relays verbatim and must not decode Opus for routing (active-speaker gate uses frame arrival only). The supernode bridges per member (`relay.rs` `set_room_audio_bridge` → `main.rs`): relay datagram for relay-connected members, WS for the rest — no member is partitioned. `JoinRoom` requests a relay grant (`ensure_room_relay`) so members acquire a relay session; WS fallback is automatic if the grant never lands. **Active-speaker cap**: the SFU forwards at most `MAX_ACTIVE_SPEAKERS` (5) concurrent talkers per room — frames from speakers over the cap are dropped server-side (receiver fills with Opus PLC) so per-receiver decode/bandwidth stays bounded as rooms grow. Selection is energy-free: `SFURoom::note_audio_should_forward` ranks senders by a decaying frame-activity score (Opus DTX makes "frames arriving" a good proxy for "talking"), with a sticky active set + displacement hysteresis. The gate (`SFURoomManager::audio_forward_targets`) is applied once at the inbound point of all three fan-out paths (WS, relay bridge, browser); rooms with ≤5 active talkers are unaffected. |
-| `room.chat.v1` | stream | room-member | Room text chat broadcast via supernode (content not persisted server-side). |
-| `room.file.v1` | stream | room-member | Signed room file broadcast via supernode; recipients verify chunks before saving. |
+| `room.audio.sfu` | datagram | room-member | Ephemeral SFU voice in supernode memory (`sfu.rs`); idle-GC after 900 s empty; definitions owned by clients (`room_store.rs`). Transport: prefers an unreliable **QUIC relay datagram** (`ROOM_AUDIO_TAG`, no TCP head-of-line blocking) when the sender holds a relay session, else falls back to base64-in-JSON `SfuAudio` over the WebSocket signaling path. Frames are **Ed25519-signed** (receivers verify identically on both paths) **and E2E-sealed** under a per-room sender key (`[epoch:u8][nonce:12][AES-256-GCM(opus)]`, AAD = conv_id ‖ sender ‖ seq; see [Supernode Opacity](#supernode-opacity-agent-contract)). The supernode relays verbatim and cannot decode Opus for routing (active-speaker gate uses frame arrival only). The supernode bridges per member (`relay.rs` `set_room_audio_bridge` → `main.rs`): relay datagram for relay-connected members, WS for the rest — no member is partitioned. `JoinRoom` requests a relay grant (`ensure_room_relay`) so members acquire a relay session; WS fallback is automatic if the grant never lands. **Active-speaker cap**: the SFU forwards at most `MAX_ACTIVE_SPEAKERS` (5) concurrent talkers per room — frames from speakers over the cap are dropped server-side (receiver fills with Opus PLC) so per-receiver decode/bandwidth stays bounded as rooms grow. Selection is energy-free: `SFURoom::note_audio_should_forward` ranks senders by a decaying frame-activity score (Opus DTX makes "frames arriving" a good proxy for "talking"), with a sticky active set + displacement hysteresis. The gate (`SFURoomManager::audio_forward_targets`) is applied once at the inbound point of all three fan-out paths (WS, relay bridge, browser); rooms with ≤5 active talkers are unaffected. |
+| `room.chat.v1` | stream | room-member | Room text chat broadcast via supernode; `body` is E2E-sealed under the per-room sender key (content not persisted server-side). |
+| `room.file.v1` | stream | room-member | Signed room file broadcast via supernode; each chunk's `data` is E2E-sealed under the per-room sender key (AAD = conv_id ‖ sender ‖ transfer_id ‖ chunk_index); recipients verify + decrypt chunks before saving. Offer/complete metadata stays cleartext. |
 | `web.host.app.v1` | stream | public | In-app `conquerd://` portal over QUIC bidi streams in embedded Chromium (4 MB/s). |
 | `web.host.h3.v1` | datagram | public | WebTransport (HTTP/3) bridge so browser clients join the same channel fabric. |
 | `game.relay.v1` | datagram | room-member | Opaque session-scoped datagram relay for in-session games. |
@@ -388,39 +385,19 @@ No central feature registry, no mandatory features, no implicit cross-feature pr
 
 This section is the single source of truth for delivery status (condensed from the former `ROADMAP.md` / `IMPROVEMENT_PLAN.md` / `TODO.md`).
 
-**Last reviewed:** 2026-06-28 (test counts refreshed to 539 unit tests by `cargo test -- --list`; voice/audio items V9–V12, F1 completed; VOICE_CHAT_REVIEW.md folded in and removed).
+**Last reviewed:** 2026-07-08 (Space Merkle Layer 1 gaps 1–3 and 5 closed — `"members"` invite-policy widening, client UI toggle, periodic Space-root re-broadcast, and root-equivocation flagging; see `docs/SPACE-MERKLE-DESIGN.md`. Test totals refreshed to 620. Durable per-feature invariants live in Architecture Notes / Using the Modular Framework / Feature Module Reference above).
 
 ### Health summary
 
-ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (539 unit tests listed; 114 features + 212 supernode + 139 headless client + 74 installer), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only. **Supernode manager** (`rust/conquerd-supernode-manager/`) is production-tested: the acdc three-node cluster (a/b/c) is the live integration-testing target — `build-deploy`, `cluster-sync`, and `exec`-based remote debugging are operational.
+ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (620 unit tests listed by `cargo test -- --list`: 114 features + 246 supernode + 184 headless client + 76 installer), architecture compliant with the capability-gated, client-only, invite-only model, and solid supply-chain hardening (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only. **Supernode manager** (`rust/conquerd-supernode-manager/`) is production-tested: the acdc three-node cluster (a/b/c) is the live integration-testing target — `build-deploy`, `cluster-sync`, and `exec`-based remote debugging are operational.
 
-### P0–P2 — Complete ✅
+### Foundations — stable ✅
 
-| Item | Outcome |
-|---|---|
-| CI hardening | `fmt --check` + `clippy -D warnings` (both workspaces) + headless client tests + `cargo-audit`; all SHA-pinned. |
-| Post-handshake replay protection | 5-minute timestamp freshness window (`MAX_MESSAGE_AGE_SECS` on client, `is_fresh(300.0)` on supernode WS path), **plus** a per-sender sliding-window dedup guard (`conquerd_features::ReplayGuard`) keyed on the message signature; `ReplayGuard` replay negative-path tests in `replay.rs`; client stale/future timestamp rejection tests in `protocol.rs` and `connection_manager::tests`. |
-| Relay + SFU smoke tests | Real mTLS QUIC suite: 2-peer room broadcast, unauthorized rejection, leave/rejoin, ticket renewal. |
-| Quota symmetry | Inbound + outbound gating on direct P2P (`core.audio.opus`), client room audio (`room.audio.sfu`), supernode WS `SfuAudio`/`SfuChat`/`SfuFile*` relay, QUIC relay datagram fan-out, and WebTransport browser fan-out (`BrowserBridge::on_inbound` + `send` + `release_session` cleanup). Bug-review pass (2026-06-11): QUIC relay now clears quota buckets on disconnect, reconnect-replacement, revoke, and stale-peer sweep (`relay.rs`); reconnect no longer lets the old connection's exit path tear down the new session (stable_id guard); dynamic-tag allocation hardened against >224-feature overflow in `webtransport.rs` and both web-SDK copies. |
-| Audio dispatch decision | Real-time Opus bypasses `dispatch_message` module callbacks but is explicitly gated at the transport layer via `check_audio_quota` / `check_room_audio_outbound_quota` / `check_inbound_feature_quota` so quota enforcement cannot be skipped accidentally. |
-| Cross-platform CI | Windows runner (non-Qt tests + client clippy) added. |
-| Platform TODOs | macOS dock badge, Linux D-Bus badge, UPnP all implemented. |
-| Supply-chain | Weekly `supply-chain.yml` (cargo-deny + audit-check) + `deny.toml`. |
-| Operator runbook | `docs/SUPERNODE.md` with full guidance + example `supernode.toml`; pre-built supernode packages for linux-x86_64, linux-aarch64, and win64 on GitHub Releases / nightlies. |
-| Threat model | `docs/THREAT_MODEL.md`. |
-| Version automation | `scripts/check_version_sync.ps1 -BumpTo X.Y.Z` bumps all crates + prints git/tag commands. |
-| Metrics export | `/api/metrics` via `web.host.app.v1`. |
-| Game relay end-to-end | `game.relay.v1` over WebTransport confirmed working: race condition in `/_conquerd/ctx.json` cache fixed (scheme-layer caches now populated on tokio thread in `connection_manager/manager.rs` before any `FetchWebApp` can succeed); self-signed TLS cert now includes `serverAuth` EKU (Chrome WebTransport requirement); cert fingerprint always re-derived from on-disk DER (stale `.hex` cache bug fixed); old certs missing the EKU detected via OID byte-scan and auto-rotated on next supernode start; template SDK synced with source (`ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, `featureForFixedTag` exports added); SDK now fails fast with a clear error when portal context exists but no WebTransport URL is available; cursor relay demo fixed (`encodeCursorLeave` now carries color so peer tracking is stable). |
-| Test suite integrity | Current listed unit tests: 539 total (114 `conquerd-features` + 212 `conquerd-supernode` + 139 headless `conquerd-client` + 74 `conquerd-installer`). Three `conquerd-features` doc-tests remain correctly `rust,ignore` (require an actual cdylib binary); `conquerd-opus` has one doc-test. |
-| Ephemeral SFU rooms | Supernode in-memory rooms only (`sfu.rs` idle GC, no `sfu_rooms.json`); client `RoomStore` replay on supernode connect; sidebar hide local-only. |
+P0–P2 delivery is complete and covered by tests: CI hardening, post-handshake replay protection, relay/SFU smoke tests, quota symmetry, cross-platform CI, platform notification/UPnP TODOs, supply-chain scanning, operator runbook, threat model, version automation, metrics export, game relay (`game.relay.v1` over WebTransport), ephemeral SFU rooms, and Space Merkle **Layer 1** (authenticated room tree, including the `"members"` invite-policy widening, its client UI toggle, periodic Space-root re-broadcast, and root-equivocation flagging).
 
-### P3 backlog (as capacity allows)
+The durable invariants for each of these live in **Architecture Notes**, **Using the Modular Framework**, and **Feature Module Reference** above; operator/build/signing detail is in the README and `docs/`. This file tracks invariants and open work — not a changelog, so completed-work detail is not re-logged here.
 
-- WASM plugin sandbox (currently native cdylib with load-time trust prompts).
-- Ollama / plugin UX polish (currently experimental).
-- In-band capability gossip (supernode bundle exchange between connected peers).
-- **Supernode E2E payload encryption.** **Direct (1:1) relay path — done.** Peer-targeted signaling that falls back to supernode WS relay (chat, file transfer, call control, capability/control) is now wrapped in a signed `EncryptedSignal` envelope: the inner message is AES-256-GCM-encrypted under a deterministic pairwise key derived from the two peers' Ed25519 identities via X25519 (`crypto::derive_pairwise_relay_key` / `Identity::derive_pairwise_relay_key`), so the relaying supernode sees only opaque `ciphertext` + routing metadata. Wrap at `ConnectionManager::maybe_wrap_for_relay` (outbound `dispatch_outbound`); unwrap + re-dispatch (with depth guard + inner/outer sender binding) in the inbound `EncryptedSignal` arm. The inner message keeps its own Ed25519 signature, so freshness/replay/trust/quota all re-run after decrypt. Backward-compatible: falls back to plaintext for not-yet-paired targets (no `PROTOCOL_VERSION` bump). Direct real-time Opus audio rides QUIC datagrams peer-to-peer and never transits the supernode, so it needs no envelope. *Limitation:* identity-static DH has **no forward secrecy** (FS via the ephemeral invite handshake is future work). Docs may now state supernodes cannot read **direct 1:1 relayed** chat/file content. **Still deferred (docs must NOT claim opacity here):** per-room `content_key` in `RoomStore` for `SfuChat` / `SfuAudio` / `SfuFile*` — room SFU payloads remain supernode-readable until a group-key-distribution design lands; the supernode relay already prefers an opaque `ciphertext` field over plaintext `body` for quota accounting, so the wire side is ready.
-- **Voice/chat audio-quality polish.** All items from the 2026-06-23 deep-dive are now resolved or decided. **Complete:** room voice over QUIC relay datagrams — T1 (no more TCP head-of-line blocking; WS fallback preserved for non-relay members); SFU active-speaker cap of 5 — T2 (frames from talkers beyond the cap dropped server-side; receiver fills via Opus PLC); client-side multi-party mixing via `mix_and_play` — V1 (peers summed, not concatenated); adaptive jitter buffer 40–240 ms — V3; AIMD adaptive bitrate for direct calls — V4; per-peer decoder leak fix — V5; soft-limiter on mix bus — V6; relay anti-thrash cooldown — X1; feature-flagged pure-Rust NLMS echo canceller (`aec` feature, off by default, needs real two-device delay tuning before enabling in shipped builds) — V2; adaptive FEC packet-loss hint via shared Arc — V12; room-call ABR from jitter-buffer underrun proxy (relay/WS path has no per-peer QUIC stats) — V11; playout ring-fill EMA drift correction — V9 (skips one 20 ms push when EMA > 65% to prevent ring overflow); comfort-noise CNG for extended PLC silence — V10 (injects ≈−66 dBFS white noise once Opus PLC fades below −64 dBFS RMS); file-transfer security audit — F1 (decompression-bomb cap in `zlib_decompress`, `total_chunks` consistency check in `on_offer_received`). **Still open:** polyphase resampling (V7 — linear interpolation is near-inaudible for 8 kHz voice at typical device rates; a windowed-sinc or `rubato` `FastFixedIn` drop-in is the right fix if this becomes perceptible); stereo/spatial mixdown (V8 — per-peer pan in `mix_pcm_frames` + stereo ring buffer; Low priority, pure UX enhancement). **Declined:** read receipts (`MessageStatus::Read`) — deliberately unwired; surfacing read timestamps is at odds with the privacy-first stance; if ever revisited, gate behind a privacy toggle defaulting **off**. Room-chat history for joiners — struck from scope; supernode does not persist messages. Offline store-and-forward — deferred; would require the supernode to hold signed, supernode-opaque E2E-encrypted messages with a TTL (in-memory TTL mailbox mirroring the endpoint-mailbox precedent); revisit as a standalone design.
+Open / deferred work is tracked in **`backlog.md`** (Layer 2 crypto, Space Merkle remaining items, plugin sandbox, audio-quality polish, speculative discovery/federation, and declined items); the Space specifics live in `docs/SPACE-MERKLE-DESIGN.md`.
 
 
 ### Pre-signing checklist (SignPath Foundation)

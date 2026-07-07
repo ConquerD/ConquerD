@@ -4,8 +4,10 @@
 //! consumes — and [`SenderKeysGroup`], the **sender-keys** group keying that
 //! backs it: the room owner generates a per-epoch key, seals it to each member
 //! 1:1 (see the `SfuGroupKey` path in `connection_manager`), and rekeys on
-//! member removal for forward secrecy / post-compromise security. The deferred
-//! TreeKEM upgrade (backlog) swaps in behind the same trait.
+//! member removal for forward secrecy / post-compromise security. TreeKEM was
+//! considered as a future O(log N) upgrade behind this same trait and declined
+//! (see `backlog.md` — invite-only rooms don't hit the O(N) rekey cost that
+//! would justify it); this is the long-term keying scheme, not an interim one.
 //!
 //! Two wire codecs share the epoch key:
 //!
@@ -16,6 +18,11 @@
 //! * **Room text chat** — the `SfuChat` `body` is sealed as
 //!   `nonce ‖ AES-256-GCM(body)`, `AAD = conv_id ‖ sender ‖ message_id`, with
 //!   `epoch` on the envelope.
+//! * **Room file transfer** — each `SfuFileChunk` `data` field is sealed as
+//!   `nonce ‖ AES-256-GCM(data)`, `AAD = conv_id ‖ sender ‖ transfer_id ‖
+//!   chunk_index`, with `epoch` on the envelope. `SfuFileOffer` / `SfuFileComplete`
+//!   metadata (size, sha256, rel_path) stays cleartext — only the chunk bytes
+//!   need sealing to close the SFU content-opacity gap.
 //!
 //! The relay stays a dumb forwarder — it never sees the key or the plaintext.
 
@@ -37,9 +44,9 @@ const MAX_RETAINED_EPOCHS: usize = 4;
 ///
 /// The trait is deliberately tiny: a caller asks for the epoch to seal *new*
 /// frames under, and can look up the key for any epoch it holds (needed to
-/// *open* frames that were in flight across a rekey). Part A supplies the real
-/// sender-keys implementation behind this trait; the deferred TreeKEM work
-/// (backlog) swaps in later with no call-site changes.
+/// *open* frames that were in flight across a rekey). [`SenderKeysGroup`]
+/// supplies the real (and, per the backlog decision, permanent) implementation
+/// behind this trait.
 ///
 /// `conv_id` is the conversation identifier — the SFU `room_id` for rooms, or
 /// the sorted peer-pair id for direct calls.
@@ -305,6 +312,68 @@ pub fn open_chat_body(
     aesgcm_decrypt(&key, nonce, ct, &aad).ok()
 }
 
+// ---------------------------------------------------------------------------
+// Room file-chunk codec
+// ---------------------------------------------------------------------------
+
+/// AAD binding a file chunk to its room, sender, transfer, and chunk index.
+/// Length-prefixed like [`voice_aad`] / [`chat_aad`] so the variable-length
+/// fields can't be re-partitioned.
+fn file_chunk_aad(conv_id: &str, sender: &str, transfer_id: &str, chunk_index: u64) -> Vec<u8> {
+    let mut aad =
+        Vec::with_capacity(4 + conv_id.len() + 4 + sender.len() + 4 + transfer_id.len() + 8);
+    for field in [conv_id, sender, transfer_id] {
+        aad.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        aad.extend_from_slice(field.as_bytes());
+    }
+    aad.extend_from_slice(&chunk_index.to_be_bytes());
+    aad
+}
+
+/// Seal a `room.file.v1` chunk's raw bytes under the current epoch key as
+/// `nonce ‖ aesgcm(data)`.
+///
+/// Returns `(epoch, sealed)` so the caller can put `epoch` on the envelope, or
+/// `None` when no current key exists for `conv_id`. `AAD = conv_id ‖ sender ‖
+/// transfer_id ‖ chunk_index`.
+pub fn seal_file_chunk(
+    keys: &dyn GroupKeySource,
+    conv_id: &str,
+    sender: &str,
+    transfer_id: &str,
+    chunk_index: u64,
+    data: &[u8],
+) -> Option<(u8, Vec<u8>)> {
+    let epoch = keys.current_epoch(conv_id);
+    let key = keys.epoch_key(conv_id, epoch)?;
+    let aad = file_chunk_aad(conv_id, sender, transfer_id, chunk_index);
+    let (nonce, ct) = aesgcm_encrypt(&key, data, &aad).ok()?;
+    let mut sealed = Vec::with_capacity(nonce.len() + ct.len());
+    sealed.extend_from_slice(&nonce);
+    sealed.extend_from_slice(&ct);
+    Some((epoch, sealed))
+}
+
+/// Open a chunk sealed by [`seal_file_chunk`] under `(conv_id, epoch)`.
+pub fn open_file_chunk(
+    keys: &dyn GroupKeySource,
+    conv_id: &str,
+    sender: &str,
+    transfer_id: &str,
+    chunk_index: u64,
+    epoch: u8,
+    sealed: &[u8],
+) -> Option<Vec<u8>> {
+    if sealed.len() < VOICE_NONCE_LEN {
+        return None;
+    }
+    let nonce = &sealed[..VOICE_NONCE_LEN];
+    let ct = &sealed[VOICE_NONCE_LEN..];
+    let key = keys.epoch_key(conv_id, epoch)?;
+    let aad = file_chunk_aad(conv_id, sender, transfer_id, chunk_index);
+    aesgcm_decrypt(&key, nonce, ct, &aad).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +478,31 @@ mod tests {
         );
         // A different room derives a different key, so cross-room frames fail.
         assert!(open_voice_frame(&b, "other-room", SENDER, 3, &frame).is_none());
+    }
+
+    #[test]
+    fn file_chunk_roundtrip_and_binding() {
+        let keys = owner_group();
+        let (epoch, sealed) =
+            seal_file_chunk(&keys, CONV, SENDER, "xfer-1", 3, b"chunk bytes").unwrap();
+        assert_eq!(epoch, 0);
+        let out = open_file_chunk(&keys, CONV, SENDER, "xfer-1", 3, epoch, &sealed).unwrap();
+        assert_eq!(out, b"chunk bytes");
+        // Wrong transfer_id / chunk_index / sender / epoch all fail the tag check.
+        assert!(open_file_chunk(&keys, CONV, SENDER, "xfer-2", 3, epoch, &sealed).is_none());
+        assert!(open_file_chunk(&keys, CONV, SENDER, "xfer-1", 4, epoch, &sealed).is_none());
+        assert!(open_file_chunk(&keys, CONV, "eve", "xfer-1", 3, epoch, &sealed).is_none());
+        assert!(open_file_chunk(&keys, CONV, SENDER, "xfer-1", 3, 1, &sealed).is_none());
+    }
+
+    #[test]
+    fn file_chunk_tampered_ciphertext_fails_to_open() {
+        let keys = owner_group();
+        let (epoch, mut sealed) =
+            seal_file_chunk(&keys, CONV, SENDER, "xfer-1", 0, b"payload").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        assert!(open_file_chunk(&keys, CONV, SENDER, "xfer-1", 0, epoch, &sealed).is_none());
     }
 
     #[test]

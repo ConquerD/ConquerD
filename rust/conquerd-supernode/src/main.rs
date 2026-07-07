@@ -235,6 +235,16 @@ struct SupernodeState {
 #[derive(Default)]
 struct SpaceRootStore {
     roots: HashMap<String, space::SignedSpaceRoot>,
+    /// `space_id` → count of detected equivocations (two differently-hashed,
+    /// validly-signed roots seen for the same `(space_id, epoch)`). We chose a
+    /// set tree, not an append-only log, so there is no consistency proof
+    /// between epochs — a malicious owner *can* sign two roots for one epoch.
+    /// This is the lighter of the two SPACE-MERKLE-DESIGN §9 mitigations
+    /// (flag conflicts instead of building a CT-style history tree): we cannot
+    /// tell which root is "true", so we keep the first-seen one (unchanged
+    /// behavior) but make the conflict observable for operators instead of
+    /// silently dropping it.
+    equivocations: HashMap<String, u32>,
 }
 
 impl SpaceRootStore {
@@ -246,7 +256,25 @@ impl SpaceRootStore {
             return false;
         }
         if let Some(existing) = self.roots.get(&root.space_id) {
-            if existing.signer != root.signer || root.epoch <= existing.epoch {
+            if existing.signer != root.signer {
+                return false;
+            }
+            if root.epoch == existing.epoch && root.root_hash != existing.root_hash {
+                // Same signer, same epoch, different content: root-equivocation.
+                // Keep the first-seen root (unchanged acceptance policy) but
+                // record the conflict so it surfaces in `/api/stats`.
+                let count = self.equivocations.entry(root.space_id.clone()).or_insert(0);
+                *count += 1;
+                warn!(
+                    "space root equivocation detected: space_id={} epoch={} signer={} (conflicting root rejected, {} total)",
+                    &root.space_id[..root.space_id.len().min(12)],
+                    root.epoch,
+                    &root.signer[..root.signer.len().min(12)],
+                    count
+                );
+                return false;
+            }
+            if root.epoch <= existing.epoch {
                 return false;
             }
         }
@@ -256,6 +284,18 @@ impl SpaceRootStore {
 
     fn get(&self, space_id: &str) -> Option<space::SignedSpaceRoot> {
         self.roots.get(space_id).cloned()
+    }
+
+    /// All currently-held roots (one per `space_id`), for periodic cluster
+    /// re-gossip (SPACE-MERKLE-DESIGN §8) so members that missed the on-change
+    /// gossip, or joined the cluster later, converge without a client resend.
+    fn all(&self) -> Vec<space::SignedSpaceRoot> {
+        self.roots.values().cloned().collect()
+    }
+
+    /// Total detected root-equivocations across all spaces, for `/api/stats`.
+    fn equivocation_count(&self) -> u32 {
+        self.equivocations.values().sum()
     }
 }
 
@@ -439,8 +479,21 @@ impl SupernodeState {
             } else {
                 sfu::RoomType::Public
             };
-            sfu.write()
-                .create_room(Some(room_id), &proof.node.name, rt, "");
+            // Carry the proven SpaceNode's `invite_policy` onto the
+            // materialized room (§7 "proven SpaceNode" resolution). Note this
+            // is created with an empty `creator_id` (proof-materialized rooms
+            // have no local creator — see the comment on `apply_room_grant`),
+            // so `generate_invite_token_checked` still refuses to mint for it
+            // regardless of policy until Layer 2's node-key capability path
+            // lands; this only keeps the room's stored policy consistent with
+            // the Space definition in the meantime.
+            sfu.write().create_room_with_policy(
+                Some(room_id),
+                &proof.node.name,
+                rt,
+                "",
+                &proof.node.invite_policy,
+            );
         }
 
         // Admission decision: public → proof-only; private → owner-signed grant
@@ -1070,6 +1123,13 @@ impl SupernodeState {
             let cluster = self.cluster_stats();
             if !cluster.is_null() {
                 obj.insert("cluster".into(), cluster);
+            }
+            let equivocations = self.space_roots.read().equivocation_count();
+            if equivocations > 0 {
+                obj.insert(
+                    "space_root_equivocations".into(),
+                    serde_json::json!(equivocations),
+                );
             }
         }
         value
@@ -2027,6 +2087,16 @@ impl SupernodeHandler {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or(&msg.sender);
+        // Client-supplied invite policy (`"owner"` | `"members"`); absent or
+        // unrecognized values normalize to the safe `"owner"` default inside
+        // `create_room_with_policy`. The client is the authority on a room's
+        // Space-linked `invite_policy` (same trust level as `room_name`/
+        // `room_type`, which are also client-supplied here and unverified).
+        let invite_policy = msg
+            .payload
+            .get("invite_policy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("owner");
 
         let resolved_id = room_id
             .map(String::from)
@@ -2063,9 +2133,13 @@ impl SupernodeHandler {
         }
 
         let mut sfu_lock = sfu.write();
-        let Some((room, created_new)) =
-            sfu_lock.create_room(room_id, room_name, room_type, creator_id)
-        else {
+        let Some((room, created_new)) = sfu_lock.create_room_with_policy(
+            room_id,
+            room_name,
+            room_type,
+            creator_id,
+            invite_policy,
+        ) else {
             return;
         };
         let room_id_out = room.room_id.clone();
@@ -2474,6 +2548,14 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
             })
         };
+        let local_space_roots: cluster_link::LocalSpaceRootsFn = {
+            let weak = weak.clone();
+            Arc::new(move || {
+                weak.upgrade()
+                    .map(|s| s.space_roots.read().all())
+                    .unwrap_or_default()
+            })
+        };
         let link = cluster_link::ClusterLink::new(
             identity.clone(),
             membership,
@@ -2482,7 +2564,7 @@ async fn main() -> anyhow::Result<()> {
             on_peer_auth,
             on_space_root,
         );
-        match link.start(local_rooms).await {
+        match link.start(local_rooms, local_space_roots).await {
             Ok(port) => {
                 info!("Cluster link started on port {port}");
                 *state.cluster_link.write() = Some(link);
@@ -3232,6 +3314,49 @@ mod space_admission_tests {
         // (signature won't verify for the tampered fields anyway)
         assert!(!store2.accept(root2), "cross-signer takeover refused");
         assert_eq!(store2.get(&sp3.space_id).unwrap().epoch, good.epoch);
+    }
+
+    #[test]
+    fn space_root_store_flags_same_epoch_content_conflict_as_equivocation() {
+        // Same owner key, same space_id, same epoch — but two different node
+        // sets produce two different `root_hash`es. A malicious (or buggy)
+        // owner signing both is exactly the equivocation SPACE-MERKLE-DESIGN §9
+        // says a set tree cannot prevent structurally; we can only detect and
+        // flag it (lighter mitigation), which is what this test verifies.
+        let (_owner, key, sp, root_a) = fixture();
+        let mut sp_fork = sp.clone();
+        sp_fork.upsert_node(space::SpaceNode {
+            node_id: space::derive_node_id(&sp_fork.space_id, &sp_fork.owner_pub, "Fork"),
+            parent_id: sp_fork.space_id.clone(),
+            kind: "room".to_owned(),
+            name: "Fork".to_owned(),
+            node_type: "public".to_owned(),
+            owner_pub: sp_fork.owner_pub.clone(),
+            invite_policy: String::new(),
+            inherit: false,
+            key_commit: String::new(),
+        });
+        // Same epoch (forced, simulating an attacker/bug re-using an epoch
+        // number) as `root_a`, different node set → different root_hash.
+        sp_fork.epoch = sp.epoch;
+        let root_b = sp_fork.signed_root(1000, |b| ed25519_sign(&key.to_bytes(), b).unwrap());
+        assert_eq!(root_a.epoch, root_b.epoch);
+        assert_ne!(root_a.root_hash, root_b.root_hash);
+
+        let mut store = SpaceRootStore::default();
+        assert!(store.accept(root_a.clone()), "first root accepted");
+        assert_eq!(store.equivocation_count(), 0);
+        assert!(
+            !store.accept(root_b),
+            "conflicting same-epoch root rejected"
+        );
+        assert_eq!(
+            store.equivocation_count(),
+            1,
+            "conflicting same-epoch root flagged as an equivocation"
+        );
+        // The first-seen root is retained (unchanged acceptance policy).
+        assert_eq!(store.get(&sp.space_id).unwrap().root_hash, root_a.root_hash);
     }
 
     #[test]
