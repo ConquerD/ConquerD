@@ -786,9 +786,17 @@ mod tests {
         assert!(decoded.verify());
     }
 
-    fn reserve_addr() -> String {
-        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        format!("127.0.0.1:{}", sock.local_addr().unwrap().port())
+    /// Reserve two *distinct* ephemeral ports. Binding one socket at a time and
+    /// dropping it before the next bind can hand back the same port twice (the OS
+    /// reassigns the just-freed port), so the second link fails to bind ("address
+    /// already in use", os error 10048). Binding both sockets at once guarantees
+    /// the kernel picks two different ports.
+    fn reserve_two_addrs() -> (String, String) {
+        let s1 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let s2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a = format!("127.0.0.1:{}", s1.local_addr().unwrap().port());
+        let b = format!("127.0.0.1:{}", s2.local_addr().unwrap().port());
+        (a, b)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -798,7 +806,7 @@ mod tests {
         let id_a = Identity::generate();
         let id_b = Identity::generate();
         let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
-        let (a_addr, b_addr) = (reserve_addr(), reserve_addr());
+        let (a_addr, b_addr) = reserve_two_addrs();
 
         let mk = |id: &str, addr: &str| crate::cluster::ClusterMember {
             identity_pub: id.to_string(),
@@ -881,7 +889,7 @@ mod tests {
         let id_a = Identity::generate();
         let id_b = Identity::generate();
         let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
-        let (a_addr, b_addr) = (reserve_addr(), reserve_addr());
+        let (a_addr, b_addr) = reserve_two_addrs();
 
         let mk = |id: &str, addr: &str| crate::cluster::ClusterMember {
             identity_pub: id.to_string(),
@@ -949,7 +957,7 @@ mod tests {
         let id_a = Identity::generate();
         let id_b = Identity::generate();
         let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
-        let (a_addr, b_addr) = (reserve_addr(), reserve_addr());
+        let (a_addr, b_addr) = reserve_two_addrs();
 
         let mk = |id: &str, addr: &str| crate::cluster::ClusterMember {
             identity_pub: id.to_string(),
