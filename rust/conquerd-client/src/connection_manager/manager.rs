@@ -30,7 +30,7 @@ use crate::web_app_client::{self, WebAppResponse};
 use super::events::{ConnectionCommand, ConnectionEvent};
 use super::internal::{
     rewrite_loopback_wt_url, InternalEvent, PeerConnection, PeerConnectionState,
-    PeerTransportStats, PendingInvite, SupernodeSession, INVITE_TTL,
+    PeerTransportStats, PendingInvite, SupernodePingTracker, SupernodeSession, INVITE_TTL,
 };
 use super::quic::run_quic_peer_session;
 use super::ws::supernode_ws_task;
@@ -380,6 +380,8 @@ pub struct ConnectionManager {
     replay_guard: ReplayGuard,
     /// Latest QUIC transport stats keyed by peer id.
     transport_stats: HashMap<String, PeerTransportStats>,
+    /// WS Ping/Pong RTT trackers keyed by supernode identity pubkey.
+    supernode_ping: HashMap<String, SupernodePingTracker>,
     /// `supernode_id:room_id` keys for in-flight materialize-only creates.
     /// `SfuRoomCreated` must not auto-join these rooms.
     pending_materialize: HashSet<String>,
@@ -496,6 +498,7 @@ impl ConnectionManager {
             quic_relays: HashMap::new(),
             replay_guard: ReplayGuard::new(Self::MAX_MESSAGE_AGE_SECS),
             transport_stats: HashMap::new(),
+            supernode_ping: HashMap::new(),
             pending_materialize: HashSet::new(),
             pending_private_room_joins: HashSet::new(),
             pending_room_invite_entries: HashMap::new(),
@@ -898,19 +901,36 @@ impl ConnectionManager {
             // sessions (see `transport_stats` insertion on QUIC connect);
             // relay-assisted peers are tracked separately in `quic_relays`
             // and never reach this loop, so a direct stats row is never relay.
-            let payload = serde_json::json!({
-                "peer_id": peer_id,
-                "rtt_ms": stats.rtt_ms,
-                "packet_loss_pct": stats.packet_loss_pct,
-                "jitter_ms": stats.jitter_ms,
-                "relay": false,
-                "bandwidth_kbps": stats.bandwidth_kbps,
-            });
-            let _ = self.event_tx.try_send(ConnectionEvent::ConnectionStats {
-                peer_id: peer_id.clone(),
-                json: payload.to_string(),
-            });
+            self.emit_connection_stats_row(peer_id, stats, false);
         }
+        for (supernode_id, sn) in &self.supernodes {
+            if !sn.connected {
+                continue;
+            }
+            let Some(stats) = self.transport_stats.get(supernode_id) else {
+                continue;
+            };
+            let relay = self
+                .quic_relays
+                .get(supernode_id)
+                .is_some_and(|r| r.is_alive());
+            self.emit_connection_stats_row(supernode_id, stats, relay);
+        }
+    }
+
+    fn emit_connection_stats_row(&self, peer_id: &str, stats: &PeerTransportStats, relay: bool) {
+        let payload = serde_json::json!({
+            "peer_id": peer_id,
+            "rtt_ms": stats.rtt_ms,
+            "packet_loss_pct": stats.packet_loss_pct,
+            "jitter_ms": stats.jitter_ms,
+            "relay": relay,
+            "bandwidth_kbps": stats.bandwidth_kbps,
+        });
+        let _ = self.event_tx.try_send(ConnectionEvent::ConnectionStats {
+            peer_id: peer_id.to_owned(),
+            json: payload.to_string(),
+        });
     }
 
     // -- supernode WebSocket -------------------------------------------------
@@ -1857,6 +1877,8 @@ impl ConnectionManager {
                 if let Some(sn) = self.supernodes.get_mut(&peer_id) {
                     sn.connected = false;
                 }
+                self.transport_stats.remove(&peer_id);
+                self.supernode_ping.remove(&peer_id);
                 // If this supernode was hosting our current SFU room, tear down
                 // local room tracking immediately. We cannot usefully send
                 // SfuLeave over a dead link; the room is supernode-ephemeral.
@@ -2767,10 +2789,29 @@ impl ConnectionManager {
         if let Ok(json) = ping_msg.to_json() {
             for sn in self.supernodes.values() {
                 if sn.connected {
+                    self.supernode_ping
+                        .entry(sn.peer_id.clone())
+                        .or_default()
+                        .note_ping_sent();
                     let _ = sn.send_tx.try_send(WsMessage::Text(json.clone()));
                 }
             }
         }
+    }
+
+    fn record_supernode_pong(&mut self, supernode_id: &str) {
+        if !self.supernodes.contains_key(supernode_id) {
+            return;
+        }
+        let Some(stats) = self
+            .supernode_ping
+            .entry(supernode_id.to_owned())
+            .or_default()
+            .note_pong()
+        else {
+            return;
+        };
+        self.transport_stats.insert(supernode_id.to_owned(), stats);
     }
 
     // -- inbound message handling --------------------------------------------
@@ -3102,6 +3143,7 @@ impl ConnectionManager {
             }
             MessageType::Pong => {
                 debug!("Pong from {}", msg.sender);
+                self.record_supernode_pong(&msg.sender);
             }
             MessageType::ChatMessage => {
                 let sender_peer_id = self.canonical_peer_id_for_sender(&msg.sender);

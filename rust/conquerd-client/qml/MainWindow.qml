@@ -78,6 +78,45 @@ ApplicationWindow {
         return handle
     }
 
+    // Per-supernode transport stats keyed by canonical node id (from connectionStats).
+    property var nodeConnectionStats: ({})
+
+    function upsertNodeConnectionStats(peerId, stats) {
+        var canon = canonicalNodeId(peerId)
+        if (canon === "") return
+        var next = Object.assign({}, nodeConnectionStats)
+        next[canon] = stats
+        nodeConnectionStats = next
+    }
+
+    function clearNodeConnectionStats(nodeId) {
+        var canon = canonicalNodeId(nodeId)
+        if (canon === "" && nodeId) canon = nodeId
+        if (canon === "" || !nodeConnectionStats[canon]) return
+        var next = Object.assign({}, nodeConnectionStats)
+        delete next[canon]
+        nodeConnectionStats = next
+    }
+
+    function supernodeAvatarTooltip(nodeId, connected) {
+        var id = canonicalNodeId(nodeId)
+        if (id === "") id = nodeId || ""
+        var lines = [id]
+        var stats = nodeConnectionStats[id]
+        if (stats && stats.rtt_ms > 0) {
+            lines.push("Ping: " + Math.round(stats.rtt_ms) + " ms")
+            lines.push("Packet loss: " + (stats.packet_loss_pct || 0).toFixed(1)
+                + "% · Jitter: " + Math.round(stats.jitter_ms || 0) + " ms")
+        } else if (connected) {
+            lines.push("Ping: —")
+            lines.push("Packet loss: — · Jitter: —")
+        }
+        lines.push("")
+        lines.push("Left click — open portal")
+        lines.push("Right click — options")
+        return lines.join("\n")
+    }
+
     function peerHandleFor(peerId) {
         if (!peerId || peerId === "") return ""
         for (var row = 0; row < peerModel.rowCount(); row++) {
@@ -808,6 +847,15 @@ ApplicationWindow {
 
         backend.roomsSidebarSync.connect(root.syncRoomsSidebar)
 
+        backend.connectionStats.connect(function(json) {
+            try {
+                var stats = JSON.parse(json)
+                if (!stats.peer_id) return
+                if (!backend.isKnownSupernode(stats.peer_id)) return
+                root.upsertNodeConnectionStats(stats.peer_id, stats)
+            } catch (e) {}
+        })
+
         // Wire node connect/disconnect into nodeListModel (upsert by node_id)
         backend.nodesUpdated.connect(function(json) {
             try {
@@ -819,8 +867,11 @@ ApplicationWindow {
                     var nodeIdx = root.findNodeIndex(canon)
                     if (nodeIdx >= 0) {
                         nodeListModel.setProperty(nodeIdx, "node_id", canon)
-                        if (p.connected !== undefined && p.connected !== null)
+                        if (p.connected !== undefined && p.connected !== null) {
                             nodeListModel.setProperty(nodeIdx, "connected", p.connected)
+                            if (!p.connected)
+                                root.clearNodeConnectionStats(canon)
+                        }
                         if (p.homepage_url !== undefined)
                             nodeListModel.setProperty(nodeIdx, "homepage_url", p.homepage_url)
                         if (p.title !== undefined)
@@ -961,6 +1012,7 @@ ApplicationWindow {
         }
         function onSupernodeRemoved(nodeId) {
             if (!nodeId || nodeId === "") return
+            root.clearNodeConnectionStats(nodeId)
             // Peer store is already updated when this fires; canonicalNodeId()
             // would return "" because isKnownSupernode() is false.
             for (var j = nodeListModel.count - 1; j >= 0; j--) {
@@ -1457,7 +1509,8 @@ ApplicationWindow {
 
                                     ToolTip {
                                         visible: groupSnHover.hovered
-                                        text: "Left Click — Open Portal\nRight Click — Options"
+                                        text: root.supernodeAvatarTooltip(
+                                            roomGroup.node_id, roomGroup.connected)
                                         delay: 300
                                         timeout: 5000
                                     }

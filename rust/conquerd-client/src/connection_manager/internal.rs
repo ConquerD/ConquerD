@@ -154,3 +154,73 @@ pub(super) struct PeerTransportStats {
     pub(super) jitter_ms: f64,
     pub(super) bandwidth_kbps: f64,
 }
+
+/// Application-level Ping/Pong RTT tracking for supernode WebSocket sessions.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SupernodePingTracker {
+    pending_since: Option<Instant>,
+    pings_sent: u32,
+    pongs_recv: u32,
+    last_rtt_ms: f64,
+    prev_rtt_ms: Option<f64>,
+}
+
+impl SupernodePingTracker {
+    pub(super) fn note_ping_sent(&mut self) {
+        self.pings_sent = self.pings_sent.saturating_add(1);
+        self.pending_since = Some(Instant::now());
+    }
+
+    pub(super) fn note_pong(&mut self) -> Option<PeerTransportStats> {
+        let sent_at = self.pending_since.take()?;
+        self.pongs_recv = self.pongs_recv.saturating_add(1);
+        let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+        let jitter_ms = self
+            .prev_rtt_ms
+            .or_else(|| (self.last_rtt_ms > 0.0).then_some(self.last_rtt_ms))
+            .map(|prev| (rtt_ms - prev).abs())
+            .unwrap_or(0.0);
+        self.prev_rtt_ms = Some(self.last_rtt_ms);
+        self.last_rtt_ms = rtt_ms;
+        let packet_loss_pct = if self.pings_sent > 0 {
+            ((self.pings_sent.saturating_sub(self.pongs_recv)) as f64 / self.pings_sent as f64)
+                * 100.0
+        } else {
+            0.0
+        };
+        if self.pings_sent > 20 {
+            self.pings_sent = 10;
+            self.pongs_recv = (self.pongs_recv / 2).max(1);
+        }
+        Some(PeerTransportStats {
+            rtt_ms,
+            packet_loss_pct,
+            jitter_ms,
+            bandwidth_kbps: 0.0,
+        })
+    }
+}
+
+#[cfg(test)]
+mod ping_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn supernode_ping_tracker_rtt_and_loss() {
+        let mut t = SupernodePingTracker::default();
+        t.note_ping_sent();
+        std::thread::sleep(Duration::from_millis(5));
+        let stats = t.note_pong().expect("pong");
+        assert!(stats.rtt_ms >= 4.0);
+        assert_eq!(stats.packet_loss_pct, 0.0);
+
+        t.note_ping_sent();
+        let stats2 = t.note_pong().expect("second pong");
+        assert!(stats2.jitter_ms >= 0.0);
+
+        t.note_ping_sent();
+        t.note_ping_sent();
+        let stats3 = t.note_pong().expect("third pong");
+        assert!(stats3.packet_loss_pct >= 0.0 && stats3.packet_loss_pct <= 100.0);
+    }
+}
