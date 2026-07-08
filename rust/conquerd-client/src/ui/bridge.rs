@@ -774,6 +774,12 @@ pub mod ffi {
         #[rust_name = "is_known_supernode"]
         fn isKnownSupernode(self: Pin<&mut AppBridge>, node_id: &QString) -> bool;
 
+        /// Resolve a peer's display handle from the trust store (`peer_id` or
+        /// `identity_pub`). Falls back to a truncated id when unknown.
+        #[qinvokable]
+        #[rust_name = "peer_display_name"]
+        fn peerDisplayName(self: Pin<&mut AppBridge>, peer_id: &QString) -> QString;
+
         /// Delete a single chat message from the store by ID.
         /// Emits `messageDeleted(msg_id)` on success.
         #[qinvokable]
@@ -972,6 +978,14 @@ pub struct AppBridgeRust {
     /// Remote peer id for an active direct P2P call (identity_pub or peer_id).
     active_direct_call_peer_id: String,
 
+    /// Session-scoped set of rooms whose roster has confirmed us as a member,
+    /// keyed `supernode_id:room_id`. Once admitted we are in the supernode's
+    /// `allowed` set, so re-entry can use a plain `SfuJoin`; re-sending the
+    /// single-use invite token would be a redundant round-trip (it is spent on
+    /// first use). Not persisted: after a restart we re-send the invite once —
+    /// the supernode accepts it via its already-allowed check — then re-mark here.
+    admitted_rooms: HashSet<String>,
+
     /// Rolling in-memory diagnostic log buffer (max 300 entries).
     event_log: std::collections::VecDeque<String>,
 
@@ -1106,6 +1120,7 @@ impl Default for AppBridgeRust {
             direct_connected_peer_ids: HashSet::new(),
             room_present_peer_ids: HashSet::new(),
             active_direct_call_peer_id: String::new(),
+            admitted_rooms: HashSet::new(),
             event_log: std::collections::VecDeque::with_capacity(300),
             avatar_config_json: String::new(),
         }
@@ -1928,12 +1943,17 @@ impl ffi::AppBridge {
         let key = room_chat_history_key(&sn, &rid);
         if let Some(ref cs) = self.rust().chat_store {
             let store_key = room_chat_store_peer_id(&sn, &rid);
-            let msgs: Vec<serde_json::Value> = cs
-                .get_history(&store_key, 0)
-                .map(|rows| rows.iter().map(room_chat_message_to_json).collect())
-                .unwrap_or_default();
-            for msg in msgs {
-                let json = msg.to_string();
+            let json_msgs: Vec<String> = {
+                let r = self.rust();
+                cs.get_history(&store_key, 0)
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|m| room_chat_message_to_json(r, m).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            for json in json_msgs {
                 self.as_mut()
                     .room_chat_received(QString::from(json.as_str()));
             }
@@ -1966,6 +1986,22 @@ impl ffi::AppBridge {
             .as_ref()
             .map(|ps| ps.read().is_supernode_id(&id))
             .unwrap_or(false)
+    }
+
+    fn peer_display_name(self: Pin<&mut Self>, peer_id: &QString) -> QString {
+        let r = self.rust();
+        let label = if let Some(ps) = r.peer_store.as_ref() {
+            let store = ps.read();
+            room_participant_label(
+                Some(&store),
+                &peer_id.to_string(),
+                &r.my_peer_id,
+                &r.my_public_id,
+            )
+        } else {
+            room_participant_label(None, &peer_id.to_string(), &r.my_peer_id, &r.my_public_id)
+        };
+        QString::from(label.as_str())
     }
 
     fn delete_message(mut self: Pin<&mut Self>, msg_id: &QString) {
@@ -2213,9 +2249,14 @@ impl ffi::AppBridge {
             .as_ref()
             .map(|e| e.room_type.clone())
             .unwrap_or_else(|| "public".to_owned());
-        let use_invite = stored.as_ref().is_some_and(|e| {
-            e.room_type == "private" && !e.is_creator && !e.invite_token.is_empty()
-        });
+        // Skip the invite round-trip once we've already been admitted this
+        // session: the single-use token is spent on first use, and we're now in
+        // the supernode's `allowed` set, so a plain `SfuJoin` is accepted.
+        let already_admitted = self.rust().admitted_rooms.contains(&format!("{sid}:{rid}"));
+        let use_invite = !already_admitted
+            && stored.as_ref().is_some_and(|e| {
+                e.room_type == "private" && !e.is_creator && !e.invite_token.is_empty()
+            });
         debug!(
             "join_room rid={} type={} is_creator={} token_len={} -> {}",
             rid,
@@ -3102,6 +3143,7 @@ impl ffi::AppBridge {
         let json = serde_json::json!({
             "msg_id": message_id.clone(),
             "sender": handle.clone(),
+            "sender_id": sender_id.clone(),
             "body": body_str.clone(),
             "timestamp": now_ts,
             "kind": "text",
@@ -3553,10 +3595,15 @@ fn chat_message_to_json(msg: &crate::chat_store::ChatMessage) -> serde_json::Val
     })
 }
 
-fn room_chat_message_to_json(msg: &crate::chat_store::ChatMessage) -> serde_json::Value {
+fn room_chat_message_to_json(
+    bridge: &AppBridgeRust,
+    msg: &crate::chat_store::ChatMessage,
+) -> serde_json::Value {
+    let sender = room_chat_display_sender(bridge, &msg.sender_handle, &msg.sender);
     serde_json::json!({
         "msg_id": msg.id,
-        "sender": msg.sender_handle,
+        "sender": sender,
+        "sender_id": msg.sender,
         "body": msg.body,
         "timestamp": msg.timestamp,
         "kind": msg.kind.as_str(),
@@ -3564,6 +3611,26 @@ fn room_chat_message_to_json(msg: &crate::chat_store::ChatMessage) -> serde_json
         "is_room": true,
         "status": msg.status.as_str(),
     })
+}
+
+fn room_chat_display_sender(
+    bridge: &AppBridgeRust,
+    sender_handle: &str,
+    sender_id: &str,
+) -> String {
+    if !sender_handle.is_empty() {
+        return sender_handle.to_owned();
+    }
+    if let Some(ps) = bridge.peer_store.as_ref() {
+        let store = ps.read();
+        return room_participant_label(
+            Some(&store),
+            sender_id,
+            &bridge.my_peer_id,
+            &bridge.my_public_id,
+        );
+    }
+    room_participant_label(None, sender_id, &bridge.my_peer_id, &bridge.my_public_id)
 }
 
 fn peer_row_json_with_presence(
@@ -4986,6 +5053,16 @@ fn dispatch_event(
         } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 let canon = canon_supernode_id(bridge.rust(), &supernode_id);
+                // Authoritative roster confirming us present → the room is admitted;
+                // subsequent re-entries skip the spent-token invite path (join_room).
+                let my_pub = bridge.rust().my_public_id.clone();
+                if !my_pub.is_empty() && members.contains(&my_pub) {
+                    bridge
+                        .as_mut()
+                        .rust_mut()
+                        .admitted_rooms
+                        .insert(format!("{}:{}", canon, room_id));
+                }
                 let apply =
                     should_apply_room_roster(bridge.rust(), canon.as_str(), room_id.as_str());
                 if apply {
@@ -5113,21 +5190,24 @@ fn dispatch_event(
             {
                 return;
             }
-            let json = serde_json::json!({
-                "msg_id": message_id.clone(),
-                "sender": sender_handle.clone(),
-                "body": body.clone(),
-                "timestamp": timestamp,
-                "kind": "text",
-                "mine": false,
-                "is_room": true,
-                "status": "delivered",
-            })
-            .to_string();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 let Some(sn) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
                     return;
                 };
+                let display_sender =
+                    room_chat_display_sender(bridge.rust(), &sender_handle, &sender_id);
+                let json = serde_json::json!({
+                    "msg_id": message_id.clone(),
+                    "sender": display_sender.clone(),
+                    "sender_id": sender_id.clone(),
+                    "body": body.clone(),
+                    "timestamp": timestamp,
+                    "kind": "text",
+                    "mine": false,
+                    "is_room": true,
+                    "status": "delivered",
+                })
+                .to_string();
                 if let Some(ref cs) = bridge.rust().chat_store {
                     let store_key = room_chat_store_peer_id(&sn, &room_id);
                     let chat_msg = crate::chat_store::ChatMessage {
@@ -5144,7 +5224,7 @@ fn dispatch_event(
                         attachment_path: String::new(),
                         size_str: String::new(),
                         status_note: String::new(),
-                        sender_handle: sender_handle.clone(),
+                        sender_handle: display_sender.clone(),
                     };
                     if let Err(e) = cs.insert(&chat_msg) {
                         warn!("chat_store insert (room inbound) error: {e}");

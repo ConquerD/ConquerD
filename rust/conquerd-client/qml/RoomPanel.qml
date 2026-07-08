@@ -36,6 +36,7 @@ Item {
         roomChatModel.append({
             "msgId": msg.msg_id || "",
             "sender": msg.sender || "",
+            "senderPeerId": msg.sender_id || "",
             "body": msg.body || "",
             "timestamp": msg.timestamp || 0,
             "kind": msg.kind || "text",
@@ -119,6 +120,7 @@ Item {
             delegate: ChatRichMessageDelegate {
                 msgId: model.msgId || ""
                 sender: model.sender || ""
+                senderPeerId: model.senderPeerId || ""
                 body: model.body || ""
                 kind: model.kind || "text"
                 mine: !!model.mine

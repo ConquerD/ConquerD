@@ -2196,6 +2196,16 @@ impl SupernodeHandler {
         // replicates on its own. Otherwise fall back to the legacy token.
         let has_proof = msg.payload.get("space_proof").is_some();
         let room_exists = sfu.read().get_room(room_id).is_some();
+        // Re-entry: a peer previously admitted to this private room is still in
+        // its `allowed` set (grants replicate cluster-wide). The single-use
+        // invite token is consumed on the first join, so on every subsequent
+        // re-entry the client re-sends a now-spent token and would otherwise be
+        // rejected — stranding the member out of a room they already belong to
+        // (they never even reach `SfuJoin`). Admit already-allowed peers directly.
+        let already_member = sfu
+            .read()
+            .get_room(room_id)
+            .is_some_and(|r| r.is_peer_allowed(&msg.sender));
         let by_proof = self
             .state
             .try_space_admission(&msg.sender, room_id, &msg.payload);
@@ -2203,9 +2213,9 @@ impl SupernodeHandler {
             && sfu
                 .write()
                 .validate_room_invite(room_id, token, &msg.sender);
-        let valid = by_proof || by_token;
+        let valid = by_proof || by_token || already_member;
         tracing::warn!(
-            "SfuRoomInvite peer={} room={} exists={} has_proof={} token_len={} by_proof={} by_token={} => valid={}",
+            "SfuRoomInvite peer={} room={} exists={} has_proof={} token_len={} by_proof={} by_token={} already_member={} => valid={}",
             &msg.sender[..12.min(msg.sender.len())],
             room_id,
             room_exists,
@@ -2213,6 +2223,7 @@ impl SupernodeHandler {
             token.len(),
             by_proof,
             by_token,
+            already_member,
             valid
         );
         let room_info = sfu

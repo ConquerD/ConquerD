@@ -13,6 +13,8 @@ Item {
 
     property string msgId: ""
     property string sender: ""
+    /// Ed25519 public id for avatar lookup (room chat).
+    property string senderPeerId: ""
     property string body: ""
     property string kind: "text"
     property bool mine: false
@@ -23,9 +25,29 @@ Item {
     property bool inlinePreviewAck: false
     property bool allowDelete: true
 
+    readonly property string avatarPeerId: root.mine
+        ? (backend.public_id || "")
+        : (root.senderPeerId || "")
+
     width: ListView.view ? ListView.view.width : parent.width
-    implicitHeight: column.implicitHeight + 10
+    implicitHeight: messageRow.implicitHeight + 10
     height: implicitHeight
+
+    function senderDisplayName() {
+        if (root.sender && root.sender !== "" && root.sender !== root.senderPeerId)
+            return root.sender
+        var id = root.senderPeerId || ""
+        if (id !== "") {
+            var resolved = backend.peerDisplayName(id)
+            if (resolved && resolved !== "" && resolved !== id)
+                return resolved
+        }
+        if (root.sender && root.sender !== "")
+            return root.sender
+        if (id.length > 12)
+            return id.substring(0, 12) + "…"
+        return id
+    }
 
     function escapeHtml(value) {
         return (value || "")
@@ -123,8 +145,8 @@ Item {
 
     property string dateSeparator: ""
 
-    Column {
-        id: column
+    Row {
+        id: messageRow
         anchors {
             right: root.mine ? parent.right : undefined
             left: root.mine ? undefined : parent.left
@@ -133,7 +155,25 @@ Item {
             top: parent.top
             topMargin: 5
         }
-        width: Math.min(root.width * 0.75, 500)
+        spacing: root.isRoom ? 8 : 0
+
+        Avatar {
+            visible: root.isRoom && root.avatarPeerId !== ""
+            peerId: root.avatarPeerId
+            size: 32
+            showRing: true
+            anchors.top: parent.top
+            anchors.topMargin: 2
+
+            HoverHandler { id: avatarHover }
+            ToolTip.visible: avatarHover.hovered && root.senderDisplayName() !== ""
+            ToolTip.text: root.senderDisplayName()
+            ToolTip.delay: 400
+        }
+
+        Column {
+        id: column
+        width: Math.min(root.width * (root.isRoom ? 0.72 : 0.75), 500)
         spacing: 4
 
         Text {
@@ -149,10 +189,11 @@ Item {
         }
 
         Text {
-            visible: root.isRoom && !root.mine && root.sender !== ""
-            text: root.sender
+            visible: root.isRoom && !root.mine && root.senderDisplayName() !== ""
+            text: root.senderDisplayName()
             color: Theme.muted
             font.pixelSize: Theme.fontSizeCaption
+            font.bold: true
             elide: Text.ElideRight
             width: parent.width
         }
@@ -336,6 +377,7 @@ Item {
                 ToolTip.visible: hovered
                 onClicked: root.deleteRequested(root.msgId)
             }
+        }
         }
     }
 
