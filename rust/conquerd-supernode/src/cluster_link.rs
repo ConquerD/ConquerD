@@ -834,6 +834,80 @@ mod tests {
         (a, b)
     }
 
+    /// Build the two-member `ClusterConfig`/`ClusterMembership` pair for a
+    /// given address pair. Shared by `start_two_node_link` below.
+    fn membership_pair(
+        a_pub: &str,
+        b_pub: &str,
+        a_addr: &str,
+        b_addr: &str,
+    ) -> (ClusterMembership, ClusterMembership) {
+        let mk = |id: &str, addr: &str| crate::cluster::ClusterMember {
+            identity_pub: id.to_string(),
+            relay_addr: addr.to_string(),
+            cluster_addr: Some(addr.to_string()),
+            ws_addr: None,
+            web_port: None,
+        };
+        let cfg = crate::cluster::ClusterConfig {
+            cluster_id: "test".into(),
+            members: vec![mk(a_pub, a_addr), mk(b_pub, b_addr)],
+        };
+        (
+            ClusterMembership::new(cfg.clone(), a_pub),
+            ClusterMembership::new(cfg, b_pub),
+        )
+    }
+
+    /// Construct and start a two-node cluster link, retrying with a fresh
+    /// address pair a bounded number of times.
+    ///
+    /// `reserve_two_addrs()` reserves free ports by binding-then-dropping two
+    /// sockets, but the real bind happens inside `ClusterLink::start()` only
+    /// after building the QUIC server config (cert generation), which takes
+    /// long enough that another concurrently-running test in this file can
+    /// grab the just-freed port first (Windows: "Only one usage of each
+    /// socket address...", os error 10048). Retrying with a fresh pair
+    /// absorbs that race instead of failing the whole test run.
+    async fn start_two_node_link(
+        a_pub: &str,
+        b_pub: &str,
+        mut new_link_a: impl FnMut(ClusterMembership) -> Arc<ClusterLink>,
+        mut new_link_b: impl FnMut(ClusterMembership) -> Arc<ClusterLink>,
+        rooms_a: LocalRoomsFn,
+        roots_a: LocalSpaceRootsFn,
+        rooms_b: LocalRoomsFn,
+        roots_b: LocalSpaceRootsFn,
+    ) -> (Arc<ClusterLink>, Arc<ClusterLink>) {
+        const ATTEMPTS: u32 = 5;
+        for attempt in 1..=ATTEMPTS {
+            let (a_addr, b_addr) = reserve_two_addrs();
+            let (mem_a, mem_b) = membership_pair(a_pub, b_pub, &a_addr, &b_addr);
+            let link_a = new_link_a(mem_a);
+            let link_b = new_link_b(mem_b);
+            let res_a = link_a.start(rooms_a.clone(), roots_a.clone()).await;
+            let res_b = if res_a.is_ok() {
+                link_b.start(rooms_b.clone(), roots_b.clone()).await
+            } else {
+                Err(anyhow::anyhow!("link A start failed"))
+            };
+            if res_a.is_ok() && res_b.is_ok() {
+                return (link_a, link_b);
+            }
+            link_a.shutdown();
+            link_b.shutdown();
+            if attempt == ATTEMPTS {
+                panic!(
+                    "failed to start cluster link pair after {ATTEMPTS} attempts \
+                     (port bind race): a={:?} b={:?}",
+                    res_a.err(),
+                    res_b.err()
+                );
+            }
+        }
+        unreachable!()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_node_cluster_replicates_room_chat_over_quic() {
         let _ = rustls::crypto::ring::default_provider().install_default();
