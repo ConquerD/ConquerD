@@ -1355,6 +1355,40 @@ ApplicationWindow {
                                 }
                             }
                         }
+                        // Per-contact invite: embeds an owner-signed SpaceGrant
+                        // bound to the chosen peer, so a private room admits them
+                        // durably by proof+grant (survives supernode restarts).
+                        Menu {
+                            id: inviteContactMenu
+                            title: qsTr("Invite Contact to Room")
+                            enabled: contactInviteInstantiator.count > 0
+                            Instantiator {
+                                id: contactInviteInstantiator
+                                model: peerModel
+                                delegate: MenuItem {
+                                    text: (handle && handle !== "") ? handle : peerId
+                                    onTriggered: {
+                                        var url = backend.generateRoomInviteForPeer(
+                                            roomContextMenu.targetSupernodeId,
+                                            roomContextMenu.targetRoomId,
+                                            roomContextMenu.targetRoomName,
+                                            peerId)
+                                        if (url !== "") {
+                                            backend.copyToClipboard(url)
+                                            invitePopup.visible = true
+                                        } else if (trayIcon.available) {
+                                            trayIcon.showMessage(
+                                                qsTr("Room invite"),
+                                                qsTr("Couldn't build the invite — you must own this room's Space and be connected to its supernode."),
+                                                Platform.SystemTrayIcon.Warning,
+                                                5000)
+                                        }
+                                    }
+                                }
+                                onObjectAdded: (index, object) => inviteContactMenu.insertItem(index, object)
+                                onObjectRemoved: (index, object) => inviteContactMenu.removeItem(object)
+                            }
+                        }
                         MenuSeparator {}
                         MenuItem {
                             text: qsTr("Create Public Sub-room…")

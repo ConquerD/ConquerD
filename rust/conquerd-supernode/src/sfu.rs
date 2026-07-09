@@ -613,6 +613,27 @@ impl SFURoomManager {
         true
     }
 
+    /// Bind a room to its cryptographically-proven Space owner by adopting
+    /// `owner_pub` as `creator_id` when the room currently has none. A Space
+    /// room re-materialized after a restart/idle-GC comes back with an empty
+    /// creator (in-memory SFU state is lost), which strips the owner's ability
+    /// to mint invites or self-admit. A verified inclusion proof re-establishes
+    /// `owner_pub` as the owner, so adopting it here restores that authority
+    /// and is durable across restarts (re-applied on every proof-bearing join).
+    /// No-op if `owner_pub` is empty or the room already has a creator.
+    pub fn adopt_creator_if_empty(&mut self, room_id: &str, owner_pub: &str) -> bool {
+        if owner_pub.is_empty() {
+            return false;
+        }
+        match self.rooms.get_mut(room_id) {
+            Some(room) if room.creator_id.is_empty() => {
+                room.creator_id = owner_pub.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Generate an invite token for a room.
     pub fn generate_invite_token(&mut self, room_id: &str, created_by: &str) -> Option<String> {
         self.rooms

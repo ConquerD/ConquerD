@@ -2150,6 +2150,24 @@ impl ConnectionManager {
             "invite_token".to_owned(),
             Value::String(invite_token.to_owned()),
         );
+        // Attach the Space proof-based admission creds carried by the invite link
+        // (mirrors `send_room_join`) so the supernode can verify the proof,
+        // materialize the room, and adopt its proven owner on any cluster member
+        // — without this the invite is token-only and the proof path never runs.
+        // Peek (not consume): the follow-up `SfuJoin` removes them after accept.
+        if let Some((root, proof, grant)) = self.pending_join_space_creds.get(room_id).cloned() {
+            for (key, text) in [
+                ("space_root", root),
+                ("space_proof", proof),
+                ("space_grant", grant),
+            ] {
+                if !text.is_empty() {
+                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        msg.payload.insert(key.to_owned(), v);
+                    }
+                }
+            }
+        }
         self.dispatch_outbound(msg).await;
     }
 

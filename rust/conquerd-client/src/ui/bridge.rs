@@ -294,6 +294,23 @@ pub mod ffi {
             room_name: &QString,
         ) -> QString;
 
+        /// Like `generateRoomInvite`, but binds the invite to a specific peer by
+        /// embedding an owner-signed `SpaceGrant(node_id=room, grantee_pub)`.
+        /// A private Space room then admits that peer durably by proof+grant —
+        /// no server-side invite-token state, so it survives supernode restarts.
+        /// Use for inviting a known contact; `generateRoomInvite` stays the
+        /// shareable (token-gated) variant. Returns "" if we don't own the room's
+        /// Space or the host address is unknown.
+        #[qinvokable]
+        #[rust_name = "generate_room_invite_for_peer"]
+        fn generateRoomInviteForPeer(
+            self: Pin<&mut AppBridge>,
+            supernode_id: &QString,
+            room_id: &QString,
+            room_name: &QString,
+            grantee_pub: &QString,
+        ) -> QString;
+
         /// Emitted when a pasted room invite's host supernode has connected and
         /// the room is ready to enter. The token is already persisted, so the
         /// normal join path validates it.
@@ -1039,6 +1056,65 @@ fn request_room_invite_url(
         .recv_timeout(std::time::Duration::from_secs(2))
         .ok()
         .flatten()
+}
+
+/// Per-peer variant of [`request_room_invite_url`]: also embeds an owner-signed
+/// [`crate::space::SpaceGrant`] bound to `grantee_pub`, so a private Space room
+/// admits that peer by proof+grant — durable across supernode restarts with no
+/// server-side token state (see `space_admission_ok` on the supernode).
+fn request_room_invite_url_for_peer(
+    rust: &AppBridgeRust,
+    supernode_id: String,
+    room_id: String,
+    room_name: String,
+    room_type: String,
+    invite_token: String,
+    grantee_pub: String,
+) -> Option<String> {
+    let tx = rust.conn_cmd_tx.as_ref()?;
+    let (space_root, space_proof) = build_space_invite_fields(rust, &supernode_id, &room_id);
+    let space_grant = build_space_grant_field(rust, &supernode_id, &room_id, &grantee_pub);
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    tx.try_send(ConnectionCommand::GenerateRoomInvite {
+        supernode_id,
+        room_id,
+        room_name,
+        room_type,
+        invite_token,
+        space_root,
+        space_proof,
+        space_grant,
+        reply_tx,
+    })
+    .ok()?;
+    reply_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .ok()
+        .flatten()
+}
+
+/// Sign an owner `SpaceGrant` admitting `grantee_pub` to `room_id`, returning its
+/// JSON — or `""` if `grantee_pub` is empty or we don't own the room's Space.
+/// `expires_at = 0` (valid until epoch exclusion/revocation) so the grant is not
+/// time-bound and survives restarts for the room's lifetime in the Space.
+fn build_space_grant_field(
+    rust: &AppBridgeRust,
+    supernode_id: &str,
+    room_id: &str,
+    grantee_pub: &str,
+) -> String {
+    if grantee_pub.is_empty() {
+        return String::new();
+    }
+    let (Some(rs), Some(identity)) = (rust.room_store.as_ref(), rust.identity.as_ref()) else {
+        return String::new();
+    };
+    let space_id = crate::room_store::RoomStore::space_id_for(&rust.my_public_id, supernode_id);
+    let Some(space) = rs.read().get_space(&space_id) else {
+        return String::new();
+    };
+    let grant = space.grant(room_id, grantee_pub, 0, |b| identity.sign(b));
+    serde_json::to_string(&grant).unwrap_or_default()
 }
 
 /// Build `(space_root_json, space_proof_json)` for a room from the owner's local
@@ -1843,6 +1919,74 @@ impl ffi::AppBridge {
             .unwrap_or_else(|| room_name.to_string());
 
         match request_room_invite_url(self.rust(), sid, rid, name, room_type, invite_token) {
+            Some(url) => {
+                self.as_mut().set_invite_url(QString::from(url.as_str()));
+                QString::from(url.as_str())
+            }
+            None => QString::default(),
+        }
+    }
+
+    fn generate_room_invite_for_peer(
+        mut self: Pin<&mut Self>,
+        supernode_id: &QString,
+        room_id: &QString,
+        room_name: &QString,
+        grantee_pub: &QString,
+    ) -> QString {
+        let sid = self
+            .rust()
+            .resolve_supernode_node_id_str(&supernode_id.to_string())
+            .unwrap_or_else(|| supernode_id.to_string());
+        let rid = room_id.to_string();
+        // The grant's `grantee_pub` must be the invitee's base64url identity_pub
+        // (matched against the joiner's connection id at admission). QML passes a
+        // peer's `peerId`, so resolve it to the canonical identity_pub; fall back
+        // to the raw value when it's already an identity_pub not in the store.
+        let grantee = {
+            let raw = grantee_pub.to_string();
+            self.rust()
+                .peer_store
+                .as_ref()
+                .and_then(|ps| {
+                    let store = ps.read();
+                    store
+                        .get(&raw)
+                        .or_else(|| store.get_by_identity(&raw))
+                        .map(|r| r.identity_pub.clone())
+                })
+                .unwrap_or(raw)
+        };
+
+        let stored = self
+            .rust()
+            .room_store
+            .as_ref()
+            .and_then(|rs| rs.read().get(&sid, &rid).cloned());
+        let room_type = stored
+            .as_ref()
+            .map(|e| e.room_type.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "public".to_owned());
+        let invite_token = stored
+            .as_ref()
+            .map(|e| e.invite_token.clone())
+            .unwrap_or_default();
+        let name = stored
+            .as_ref()
+            .map(|e| e.room_name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| room_name.to_string());
+
+        match request_room_invite_url_for_peer(
+            self.rust(),
+            sid,
+            rid,
+            name,
+            room_type,
+            invite_token,
+            grantee,
+        ) {
             Some(url) => {
                 self.as_mut().set_invite_url(QString::from(url.as_str()));
                 QString::from(url.as_str())

@@ -480,20 +480,30 @@ impl SupernodeState {
                 sfu::RoomType::Public
             };
             // Carry the proven SpaceNode's `invite_policy` onto the
-            // materialized room (§7 "proven SpaceNode" resolution). Note this
-            // is created with an empty `creator_id` (proof-materialized rooms
-            // have no local creator — see the comment on `apply_room_grant`),
-            // so `generate_invite_token_checked` still refuses to mint for it
-            // regardless of policy until Layer 2's node-key capability path
-            // lands; this only keeps the room's stored policy consistent with
-            // the Space definition in the meantime.
-            sfu.write().create_room_with_policy(
+            // materialized room (§7 "proven SpaceNode" resolution). It is first
+            // created with an empty `creator_id`; the adopt step below binds it
+            // to the proven Space owner.
+            let mut s = sfu.write();
+            s.create_room_with_policy(
                 Some(room_id),
                 &proof.node.name,
                 rt,
                 "",
                 &proof.node.invite_policy,
             );
+            // Bind the room to its cryptographically-proven Space owner. The
+            // inclusion proof (verified against the current signed root above)
+            // authenticates `proof.node.owner_pub` as the room's owner, so
+            // adopting it as `creator_id` restores owner minting + self-admit
+            // for a room re-materialized after a restart/idle-GC — the durable
+            // replacement for the deferred Layer 2 node-key capability path.
+            if s.adopt_creator_if_empty(room_id, &proof.node.owner_pub) {
+                info!(
+                    "[space] room {} adopted proven owner {} as creator",
+                    &room_id[..12.min(room_id.len())],
+                    &proof.node.owner_pub[..12.min(proof.node.owner_pub.len())]
+                );
+            }
         }
 
         // Admission decision: public → proof-only; private → owner-signed grant
