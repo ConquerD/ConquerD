@@ -37,8 +37,11 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - QUIC relay transport for NAT-traversed room audio plus room chat/file signaling when available; WebSocket remains the membership and fallback signaling path.
 - Room parity with direct-peer features: chat, voice, file transfer.
 - Create public or private rooms from the Rooms sidebar; right-click **Remove room** hides the room locally (does not delete server-side state — there is none to delete).
+- **Sub-rooms**: nest a room under any existing room (not just directly under the supernode) via **Create Public/Private Sub-room…**; the sidebar shows expand/collapse for rooms that have children.
+- Private rooms can enable **"Members can invite"** so any current member — not just the creator — can mint new invite tokens for that room.
 - Peer room invites with accept/decline flow.
 - Up to 32 participants per room.
+- Room (and sub-room) membership is backed by a client-signed, authenticated **Space** tree (Merkle inclusion proofs over room definitions) so any cluster member can admit a proven joiner even if it never saw the room's original grant; see `docs/SPACE-MERKLE-DESIGN.md`.
 
 ### In-App Supernode Portal & Browser Games
 - Supernodes with `web_port` configured serve an in-app portal over a QUIC bidi-stream channel (`web.host.app.v1`). The native client browses `conquerd://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no CA needed.

@@ -24,11 +24,13 @@ be treated as an emergency fallback only (not the common path).
 `docs/SPACE-MERKLE-DESIGN.md` is the authoritative not-done list (Layer 1 shipped). In brief:
 
 - **Layer 1 gaps:** `"members"` invite-policy widening, client UI toggle for invite policy, periodic
-  Space-root re-broadcast, and root-equivocation flagging (lighter mitigation) are all **done** — see
-  `docs/SPACE-MERKLE-DESIGN.md` items 1, 2, 3, 5. Still open: legacy-roster-path removal + migration
-  criteria (item 4 — gated on production verification, not actionable yet), deeper trees beyond
-  Server→Room (`Closet`, item 6), and the CT-style append-only history tree redesign (item 5's
-  heavier alternative, deferred).
+  Space-root re-broadcast, root-equivocation flagging (lighter mitigation), and deeper nesting
+  (sub-rooms under any existing room, arbitrary depth via `parent_id`) are all **done** — see the
+  "Already shipped" section of `docs/SPACE-MERKLE-DESIGN.md`. Still open: legacy-roster-path removal
+  + migration criteria (gated on production verification, not actionable yet) and the CT-style
+  append-only history tree redesign (the heavier alternative to the shipped equivocation-logging
+  mitigation). The backlog's `Closet` idea (a distinct node `kind` for a different semantic, e.g.
+  text-only sub-channels) remains a separate, unbuilt, additive refinement — not required for depth.
 - **Layer 2:** per-node epoch secrets, HKDF inheritance down `inherit=true` edges
   (`child_key = HKDF(parent_epoch_secret, "space-node" ‖ node_id)`, grants downward only),
   `inherit=false` compartments sealed with their own pairwise-distributed group key (owner → each

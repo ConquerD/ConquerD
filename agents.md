@@ -126,6 +126,7 @@ Responsibilities:
 - Keep the **Peers vs Rooms** split: the Peers rail (`PeerList.qml` / `PeerListModel`) must list only `PeerStore::list_non_supernode_peers()`; the Rooms sidebar (`MainWindow.qml` `nodeListModel`, `RoomPanel.qml`) must list only trusted supernodes (`PeerStore::supernodes()`, `AppBridge::isKnownSupernode`). Never show supernodes in Peers or ordinary peers in Rooms.
 - Keep **room UX** aligned with client-owned definitions + ephemeral supernode hosting: `CreateRoomDialog.qml` / `create_room` for user-initiated create (auto-join); `RoomStore::hide_from_sidebar` for sidebar remove (local only — no `SfuRoomDelete`); `SupernodeConnected` replay via `CreateRoom { materialize_only: true }` must not auto-join; room list filtering uses `filter_sfu_rooms_for_sidebar` + composite `(supernodeId, roomId)` keys.
 - Keep the Avatar section on the Identity settings tab (`SettingsPage.qml`, `settingsTab = 1`) in sync with `AvatarConfig` fields in `avatar_config.rs`; the `settings.avatar_config_json` qproperty on `SettingsModel` bridges the two. Avatar SVGs are rendered via `backend.avatarSvg(peerId, configJson)` → `data:image/svg+xml;base64,...` in `Avatar.qml`.
+- Keep `CreateRoomDialog.qml`'s "members can invite" toggle and sub-room nesting ("Create Sub-room", `parentRoomId`) in sync with the Space tree: both flow through `AppBridge::create_room_impl`/`create_sub_room` → `ConnectionCommand::CreateRoom` → `RoomStore::adopt_room_into_space`. Sidebar expand/collapse in `MainWindow.qml` reflects `has_children`; don't add a new Space node `kind` for nesting — `parent_id` already supports arbitrary depth (see `docs/SPACE-MERKLE-DESIGN.md`).
 
 Working style:
 - Avoid backend-dependent UX affordances.
@@ -385,7 +386,7 @@ No central feature registry, no mandatory features, no implicit cross-feature pr
 
 This section is the single source of truth for delivery status (condensed from the former `ROADMAP.md` / `IMPROVEMENT_PLAN.md` / `TODO.md`).
 
-**Last reviewed:** 2026-07-08 (Space Merkle Layer 1 gaps 1–3 and 5 closed — `"members"` invite-policy widening, client UI toggle, periodic Space-root re-broadcast, and root-equivocation flagging; see `docs/SPACE-MERKLE-DESIGN.md`. Test totals refreshed to 620. Durable per-feature invariants live in Architecture Notes / Using the Modular Framework / Feature Module Reference above).
+**Last reviewed:** 2026-07-08 (Space Merkle Layer 1 gaps 1–3, 5 (lighter mitigation), and 6 closed — `"members"` invite-policy widening, client UI toggle, periodic Space-root re-broadcast, root-equivocation flagging, and sub-room nesting (Server → Room → Room, arbitrary depth via existing `parent_id`); see `docs/SPACE-MERKLE-DESIGN.md`. Remaining Space Merkle work is legacy-roster-path removal (blocked on a production-verification gate, not actionable), the heavier CT-log root-equivocation redesign, and Layer 2 key hierarchy — all still open. Test totals refreshed to 620. Durable per-feature invariants live in Architecture Notes / Using the Modular Framework / Feature Module Reference above).
 
 ### Health summary
 
