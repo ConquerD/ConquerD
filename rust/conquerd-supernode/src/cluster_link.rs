@@ -915,22 +915,6 @@ mod tests {
         let id_a = Identity::generate();
         let id_b = Identity::generate();
         let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
-        let (a_addr, b_addr) = reserve_two_addrs();
-
-        let mk = |id: &str, addr: &str| crate::cluster::ClusterMember {
-            identity_pub: id.to_string(),
-            relay_addr: addr.to_string(),
-            cluster_addr: Some(addr.to_string()),
-            ws_addr: None,
-            web_port: None,
-        };
-        let cfg = crate::cluster::ClusterConfig {
-            cluster_id: "test".into(),
-            members: vec![mk(&a_pub, &a_addr), mk(&b_pub, &b_addr)],
-        };
-
-        let mem_a = ClusterMembership::new(cfg.clone(), &a_pub);
-        let mem_b = ClusterMembership::new(cfg, &b_pub);
 
         // B records what it receives; A receives nothing in this test.
         let received = Arc::new(parking_lot::Mutex::new(Vec::<ReplicatedMsg>::new()));
@@ -943,28 +927,39 @@ mod tests {
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
         let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
-        let link_a = ClusterLink::new(
-            id_a,
-            mem_a,
-            on_a,
-            no_grant.clone(),
-            no_auth.clone(),
-            no_root.clone(),
-        );
-        let link_b = ClusterLink::new(id_b, mem_b, on_b, no_grant, no_auth, no_root);
-
         // Only B has a local subscriber for "room1".
         let a_rooms: LocalRoomsFn = Arc::new(Vec::new);
         let b_rooms: LocalRoomsFn = Arc::new(|| vec!["room1".to_string()]);
 
-        link_a
-            .start(a_rooms, Arc::new(Vec::new))
-            .await
-            .expect("link A start");
-        link_b
-            .start(b_rooms, Arc::new(Vec::new))
-            .await
-            .expect("link B start");
+        let (link_a, link_b) = start_two_node_link(
+            &a_pub,
+            &b_pub,
+            |mem_a| {
+                ClusterLink::new(
+                    id_a.clone(),
+                    mem_a,
+                    on_a.clone(),
+                    no_grant.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            |mem_b| {
+                ClusterLink::new(
+                    id_b.clone(),
+                    mem_b,
+                    on_b.clone(),
+                    no_grant.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            a_rooms,
+            Arc::new(Vec::new),
+            b_rooms,
+            Arc::new(Vec::new),
+        )
+        .await;
 
         // Once the link is up and B's subscription has reached A, A's replicate
         // routes the frame to B. Retry to absorb connect/propagation latency.
@@ -1004,21 +999,6 @@ mod tests {
         let id_a = Identity::generate();
         let id_b = Identity::generate();
         let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
-        let (a_addr, b_addr) = reserve_two_addrs();
-
-        let mk = |id: &str, addr: &str| crate::cluster::ClusterMember {
-            identity_pub: id.to_string(),
-            relay_addr: addr.to_string(),
-            cluster_addr: Some(addr.to_string()),
-            ws_addr: None,
-            web_port: None,
-        };
-        let cfg = crate::cluster::ClusterConfig {
-            cluster_id: "test".into(),
-            members: vec![mk(&a_pub, &a_addr), mk(&b_pub, &b_addr)],
-        };
-        let mem_a = ClusterMembership::new(cfg.clone(), &a_pub);
-        let mem_b = ClusterMembership::new(cfg, &b_pub);
 
         // B records grants it receives.
         let grants = Arc::new(parking_lot::Mutex::new(Vec::<RoomGrant>::new()));
@@ -1031,25 +1011,36 @@ mod tests {
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
         let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
-        let link_a = ClusterLink::new(
-            id_a,
-            mem_a,
-            no_repl.clone(),
-            no_grant,
-            no_auth.clone(),
-            no_root.clone(),
-        );
-        let link_b = ClusterLink::new(id_b, mem_b, no_repl, on_grant_b, no_auth, no_root);
-
         let rooms: LocalRoomsFn = Arc::new(Vec::new);
-        link_a
-            .start(rooms.clone(), Arc::new(Vec::new))
-            .await
-            .expect("link A start");
-        link_b
-            .start(rooms, Arc::new(Vec::new))
-            .await
-            .expect("link B start");
+        let (link_a, link_b) = start_two_node_link(
+            &a_pub,
+            &b_pub,
+            |mem_a| {
+                ClusterLink::new(
+                    id_a.clone(),
+                    mem_a,
+                    no_repl.clone(),
+                    no_grant.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            |mem_b| {
+                ClusterLink::new(
+                    id_b.clone(),
+                    mem_b,
+                    no_repl.clone(),
+                    on_grant_b.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            rooms.clone(),
+            Arc::new(Vec::new),
+            rooms,
+            Arc::new(Vec::new),
+        )
+        .await;
 
         let mut delivered = false;
         for _ in 0..100 {
@@ -1082,21 +1073,6 @@ mod tests {
         let id_a = Identity::generate();
         let id_b = Identity::generate();
         let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
-        let (a_addr, b_addr) = reserve_two_addrs();
-
-        let mk = |id: &str, addr: &str| crate::cluster::ClusterMember {
-            identity_pub: id.to_string(),
-            relay_addr: addr.to_string(),
-            cluster_addr: Some(addr.to_string()),
-            ws_addr: None,
-            web_port: None,
-        };
-        let cfg = crate::cluster::ClusterConfig {
-            cluster_id: "test".into(),
-            members: vec![mk(&a_pub, &a_addr), mk(&b_pub, &b_addr)],
-        };
-        let mem_a = ClusterMembership::new(cfg.clone(), &a_pub);
-        let mem_b = ClusterMembership::new(cfg, &b_pub);
 
         // A owns one signed Space root, advertised via `local_space_roots`.
         let owner = Identity::generate();
@@ -1118,25 +1094,36 @@ mod tests {
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
         let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
-        let link_a = ClusterLink::new(
-            id_a,
-            mem_a,
-            no_repl.clone(),
-            no_grant.clone(),
-            no_auth.clone(),
-            no_root,
-        );
-        let link_b = ClusterLink::new(id_b, mem_b, no_repl, no_grant, no_auth, on_root_b);
-
         let rooms: LocalRoomsFn = Arc::new(Vec::new);
-        link_a
-            .start(rooms.clone(), a_roots)
-            .await
-            .expect("link A start");
-        link_b
-            .start(rooms, Arc::new(Vec::new))
-            .await
-            .expect("link B start");
+        let (link_a, link_b) = start_two_node_link(
+            &a_pub,
+            &b_pub,
+            |mem_a| {
+                ClusterLink::new(
+                    id_a.clone(),
+                    mem_a,
+                    no_repl.clone(),
+                    no_grant.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            |mem_b| {
+                ClusterLink::new(
+                    id_b.clone(),
+                    mem_b,
+                    no_repl.clone(),
+                    no_grant.clone(),
+                    no_auth.clone(),
+                    on_root_b.clone(),
+                )
+            },
+            rooms.clone(),
+            a_roots,
+            rooms,
+            Arc::new(Vec::new),
+        )
+        .await;
 
         let mut delivered = false;
         for _ in 0..100 {
@@ -1164,21 +1151,6 @@ mod tests {
         let id_a = Identity::generate();
         let id_b = Identity::generate();
         let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
-        let (a_addr, b_addr) = reserve_two_addrs();
-
-        let mk = |id: &str, addr: &str| crate::cluster::ClusterMember {
-            identity_pub: id.to_string(),
-            relay_addr: addr.to_string(),
-            cluster_addr: Some(addr.to_string()),
-            ws_addr: None,
-            web_port: None,
-        };
-        let cfg = crate::cluster::ClusterConfig {
-            cluster_id: "test".into(),
-            members: vec![mk(&a_pub, &a_addr), mk(&b_pub, &b_addr)],
-        };
-        let mem_a = ClusterMembership::new(cfg.clone(), &a_pub);
-        let mem_b = ClusterMembership::new(cfg, &b_pub);
 
         let auths = Arc::new(parking_lot::Mutex::new(Vec::<PeerAuthGrant>::new()));
         let on_auth_b: OnPeerAuthFn = {
@@ -1190,25 +1162,36 @@ mod tests {
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
         let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
-        let link_a = ClusterLink::new(
-            id_a,
-            mem_a,
-            no_repl.clone(),
-            no_grant.clone(),
-            no_auth,
-            no_root.clone(),
-        );
-        let link_b = ClusterLink::new(id_b, mem_b, no_repl, no_grant, on_auth_b, no_root);
-
         let rooms: LocalRoomsFn = Arc::new(Vec::new);
-        link_a
-            .start(rooms.clone(), Arc::new(Vec::new))
-            .await
-            .expect("link A start");
-        link_b
-            .start(rooms, Arc::new(Vec::new))
-            .await
-            .expect("link B start");
+        let (link_a, link_b) = start_two_node_link(
+            &a_pub,
+            &b_pub,
+            |mem_a| {
+                ClusterLink::new(
+                    id_a.clone(),
+                    mem_a,
+                    no_repl.clone(),
+                    no_grant.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            |mem_b| {
+                ClusterLink::new(
+                    id_b.clone(),
+                    mem_b,
+                    no_repl.clone(),
+                    no_grant.clone(),
+                    on_auth_b.clone(),
+                    no_root.clone(),
+                )
+            },
+            rooms.clone(),
+            Arc::new(Vec::new),
+            rooms,
+            Arc::new(Vec::new),
+        )
+        .await;
 
         let mut delivered = false;
         for _ in 0..100 {
