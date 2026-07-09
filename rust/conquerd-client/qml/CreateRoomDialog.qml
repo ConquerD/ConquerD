@@ -277,8 +277,7 @@ Dialog {
             }
         }
         delegate: Button {
-            text: DialogButtonBox.buttonText(this)
-            enabled: DialogButtonBox.buttonRole(this) !== DialogButtonBox.AcceptRole
+            enabled: DialogButtonBox.buttonRole !== DialogButtonBox.AcceptRole
                   || (roomNameField.text.trim() !== ""
                       && (root.supernodePreset
                           || (supernodeBox.currentIndex >= 0 && root.nodeListModel.count > 0)))

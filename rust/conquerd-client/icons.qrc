@@ -35,5 +35,9 @@
         <file alias="icons/x-circle.svg">qml/icons/x-circle.svg</file>
         <file alias="icons/stop.svg">qml/icons/stop.svg</file>
         <file alias="icons/undo.svg">qml/icons/undo.svg</file>
+        <file alias="icons/peers.svg">qml/icons/peers.svg</file>
+        <file alias="icons/clipboard.svg">qml/icons/clipboard.svg</file>
+        <file alias="icons/connect.svg">qml/icons/connect.svg</file>
+        <file alias="icons/warning.svg">qml/icons/warning.svg</file>
     </qresource>
 </RCC>
