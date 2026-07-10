@@ -543,6 +543,27 @@ impl SFURoomManager {
             .collect()
     }
 
+    /// Descriptors for **durable** rooms — those with a creator (client-owned,
+    /// not anonymous GC-able rooms) and not the always-present `default` lobby.
+    /// Gossiped to cluster peers so any member can materialize them and accept a
+    /// failed-over join, independent of whether the client pre-seeded that node.
+    /// Returns `(room_id, room_name, room_type, creator_id, invite_policy)`.
+    pub fn durable_room_descriptors(&self) -> Vec<(String, String, RoomType, String, String)> {
+        self.rooms
+            .values()
+            .filter(|r| r.room_id != DEFAULT_ROOM_ID && !r.creator_id.is_empty())
+            .map(|r| {
+                (
+                    r.room_id.clone(),
+                    r.room_name.clone(),
+                    r.room_type,
+                    r.creator_id.clone(),
+                    r.invite_policy.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Get all peers who should receive text chat (participants + subscribers).
     pub fn get_chat_recipients(&self, room_id: &str) -> Vec<String> {
         self.rooms
@@ -714,6 +735,33 @@ pub struct SFURoomStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_descriptors_skip_default_and_anonymous_rooms() {
+        let mut mgr = SFURoomManager::new();
+        // A client-owned room — durable, should be advertised to the cluster.
+        mgr.create_room_with_policy(
+            Some("owned"),
+            "We Gamin?",
+            RoomType::Private,
+            "OWNER",
+            "members",
+        )
+        .expect("room");
+        // The always-present default lobby has no creator — not advertised.
+        mgr.create_room(Some(DEFAULT_ROOM_ID), "Lobby", RoomType::Public, "");
+        // An anonymous (creatorless, GC-able) room — not advertised.
+        mgr.create_room(Some("anon"), "Anon", RoomType::Public, "");
+
+        let descs = mgr.durable_room_descriptors();
+        assert_eq!(descs.len(), 1, "only the client-owned room is durable");
+        let (id, name, rtype, creator, policy) = &descs[0];
+        assert_eq!(id, "owned");
+        assert_eq!(name, "We Gamin?");
+        assert_eq!(*rtype, RoomType::Private);
+        assert_eq!(creator, "OWNER");
+        assert_eq!(policy, "members");
+    }
 
     #[test]
     fn is_chat_sender_requires_membership() {

@@ -18,9 +18,11 @@ ApplicationWindow {
     visible: true
     minimumWidth: 960
     minimumHeight: 640
-    // Qt.CustomizeWindowHint hides the native title bar while keeping
-    // WS_THICKFRAME + WS_CAPTION so DWM provides Aero Snap, Snap Layouts
-    // (Win11 hover-maximize), and Win+Arrow snapping.
+    // CustomizeWindowHint hides Qt's default title-bar widgets. On Windows,
+    // window_chrome.cpp re-applies WS_CAPTION|WS_THICKFRAME and handles
+    // WM_NCCALCSIZE so DWM Aero Snap / drag-to-edge works with our QML
+    // TitleBar (startSystemMove). Without that helper, CustomizeWindowHint
+    // alone omits WS_CAPTION and snap is broken.
     flags: Qt.Window | Qt.CustomizeWindowHint
 
     Material.theme: Theme.isDark ? Material.Dark : Material.Light
@@ -1829,14 +1831,20 @@ ApplicationWindow {
 
                                                     Rectangle {
                                                         id: roomVoiceBubble
+                                                        // Once the hosting supernode disconnects, `voice_count` is
+                                                        // whatever we last heard — there is no live refresh path
+                                                        // for a dead session (RequestRoomList would just target a
+                                                        // closed connection), so treat the count as unknown rather
+                                                        // than rendering a stale number as if it were live.
+                                                        readonly property bool countIsStale: !roomGroup.connected
                                                         Layout.alignment: Qt.AlignVCenter
                                                         Layout.preferredWidth: voiceBubbleRow.implicitWidth + 10
                                                         Layout.preferredHeight: 22
                                                         radius: 11
-                                                        color: roomDelegate.voice_count > 0
+                                                        color: (!roomVoiceBubble.countIsStale && roomDelegate.voice_count > 0)
                                                             ? Theme.semanticTint(Theme.online, 0.16)
                                                             : Theme.bg2
-                                                        border.color: roomDelegate.voice_count > 0
+                                                        border.color: (!roomVoiceBubble.countIsStale && roomDelegate.voice_count > 0)
                                                             ? Theme.online
                                                             : Theme.divider
                                                         border.width: 1
@@ -1854,14 +1862,14 @@ ApplicationWindow {
                                                                 height: 12
                                                                 anchors.verticalCenter: parent.verticalCenter
                                                                 fillMode: Image.PreserveAspectFit
-                                                                opacity: roomDelegate.voice_count > 0 ? 1.0 : 0.55
+                                                                opacity: (!roomVoiceBubble.countIsStale && roomDelegate.voice_count > 0) ? 1.0 : 0.55
                                                             }
 
                                                             Label {
-                                                                text: roomDelegate.voice_count.toString()
-                                                                color: roomDelegate.voice_count > 0 ? Theme.online : Theme.muted
+                                                                text: roomVoiceBubble.countIsStale ? "\u2014" : roomDelegate.voice_count.toString()
+                                                                color: (!roomVoiceBubble.countIsStale && roomDelegate.voice_count > 0) ? Theme.online : Theme.muted
                                                                 font.pixelSize: Theme.fontSizeCaption
-                                                                font.bold: roomDelegate.voice_count > 0
+                                                                font.bold: !roomVoiceBubble.countIsStale && roomDelegate.voice_count > 0
                                                                 anchors.verticalCenter: parent.verticalCenter
                                                             }
                                                         }
@@ -1889,6 +1897,16 @@ ApplicationWindow {
 
                                                             contentItem: Column {
                                                                 spacing: Theme.spacingXs
+
+                                                                Label {
+                                                                    visible: roomVoiceBubble.countIsStale
+                                                                    width: roomVoicePopup.availableWidth
+                                                                    text: "Supernode offline \u2014 counts may be stale"
+                                                                    color: Theme.muted
+                                                                    font.italic: true
+                                                                    font.pixelSize: Theme.fontSizeCaption
+                                                                    wrapMode: Text.WordWrap
+                                                                }
 
                                                                 Label {
                                                                     width: roomVoicePopup.availableWidth

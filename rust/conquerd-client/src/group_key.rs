@@ -2,12 +2,22 @@
 //!
 //! This module defines the [`GroupKeySource`] trait — the read seam the codec
 //! consumes — and [`SenderKeysGroup`], the **sender-keys** group keying that
-//! backs it: the room owner generates a per-epoch key, seals it to each member
-//! 1:1 (see the `SfuGroupKey` path in `connection_manager`), and rekeys on
-//! member removal for forward secrecy / post-compromise security. TreeKEM was
-//! considered as a future O(log N) upgrade behind this same trait and declined
-//! (see `backlog.md` — invite-only rooms don't hit the O(N) rekey cost that
-//! would justify it); this is the long-term keying scheme, not an interim one.
+//! backs it: a room's elected keyer (see `connection_manager::manager` —
+//! deterministically the lexicographically smallest member `public_id`
+//! currently present, not necessarily whoever created the room) generates a
+//! per-epoch key and seals it to each member 1:1 (the `SfuGroupKey` path), and
+//! rekeys on member removal for forward secrecy / post-compromise security.
+//! Any member holding real key material can reseal it to a newcomer, so a
+//! joiner reliably receives the current epoch on any join path — including
+//! the built-in `default` room, which has no client-side creator at all (see
+//! `backlog.md` "Crypto — group key reliability"). Until real key material has
+//! been generated or received for a conversation, [`Self`] transparently falls
+//! back to a deterministic per-room key (every member can derive it locally,
+//! at the cost of zero confidentiality vs. the relay) so audio/chat/file keep
+//! working during that gap. TreeKEM was considered as a future O(log N)
+//! upgrade behind this same trait and declined (see `backlog.md` — invite-only
+//! rooms don't hit the O(N) rekey cost that would justify it); this is the
+//! long-term keying scheme, not an interim one.
 //!
 //! Two wire codecs share the epoch key:
 //!
@@ -87,13 +97,13 @@ impl GroupState {
 
 /// Sender-keys [`GroupKeySource`]: in-memory per-conversation epoch keys.
 ///
-/// The room **owner** generates the key ([`Self::new_owner_epoch`]) and rotates
-/// it on member removal ([`Self::rotate`]); every member installs keys received
-/// over the sealed `SfuGroupKey` path ([`Self::install`]). Keys are transport-
-/// only and held in memory: room chat is decrypted before it reaches the chat
-/// store (which re-encrypts at rest under its own key) and audio is ephemeral,
-/// so nothing here needs to survive a restart. A fresh epoch each session is
-/// expected and cheap.
+/// The room's elected keyer generates the key ([`Self::new_owner_epoch`]) and
+/// rotates it on member removal ([`Self::rotate`]); every member installs keys
+/// received over the sealed `SfuGroupKey` path ([`Self::install`]). Keys are
+/// transport-only and held in memory: room chat is decrypted before it reaches
+/// the chat store (which re-encrypts at rest under its own key) and audio is
+/// ephemeral, so nothing here needs to survive a restart. A fresh epoch each
+/// session is expected and cheap.
 ///
 /// `epoch` is a `u8` (fixed by the voice frame format); it wraps after 256
 /// rotations in a single session — far beyond realistic membership churn.
@@ -144,6 +154,17 @@ impl SenderKeysGroup {
         true
     }
 
+    /// True when this peer holds real (distributed, non-deterministic) key
+    /// material for `conv_id` — generated locally via [`Self::new_owner_epoch`]
+    /// / [`Self::rotate`], or received over the sealed `SfuGroupKey` path via
+    /// [`Self::install`]. Used to decide whether this peer already has
+    /// something to hand on to newcomers (see `connection_manager::manager`'s
+    /// elected-keyer logic) and whether the deterministic fallback below is
+    /// still in play for `conv_id`.
+    pub fn has_real_key(&self, conv_id: &str) -> bool {
+        self.groups.contains_key(conv_id)
+    }
+
     /// Forget any distributed key material for `conv_id` (the deterministic
     /// fallback remains available).
     pub fn forget(&mut self, conv_id: &str) {
@@ -152,26 +173,33 @@ impl SenderKeysGroup {
 }
 
 impl GroupKeySource for SenderKeysGroup {
-    fn current_epoch(&self, _conv_id: &str) -> u8 {
-        // Epoch 0 is the deterministic per-room key that every member can derive.
-        // (Distributed sender-keys at higher epochs are deferred — see the
-        // module note — because there is no reliable key-generator for rooms a
-        // peer merely *joins*, e.g. the default room, which left members with no
-        // key and dropped all audio.)
-        0
+    fn current_epoch(&self, conv_id: &str) -> u8 {
+        // The highest epoch this peer actually holds real key material for, or
+        // 0 (the deterministic fallback epoch) when no real key has been
+        // generated/received yet for this conversation — e.g. the brief window
+        // right after joining before the elected keyer's `SfuGroupKey` arrives.
+        self.groups.get(conv_id).map(|s| s.current).unwrap_or(0)
     }
 
     fn epoch_key(&self, conv_id: &str, epoch: u8) -> Option<[u8; GROUP_KEY_LEN]> {
+        if let Some(state) = self.groups.get(conv_id) {
+            // We hold real key material for this conversation — use it, even
+            // at epoch 0 (a real owner-generated epoch-0 key, not the
+            // deterministic one). A requested epoch we don't hold (evicted or
+            // not yet received) fails closed rather than silently downgrading
+            // to the deterministic key.
+            return state.keys.get(&epoch).copied();
+        }
         if epoch == 0 {
-            // Deterministic per-room key: every member derives the same value, so
-            // audio/chat work in *any* room (created, joined, or default) without
-            // depending on the fragile SfuGroupKey distribution. No confidentiality
-            // vs. the relay (it also knows `conv_id`) — acceptable pre-release; the
-            // distribution path stays wired but dormant for a future secure upgrade.
+            // No real key has been generated/received yet for `conv_id`. Fall
+            // back to the deterministic per-room key so audio/chat/file keep
+            // working in the gap before real keying lands; this is superseded
+            // the instant a real key is installed via `install`/
+            // `new_owner_epoch` (no confidentiality vs. the relay until then —
+            // it also knows `conv_id`).
             return Some(deterministic_room_key(conv_id));
         }
-        // Higher epochs: only an explicitly installed distributed key (dormant).
-        self.groups.get(conv_id)?.keys.get(&epoch).copied()
+        None
     }
 }
 
@@ -516,5 +544,50 @@ mod tests {
         assert!(state.keys.len() <= MAX_RETAINED_EPOCHS);
         // The current epoch key is always retained.
         assert!(state.keys.contains_key(&state.current));
+    }
+
+    #[test]
+    fn real_key_is_actually_used_once_distributed() {
+        // Regression test for the reliability fix: once a member holds real
+        // key material, encryption must use it — not silently stay pinned to
+        // the deterministic fallback (the previously-shipped, "wired but
+        // dormant" behavior this closes out).
+        let keys = owner_group();
+        assert!(keys.has_real_key(CONV));
+        let real_key = keys.epoch_key(CONV, 0).unwrap();
+        assert_ne!(real_key, deterministic_room_key(CONV));
+    }
+
+    #[test]
+    fn rotation_is_actually_consumed_for_new_frames() {
+        // Before the fix, `current_epoch` was hardcoded to 0 forever, so a
+        // rotated (higher-epoch) key was generated and distributed but never
+        // actually selected for new outgoing frames. Confirm it now is.
+        let mut owner = SenderKeysGroup::new();
+        owner.new_owner_epoch(CONV);
+        let (new_epoch, new_key) = owner.rotate(CONV);
+        assert_eq!(owner.current_epoch(CONV), new_epoch);
+        assert_eq!(owner.epoch_key(CONV, new_epoch), Some(new_key));
+
+        let frame = seal_voice_frame(&owner, CONV, SENDER, 1, b"post-rotate").unwrap();
+        assert_eq!(frame[0], new_epoch);
+    }
+
+    #[test]
+    fn unknown_higher_epoch_fails_closed_instead_of_falling_back() {
+        // A member with real key state for a conversation, asked to open a
+        // frame at an epoch it never received, must fail rather than silently
+        // downgrading to the deterministic key.
+        let keys = owner_group();
+        assert!(keys.epoch_key(CONV, 5).is_none());
+    }
+
+    #[test]
+    fn no_real_key_yet_falls_back_to_deterministic_only_at_epoch_zero() {
+        let keys = SenderKeysGroup::new();
+        assert!(!keys.has_real_key(CONV));
+        assert_eq!(keys.current_epoch(CONV), 0);
+        assert_eq!(keys.epoch_key(CONV, 0), Some(deterministic_room_key(CONV)));
+        assert_eq!(keys.epoch_key(CONV, 1), None);
     }
 }

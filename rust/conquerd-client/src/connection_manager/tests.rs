@@ -1,7 +1,7 @@
 use super::internal::{host_from_url, is_loopback_or_wildcard, rewrite_loopback_wt_url};
 use super::manager::{
-    build_room_invite_url, parse_quic_lan_hint, parse_room_invite, peer_quic_endpoint,
-    RoomInvitePayload, ROOM_INVITE_SCHEMA,
+    build_room_invite_url, is_elected_keyer, parse_quic_lan_hint, parse_room_invite,
+    peer_quic_endpoint, plan_cluster_failover, FailoverPlan, RoomInvitePayload, ROOM_INVITE_SCHEMA,
 };
 use super::ConnectionManager;
 
@@ -398,4 +398,172 @@ fn encrypted_signal_envelope_round_trips_and_hides_plaintext() {
     let eve = Identity::generate();
     let eve_key = eve.derive_pairwise_relay_key(&alice.public_id()).unwrap();
     assert!(decrypt_blob(&eve_key, &ct_b).is_err());
+}
+
+/// Room group-key "elected keyer" tie-break (`is_elected_keyer`), the fix for
+/// the reliability gap in `backlog.md` "Crypto — group key reliability": any
+/// member holding real key material can distribute it, chosen deterministically
+/// (lexicographically smallest `public_id` present) so every member agrees on
+/// a single actor without a fixed room "creator" — the property that lets the
+/// built-in ownerless `default` room get keyed at all.
+#[test]
+fn elected_keyer_is_the_lexicographically_smallest_member() {
+    let members = vec!["bob".to_owned(), "alice".to_owned(), "carol".to_owned()];
+    assert!(is_elected_keyer(&members, "alice"));
+    assert!(!is_elected_keyer(&members, "bob"));
+    assert!(!is_elected_keyer(&members, "carol"));
+}
+
+#[test]
+fn elected_keyer_requires_membership() {
+    let members = vec!["bob".to_owned(), "carol".to_owned()];
+    // Not present in the room at all → never the keyer, even if our id would
+    // otherwise sort first.
+    assert!(!is_elected_keyer(&members, "alice"));
+}
+
+#[test]
+fn elected_keyer_is_unique_for_a_given_snapshot() {
+    // Every member of the same snapshot must agree on exactly one keyer.
+    let members = vec!["zeta".to_owned(), "mid".to_owned(), "aaa".to_owned()];
+    let winners: Vec<&str> = members
+        .iter()
+        .filter(|m| is_elected_keyer(&members, m))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(winners, vec!["aaa"]);
+}
+
+#[test]
+fn elected_keyer_recomputes_when_the_smallest_member_leaves() {
+    // Simulates the keyer departing: the next-smallest remaining member takes
+    // over automatically on the next membership snapshot (default-room
+    // continuity + reconnect-after-drop, without a fixed owner).
+    let before = vec!["aaa".to_owned(), "mid".to_owned(), "zeta".to_owned()];
+    assert!(is_elected_keyer(&before, "aaa"));
+
+    let after_aaa_left = vec!["mid".to_owned(), "zeta".to_owned()];
+    assert!(!is_elected_keyer(&after_aaa_left, "aaa"));
+    assert!(is_elected_keyer(&after_aaa_left, "mid"));
+}
+
+#[test]
+fn single_member_room_is_its_own_keyer() {
+    // The very first member of a room (e.g. the built-in `default` room,
+    // which has no client-side creator) bootstraps its own real key.
+    let members = vec!["solo".to_owned()];
+    assert!(is_elected_keyer(&members, "solo"));
+}
+
+// ── Cluster failover selection (`plan_cluster_failover`) ────────────────────
+//
+// The regression these guard against: eager multi-homing opens a session to
+// every sibling up front, so a failover selector that *excludes* siblings we
+// already have a session with finds nothing and the room is silently dropped
+// when its host dies. Failover must instead prefer exactly those live sessions.
+
+fn targets(ids: &[&str]) -> Vec<(String, String)> {
+    ids.iter()
+        .map(|id| ((*id).to_owned(), format!("ws://{id}.example:34935")))
+        .collect()
+}
+
+#[test]
+fn failover_fans_out_to_every_live_sibling() {
+    // Both siblings have live sessions (eager multi-homing). Because a denied
+    // join is silent, we can't know which one still holds the room, so both are
+    // attempted at once and none are left cold.
+    let t = targets(&["B", "C"]);
+    let plan = plan_cluster_failover(&t, |_| Some(true));
+    assert_eq!(
+        plan,
+        FailoverPlan::Fanout {
+            live: vec!["B".to_owned(), "C".to_owned()],
+            cold: vec![],
+        }
+    );
+}
+
+#[test]
+fn failover_regression_live_sibling_is_never_excluded() {
+    // The original bug: the selector excluded siblings we already had a session
+    // with, and eager multi-homing meant that was *all* of them — so failover
+    // found nothing and the room was silently dropped. A live sibling must now
+    // always appear in `live`, never be filtered away.
+    let t = targets(&["B", "C"]);
+    let plan = plan_cluster_failover(&t, |id| match id {
+        "B" => Some(true), // already have a live session — must still be a target
+        _ => None,
+    });
+    let FailoverPlan::Fanout { live, cold } = plan else {
+        panic!("expected a fan-out plan, got {plan:?}");
+    };
+    assert_eq!(live, vec!["B".to_owned()]);
+    assert_eq!(
+        cold,
+        vec![("C".to_owned(), "ws://C.example:34935".to_owned())]
+    );
+}
+
+#[test]
+fn failover_treats_a_down_session_as_cold() {
+    // A sibling whose session exists but is disconnected can't accept a join
+    // now, so it is armed as cold (a live one, C, is attempted immediately).
+    let t = targets(&["B", "C"]);
+    let plan = plan_cluster_failover(&t, |id| match id {
+        "B" => Some(false), // session exists but down
+        "C" => Some(true),
+        _ => None,
+    });
+    assert_eq!(
+        plan,
+        FailoverPlan::Fanout {
+            live: vec!["C".to_owned()],
+            cold: vec![("B".to_owned(), "ws://B.example:34935".to_owned())],
+        }
+    );
+}
+
+#[test]
+fn failover_all_cold_when_none_are_live() {
+    // Whole cluster momentarily unreachable: no live attempt, every sibling is
+    // armed cold so the first to reconnect resumes the room.
+    let t = targets(&["B", "C"]);
+    let plan = plan_cluster_failover(&t, |id| match id {
+        "B" => Some(false), // session exists but down
+        _ => None,          // never dialed
+    });
+    assert_eq!(
+        plan,
+        FailoverPlan::Fanout {
+            live: vec![],
+            cold: t,
+        }
+    );
+}
+
+#[test]
+fn failover_without_a_roster_is_a_noop() {
+    // A standalone (non-clustered) supernode has no siblings to move to.
+    let plan = plan_cluster_failover(&[], |_| None);
+    assert_eq!(plan, FailoverPlan::None);
+}
+
+#[test]
+fn failover_preserves_roster_order_within_live_and_cold() {
+    // Determinism: siblings keep roster order within each bucket, so all clients
+    // sharing the roster attempt the same members in the same order.
+    let t = targets(&["B", "C", "D"]);
+    let plan = plan_cluster_failover(&t, |id| match id {
+        "B" => Some(true),
+        "D" => Some(true),
+        _ => None, // C is cold
+    });
+    assert_eq!(
+        plan,
+        FailoverPlan::Fanout {
+            live: vec!["B".to_owned(), "D".to_owned()],
+            cold: vec![("C".to_owned(), "ws://C.example:34935".to_owned())],
+        }
+    );
 }

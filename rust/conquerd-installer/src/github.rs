@@ -24,6 +24,31 @@ pub struct ReleaseInfo {
     pub manifest_url: String,
 }
 
+/// Human-facing details for the update-available UI.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateDetails {
+    /// e.g. `"1.0.0"` or `"1.2.3"` (semver without leading `v`).
+    pub version: String,
+    /// `"nightly"` when on the nightly channel, else empty.
+    pub channel: String,
+    /// e.g. `"2026-07-10"` or `"2026-07-10 14:32 UTC"`.
+    pub datetime: String,
+    /// Archive SHA-256 hex (lowercase).
+    pub hash: String,
+}
+
+impl UpdateDetails {
+    /// One-line title: `v1.0.0 nightly` or `v1.2.3`.
+    pub fn version_line(&self) -> String {
+        let ver = self.version.trim_start_matches(['v', 'V']);
+        if self.channel.is_empty() {
+            format!("v{ver}")
+        } else {
+            format!("v{ver} {}", self.channel)
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct GhRelease {
     tag_name: String,
@@ -129,6 +154,112 @@ pub fn nightly_remote_hash(release: &ReleaseInfo) -> anyhow::Result<String> {
                 current_platform_id()
             )
         })
+}
+
+/// Fetch nightly manifest details used by the update prompt UI.
+pub fn nightly_update_details(release: &ReleaseInfo) -> anyhow::Result<UpdateDetails> {
+    if release.manifest_url.is_empty() {
+        bail!("Nightly release is missing releases_manifest.json URL");
+    }
+
+    let raw_json = fetch_release_manifest(&release.manifest_url)?;
+    let mf = release_manifest::ReleaseManifest::parse_unsigned(&raw_json)?;
+    let entry = mf
+        .entry_for_platform(current_platform_id())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No nightly manifest entry for platform {}",
+                current_platform_id()
+            )
+        })?;
+
+    Ok(UpdateDetails {
+        // Installer package version is the product version; channel is separate.
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        channel: "nightly".to_string(),
+        datetime: format_release_datetime(entry.published_at, &entry.version, &entry.build_id),
+        hash: entry.build_hash.to_lowercase(),
+    })
+}
+
+/// Best-effort human datetime from manifest fields.
+fn format_release_datetime(published_at: f64, version: &str, build_id: &str) -> String {
+    if published_at > 0.0 {
+        let secs = published_at.floor() as i64;
+        if let Some(s) = format_unix_utc(secs) {
+            return s;
+        }
+    }
+    // Prefer YYYYMMDD embedded in `nightly-20260710`.
+    if let Some(date) = version.strip_prefix("nightly-") {
+        if date.len() >= 8 && date.as_bytes().iter().take(8).all(u8::is_ascii_digit) {
+            let y = &date[0..4];
+            let m = &date[4..6];
+            let d = &date[6..8];
+            return format!("{y}-{m}-{d}");
+        }
+    }
+    // build_id may end with a run number; leave blank rather than inventing.
+    let _ = build_id;
+    String::new()
+}
+
+fn format_unix_utc(secs: i64) -> Option<String> {
+    // Manual UTC formatting avoids pulling in chrono for one display string.
+    // Algorithm: civil_from_days (Howard Hinnant).
+    if secs < 0 {
+        return None;
+    }
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let hh = tod / 3600;
+    let mm = (tod % 3600) / 60;
+    Some(format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02} UTC"))
+}
+
+/// Build UI details for a remote release (nightly or stable).
+pub fn update_details_for_release(
+    release: &ReleaseInfo,
+    nightly: bool,
+) -> anyhow::Result<UpdateDetails> {
+    if nightly {
+        if let Ok(d) = nightly_update_details(release) {
+            return Ok(d);
+        }
+        // Fall back to .sha256 when the manifest is unavailable.
+        let hash = if !release.sha256_url.is_empty() {
+            fetch_sha256(&release.sha256_url).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        return Ok(UpdateDetails {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            channel: "nightly".to_string(),
+            datetime: String::new(),
+            hash,
+        });
+    }
+
+    Ok(UpdateDetails {
+        version: release.version.clone(),
+        channel: String::new(),
+        datetime: String::new(),
+        hash: if !release.sha256_url.is_empty() {
+            fetch_sha256(&release.sha256_url).unwrap_or_default()
+        } else {
+            String::new()
+        },
+    })
 }
 
 /// Fetch either the rolling nightly build or the latest stable GitHub release.
@@ -328,6 +459,42 @@ mod tests {
             release.manifest_url,
             format!("{NIGHTLY_DOWNLOAD_BASE}/releases_manifest.json")
         );
+    }
+
+    #[test]
+    fn update_details_version_line_nightly() {
+        let d = UpdateDetails {
+            version: "1.0.0".into(),
+            channel: "nightly".into(),
+            datetime: "2026-07-10".into(),
+            hash: "abc".into(),
+        };
+        assert_eq!(d.version_line(), "v1.0.0 nightly");
+    }
+
+    #[test]
+    fn update_details_version_line_stable() {
+        let d = UpdateDetails {
+            version: "1.2.3".into(),
+            channel: String::new(),
+            datetime: String::new(),
+            hash: String::new(),
+        };
+        assert_eq!(d.version_line(), "v1.2.3");
+    }
+
+    #[test]
+    fn format_release_datetime_from_nightly_version() {
+        let s = format_release_datetime(0.0, "nightly-20260710", "");
+        assert_eq!(s, "2026-07-10");
+    }
+
+    #[test]
+    fn format_release_datetime_from_unix() {
+        // 2024-01-01 00:00:00 UTC
+        let s = format_release_datetime(1_704_067_200.0, "1.0.0", "");
+        assert!(s.starts_with("2024-01-01"), "got {s}");
+        assert!(s.ends_with("UTC"), "got {s}");
     }
 
     #[test]

@@ -48,6 +48,24 @@ pub enum ConnectionEvent {
     SupernodeConnected(String),
     /// Connection to a supernode WebSocket lost.
     SupernodeDisconnected(String),
+    /// The active room was resumed on a different cluster member after its host
+    /// was lost. Tells the UI to re-point its active-room view at `supernode_id`
+    /// (the sibling that accepted the rejoin) instead of tearing the room down —
+    /// the cluster presents as one logical supernode, so this is a move, not a
+    /// leave. `room_id` is unchanged; only the hosting member differs.
+    RoomFailedOver {
+        supernode_id: String,
+        room_id: String,
+    },
+    /// Verified cluster sibling roster for a supernode, learned from its own
+    /// signed `SUPERNODE_INFO` reply. `members` are sibling identity_pubs
+    /// (excludes `supernode_id` itself). Lets the UI replay client-owned rooms
+    /// saved under a sibling's identity onto this supernode too, since a
+    /// cluster presents as one logical supernode to peers.
+    ClusterMembersUpdated {
+        supernode_id: String,
+        members: Vec<String>,
+    },
     /// Session state update for a peer.
     SessionStateUpdate(PeerSessionState),
     /// Typing indicator from a peer.

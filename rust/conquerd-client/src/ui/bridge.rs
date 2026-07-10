@@ -1012,6 +1012,15 @@ pub struct AppBridgeRust {
 
     /// User's own avatar config as JSON (saved in settings, broadcast to peers).
     avatar_config_json: String,
+
+    /// Verified cluster siblings per supernode, learned from each supernode's
+    /// own signed `SUPERNODE_INFO` roster (`ConnectionEvent::ClusterMembersUpdated`).
+    /// Used so `replay_saved_rooms_on_supernode_connect` can also materialize
+    /// rooms saved under a sibling's identity onto the node we just connected
+    /// to — a cluster presents as one logical supernode, so a room known on
+    /// one member should be replayed on any other member we're already
+    /// connected to (see backlog.md-adjacent cluster failover notes).
+    cluster_siblings: std::collections::HashMap<String, Vec<String>>,
 }
 
 fn request_invite_url(rust: &AppBridgeRust) -> Option<String> {
@@ -1199,6 +1208,7 @@ impl Default for AppBridgeRust {
             admitted_rooms: HashSet::new(),
             event_log: std::collections::VecDeque::with_capacity(300),
             avatar_config_json: String::new(),
+            cluster_siblings: std::collections::HashMap::new(),
         }
     }
 }
@@ -4398,30 +4408,49 @@ fn replay_saved_rooms_on_supernode_connect(
     peer_store: &crate::peer_store::PeerStore,
     conn_cmd_tx: &mpsc::Sender<ConnectionCommand>,
     supernode_id: &str,
+    sibling_ids: &[String],
     my_public_id: &str,
     identity: Option<&crate::identity::Identity>,
 ) {
-    for entry in room_store.list_for_supernode_resolved(peer_store, supernode_id) {
-        if entry.room_id == "default" {
-            continue;
+    // Rooms saved under `supernode_id` itself take priority; verified cluster
+    // siblings only fill in rooms we don't already have a direct entry for,
+    // so a member we're already connected to also gets client-owned rooms we
+    // only ever created/joined via one of its siblings — a cluster presents
+    // as one logical supernode to peers (see agents.md "Crypto — group key
+    // reliability" neighbourhood / cluster failover notes in backlog.md).
+    let mut seen_room_ids: HashSet<String> = HashSet::new();
+    let source_ids: Vec<&str> = std::iter::once(supernode_id)
+        .chain(sibling_ids.iter().map(String::as_str))
+        .collect();
+    for source_id in source_ids {
+        for entry in room_store.list_for_supernode_resolved(peer_store, source_id) {
+            if entry.room_id == "default" {
+                continue;
+            }
+            if !seen_room_ids.insert(entry.room_id.clone()) {
+                continue;
+            }
+            // Hide status is a sidebar preference for the connection we're
+            // materializing *onto* (`supernode_id`), not the source the saved
+            // entry happened to come from.
+            if room_store.is_hidden_from_sidebar(supernode_id, &entry.room_id) {
+                continue;
+            }
+            let creator_id = if entry.creator_id.is_empty() {
+                my_public_id.to_owned()
+            } else {
+                entry.creator_id.clone()
+            };
+            let _ = conn_cmd_tx.try_send(ConnectionCommand::CreateRoom {
+                supernode_id: supernode_id.to_owned(),
+                room_name: entry.room_name.clone(),
+                room_type: entry.room_type.clone(),
+                room_id: Some(entry.room_id.clone()),
+                creator_id: Some(creator_id),
+                materialize_only: true,
+                invite_policy: entry.invite_policy.clone(),
+            });
         }
-        if room_store.is_hidden_from_sidebar(supernode_id, &entry.room_id) {
-            continue;
-        }
-        let creator_id = if entry.creator_id.is_empty() {
-            my_public_id.to_owned()
-        } else {
-            entry.creator_id.clone()
-        };
-        let _ = conn_cmd_tx.try_send(ConnectionCommand::CreateRoom {
-            supernode_id: supernode_id.to_owned(),
-            room_name: entry.room_name.clone(),
-            room_type: entry.room_type.clone(),
-            room_id: Some(entry.room_id.clone()),
-            creator_id: Some(creator_id),
-            materialize_only: true,
-            invite_policy: entry.invite_policy.clone(),
-        });
     }
     // Periodic Space-root re-broadcast (SPACE-MERKLE-DESIGN §8, open item 3):
     // reconnect is the one guaranteed convergence point (the supernode may have
@@ -5026,11 +5055,18 @@ fn dispatch_event(
                     bridge.rust().peer_store.as_ref(),
                     bridge.rust().conn_cmd_tx.as_ref(),
                 ) {
+                    let siblings = bridge
+                        .rust()
+                        .cluster_siblings
+                        .get(&canon)
+                        .cloned()
+                        .unwrap_or_default();
                     replay_saved_rooms_on_supernode_connect(
                         &rs.read(),
                         &ps.read(),
                         tx,
                         &canon,
+                        &siblings,
                         &my_public_id,
                         bridge.rust().identity.as_deref(),
                     );
@@ -5052,26 +5088,101 @@ fn dispatch_event(
                     .as_mut()
                     .nodes_updated(QString::from(node_json.as_str()));
 
-                // If the lost supernode was hosting the active room, perform a
-                // full local leave (SfuClient + CallController + in-room state)
-                // so the client does not remain stuck targeting a dead host
-                // for audio/chat while other supernodes or direct peers are
-                // still usable. This mirrors explicit remove_room / leave paths
-                // and the multi-supernode isolation requirement.
+                // If the lost supernode was hosting the active room, decide
+                // whether to tear the room down or hold it for cluster failover.
                 if bridge.rust().current_supernode_id == canon {
-                    bridge.as_mut().leave_room();
-                    {
-                        let mut r = bridge.as_mut().rust_mut();
-                        r.current_supernode_id.clear();
-                        r.current_room_id.clear();
+                    // Clustered host with verified siblings: the connection layer
+                    // is failing the room over to a sibling right now (it will
+                    // emit `RoomFailedOver` once one accepts). Keep the room and
+                    // show a transient reconnecting state instead of tearing down
+                    // and flashing offline — the cluster presents as one node.
+                    let has_siblings = bridge
+                        .rust()
+                        .cluster_siblings
+                        .get(&canon)
+                        .is_some_and(|s| !s.is_empty());
+                    if has_siblings {
+                        bridge
+                            .as_mut()
+                            .set_session_banner(QString::from("Reconnecting to cluster\u{2026}"));
+                        // Leave current_supernode_id/current_room_id intact so the
+                        // pending `RoomFailedOver` can re-point them; connection
+                        // mode stays "room" so the UI keeps showing the room.
+                    } else {
+                        // Standalone host (no failover possible): full local leave
+                        // so we don't stay stuck targeting a dead host for
+                        // audio/chat while other sessions remain usable.
+                        bridge.as_mut().leave_room();
+                        {
+                            let mut r = bridge.as_mut().rust_mut();
+                            r.current_supernode_id.clear();
+                            r.current_room_id.clear();
+                        }
+                        bridge
+                            .as_mut()
+                            .set_session_banner(QString::from(banner.as_str()));
+                        bridge
+                            .as_mut()
+                            .set_connection_mode(QString::from("offline"));
                     }
-                    bridge
-                        .as_mut()
-                        .set_session_banner(QString::from(banner.as_str()));
-                    bridge
-                        .as_mut()
-                        .set_connection_mode(QString::from("offline"));
                 }
+            });
+        }
+        ConnectionEvent::ClusterMembersUpdated {
+            supernode_id,
+            members,
+        } => {
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
+                    return;
+                };
+                bridge
+                    .as_mut()
+                    .rust_mut()
+                    .cluster_siblings
+                    .insert(canon, members);
+            });
+        }
+        ConnectionEvent::RoomFailedOver {
+            supernode_id,
+            room_id,
+        } => {
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
+                    return;
+                };
+                // Only follow the move if this is still our active room — the
+                // connection layer resumed it on `canon` after the old host was
+                // lost. Re-point the UI's active-room (and voice, if we were
+                // voicing this room) to the new member so it keeps showing the
+                // room instead of the "reconnecting" hold set on disconnect.
+                if bridge.rust().current_room_id != room_id {
+                    return;
+                }
+                {
+                    let mut r = bridge.as_mut().rust_mut();
+                    r.current_supernode_id = canon.clone();
+                    if r.voice_room_id == room_id {
+                        r.voice_supernode_id = canon.clone();
+                    }
+                }
+                bridge
+                    .as_mut()
+                    .set_session_banner(QString::from("Reconnected \u{00b7} cluster"));
+                bridge.as_mut().set_connection_mode(QString::from("room"));
+                bridge.as_mut().set_in_room(true);
+                // Mark the new host connected in the Nodes view; the room roster
+                // itself refreshes via the `SfuMembers` → RoomMembersChanged that
+                // accompanies the resumed join.
+                let node_json =
+                    serde_json::json!([{ "node_id": canon, "connected": true }]).to_string();
+                bridge
+                    .as_mut()
+                    .nodes_updated(QString::from(node_json.as_str()));
+                info!(
+                    "[bridge] room {} failed over to cluster member {}",
+                    room_id, canon
+                );
             });
         }
         ConnectionEvent::SupernodeInfoReceived {

@@ -50,6 +50,16 @@ fn unix_now_f64() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// The room group-key "elected keyer" tie-break: `me` acts iff it is present
+/// in `members` and no other member present sorts before it lexicographically.
+/// Every member evaluates this against the same authoritative membership
+/// snapshot, so at most one of them distributes for a given snapshot — no
+/// fixed "creator" required (see [`ConnectionManager::sync_room_membership`]
+/// and `backlog.md` "Crypto — group key reliability").
+pub(super) fn is_elected_keyer(members: &[String], me: &str) -> bool {
+    members.iter().any(|m| m == me) && !members.iter().any(|m| m.as_str() < me)
+}
+
 pub(super) fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
     let trimmed = hint.trim();
     if trimmed.is_empty() {
@@ -317,6 +327,53 @@ struct RoomCreateRequest<'a> {
     invite_policy: &'a str,
 }
 
+/// What to do with a room whose hosting supernode was just lost, given the
+/// verified cluster siblings we could move it to.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FailoverPlan {
+    /// No verified sibling advertises a signaling address — nothing to do.
+    None,
+    /// Resume the room across the cluster. We cannot know which sibling still
+    /// has the room materialized (a denied join returns *no* response, so we
+    /// can't probe one-at-a-time), so we attempt the rejoin on **every** live
+    /// sibling at once — whichever holds the room answers with `SfuMembers`,
+    /// the rest silently deny — and arm the not-yet-connected ones for a replay
+    /// when they come back.
+    Fanout {
+        /// Sibling ids with a live session; attempt the rejoin on all now.
+        live: Vec<String>,
+        /// `(identity_pub, ws_url)` for siblings without a live session; arm
+        /// each for a rejoin on its next connect and dial the ones we have no
+        /// session task for yet.
+        cold: Vec<(String, String)>,
+    },
+}
+
+/// Plan how a lost room should resume, given `targets` in roster order and a
+/// `session` lookup returning `Some(connected)` when we hold a session with
+/// that sibling (`None` when we have never dialed it).
+///
+/// Eager multi-homing keeps a session open to every sibling, so the common case
+/// is a non-empty `live` set and an immediate rejoin with no dial and no wait.
+pub(super) fn plan_cluster_failover(
+    targets: &[(String, String)],
+    session: impl Fn(&str) -> Option<bool>,
+) -> FailoverPlan {
+    if targets.is_empty() {
+        return FailoverPlan::None;
+    }
+    let mut live = Vec::new();
+    let mut cold = Vec::new();
+    for (id, url) in targets {
+        if session(id) == Some(true) {
+            live.push(id.clone());
+        } else {
+            cold.push((id.clone(), url.clone()));
+        }
+    }
+    FailoverPlan::Fanout { live, cold }
+}
+
 /// The central connection manager.
 ///
 /// Call [`ConnectionManager::run`] in a tokio task to drive all I/O. The
@@ -342,6 +399,11 @@ pub struct ConnectionManager {
     /// per-retry `WsDisconnected` storm doesn't spawn duplicate attempts.
     /// Cleared when that supernode reconnects.
     failover_in_progress: HashSet<String>,
+    /// Room we are resuming via a live-sibling fan-out and awaiting an
+    /// authoritative `SfuMembers` ack for. The sibling that answers is the one
+    /// that still holds the room, so it becomes `current_supernode_id`. Cleared
+    /// on the first ack (or when the resume otherwise completes).
+    failover_pending_room: Option<String>,
 
     /// Quinn QUIC endpoint (lazily created on first use).
     quic_endpoint: Option<quinn::Endpoint>,
@@ -404,14 +466,12 @@ pub struct ConnectionManager {
     relay_signaling_tx: mpsc::UnboundedSender<RelaySignalingInbound>,
     /// Receiver side of [`Self::relay_signaling_tx`], polled in the run loop.
     relay_signaling_rx: mpsc::UnboundedReceiver<RelaySignalingInbound>,
-    /// Sender-keys group keying for E2E room audio + room chat. The owner
-    /// generates/rotates epoch keys and seals them to members over `SfuGroupKey`;
-    /// members install received keys. See [`crate::group_key`].
+    /// Sender-keys group keying for E2E room audio + room chat. The room's
+    /// elected keyer (see [`Self::sync_room_membership`]) generates/rotates
+    /// epoch keys and seals them to members over `SfuGroupKey`; every member
+    /// installs keys it receives. See [`crate::group_key`].
     group_keys: SenderKeysGroup,
-    /// Rooms we created (`supernode_id:room_id`) — we are the group-key owner for
-    /// these and drive distribution/rotation from membership changes.
-    created_rooms: HashSet<String>,
-    /// Last-seen member set per owned room (`supernode_id:room_id` → member
+    /// Last-seen member set per room we're in (`supernode_id:room_id` → member
     /// public_ids, excluding self), used to diff joins/leaves for rekeying.
     room_group_members: HashMap<String, HashSet<String>>,
     /// Monotonic per-send sequence for E2E room-audio frames, bound into the
@@ -483,6 +543,7 @@ impl ConnectionManager {
             cluster_members: HashMap::new(),
             pending_failover_rejoin: HashMap::new(),
             failover_in_progress: HashSet::new(),
+            failover_pending_room: None,
             quic_endpoint: None,
             internal_tx,
             internal_rx,
@@ -507,7 +568,6 @@ impl ConnectionManager {
             room_relay_fail_streak: 0,
             room_relay_cooldown_frames: 0,
             group_keys: SenderKeysGroup::new(),
-            created_rooms: HashSet::new(),
             room_group_members: HashMap::new(),
             room_audio_seq: 0,
             pending_join_space_creds: HashMap::new(),
@@ -1002,35 +1062,88 @@ impl ConnectionManager {
             &supernode_id[..12.min(supernode_id.len())],
             urls
         );
+        // Surface the verified roster to the UI so it can replay client-owned
+        // rooms saved under a sibling's identity onto this supernode too (a
+        // cluster presents as one logical supernode to peers).
+        let member_ids: Vec<String> = members
+            .iter()
+            .map(|m| m.identity_pub.trim_end_matches('=').to_owned())
+            .collect();
+        let _ = self
+            .event_tx
+            .try_send(ConnectionEvent::ClusterMembersUpdated {
+                supernode_id: supernode_id.to_owned(),
+                members: member_ids,
+            });
     }
 
-    /// Ordered WebSocket failover URLs for `supernode_id`'s verified siblings,
-    /// excluding any sibling we already have a session with. Pure read of the
-    /// stored, verified roster — the basis for live failover reconnection.
+    /// Proactively open sessions to any verified cluster siblings of
+    /// `supernode_id` we don't already have one with. Without this, a peer
+    /// that only ever opened one session to the cluster becomes unreachable
+    /// the instant that single node goes down — other members can't relay
+    /// `EncryptedSignal`/room traffic to it because they have no live session
+    /// to route through (`"Relay target ... not connected"` on the supernode).
+    /// Reuses the same signature-verified roster `maybe_failover_to_cluster`
+    /// uses reactively; this just does it eagerly instead of waiting for our
+    /// own room's host to die. Purely a runtime session — does not touch
+    /// `PeerStore` trust (same as the existing reactive failover path).
+    async fn connect_cluster_siblings(&mut self, supernode_id: &str) {
+        let scheme = self
+            .supernodes
+            .get(supernode_id)
+            .and_then(|sn| sn.ws_url.split("://").next())
+            .unwrap_or("ws")
+            .to_owned();
+        let targets: Vec<(String, String)> = self
+            .cluster_sibling_targets(supernode_id, &scheme)
+            .into_iter()
+            .filter(|(id, _)| !self.supernodes.contains_key(id))
+            .collect();
+        for (sibling_id, ws_url) in targets {
+            info!(
+                "cluster: multi-homing to sibling {} at {} (reachability for cluster failover)",
+                &sibling_id[..12.min(sibling_id.len())],
+                ws_url
+            );
+            self.connect_supernode_ws(sibling_id, ws_url).await;
+        }
+    }
+
+    /// Ordered WebSocket attach-point URLs for `supernode_id`'s verified
+    /// siblings. Pure read of the stored, verified roster.
     fn cluster_failover_ws_urls(&self, supernode_id: &str, scheme: &str) -> Vec<String> {
-        self.cluster_failover_targets(supernode_id, scheme)
+        self.cluster_sibling_targets(supernode_id, scheme)
             .into_iter()
             .map(|(_, url)| url)
             .collect()
     }
 
-    /// Verified `(sibling_identity_pub, ws_url)` failover targets for
-    /// `supernode_id`, excluding siblings we already have a session with.
-    fn cluster_failover_targets(&self, supernode_id: &str, scheme: &str) -> Vec<(String, String)> {
+    /// Every verified `(sibling_identity_pub, ws_url)` attach point for
+    /// `supernode_id`, in roster order. Siblings we already hold a session with
+    /// are **included** — failover needs to see them precisely because a live
+    /// session is the cheapest place to resume the room.
+    fn cluster_sibling_targets(&self, supernode_id: &str, scheme: &str) -> Vec<(String, String)> {
         let Some(members) = self.cluster_members.get(supernode_id) else {
             return Vec::new();
         };
         members
             .iter()
             .map(|m| (m.identity_pub.trim_end_matches('=').to_owned(), m))
-            .filter(|(id, _)| !self.supernodes.contains_key(id))
             .filter_map(|(id, m)| m.ws_url(scheme).map(|url| (id, url)))
             .collect()
     }
 
-    /// When the supernode hosting our current room is lost, open a session to a
-    /// verified cluster sibling and queue a room-join replay for when it
-    /// connects. Guarded so the per-retry disconnect storm triggers this once.
+    /// When the supernode hosting our current room is lost, move the room to a
+    /// verified cluster sibling. Guarded so the per-retry disconnect storm
+    /// triggers this once.
+    ///
+    /// A denied `SfuJoin` (e.g. the room isn't materialized on that member)
+    /// returns *no* response, so we can't probe siblings one at a time. Instead
+    /// we fan the rejoin out to **every** live sibling at once: the member that
+    /// still holds the room answers with `SfuMembers` (which promotes it to
+    /// `current_supernode_id`), and the rest silently deny. Siblings that aren't
+    /// connected yet — plus the node we just lost — are armed to replay the join
+    /// when they return, so the room only truly dies once no member is reachable.
     async fn maybe_failover_to_cluster(&mut self, lost_supernode: &str, room_id: &str) {
         if room_id.is_empty() || self.failover_in_progress.contains(lost_supernode) {
             return;
@@ -1041,23 +1154,59 @@ impl ConnectionManager {
             .and_then(|sn| sn.ws_url.split("://").next())
             .unwrap_or("ws")
             .to_owned();
-        let Some((sibling_id, ws_url)) = self
-            .cluster_failover_targets(lost_supernode, &scheme)
-            .into_iter()
-            .next()
-        else {
-            return; // no verified sibling to fail over to
+        let targets = self.cluster_sibling_targets(lost_supernode, &scheme);
+        let plan = plan_cluster_failover(&targets, |id| {
+            self.supernodes.get(id).map(|sn| sn.connected)
+        });
+
+        let FailoverPlan::Fanout { live, cold } = plan else {
+            return; // FailoverPlan::None — no verified sibling to fail over to
         };
-        info!(
-            "Cluster failover: supernode {} lost — attaching to sibling {} at {} to resume room",
-            &lost_supernode[..12.min(lost_supernode.len())],
-            &sibling_id[..12.min(sibling_id.len())],
-            ws_url
-        );
         self.failover_in_progress.insert(lost_supernode.to_owned());
-        self.pending_failover_rejoin
-            .insert(sibling_id.clone(), room_id.to_owned());
-        self.connect_supernode_ws(sibling_id, ws_url).await;
+        self.current_room_id = room_id.to_owned();
+
+        // Attempt the rejoin on every live sibling now. Whichever still has the
+        // room replies with `SfuMembers`; until one does, point outbound room
+        // ops at the first live sibling so they have somewhere to go. The
+        // `SfuMembers` handler reassigns `current_supernode_id` to the actual
+        // responder (which may differ from this optimistic guess).
+        if let Some(first) = live.first() {
+            self.current_supernode_id = first.clone();
+            self.failover_pending_room = Some(room_id.to_owned());
+            info!(
+                "Cluster failover: supernode {} lost — attempting rejoin on {} live sibling(s)",
+                &lost_supernode[..12.min(lost_supernode.len())],
+                live.len()
+            );
+            for sibling_id in &live {
+                self.send_room_join(sibling_id, room_id).await;
+                self.ensure_room_relay(sibling_id).await;
+            }
+        }
+
+        // Arm every not-yet-live sibling to replay the join when it (re)connects,
+        // dialing the ones we have no session task for. The first to come back
+        // and accept the room wins.
+        //
+        // Only arm the node we just lost when there is *no* live sibling to fan
+        // out to — its return is a valid resume path then. When a fan-out is in
+        // flight, arming it would let the fresh, roomless node (post-restart,
+        // before roster gossip refills it) hijack a working failover and strand
+        // us on `room_absent`. A successful fan-out also disarms these on
+        // confirmation, but not arming it here removes the race entirely.
+        if live.is_empty() {
+            self.pending_failover_rejoin
+                .insert(lost_supernode.to_owned(), room_id.to_owned());
+        }
+        for (sibling_id, ws_url) in cold {
+            self.pending_failover_rejoin
+                .insert(sibling_id.clone(), room_id.to_owned());
+            // A sibling with an existing session has a task already retrying on
+            // its own backoff; only one we have never dialed needs one spawned.
+            if !self.supernodes.contains_key(&sibling_id) {
+                self.connect_supernode_ws(sibling_id, ws_url).await;
+            }
+        }
     }
 
     /// Resolve a signaling `target` to a `supernodes` session key (`identity_pub`).
@@ -1533,21 +1682,34 @@ impl ConnectionManager {
         }
     }
 
-    /// Owner: reconcile the group key against the current room membership.
-    /// Generates the first epoch, rotates on any departure (forward secrecy /
-    /// PCS), or seals the current epoch to newly-added members. No-op unless we
-    /// own `room_id`. `members` is the authoritative set from the supernode.
-    async fn owner_sync_group_key(
+    /// Reconcile a room's group key against the current, authoritative member
+    /// set. Any member holding real (distributed) key material for `room_id`
+    /// — not just whoever created it — can act as its "keyer": it bootstraps
+    /// the first epoch, rotates on departure (forward secrecy / PCS), or seals
+    /// the current epoch to newcomers. Exactly one member acts per snapshot
+    /// via a deterministic tie-break (the lexicographically smallest
+    /// `public_id` currently present) — every member computes the same
+    /// winner from the same authoritative set, so this needs no fixed
+    /// "creator" at all, which is what lets it also cover the built-in
+    /// `default` room (no client-side creator exists for it). A narrow
+    /// bootstrap race remains possible if two members join before either
+    /// observes the other (each may generate a competing epoch 0); it
+    /// self-heals the next time a shared membership view arrives, since only
+    /// the smaller id keeps distributing going forward — see `backlog.md`
+    /// "Crypto — group key reliability".
+    async fn sync_room_membership(
         &mut self,
         supernode_id: &str,
         room_id: &str,
         members: &[String],
     ) {
         let room_key = format!("{supernode_id}:{room_id}");
-        if !self.created_rooms.contains(&room_key) {
+        let me = self.identity.public_id();
+
+        if !is_elected_keyer(members, &me) {
             return;
         }
-        let me = self.identity.public_id();
+
         let new: HashSet<String> = members.iter().filter(|m| **m != me).cloned().collect();
         let old = self
             .room_group_members
@@ -1557,7 +1719,7 @@ impl ConnectionManager {
         let removed = old.difference(&new).count() > 0;
         let added: Vec<String> = new.difference(&old).cloned().collect();
 
-        if !self.group_keys.has_key(room_id) {
+        if !self.group_keys.has_real_key(room_id) {
             // First keying: generate epoch 0 and seal to everyone present.
             let (epoch, key) = self.group_keys.new_owner_epoch(room_id);
             let all: Vec<String> = new.iter().cloned().collect();
@@ -1873,10 +2035,24 @@ impl ConnectionManager {
                         &room_id[..12.min(room_id.len())],
                         &peer_id[..12.min(peer_id.len())]
                     );
+                    // Several siblings may have been armed for this room (all
+                    // were down). This one won the race — disarm the rest so a
+                    // later reconnect doesn't seize the room a second time, and
+                    // cancel any live-sibling fan-out awaiting confirmation.
+                    self.pending_failover_rejoin.retain(|_, r| *r != room_id);
+                    if self.failover_pending_room.as_deref() == Some(room_id.as_str()) {
+                        self.failover_pending_room = None;
+                    }
                     self.current_supernode_id = peer_id.clone();
                     self.current_room_id = room_id.clone();
                     self.send_room_join(&peer_id, &room_id).await;
                     self.ensure_room_relay(&peer_id).await;
+                    // Tell the UI the room moved to this member so it follows the
+                    // failover instead of showing offline / no room.
+                    let _ = self.event_tx.try_send(ConnectionEvent::RoomFailedOver {
+                        supernode_id: peer_id.clone(),
+                        room_id: room_id.clone(),
+                    });
                 }
                 // A pasted room invite was waiting on this supernode to connect —
                 // now enter the room via the normal (token-validated) join path.
@@ -3365,9 +3541,39 @@ impl ConnectionManager {
                             .collect()
                     })
                     .unwrap_or_default();
-                // Owner: reconcile the room group key against this authoritative
-                // member set (first keying / rotate-on-leave / seal-to-newcomer).
-                self.owner_sync_group_key(&msg.sender, &room_id, &members)
+                // If a cluster failover fan-out is awaiting confirmation for this
+                // room, the sibling that answered is the one that still holds it
+                // — promote it to the current supernode (correcting the
+                // optimistic guess made when the joins were sent). Only the first
+                // responder wins; later acks fall through as normal updates.
+                if self.failover_pending_room.as_deref() == Some(room_id.as_str()) {
+                    self.failover_pending_room = None;
+                    self.current_supernode_id = msg.sender.clone();
+                    self.current_room_id = room_id.clone();
+                    // The room is confirmed resumed here, so disarm every pending
+                    // rejoin for it — including the one for the node we failed
+                    // over *from*. Otherwise, when that node restarts (fresh and
+                    // roomless until roster gossip refills it), the reconnect
+                    // handler would blindly rejoin the room there and adopt it as
+                    // current; the fresh node silently denies (`room_absent`),
+                    // stranding a client that was already working on this sibling.
+                    self.pending_failover_rejoin.retain(|_, r| *r != room_id);
+                    info!(
+                        "Cluster failover: room resumed on sibling {}",
+                        &msg.sender[..12.min(msg.sender.len())]
+                    );
+                    self.ensure_room_relay(&msg.sender).await;
+                    // Tell the UI the room moved to this sibling so it follows the
+                    // failover instead of showing offline / no room.
+                    let _ = self.event_tx.try_send(ConnectionEvent::RoomFailedOver {
+                        supernode_id: msg.sender.clone(),
+                        room_id: room_id.clone(),
+                    });
+                }
+                // Reconcile the room group key against this authoritative member
+                // set (first keying / rotate-on-leave / seal-to-newcomer) if we're
+                // the elected keyer for this snapshot.
+                self.sync_room_membership(&msg.sender, &room_id, &members)
                     .await;
                 let _ = self.event_tx.try_send(ConnectionEvent::RoomMembersChanged {
                     supernode_id: msg.sender.clone(),
@@ -3388,19 +3594,20 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or(&msg.sender)
                     .to_owned();
-                // Owner: seal the current epoch key to the newcomer.
+                // Reseal the current epoch key to the newcomer if we're the
+                // elected keyer (see `sync_room_membership`).
                 let room_key = format!("{}:{}", msg.sender, room_id);
-                if self.created_rooms.contains(&room_key) {
-                    let mut set = self
-                        .room_group_members
-                        .get(&room_key)
-                        .cloned()
-                        .unwrap_or_default();
-                    set.insert(peer_id.clone());
-                    let members: Vec<String> = set.into_iter().collect();
-                    self.owner_sync_group_key(&msg.sender, &room_id, &members)
-                        .await;
-                }
+                let me = self.identity.public_id();
+                let mut set = self
+                    .room_group_members
+                    .get(&room_key)
+                    .cloned()
+                    .unwrap_or_default();
+                set.insert(me);
+                set.insert(peer_id.clone());
+                let members: Vec<String> = set.into_iter().collect();
+                self.sync_room_membership(&msg.sender, &room_id, &members)
+                    .await;
                 let _ = self.event_tx.try_send(ConnectionEvent::RoomPeerJoined {
                     supernode_id: msg.sender.clone(),
                     room_id,
@@ -3420,20 +3627,21 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or(&msg.sender)
                     .to_owned();
-                // Owner: a departure → rotate the epoch key and reseal to those
-                // who remain (forward secrecy + post-compromise security).
+                // A departure → rotate the epoch key and reseal to those who
+                // remain (forward secrecy + post-compromise security) if we're
+                // the elected keyer (see `sync_room_membership`).
                 let room_key = format!("{}:{}", msg.sender, room_id);
-                if self.created_rooms.contains(&room_key) {
-                    let mut set = self
-                        .room_group_members
-                        .get(&room_key)
-                        .cloned()
-                        .unwrap_or_default();
-                    set.remove(&peer_id);
-                    let members: Vec<String> = set.into_iter().collect();
-                    self.owner_sync_group_key(&msg.sender, &room_id, &members)
-                        .await;
-                }
+                let me = self.identity.public_id();
+                let mut set = self
+                    .room_group_members
+                    .get(&room_key)
+                    .cloned()
+                    .unwrap_or_default();
+                set.insert(me);
+                set.remove(&peer_id);
+                let members: Vec<String> = set.into_iter().collect();
+                self.sync_room_membership(&msg.sender, &room_id, &members)
+                    .await;
                 let _ = self.event_tx.try_send(ConnectionEvent::RoomPeerLeft {
                     supernode_id: msg.sender.clone(),
                     room_id,
@@ -3812,6 +4020,7 @@ impl ConnectionManager {
                                     members.len()
                                 );
                                 self.record_cluster_members(&msg.sender, &members);
+                                self.connect_cluster_siblings(&msg.sender).await;
                             }
                             None => warn!(
                                 "Ignoring cluster roster from {} — signature/signer check failed",
@@ -3916,10 +4125,13 @@ impl ConnectionManager {
                 } else {
                     self.current_supernode_id = supernode_id.clone();
                     self.current_room_id = room_id.clone();
-                    // We created this room → we own its group key. Start a fresh
-                    // epoch; it is sealed to members as they appear (SfuMembers).
+                    // We created this room, so we're trivially its only (and thus
+                    // smallest-id) member — bootstrapping happens naturally via
+                    // `sync_room_membership` once the SfuMembers ack arrives.
+                    // Reset any stale local state in case this room_id was reused
+                    // (room ids are derived from creator+name, so recreating with
+                    // the same name can repeat one).
                     let room_key = format!("{supernode_id}:{room_id}");
-                    self.created_rooms.insert(room_key.clone());
                     self.room_group_members.remove(&room_key);
                     self.group_keys.forget(&room_id);
                     self.send_room_join(&supernode_id, &room_id).await;

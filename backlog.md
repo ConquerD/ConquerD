@@ -7,17 +7,27 @@ is rough priority. Durable *shipped* invariants live in `agents.md`, not here.
 
 ---
 
-## Crypto — group key reliability
+## Crypto — group key reliability — shipped (2026-07-09)
 
 TreeKEM was considered here and **declined** (see Declined section) — invite-only rooms sized for
-manual invitation don't hit the O(N) rekey cost that would justify it, and it's the highest-risk
-item that was on this list. The one real gap is making the *existing* pairwise `SfuGroupKey`
-distribution (owner → each member, sealed inside `EncryptedSignal`) the reliable default for every
-room-join path, instead of falling back to the deterministic per-room key (which gives zero
-confidentiality vs. the relay — see `agents.md` Supernode Opacity notes). Concretely: a joiner
-needs to reliably receive the current epoch key from the owner (or another already-keyed member) on
-join, including the `default` room and reconnect-after-drop cases, before the deterministic key can
-be treated as an emergency fallback only (not the common path).
+manual invitation don't hit the O(N) rekey cost that would justify it. The real gap — the pairwise
+`SfuGroupKey` distribution silently never being consumed (encryption was pinned to the deterministic
+per-room key regardless of any distributed key material) and having no keyer at all for the
+ownerless built-in `default` room — is now closed:
+
+- `group_key.rs`: `SenderKeysGroup::{current_epoch, epoch_key}` now actually read installed epoch
+  key state instead of hardcoding epoch 0 → deterministic key forever; the deterministic key is now
+  a true emergency fallback used only until real key material exists for a conversation.
+  `has_real_key` distinguishes "holds distributed key material" from the always-available
+  deterministic fallback.
+- `connection_manager/manager.rs`: distribution is no longer gated on "did I create this room" —
+  any member holding real key material can act as a room's "keyer" (bootstrap the first epoch,
+  rotate on departure, reseal to newcomers), chosen deterministically per membership snapshot as the
+  lexicographically smallest `public_id` present (`is_elected_keyer`). This covers the `default`
+  room (no client-side creator exists for it) and reconnect-after-drop (the next-smallest remaining
+  member takes over automatically). A narrow bootstrap race remains possible if two members join
+  before either observes the other (documented in code); it self-heals on the next shared membership
+  snapshot.
 
 ## Space Merkle tree — remaining
 

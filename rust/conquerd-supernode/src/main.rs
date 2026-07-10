@@ -404,6 +404,28 @@ impl SupernodeState {
         s.allow_peer(room_id, peer);
     }
 
+    /// Materialize a durable room advertised in a peer's `RoomRoster` so this
+    /// member can accept a failed-over join for it. Idempotent — `create_room`
+    /// leaves an existing room untouched. Preserves the advertised `creator_id`
+    /// so the room owner retains self-admit/invite authority on any member; a
+    /// private room's other members still gain access via replicated `RoomGrant`.
+    fn apply_room_roster(&self, desc: &cluster_link::RoomDescriptor) {
+        let Some(ref sfu) = self.sfu else {
+            return;
+        };
+        let rtype = match desc.room_type.as_str() {
+            "public" => sfu::RoomType::Public,
+            _ => sfu::RoomType::Private,
+        };
+        sfu.write().create_room_with_policy(
+            Some(&desc.room_id),
+            &desc.room_name,
+            rtype,
+            &desc.creator_id,
+            &desc.invite_policy,
+        );
+    }
+
     /// Verify + store a signed Space root (highest epoch per space), and — if it
     /// was newly accepted — cluster-gossip it to peer members. Returns whether it
     /// was newly stored. Used by the owner announce path and by client-carried
@@ -2543,6 +2565,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             })
         };
+        let on_room_roster: cluster_link::OnRoomRosterFn = {
+            let weak = weak.clone();
+            Arc::new(move |desc: cluster_link::RoomDescriptor| {
+                if let Some(state) = weak.upgrade() {
+                    state.apply_room_roster(&desc);
+                }
+            })
+        };
         let on_peer_auth: cluster_link::OnPeerAuthFn = {
             let weak = weak.clone();
             Arc::new(move |g: cluster_link::PeerAuthGrant| {
@@ -2569,6 +2599,35 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
             })
         };
+        let local_room_roster: cluster_link::LocalRoomRosterFn = {
+            let weak = weak.clone();
+            Arc::new(move || {
+                let Some(state) = weak.upgrade() else {
+                    return Vec::new();
+                };
+                let Some(ref sfu) = state.sfu else {
+                    return Vec::new();
+                };
+                let descriptors = sfu.read().durable_room_descriptors();
+                descriptors
+                    .into_iter()
+                    .map(
+                        |(room_id, room_name, room_type, creator_id, invite_policy)| {
+                            cluster_link::RoomDescriptor {
+                                room_id,
+                                room_name,
+                                room_type: match room_type {
+                                    sfu::RoomType::Public => "public".to_owned(),
+                                    sfu::RoomType::Private => "private".to_owned(),
+                                },
+                                creator_id,
+                                invite_policy,
+                            }
+                        },
+                    )
+                    .collect()
+            })
+        };
         let local_space_roots: cluster_link::LocalSpaceRootsFn = {
             let weak = weak.clone();
             Arc::new(move || {
@@ -2582,10 +2641,14 @@ async fn main() -> anyhow::Result<()> {
             membership,
             on_replicate,
             on_room_grant,
+            on_room_roster,
             on_peer_auth,
             on_space_root,
         );
-        match link.start(local_rooms, local_space_roots).await {
+        match link
+            .start(local_rooms, local_room_roster, local_space_roots)
+            .await
+        {
             Ok(port) => {
                 info!("Cluster link started on port {port}");
                 *state.cluster_link.write() = Some(link);

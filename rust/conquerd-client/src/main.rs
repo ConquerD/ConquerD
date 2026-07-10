@@ -190,6 +190,8 @@ fn run_qt_ui() {
             "qrc:/qt/qml/ConquerD/Client/qml/MainWindow.qml",
         ));
         unsafe {
+            // On Windows this also installs the snap-friendly frame filter
+            // (see window_chrome.cpp via qml_startup.cpp).
             conquerd_qml_post_load_check(engine_ptr);
         }
     } else {
@@ -627,6 +629,8 @@ async fn handle_event(
         | ConnectionEvent::SfuAudioReceived { .. }
         | ConnectionEvent::DirectAudioReceived { .. }
         | ConnectionEvent::AvatarConfigUpdated { .. }
+        | ConnectionEvent::ClusterMembersUpdated { .. }
+        | ConnectionEvent::RoomFailedOver { .. }
         | ConnectionEvent::ConnectionStats { .. } => {}
     }
 }

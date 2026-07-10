@@ -9,6 +9,11 @@
 #include <QWindow>
 #include <cstdio>
 
+#if defined(Q_OS_WIN)
+// Defined in window_chrome.cpp (linked only on Windows qt-ui builds).
+extern "C" void conquerd_enable_windows_snap(void *qwindow_ptr);
+#endif
+
 static void qtLogToStderr(QtMsgType type, const QMessageLogContext &ctx, const QString &msg) {
     const char *level = "INFO";
     switch (type) {
@@ -60,6 +65,11 @@ extern "C" void conquerd_qml_post_load_check(QQmlApplicationEngine *engine) {
                     quickWin->height(),
                     quickWin->x(),
                     quickWin->y());
+#if defined(Q_OS_WIN)
+            // Force HWND creation then install snap-friendly frame chrome.
+            (void)quickWin->winId();
+            conquerd_enable_windows_snap(static_cast<QWindow *>(quickWin));
+#endif
         } else if (auto *win = qobject_cast<QWindow *>(obj)) {
             sawWindow = true;
             fprintf(stderr,
@@ -69,6 +79,10 @@ extern "C" void conquerd_qml_post_load_check(QQmlApplicationEngine *engine) {
                     win->height(),
                     win->x(),
                     win->y());
+#if defined(Q_OS_WIN)
+            (void)win->winId();
+            conquerd_enable_windows_snap(win);
+#endif
         }
     }
 

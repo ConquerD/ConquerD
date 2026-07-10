@@ -98,6 +98,10 @@ struct AppState {
     // Version info
     installed_version: String,
     target_version: String,
+    /// UI-facing update details (version line, datetime, hash).
+    update_channel: String,
+    update_datetime: String,
+    update_hash: String,
     install_state: state::InstallState,
     // Repair mode
     repair_mode: bool,
@@ -178,6 +182,9 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
         download_total: 0,
         installed_version: installed_version.clone(),
         target_version: String::new(),
+        update_channel: String::new(),
+        update_datetime: String::new(),
+        update_hash: String::new(),
         install_state: config.install_state,
         repair_mode: config.repair,
         repair_damaged: 0,
@@ -193,7 +200,8 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
 
     let icon = load_icon_data();
     let window_size = if config.splash_update || config.auto_launch {
-        [400.0, 280.0]
+        // LaunchPrompt needs room for version + datetime + hash + buttons.
+        [420.0, 340.0]
     } else {
         [520.0, 400.0]
     };
@@ -400,27 +408,55 @@ impl InstallerApp {
     // ── Launch prompt (`--launch` when an update is available) ──────────
 
     fn show_launch_prompt(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let (installed_ver, target_ver) = {
+        let (version_line, datetime, hash) = {
             let st = self.state.lock().unwrap();
-            (st.installed_version.clone(), st.target_version.clone())
+            let details = github::UpdateDetails {
+                version: if st.target_version.is_empty() {
+                    env!("CARGO_PKG_VERSION").to_string()
+                } else {
+                    st.target_version.clone()
+                },
+                channel: st.update_channel.clone(),
+                datetime: st.update_datetime.clone(),
+                hash: st.update_hash.clone(),
+            };
+            (
+                details.version_line(),
+                st.update_datetime.clone(),
+                st.update_hash.clone(),
+            )
         };
 
         ui.vertical_centered(|ui| {
             ui.heading("Update Available");
             ui.add_space(12.0);
-            ui.label(format!(
-                "A newer version is available: v{installed_ver} \u{2192} v{target_ver}"
-            ));
+            ui.label("A newer version is available:");
+            ui.add_space(6.0);
+            ui.strong(&version_line);
+            if !datetime.is_empty() {
+                ui.label(&datetime);
+            }
+            if !hash.is_empty() {
+                ui.monospace(&hash);
+            }
             ui.add_space(8.0);
             ui.label("Install the update now, or launch the version already on disk.");
             ui.add_space(20.0);
 
+            // Center the button row: measure widths, then pad with equal space.
+            let update_btn = egui::Button::new("   Update   ");
+            let skip_btn = egui::Button::new("   Skip & Launch   ");
+            let gap = 12.0;
+            // Approximate fixed sizes so we can center without a second pass.
+            let row_w = 110.0 + gap + 150.0;
+            let left_pad = ((ui.available_width() - row_w) * 0.5).max(0.0);
             ui.horizontal(|ui| {
-                if ui.button("   Update   ").clicked() {
+                ui.add_space(left_pad);
+                if ui.add(update_btn).clicked() {
                     self.start_download(ctx);
                 }
-                ui.add_space(10.0);
-                if ui.button("   Skip & Launch   ").clicked() {
+                ui.add_space(gap);
+                if ui.add(skip_btn).clicked() {
                     launch_current_and_close(&self.state, ctx);
                 }
             });
@@ -440,6 +476,9 @@ impl InstallerApp {
                 hash_status,
                 installed_ver,
                 target_ver,
+                update_channel,
+                update_datetime,
+                update_hash,
                 installer_update_available,
                 mut update_installer_too,
             ) = {
@@ -450,6 +489,9 @@ impl InstallerApp {
                     st.hash_status.clone(),
                     st.installed_version.clone(),
                     st.target_version.clone(),
+                    st.update_channel.clone(),
+                    st.update_datetime.clone(),
+                    st.update_hash.clone(),
                     st.installer_update_available,
                     st.update_installer_too,
                 )
@@ -459,9 +501,20 @@ impl InstallerApp {
             ui.add_space(5.0);
 
             if !installed_ver.is_empty() && !target_ver.is_empty() {
-                ui.label(format!(
-                    "Update available: v{installed_ver} \u{2192} v{target_ver}"
-                ));
+                let details = github::UpdateDetails {
+                    version: target_ver.clone(),
+                    channel: update_channel,
+                    datetime: update_datetime.clone(),
+                    hash: update_hash.clone(),
+                };
+                ui.label("A newer version is available:");
+                ui.strong(details.version_line());
+                if !update_datetime.is_empty() {
+                    ui.label(&update_datetime);
+                }
+                if !update_hash.is_empty() {
+                    ui.monospace(&update_hash);
+                }
                 ui.add_space(10.0);
                 if ui.button("   Update & Launch   ").clicked() {
                     self.start_download(ctx);
@@ -972,9 +1025,17 @@ fn check_and_maybe_launch(app_state: &Arc<Mutex<AppState>>, ctx: &egui::Context)
     }
 
     // Update available — prompt in launch mode, otherwise show Welcome.
+    let details = github::update_details_for_release(&release, nightly).unwrap_or_default();
     {
         let mut st = app_state.lock().unwrap();
-        st.target_version = release.version.clone();
+        st.target_version = if details.version.is_empty() {
+            release.version.clone()
+        } else {
+            details.version.clone()
+        };
+        st.update_channel = details.channel;
+        st.update_datetime = details.datetime;
+        st.update_hash = details.hash;
         st.page = if auto_launch {
             Page::LaunchPrompt
         } else {
@@ -1131,8 +1192,16 @@ fn run_download_and_install(
     let release = github::fetch_release(&repo, nightly)?;
 
     {
+        let details = github::update_details_for_release(&release, nightly).unwrap_or_default();
         let mut st = app_state.lock().unwrap();
-        st.target_version = release.version.clone();
+        st.target_version = if details.version.is_empty() {
+            release.version.clone()
+        } else {
+            details.version
+        };
+        st.update_channel = details.channel;
+        st.update_datetime = details.datetime;
+        st.update_hash = details.hash;
         st.page = Page::Downloading;
         st.progress_text = format!("Downloading {}\u{2026}", release.archive_name);
     }

@@ -74,6 +74,12 @@ pub enum ClusterMsgKind {
         room_type: String,
         allowed_peer: String,
     },
+    /// The full set of durable (client-owned) rooms the sender currently hosts.
+    /// Sent on link-up and periodically so every member can materialize the same
+    /// rooms and accept a failed-over join — self-healing where the one-shot
+    /// `RoomGrant` push missed a member whose link was down. Existence only;
+    /// per-peer ACLs for private rooms still ride `RoomGrant`.
+    RoomRoster { rooms: Vec<RoomDescriptor> },
     /// A client-authorization grant: trust `identity_pub` (add to the peer store,
     /// relay allow-list, and access grants) so any member accepts the client's
     /// signaling/relay after it fails over. Idempotent.
@@ -91,6 +97,20 @@ pub enum ClusterMsgKind {
     /// Sent on change; receivers keep the highest epoch per `(space_id, signer)`
     /// after re-verifying the owner signature.
     SpaceRoot { root: SignedSpaceRoot },
+}
+
+/// One durable room as advertised in a [`ClusterMsgKind::RoomRoster`]. Carries
+/// exactly what a receiver needs to materialize the room via `create_room`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomDescriptor {
+    pub room_id: String,
+    pub room_name: String,
+    /// "public" | "private".
+    pub room_type: String,
+    /// Room owner's identity_pub (may be empty for legacy anonymous rooms, which
+    /// are not advertised). Preserved so the owner can rejoin on any member.
+    pub creator_id: String,
+    pub invite_policy: String,
 }
 
 impl ClusterMsg {
@@ -207,6 +227,10 @@ pub type LocalSpaceRootsFn = Arc<dyn Fn() -> Vec<SignedSpaceRoot> + Send + Sync>
 pub type OnReplicateFn = Arc<dyn Fn(ReplicatedMsg) + Send + Sync>;
 /// Applies a replicated room-membership grant to the local SFU.
 pub type OnRoomGrantFn = Arc<dyn Fn(RoomGrant) + Send + Sync>;
+/// Fetches this node's durable room descriptors to advertise to peers.
+pub type LocalRoomRosterFn = Arc<dyn Fn() -> Vec<RoomDescriptor> + Send + Sync>;
+/// Materializes a room advertised by a peer's roster (idempotent).
+pub type OnRoomRosterFn = Arc<dyn Fn(RoomDescriptor) + Send + Sync>;
 /// Applies a replicated client-authorization grant (trust the peer).
 pub type OnPeerAuthFn = Arc<dyn Fn(PeerAuthGrant) + Send + Sync>;
 /// Accepts a gossiped signed Space root (store highest epoch per space).
@@ -252,12 +276,16 @@ pub struct ClusterLink {
     state: Arc<RwLock<LinkState>>,
     on_replicate: OnReplicateFn,
     on_room_grant: OnRoomGrantFn,
+    on_room_roster: OnRoomRosterFn,
     on_peer_auth: OnPeerAuthFn,
     on_space_root: OnSpaceRootFn,
     /// Set in [`ClusterLink::start`]; lets a freshly-established link advertise
     /// this node's current subscriptions immediately instead of waiting for the
     /// periodic refresh.
     local_rooms: RwLock<Option<LocalRoomsFn>>,
+    /// Set in [`ClusterLink::start`]; source of durable room descriptors for the
+    /// periodic roster gossip and the initial advertise on a new link.
+    local_room_roster: RwLock<Option<LocalRoomRosterFn>>,
     /// Set in [`ClusterLink::start`]; source of truth for the periodic Space-root
     /// re-gossip (and the initial advertise on a freshly-established link).
     local_space_roots: RwLock<Option<LocalSpaceRootsFn>>,
@@ -268,11 +296,13 @@ pub struct ClusterLink {
 }
 
 impl ClusterLink {
+    #[allow(clippy::too_many_arguments)] // one callback per replicated kind
     pub fn new(
         identity: Identity,
         membership: ClusterMembership,
         on_replicate: OnReplicateFn,
         on_room_grant: OnRoomGrantFn,
+        on_room_roster: OnRoomRosterFn,
         on_peer_auth: OnPeerAuthFn,
         on_space_root: OnSpaceRootFn,
     ) -> Arc<Self> {
@@ -282,9 +312,11 @@ impl ClusterLink {
             state: Arc::new(RwLock::new(LinkState::new())),
             on_replicate,
             on_room_grant,
+            on_room_roster,
             on_peer_auth,
             on_space_root,
             local_rooms: RwLock::new(None),
+            local_room_roster: RwLock::new(None),
             local_space_roots: RwLock::new(None),
             shutdown: Arc::new(Notify::new()),
             server_endpoint: RwLock::new(None),
@@ -405,6 +437,7 @@ impl ClusterLink {
     pub async fn start(
         self: &Arc<Self>,
         local_rooms: LocalRoomsFn,
+        local_room_roster: LocalRoomRosterFn,
         local_space_roots: LocalSpaceRootsFn,
     ) -> anyhow::Result<u16> {
         *self.local_space_roots.write() = Some(Arc::clone(&local_space_roots));
@@ -413,6 +446,7 @@ impl ClusterLink {
             .ok_or_else(|| anyhow::anyhow!("this node has no cluster_addr configured"))?;
 
         *self.local_rooms.write() = Some(Arc::clone(&local_rooms));
+        *self.local_room_roster.write() = Some(Arc::clone(&local_room_roster));
 
         let (server_config, _cert) = build_quinn_server_config(&self.identity.public_id())?;
         let endpoint = Endpoint::server(server_config, bind)?;
@@ -474,6 +508,7 @@ impl ClusterLink {
                     tokio::select! {
                         _ = interval.tick() => {
                             this.broadcast_subscriptions(&local_rooms());
+                            this.broadcast_room_roster(&local_room_roster());
                             for root in local_space_roots() {
                                 this.replicate_space_root(&root);
                             }
@@ -498,6 +533,21 @@ impl ClusterLink {
     fn broadcast_subscriptions(&self, rooms: &[String]) {
         let msg = ClusterMsg::signed(
             ClusterMsgKind::Subscriptions {
+                rooms: rooms.to_vec(),
+            },
+            &self.identity,
+        );
+        self.send_to_all_peers(&msg.encode_frame());
+    }
+
+    /// Advertise this node's durable rooms to all peers so they can materialize
+    /// them and accept a failed-over join. No-op when this node hosts none.
+    fn broadcast_room_roster(&self, rooms: &[RoomDescriptor]) {
+        if rooms.is_empty() {
+            return;
+        }
+        let msg = ClusterMsg::signed(
+            ClusterMsgKind::RoomRoster {
                 rooms: rooms.to_vec(),
             },
             &self.identity,
@@ -609,6 +659,19 @@ impl ClusterLink {
             let _ = send.write_all(&subs.encode_frame()).await;
         }
 
+        // Advertise our durable rooms immediately so a member that just came up
+        // (or reconnected) materializes them without waiting for the periodic
+        // refresh — the self-healing that a one-shot `RoomGrant` lacked.
+        let local_room_roster = self.local_room_roster.read().clone();
+        if let Some(local_room_roster) = local_room_roster {
+            let rooms = local_room_roster();
+            if !rooms.is_empty() {
+                let roster =
+                    ClusterMsg::signed(ClusterMsgKind::RoomRoster { rooms }, &self.identity);
+                let _ = send.write_all(&roster.encode_frame()).await;
+            }
+        }
+
         // Advertise our currently-held Space roots immediately too, so a member
         // that just joined the cluster converges without waiting up to
         // `SUBSCRIPTION_REFRESH` for the periodic re-gossip.
@@ -718,6 +781,11 @@ impl ClusterLink {
                     room_type,
                     allowed_peer,
                 });
+            }
+            ClusterMsgKind::RoomRoster { rooms } => {
+                for room in rooms {
+                    (self.on_room_roster)(room);
+                }
             }
             ClusterMsgKind::PeerAuth {
                 identity_pub,
@@ -869,14 +937,22 @@ mod tests {
     /// grab the just-freed port first (Windows: "Only one usage of each
     /// socket address...", os error 10048). Retrying with a fresh pair
     /// absorbs that race instead of failing the whole test run.
+    /// Empty durable-room roster source, for tests that don't exercise roster
+    /// replication.
+    fn no_roster() -> LocalRoomRosterFn {
+        Arc::new(Vec::new)
+    }
+
     async fn start_two_node_link(
         a_pub: &str,
         b_pub: &str,
         mut new_link_a: impl FnMut(ClusterMembership) -> Arc<ClusterLink>,
         mut new_link_b: impl FnMut(ClusterMembership) -> Arc<ClusterLink>,
         rooms_a: LocalRoomsFn,
+        roster_a: LocalRoomRosterFn,
         roots_a: LocalSpaceRootsFn,
         rooms_b: LocalRoomsFn,
+        roster_b: LocalRoomRosterFn,
         roots_b: LocalSpaceRootsFn,
     ) -> (Arc<ClusterLink>, Arc<ClusterLink>) {
         const ATTEMPTS: u32 = 5;
@@ -885,9 +961,13 @@ mod tests {
             let (mem_a, mem_b) = membership_pair(a_pub, b_pub, &a_addr, &b_addr);
             let link_a = new_link_a(mem_a);
             let link_b = new_link_b(mem_b);
-            let res_a = link_a.start(rooms_a.clone(), roots_a.clone()).await;
+            let res_a = link_a
+                .start(rooms_a.clone(), roster_a.clone(), roots_a.clone())
+                .await;
             let res_b = if res_a.is_ok() {
-                link_b.start(rooms_b.clone(), roots_b.clone()).await
+                link_b
+                    .start(rooms_b.clone(), roster_b.clone(), roots_b.clone())
+                    .await
             } else {
                 Err(anyhow::anyhow!("link A start failed"))
             };
@@ -924,6 +1004,7 @@ mod tests {
         };
         let on_a: OnReplicateFn = Arc::new(|_| {});
         let no_grant: OnRoomGrantFn = Arc::new(|_| {});
+        let no_roster_rx: OnRoomRosterFn = Arc::new(|_| {});
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
         let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
@@ -940,6 +1021,7 @@ mod tests {
                     mem_a,
                     on_a.clone(),
                     no_grant.clone(),
+                    no_roster_rx.clone(),
                     no_auth.clone(),
                     no_root.clone(),
                 )
@@ -950,13 +1032,16 @@ mod tests {
                     mem_b,
                     on_b.clone(),
                     no_grant.clone(),
+                    no_roster_rx.clone(),
                     no_auth.clone(),
                     no_root.clone(),
                 )
             },
             a_rooms,
+            no_roster(),
             Arc::new(Vec::new),
             b_rooms,
+            no_roster(),
             Arc::new(Vec::new),
         )
         .await;
@@ -1008,6 +1093,7 @@ mod tests {
         };
         let no_repl: OnReplicateFn = Arc::new(|_| {});
         let no_grant: OnRoomGrantFn = Arc::new(|_| {});
+        let no_roster_rx: OnRoomRosterFn = Arc::new(|_| {});
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
         let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
@@ -1021,6 +1107,7 @@ mod tests {
                     mem_a,
                     no_repl.clone(),
                     no_grant.clone(),
+                    no_roster_rx.clone(),
                     no_auth.clone(),
                     no_root.clone(),
                 )
@@ -1031,13 +1118,16 @@ mod tests {
                     mem_b,
                     no_repl.clone(),
                     on_grant_b.clone(),
+                    no_roster_rx.clone(),
                     no_auth.clone(),
                     no_root.clone(),
                 )
             },
             rooms.clone(),
+            no_roster(),
             Arc::new(Vec::new),
             rooms,
+            no_roster(),
             Arc::new(Vec::new),
         )
         .await;
@@ -1057,6 +1147,99 @@ mod tests {
             assert_eq!(got[0].room_id, "room-priv");
             assert_eq!(got[0].room_type, "private");
             assert_eq!(got[0].allowed_peer, "peerX");
+        }
+        link_a.shutdown();
+        link_b.shutdown();
+    }
+
+    /// A freshly-established cluster link advertises the sender's durable rooms
+    /// immediately, so a member that never had a room materialized (e.g. the
+    /// client only pre-seeded other members) still learns it and can accept a
+    /// failed-over join — no explicit trigger, just link establishment. This is
+    /// the self-healing that a one-shot `RoomGrant` push lacked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_node_cluster_advertises_room_roster_on_link_establish() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+        let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
+
+        // A hosts one durable room, advertised via `local_room_roster`.
+        let a_roster: LocalRoomRosterFn = Arc::new(|| {
+            vec![RoomDescriptor {
+                room_id: "93735a1f6ac6446c".into(),
+                room_name: "We Gamin?".into(),
+                room_type: "public".into(),
+                creator_id: "OWNER".into(),
+                invite_policy: "owner".into(),
+            }]
+        });
+
+        // B records the rooms it is asked to materialize.
+        let materialized = Arc::new(parking_lot::Mutex::new(Vec::<RoomDescriptor>::new()));
+        let on_roster_b: OnRoomRosterFn = {
+            let m = materialized.clone();
+            Arc::new(move |desc| m.lock().push(desc))
+        };
+        let no_repl: OnReplicateFn = Arc::new(|_| {});
+        let no_grant: OnRoomGrantFn = Arc::new(|_| {});
+        let no_roster_rx: OnRoomRosterFn = Arc::new(|_| {});
+        let no_auth: OnPeerAuthFn = Arc::new(|_| {});
+        let no_root: OnSpaceRootFn = Arc::new(|_| {});
+
+        let rooms: LocalRoomsFn = Arc::new(Vec::new);
+        let (link_a, link_b) = start_two_node_link(
+            &a_pub,
+            &b_pub,
+            |mem_a| {
+                ClusterLink::new(
+                    id_a.clone(),
+                    mem_a,
+                    no_repl.clone(),
+                    no_grant.clone(),
+                    no_roster_rx.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            |mem_b| {
+                ClusterLink::new(
+                    id_b.clone(),
+                    mem_b,
+                    no_repl.clone(),
+                    no_grant.clone(),
+                    on_roster_b.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            rooms.clone(),
+            a_roster,
+            Arc::new(Vec::new),
+            rooms,
+            no_roster(),
+            Arc::new(Vec::new),
+        )
+        .await;
+
+        // No explicit send — B should materialize A's room purely from the
+        // on-establish (and periodic) roster advertisement.
+        let mut delivered = false;
+        for _ in 0..100 {
+            if !materialized.lock().is_empty() {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(delivered, "B never received A's durable room roster");
+        {
+            let got = materialized.lock();
+            assert_eq!(got[0].room_id, "93735a1f6ac6446c");
+            assert_eq!(got[0].room_name, "We Gamin?");
+            assert_eq!(got[0].room_type, "public");
+            assert_eq!(got[0].creator_id, "OWNER");
         }
         link_a.shutdown();
         link_b.shutdown();
@@ -1091,6 +1274,7 @@ mod tests {
         };
         let no_repl: OnReplicateFn = Arc::new(|_| {});
         let no_grant: OnRoomGrantFn = Arc::new(|_| {});
+        let no_roster_rx: OnRoomRosterFn = Arc::new(|_| {});
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
         let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
@@ -1104,6 +1288,7 @@ mod tests {
                     mem_a,
                     no_repl.clone(),
                     no_grant.clone(),
+                    no_roster_rx.clone(),
                     no_auth.clone(),
                     no_root.clone(),
                 )
@@ -1114,13 +1299,16 @@ mod tests {
                     mem_b,
                     no_repl.clone(),
                     no_grant.clone(),
+                    no_roster_rx.clone(),
                     no_auth.clone(),
                     on_root_b.clone(),
                 )
             },
             rooms.clone(),
+            no_roster(),
             a_roots,
             rooms,
+            no_roster(),
             Arc::new(Vec::new),
         )
         .await;
@@ -1159,6 +1347,7 @@ mod tests {
         };
         let no_repl: OnReplicateFn = Arc::new(|_| {});
         let no_grant: OnRoomGrantFn = Arc::new(|_| {});
+        let no_roster_rx: OnRoomRosterFn = Arc::new(|_| {});
         let no_auth: OnPeerAuthFn = Arc::new(|_| {});
         let no_root: OnSpaceRootFn = Arc::new(|_| {});
 
@@ -1172,6 +1361,7 @@ mod tests {
                     mem_a,
                     no_repl.clone(),
                     no_grant.clone(),
+                    no_roster_rx.clone(),
                     no_auth.clone(),
                     no_root.clone(),
                 )
@@ -1182,13 +1372,16 @@ mod tests {
                     mem_b,
                     no_repl.clone(),
                     no_grant.clone(),
+                    no_roster_rx.clone(),
                     on_auth_b.clone(),
                     no_root.clone(),
                 )
             },
             rooms.clone(),
+            no_roster(),
             Arc::new(Vec::new),
             rooms,
+            no_roster(),
             Arc::new(Vec::new),
         )
         .await;

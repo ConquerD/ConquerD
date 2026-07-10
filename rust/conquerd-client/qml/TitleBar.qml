@@ -1,13 +1,13 @@
-// TitleBar.qml — Custom frameless window title bar.
+// TitleBar.qml — Custom window title bar (client-side chrome).
 //
-// Usage: add to ApplicationWindow with flags Qt.FramelessWindowHint.
-// Provides drag-to-move, double-click-to-maximize, and min/max/close buttons.
-// Wire backend.minimizeWindow / maximizeWindow / closeWindow invokables in
-// bridge.rs (or call Window methods directly).
+// Usage: add to ApplicationWindow with flags Qt.Window | Qt.CustomizeWindowHint.
+// Provides drag-to-move (startSystemMove → Aero Snap on Windows), double-click
+// maximize, and min/max/close buttons.
 
 import QtQuick
 import QtQuick.Controls.Material
 import QtQuick.Layouts
+import QtQuick.Window
 import ConquerD.Client 1.0
 
 Item {
@@ -28,17 +28,32 @@ Item {
         ? (appWindow.visibility === Window.Maximized || appWindow.visibility === Window.FullScreen)
         : false
 
-    // Drag-to-move region
+    // Drag-to-move. Prefer startSystemMove so Windows engages Aero Snap /
+    // Snap Assist when the cursor hits a screen edge. DragHandler alone can
+    // miss the system move modal loop if a child steals the grab; the
+    // empty filler Item in contentSlot is the primary drag surface, and
+    // this handler covers the rest of the bar that is not a control.
     DragHandler {
         id: dragHandler
         target: null
+        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchScreen
+        // Do not CanTakeOverFromItems — that steals drags from TextField
+        // selection and buttons. Empty filler + non-interactive chrome still
+        // activate this handler for startSystemMove / Aero Snap.
         onActiveChanged: {
-            if (active && appWindow) appWindow.startSystemMove()
+            if (!active || !appWindow)
+                return
+            // startSystemMove engages the system move modal loop so Windows
+            // can snap to edges / corners (requires snap-friendly frame
+            // styles from window_chrome.cpp).
+            appWindow.startSystemMove()
         }
     }
 
     // Double-click to toggle maximize
     TapHandler {
+        acceptedButtons: Qt.LeftButton
+        gesturePolicy: TapHandler.DragThreshold
         onDoubleTapped: {
             if (!appWindow) return
             if (root.isMaximized)

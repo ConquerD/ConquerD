@@ -116,10 +116,13 @@ impl ReleaseManifest {
 
     /// Return the published archive hash for a platform, if present.
     pub fn build_hash_for_platform(&self, platform: &str) -> Option<String> {
-        self.releases
-            .iter()
-            .find(|e| e.platform == platform)
+        self.entry_for_platform(platform)
             .map(|e| e.build_hash.to_lowercase())
+    }
+
+    /// Return the manifest entry for a platform, if present.
+    pub fn entry_for_platform(&self, platform: &str) -> Option<&ManifestEntry> {
+        self.releases.iter().find(|e| e.platform == platform)
     }
 }
 

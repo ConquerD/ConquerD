@@ -334,6 +334,9 @@ fn build_qt_ui() {
     #[cfg(target_os = "windows")]
     compile_app_icon_cpp();
 
+    #[cfg(target_os = "windows")]
+    compile_window_chrome_cpp();
+
     compile_qml_startup_cpp();
 }
 
@@ -472,6 +475,41 @@ fn compile_app_icon_cpp() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=conquerd_app_icon");
+}
+
+#[cfg(all(feature = "qt-ui", target_os = "windows"))]
+fn compile_window_chrome_cpp() {
+    use std::path::PathBuf;
+
+    println!("cargo:rerun-if-changed=src/ui/window_chrome.cpp");
+
+    let Some(qt_prefix) = resolve_qt_prefix() else {
+        eprintln!(
+            "cargo:warning=window_chrome.cpp: cannot find Qt prefix; set QMAKE, QT_DIR, or CMAKE_PREFIX_PATH"
+        );
+        return;
+    };
+
+    let Ok(out_dir) = std::env::var("OUT_DIR") else {
+        eprintln!("cargo:warning=window_chrome.cpp: OUT_DIR is not set; skipping chrome shim");
+        return;
+    };
+    let out_dir = PathBuf::from(out_dir);
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .std("c++17")
+        .file("src/ui/window_chrome.cpp")
+        .flag("/EHsc")
+        .flag("/Zc:__cplusplus")
+        .flag("/permissive-");
+    configure_qt_cpp_build(&mut build, &qt_prefix, &["QtCore", "QtGui"]);
+    // dwmapi is pulled via #pragma comment in the cpp; also link explicitly.
+    println!("cargo:rustc-link-lib=dwmapi");
+    build.compile("conquerd_window_chrome");
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=conquerd_window_chrome");
 }
 
 #[cfg(feature = "qt-ui")]
