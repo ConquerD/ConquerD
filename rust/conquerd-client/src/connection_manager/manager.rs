@@ -1551,7 +1551,21 @@ impl ConnectionManager {
         // connected there (signaling.rs "Relay to target"); the rest drop it.
         // Inbound chat is idempotent (deduped by message_id), so multiple
         // copies arriving by different paths are shown exactly once.
-        if chat_attempt.is_some() {
+        //
+        // Peer-targeted `EncryptedSignal` (room `SfuGroupKey` distribution, and
+        // any other pre-wrapped envelope) fans out the same way. Multi-homed
+        // recipients may only be live on a subset of cluster members; a
+        // first-only delivery can land on a node where the peer is not
+        // connected and strand the group key permanently (no automatic retry),
+        // which silences E2E room audio for both sides.
+        let peer_encrypted_fanout = msg_type == MessageType::EncryptedSignal
+            && msg.target.is_some()
+            && msg
+                .target
+                .as_ref()
+                .and_then(|t| self.resolve_supernode_ws_target(t))
+                .is_none();
+        if chat_attempt.is_some() || peer_encrypted_fanout {
             let mut delivered_any = false;
             for sn in self.supernodes.values() {
                 if sn.connected
@@ -1566,7 +1580,7 @@ impl ConnectionManager {
             if delivered_any {
                 return;
             }
-            warn!("No connected supernode accepted chat relay {:?}", msg_type);
+            warn!("No connected supernode accepted relay {:?}", msg_type);
             if let Some((peer_id, message_id)) = chat_attempt {
                 let _ = self.event_tx.try_send(ConnectionEvent::ChatSendFailed {
                     peer_id,
@@ -1674,6 +1688,13 @@ impl ConnectionManager {
     /// Owner: seal the group key for `(room_id, epoch)` to each member and send
     /// it (inside an `EncryptedSignal` envelope) so the supernode forwards it
     /// blind. `members` must already exclude ourselves.
+    ///
+    /// The **inner** `SfuGroupKey` is Ed25519-signed before sealing. The
+    /// receiver unwraps the envelope and re-dispatches the inner message through
+    /// the full inbound pipeline (signature + freshness + replay). An unsigned
+    /// inner is dropped as "signature missing", so the peer never installs the
+    /// epoch key, stays on the deterministic fallback, and E2E room audio is
+    /// silenced for both sides (keyer seals under the real key; peer cannot open).
     async fn distribute_group_key(
         &mut self,
         room_id: &str,
@@ -1694,6 +1715,17 @@ impl ConnectionManager {
             inner
                 .payload
                 .insert("key".to_owned(), Value::String(key_b64.clone()));
+            // Sign inner before seal — see doc comment above.
+            let Ok(canonical) = inner.canonical_bytes() else {
+                warn!(
+                    "[group-key] could not canonicalize SfuGroupKey for {}",
+                    &member[..8.min(member.len())]
+                );
+                continue;
+            };
+            let sig = self.identity.sign(&canonical);
+            use base64::Engine;
+            inner.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(sig));
             if let Some(env) = self.seal_signal_to_member(&inner, member) {
                 self.dispatch_outbound(env).await;
             } else {
@@ -3545,7 +3577,7 @@ impl ConnectionManager {
                             let mut key = [0u8; 32];
                             key.copy_from_slice(&bytes);
                             self.group_keys.install(room_id, epoch as u8, key);
-                            debug!(
+                            info!(
                                 "[group-key] installed epoch {} for room {} from {}",
                                 epoch,
                                 &room_id[..8.min(room_id.len())],
@@ -3837,7 +3869,10 @@ impl ConnectionManager {
                     ) {
                         Some(opus) => opus,
                         None => {
-                            debug!(
+                            // warn: a persistent open failure means group-key
+                            // desync (missed/unsigned SfuGroupKey install) —
+                            // audio is fully silent until keys reconverge.
+                            warn!(
                                 "[room.audio.sfu] failed to open E2E frame from {}; dropping",
                                 &msg.sender[..8.min(msg.sender.len())]
                             );
