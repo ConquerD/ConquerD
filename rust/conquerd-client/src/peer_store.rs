@@ -329,6 +329,22 @@ impl PeerStore {
             .any(|r| !r.blocked && r.is_supernode && (r.identity_pub == id || r.peer_id == id))
     }
 
+    /// True when `id` is a trusted supernode the user explicitly joined via an
+    /// invite (as opposed to one only learned from a cluster roster). Used to
+    /// pin a cluster's single display identity to the member the user actually
+    /// connected through, which is also guaranteed to be a known supernode.
+    pub fn is_invite_supernode_id(&self, id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        self.records.values().any(|r| {
+            !r.blocked
+                && r.is_supernode
+                && r.supernode_from_invite
+                && (r.identity_pub == id || r.peer_id == id)
+        })
+    }
+
     /// Resolve a supernode sidebar / signaling id to the canonical
     /// `identity_pub` (base64url Ed25519 key). Returns `None` for ordinary peers.
     pub fn resolve_supernode_identity_pub(&self, id: &str) -> Option<String> {

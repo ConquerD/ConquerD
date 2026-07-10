@@ -786,6 +786,14 @@ pub mod ffi {
         #[rust_name = "resolve_supernode_node_id"]
         fn resolveSupernodeNodeId(self: Pin<&mut AppBridge>, node_id: &QString) -> QString;
 
+        /// Map a supernode id to its cluster's stable representative id (the
+        /// smallest member id in the verified roster), so the sidebar collapses
+        /// all members of a cluster into one logical node. Returns `node_id`
+        /// unchanged for a standalone supernode or an unknown id.
+        #[qinvokable]
+        #[rust_name = "cluster_representative_id"]
+        fn clusterRepresentative(self: Pin<&mut AppBridge>, node_id: &QString) -> QString;
+
         /// True when `node_id` belongs to a trusted supernode in the peer store.
         #[qinvokable]
         #[rust_name = "is_known_supernode"]
@@ -1021,6 +1029,13 @@ pub struct AppBridgeRust {
     /// one member should be replayed on any other member we're already
     /// connected to (see backlog.md-adjacent cluster failover notes).
     cluster_siblings: std::collections::HashMap<String, Vec<String>>,
+
+    /// Live WS state per cluster member (canonical id → connected), the source
+    /// of truth for the cluster "green if ANY member reachable" rollup. A
+    /// cluster presents as one logical node keyed by its stable representative
+    /// (the smallest member id), so per-member connect/disconnect patches are
+    /// folded here rather than pushed to the sidebar individually.
+    supernode_connected: std::collections::HashMap<String, bool>,
 }
 
 fn request_invite_url(rust: &AppBridgeRust) -> Option<String> {
@@ -1209,6 +1224,7 @@ impl Default for AppBridgeRust {
             event_log: std::collections::VecDeque::with_capacity(300),
             avatar_config_json: String::new(),
             cluster_siblings: std::collections::HashMap::new(),
+            supernode_connected: std::collections::HashMap::new(),
         }
     }
 }
@@ -1219,6 +1235,120 @@ impl AppBridgeRust {
             .as_ref()
             .and_then(|ps| ps.read().resolve_supernode_identity_pub(id))
     }
+
+    fn cluster_full_set(&self, member: &str) -> Vec<String> {
+        cluster_full_set(&self.cluster_siblings, member)
+    }
+
+    /// The cluster's display identity. Pinned to the member the user joined
+    /// through — the invite supernode (e.g. node A) — because it is stable and,
+    /// crucially, always a KNOWN supernode. Roster-learned siblings are not in
+    /// the peer store, so folding onto one would make the sidebar prune the row
+    /// (`pruneNonSupernodeEntries`) and the whole cluster would vanish. Falls
+    /// back to the smallest known supernode, then to `member`.
+    fn cluster_representative(&self, member: &str) -> String {
+        let full = cluster_full_set(&self.cluster_siblings, member);
+        if let Some(ps) = self.peer_store.as_ref() {
+            let store = ps.read();
+            if let Some(rep) = full
+                .iter()
+                .filter(|m| store.is_invite_supernode_id(m))
+                .min()
+            {
+                return rep.clone();
+            }
+            if let Some(rep) = full.iter().filter(|m| store.is_supernode_id(m)).min() {
+                return rep.clone();
+            }
+        }
+        cluster_representative(&self.cluster_siblings, member)
+    }
+
+    /// A stable key under which to record a supernode's live state for the
+    /// cluster rollup: the canonical id when it's a known supernode, else the
+    /// normalized id when it's a verified cluster member (a roster-learned
+    /// sibling we hold a session with but haven't promoted to a trusted
+    /// supernode). `None` for an id that is neither — nothing to roll up.
+    fn cluster_member_key(&self, id: &str) -> Option<String> {
+        if let Some(canon) = self.resolve_supernode_node_id_str(id) {
+            return Some(canon);
+        }
+        let norm = id.trim_end_matches('=').to_owned();
+        let is_member = self.cluster_siblings.contains_key(&norm)
+            || self
+                .cluster_siblings
+                .values()
+                .any(|v| v.iter().any(|s| s == &norm));
+        is_member.then_some(norm)
+    }
+
+    fn cluster_rollup_connected(&self, member: &str) -> bool {
+        cluster_rollup_connected(&self.cluster_siblings, &self.supernode_connected, member)
+    }
+
+    fn pick_live_cluster_member(&self, member: &str) -> Option<String> {
+        pick_live_cluster_member(&self.cluster_siblings, &self.supernode_connected, member)
+    }
+}
+
+type ClusterSiblings = std::collections::HashMap<String, Vec<String>>;
+type MemberConnected = std::collections::HashMap<String, bool>;
+
+/// Every member of `member`'s cluster, including `member` itself. Built from the
+/// verified sibling rosters, unioning any roster that mentions `member` as a key
+/// or a value so the set converges no matter which member's `SUPERNODE_INFO`
+/// arrived first. Returns just `[member]` for a standalone supernode.
+fn cluster_full_set(siblings: &ClusterSiblings, member: &str) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    set.insert(member.to_owned());
+    for (key, sibs) in siblings {
+        if key == member || sibs.iter().any(|s| s == member) {
+            set.insert(key.clone());
+            set.extend(sibs.iter().cloned());
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// The cluster's stable representative id = the smallest member id in the full
+/// set. Identical on every client (deterministic over the same roster) and
+/// unchanging across failover, so it's the logical node's identity for
+/// avatar/name/grouping. Returns `member` unchanged when standalone.
+fn cluster_representative(siblings: &ClusterSiblings, member: &str) -> String {
+    cluster_full_set(siblings, member)
+        .into_iter()
+        .min()
+        .unwrap_or_else(|| member.to_owned())
+}
+
+/// Whether ANY member of `member`'s cluster currently has a live WS session —
+/// the "green if any reachable" rollup for the logical node.
+fn cluster_rollup_connected(
+    siblings: &ClusterSiblings,
+    connected: &MemberConnected,
+    member: &str,
+) -> bool {
+    cluster_full_set(siblings, member)
+        .iter()
+        .any(|m| connected.get(m).copied().unwrap_or(false))
+}
+
+/// A currently-connected member of `member`'s cluster to serve node-scoped work
+/// (e.g. the portal): the representative when it's live, else any live member,
+/// else `None` when the whole cluster is down.
+fn pick_live_cluster_member(
+    siblings: &ClusterSiblings,
+    connected: &MemberConnected,
+    member: &str,
+) -> Option<String> {
+    let set = cluster_full_set(siblings, member);
+    if let Some(rep) = set.iter().min() {
+        if connected.get(rep).copied().unwrap_or(false) {
+            return Some(rep.clone());
+        }
+    }
+    set.into_iter()
+        .find(|m| connected.get(m).copied().unwrap_or(false))
 }
 
 impl Drop for AppBridgeRust {
@@ -2133,6 +2263,16 @@ impl ffi::AppBridge {
         QString::from(resolved.as_str())
     }
 
+    fn cluster_representative_id(self: Pin<&mut Self>, node_id: &QString) -> QString {
+        // Canonicalize first (peer_id/alias → identity_pub), then fold to the
+        // cluster representative. Unknown ids pass through unchanged so callers
+        // can chain this after `resolveSupernodeNodeId` safely.
+        let id = node_id.to_string();
+        let canon = self.rust().resolve_supernode_node_id_str(&id).unwrap_or(id);
+        let rep = self.rust().cluster_representative(&canon);
+        QString::from(rep.as_str())
+    }
+
     fn is_known_supernode(self: Pin<&mut Self>, node_id: &QString) -> bool {
         let id = node_id.to_string();
         self.rust()
@@ -2859,7 +2999,7 @@ impl ffi::AppBridge {
     }
 
     fn open_node_portal(mut self: Pin<&mut Self>, supernode_id: &QString) {
-        let Some(sn_id) = self
+        let Some(canon) = self
             .rust()
             .resolve_supernode_node_id_str(&supernode_id.to_string())
         else {
@@ -2869,6 +3009,16 @@ impl ffi::AppBridge {
             );
             return;
         };
+        // The id from the sidebar is the cluster's representative, which may be a
+        // member that is currently down. The portal (relay + WebTransport + cert)
+        // is served per-member, so open it against any live member of the cluster.
+        // Assumes members serve the same web assets (true for a provisioned
+        // cluster). Falls back to the representative when none are live, degrading
+        // to the existing "portal unavailable" behavior.
+        let sn_id = self
+            .rust()
+            .pick_live_cluster_member(&canon)
+            .unwrap_or(canon);
         info!("[bridge] open_node_portal called sn={}", sn_id);
         // Request a relay slot — the ConnectionManager will open the QUIC
         // relay connection on RelayGranted, making the scheme handler ready.
@@ -4403,6 +4553,28 @@ fn sync_saved_rooms_from_list(
     }
 }
 
+/// Record a cluster member's live WS state and push the resulting cluster-level
+/// rollup to the sidebar as one patch on the stable representative row. This is
+/// how the cluster stays green while any member is reachable: per-member
+/// connect/disconnect never reaches the sidebar directly, only the OR-rollup on
+/// the representative does.
+fn emit_cluster_node_connected(
+    mut bridge: Pin<&mut ffi::AppBridge>,
+    member: &str,
+    connected: bool,
+) {
+    {
+        let mut r = bridge.as_mut().rust_mut();
+        r.supernode_connected.insert(member.to_owned(), connected);
+    }
+    let rep = bridge.rust().cluster_representative(member);
+    let rollup = bridge.rust().cluster_rollup_connected(member);
+    let node_json = serde_json::json!([{ "node_id": rep, "connected": rollup }]).to_string();
+    bridge
+        .as_mut()
+        .nodes_updated(QString::from(node_json.as_str()));
+}
+
 fn replay_saved_rooms_on_supernode_connect(
     room_store: &crate::room_store::RoomStore,
     peer_store: &crate::peer_store::PeerStore,
@@ -5041,14 +5213,18 @@ fn dispatch_event(
                 bridge
                     .as_mut()
                     .set_session_banner(QString::from(banner.as_str()));
+                // Fold this member's live state into the cluster rollup and push
+                // one patch on the stable representative row (green if ANY member
+                // is up). This runs for roster-learned siblings too, so the
+                // logical node reflects the whole cluster's reachability.
+                if let Some(key) = bridge.rust().cluster_member_key(&id) {
+                    emit_cluster_node_connected(bridge.as_mut(), &key, true);
+                }
+                // Known-supernode work (room replay, banners) needs the canonical
+                // id; a not-yet-trusted sibling only contributes to the rollup.
                 let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&id) else {
                     return;
                 };
-                let node_json =
-                    serde_json::json!([{ "node_id": canon, "connected": true }]).to_string();
-                bridge
-                    .as_mut()
-                    .nodes_updated(QString::from(node_json.as_str()));
                 let my_public_id = bridge.rust().my_public_id.clone();
                 if let (Some(rs), Some(ps), Some(tx)) = (
                     bridge.rust().room_store.as_ref(),
@@ -5074,58 +5250,37 @@ fn dispatch_event(
             });
         }
         ConnectionEvent::SupernodeDisconnected(id) => {
-            let banner = format!("Supernode disconnected \u{00b7} {id}");
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                bridge
-                    .as_mut()
-                    .set_session_banner(QString::from(banner.as_str()));
-                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&id) else {
+                let Some(key) = bridge.rust().cluster_member_key(&id) else {
                     return;
                 };
-                let node_json =
-                    serde_json::json!([{ "node_id": canon, "connected": false }]).to_string();
-                bridge
-                    .as_mut()
-                    .nodes_updated(QString::from(node_json.as_str()));
-
-                // If the lost supernode was hosting the active room, decide
-                // whether to tear the room down or hold it for cluster failover.
-                if bridge.rust().current_supernode_id == canon {
-                    // Clustered host with verified siblings: the connection layer
-                    // is failing the room over to a sibling right now (it will
-                    // emit `RoomFailedOver` once one accepts). Keep the room and
-                    // show a transient reconnecting state instead of tearing down
-                    // and flashing offline — the cluster presents as one node.
-                    let has_siblings = bridge
-                        .rust()
-                        .cluster_siblings
-                        .get(&canon)
-                        .is_some_and(|s| !s.is_empty());
-                    if has_siblings {
-                        bridge
-                            .as_mut()
-                            .set_session_banner(QString::from("Reconnecting to cluster\u{2026}"));
-                        // Leave current_supernode_id/current_room_id intact so the
-                        // pending `RoomFailedOver` can re-point them; connection
-                        // mode stays "room" so the UI keeps showing the room.
-                    } else {
-                        // Standalone host (no failover possible): full local leave
-                        // so we don't stay stuck targeting a dead host for
-                        // audio/chat while other sessions remain usable.
-                        bridge.as_mut().leave_room();
-                        {
-                            let mut r = bridge.as_mut().rust_mut();
-                            r.current_supernode_id.clear();
-                            r.current_room_id.clear();
-                        }
-                        bridge
-                            .as_mut()
-                            .set_session_banner(QString::from(banner.as_str()));
-                        bridge
-                            .as_mut()
-                            .set_connection_mode(QString::from("offline"));
+                // Fold into the cluster rollup: the logical node stays green
+                // (and this pushes no visible change) while any sibling remains
+                // reachable. `cluster_up` is false only when the whole cluster
+                // — or a standalone node — is down.
+                emit_cluster_node_connected(bridge.as_mut(), &key, false);
+                let cluster_up = bridge.rust().cluster_rollup_connected(&key);
+                if cluster_up {
+                    // Cluster still reachable via another member: hold the room in
+                    // place (the connection layer emits `RoomFailedOver` once a
+                    // sibling accepts the resumed join) — nothing visible changes.
+                    return;
+                }
+                // Whole cluster (or a standalone host) is gone.
+                if bridge.rust().current_supernode_id == key {
+                    // We were hosting the active room here: full local leave so we
+                    // don't stay stuck targeting a dead host for audio/chat.
+                    bridge.as_mut().leave_room();
+                    {
+                        let mut r = bridge.as_mut().rust_mut();
+                        r.current_supernode_id.clear();
+                        r.current_room_id.clear();
                     }
                 }
+                bridge.as_mut().set_session_banner(QString::from("Offline"));
+                bridge
+                    .as_mut()
+                    .set_connection_mode(QString::from("offline"));
             });
         }
         ConnectionEvent::ClusterMembersUpdated {
@@ -5171,14 +5326,19 @@ fn dispatch_event(
                     .set_session_banner(QString::from("Reconnected \u{00b7} cluster"));
                 bridge.as_mut().set_connection_mode(QString::from("room"));
                 bridge.as_mut().set_in_room(true);
-                // Mark the new host connected in the Nodes view; the room roster
-                // itself refreshes via the `SfuMembers` → RoomMembersChanged that
-                // accompanies the resumed join.
-                let node_json =
-                    serde_json::json!([{ "node_id": canon, "connected": true }]).to_string();
-                bridge
-                    .as_mut()
-                    .nodes_updated(QString::from(node_json.as_str()));
+                // Mark the new host connected and re-emit the cluster rollup so
+                // the single logical node stays green.
+                emit_cluster_node_connected(bridge.as_mut(), &canon, true);
+                // Refresh the new host's room list so the sidebar shows the room
+                // under this member with its real participant count (the count is
+                // per-supernode; the pre-failover list came from the lost host and
+                // now reads as a stale dash). The `SfuMembers` accompanying the
+                // resumed join updates the voice rail; this fixes the sidebar.
+                if let Some(tx) = bridge.rust().conn_cmd_tx.as_ref() {
+                    let _ = tx.try_send(ConnectionCommand::RequestRoomList {
+                        supernode_id: canon.clone(),
+                    });
+                }
                 info!(
                     "[bridge] room {} failed over to cluster member {}",
                     room_id, canon
@@ -5218,8 +5378,12 @@ fn dispatch_event(
                 let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
                     return;
                 };
+                // Land title/homepage on the cluster's representative row so the
+                // single logical node carries a stable name (members of a cluster
+                // share operator title/homepage).
+                let rep = bridge.rust().cluster_representative(&canon);
                 let node_json = serde_json::json!([{
-                    "node_id": canon,
+                    "node_id": rep,
                     "homepage_url": homepage_url,
                     "title": title,
                     "sfu_enabled": sfu_enabled,
@@ -6129,5 +6293,85 @@ fn dispatch_call_event(
             });
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod cluster_grouping_tests {
+    use super::{
+        cluster_full_set, cluster_representative, cluster_rollup_connected,
+        pick_live_cluster_member, ClusterSiblings, MemberConnected,
+    };
+
+    /// A 3-member cluster where each member's verified roster lists the other
+    /// two (siblings exclude self, as `verified_members` returns them).
+    fn abc_cluster() -> ClusterSiblings {
+        let mut s = ClusterSiblings::new();
+        s.insert("A".into(), vec!["B".into(), "C".into()]);
+        s.insert("B".into(), vec!["A".into(), "C".into()]);
+        s.insert("C".into(), vec!["A".into(), "B".into()]);
+        s
+    }
+
+    fn connected(pairs: &[(&str, bool)]) -> MemberConnected {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect()
+    }
+
+    #[test]
+    fn full_set_includes_self_and_all_members() {
+        let s = abc_cluster();
+        assert_eq!(cluster_full_set(&s, "B"), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn representative_is_smallest_and_stable_from_any_member() {
+        let s = abc_cluster();
+        // Same representative regardless of which member we ask from — the
+        // property that keeps the logical node's identity stable across failover.
+        assert_eq!(cluster_representative(&s, "A"), "A");
+        assert_eq!(cluster_representative(&s, "B"), "A");
+        assert_eq!(cluster_representative(&s, "C"), "A");
+    }
+
+    #[test]
+    fn full_set_converges_when_only_one_roster_arrived() {
+        // Only B's roster has been received so far (naming A and C); A and C are
+        // not yet keys. The set must still resolve to all three from any of them.
+        let mut s = ClusterSiblings::new();
+        s.insert("B".into(), vec!["A".into(), "C".into()]);
+        assert_eq!(cluster_full_set(&s, "A"), vec!["A", "B", "C"]);
+        assert_eq!(cluster_representative(&s, "C"), "A");
+    }
+
+    #[test]
+    fn standalone_node_is_its_own_cluster() {
+        let s = ClusterSiblings::new();
+        assert_eq!(cluster_full_set(&s, "solo"), vec!["solo"]);
+        assert_eq!(cluster_representative(&s, "solo"), "solo");
+    }
+
+    #[test]
+    fn rollup_is_green_while_any_member_is_up() {
+        let s = abc_cluster();
+        // Representative A is down but B is up — the logical node stays green.
+        let c = connected(&[("A", false), ("B", true), ("C", false)]);
+        assert!(cluster_rollup_connected(&s, &c, "A"));
+        // All down → not green.
+        let c = connected(&[("A", false), ("B", false), ("C", false)]);
+        assert!(!cluster_rollup_connected(&s, &c, "A"));
+    }
+
+    #[test]
+    fn pick_live_prefers_representative_then_any_live_member() {
+        let s = abc_cluster();
+        // Representative A live → chosen.
+        let c = connected(&[("A", true), ("B", true)]);
+        assert_eq!(pick_live_cluster_member(&s, &c, "C"), Some("A".into()));
+        // A down, B live → B (any live member serves the portal).
+        let c = connected(&[("A", false), ("B", true)]);
+        assert_eq!(pick_live_cluster_member(&s, &c, "C"), Some("B".into()));
+        // All down → none.
+        let c = connected(&[("A", false), ("B", false), ("C", false)]);
+        assert_eq!(pick_live_cluster_member(&s, &c, "A"), None);
     }
 }

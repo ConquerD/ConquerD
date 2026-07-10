@@ -73,7 +73,12 @@ ApplicationWindow {
         if (!nodeId || nodeId === "") return ""
         if (!backend.isKnownSupernode(nodeId)) return ""
         var resolved = backend.resolveSupernodeNodeId(nodeId)
-        return resolved !== "" ? resolved : nodeId
+        if (resolved === "") resolved = nodeId
+        // Fold every member of a cluster to its stable representative id so the
+        // sidebar shows one logical node (one row, one avatar, one green dot,
+        // one merged room list) regardless of which member currently hosts us.
+        var rep = backend.clusterRepresentative(resolved)
+        return rep !== "" ? rep : resolved
     }
 
     function pruneNonSupernodeEntries() {
