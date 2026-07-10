@@ -1,9 +1,11 @@
 use super::internal::{host_from_url, is_loopback_or_wildcard, rewrite_loopback_wt_url};
 use super::manager::{
     build_room_invite_url, is_elected_keyer, parse_quic_lan_hint, parse_room_invite,
-    peer_quic_endpoint, plan_cluster_failover, FailoverPlan, RoomInvitePayload, ROOM_INVITE_SCHEMA,
+    peer_quic_endpoint, plan_cluster_failover, union_members_for_room, FailoverPlan,
+    RoomInvitePayload, ROOM_INVITE_SCHEMA,
 };
 use super::ConnectionManager;
+use std::collections::{HashMap, HashSet};
 
 #[test]
 fn parses_saved_quic_endpoints() {
@@ -453,6 +455,57 @@ fn single_member_room_is_its_own_keyer() {
     // which has no client-side creator) bootstraps its own real key.
     let members = vec!["solo".to_owned()];
     assert!(is_elected_keyer(&members, "solo"));
+}
+
+// ── Cluster-wide room membership union (`union_members_for_room`) ────────────
+//
+// The regression these guard against: with cluster multi-homing the same room
+// has one membership snapshot per supernode. Diffing a single node's snapshot
+// made a peer that simply hadn't joined on THIS node yet look like it had left,
+// firing a spurious group-key rotation that stranded that peer on a stale epoch
+// and silenced E2E audio. Keyer decisions must diff the union across nodes.
+
+fn snap(pairs: &[(&str, &[&str])]) -> HashMap<String, HashSet<String>> {
+    pairs
+        .iter()
+        .map(|(k, members)| {
+            (
+                (*k).to_owned(),
+                members.iter().map(|m| (*m).to_owned()).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn room_union_merges_members_across_supernode_snapshots() {
+    // peer2 is joined on A and C but not yet on B — the union still has it, so
+    // no node's lagging snapshot can make it look departed.
+    let snaps = snap(&[
+        ("A:default", &["peer2"]),
+        ("B:default", &[]),
+        ("C:default", &["peer2", "peer3"]),
+    ]);
+    let mut got: Vec<String> = union_members_for_room(&snaps, "default")
+        .into_iter()
+        .collect();
+    got.sort();
+    assert_eq!(got, vec!["peer2".to_owned(), "peer3".to_owned()]);
+}
+
+#[test]
+fn room_union_does_not_leak_other_rooms() {
+    // A room-id suffix match must not pull members from a different room on the
+    // same supernode.
+    let snaps = snap(&[("A:room-aaa", &["peerX"]), ("A:room-bbb", &["peerY"])]);
+    let got = union_members_for_room(&snaps, "room-aaa");
+    assert_eq!(got, HashSet::from(["peerX".to_owned()]));
+}
+
+#[test]
+fn room_union_is_empty_when_room_absent() {
+    let snaps = snap(&[("A:default", &["peer2"])]);
+    assert!(union_members_for_room(&snaps, "unheard-of").is_empty());
 }
 
 // ── Cluster failover selection (`plan_cluster_failover`) ────────────────────

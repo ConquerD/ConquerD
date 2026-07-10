@@ -60,6 +60,29 @@ pub(super) fn is_elected_keyer(members: &[String], me: &str) -> bool {
     members.iter().any(|m| m == me) && !members.iter().any(|m| m.as_str() < me)
 }
 
+/// Cluster-wide union of a room's members across every supernode snapshot.
+///
+/// `snapshots` is keyed by `"{supernode_id}:{room_id}"` (per-node last-seen
+/// member sets, excluding self). Under clustering the same logical room is
+/// hosted on multiple members, each with its own snapshot; the union is the
+/// authoritative "who is in this room anywhere" set used for keyer election and
+/// join/leave diffing, so a peer present on any node is never mistaken for
+/// having left. Supernode ids are base64url and room ids hex, so neither
+/// contains `':'` — the single separator makes the `":{room_id}"` suffix exact.
+pub(super) fn union_members_for_room(
+    snapshots: &HashMap<String, HashSet<String>>,
+    room_id: &str,
+) -> HashSet<String> {
+    let suffix = format!(":{room_id}");
+    let mut union = HashSet::new();
+    for (key, members) in snapshots {
+        if key.ends_with(&suffix) {
+            union.extend(members.iter().cloned());
+        }
+    }
+    union
+}
+
 pub(super) fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
     let trimmed = hint.trim();
     if trimmed.is_empty() {
@@ -1686,17 +1709,22 @@ impl ConnectionManager {
     /// set. Any member holding real (distributed) key material for `room_id`
     /// — not just whoever created it — can act as its "keyer": it bootstraps
     /// the first epoch, rotates on departure (forward secrecy / PCS), or seals
-    /// the current epoch to newcomers. Exactly one member acts per snapshot
-    /// via a deterministic tie-break (the lexicographically smallest
-    /// `public_id` currently present) — every member computes the same
-    /// winner from the same authoritative set, so this needs no fixed
-    /// "creator" at all, which is what lets it also cover the built-in
-    /// `default` room (no client-side creator exists for it). A narrow
-    /// bootstrap race remains possible if two members join before either
-    /// observes the other (each may generate a competing epoch 0); it
-    /// self-heals the next time a shared membership view arrives, since only
-    /// the smaller id keeps distributing going forward — see `backlog.md`
-    /// "Crypto — group key reliability".
+    /// the current epoch to newcomers. Exactly one member acts via a
+    /// deterministic tie-break (the lexicographically smallest `public_id`
+    /// currently present) — every member computes the same winner from the same
+    /// authoritative set, so this needs no fixed "creator" at all, which is what
+    /// lets it also cover the built-in `default` room (no client-side creator).
+    ///
+    /// The membership set is the **cluster-wide union** across every supernode
+    /// we're multi-homed to, not the single `supernode_id` snapshot that carried
+    /// this update. That matters under clustering: the same logical room is
+    /// hosted on several members, and each sends its own `SfuMembers`. If we
+    /// diffed a single node's snapshot, a peer that had merely not yet joined on
+    /// *this* node (but is present on a sibling) would look like a departure and
+    /// trigger a **spurious key rotation**, advancing the epoch and stranding
+    /// that peer on stale key material — silencing E2E audio. Diffing the union
+    /// means a member counts as present while on any node, and a rotation fires
+    /// only on a true, cluster-wide leave.
     async fn sync_room_membership(
         &mut self,
         supernode_id: &str,
@@ -1706,28 +1734,36 @@ impl ConnectionManager {
         let room_key = format!("{supernode_id}:{room_id}");
         let me = self.identity.public_id();
 
-        if !is_elected_keyer(members, &me) {
+        // Cluster-wide union of this room's members BEFORE applying this node's
+        // snapshot, then apply the snapshot and recompute. Snapshots exclude us,
+        // so the union does too.
+        let union_old = union_members_for_room(&self.room_group_members, room_id);
+        let node_new: HashSet<String> = members.iter().filter(|m| **m != me).cloned().collect();
+        self.room_group_members.insert(room_key, node_new);
+        let union_new = union_members_for_room(&self.room_group_members, room_id);
+
+        // Keyer election over the union (plus us): only the deterministic winner
+        // across the whole cluster distributes, so members never disagree on who
+        // keys or race competing epochs once they share a view.
+        let mut present: Vec<String> = union_new.iter().cloned().collect();
+        present.push(me.clone());
+        if !is_elected_keyer(&present, &me) {
             return;
         }
 
-        let new: HashSet<String> = members.iter().filter(|m| **m != me).cloned().collect();
-        let old = self
-            .room_group_members
-            .get(&room_key)
-            .cloned()
-            .unwrap_or_default();
-        let removed = old.difference(&new).count() > 0;
-        let added: Vec<String> = new.difference(&old).cloned().collect();
+        let removed = union_old.difference(&union_new).count() > 0;
+        let added: Vec<String> = union_new.difference(&union_old).cloned().collect();
 
         if !self.group_keys.has_real_key(room_id) {
             // First keying: generate epoch 0 and seal to everyone present.
             let (epoch, key) = self.group_keys.new_owner_epoch(room_id);
-            let all: Vec<String> = new.iter().cloned().collect();
+            let all: Vec<String> = union_new.iter().cloned().collect();
             self.distribute_group_key(room_id, epoch, &key, &all).await;
         } else if removed {
-            // A member left → rotate for forward secrecy and reseal to the rest.
+            // A member left the cluster entirely → rotate for forward secrecy
+            // and reseal to the rest.
             let (epoch, key) = self.group_keys.rotate(room_id);
-            let all: Vec<String> = new.iter().cloned().collect();
+            let all: Vec<String> = union_new.iter().cloned().collect();
             self.distribute_group_key(room_id, epoch, &key, &all).await;
         } else if !added.is_empty() {
             // Pure join(s) → seal the current epoch to the newcomers only.
@@ -1737,7 +1773,6 @@ impl ConnectionManager {
                     .await;
             }
         }
-        self.room_group_members.insert(room_key, new);
     }
 
     // -- QUIC direct connect ------------------------------------------------
