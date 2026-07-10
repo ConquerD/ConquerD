@@ -402,6 +402,98 @@ fn encrypted_signal_envelope_round_trips_and_hides_plaintext() {
     assert!(decrypt_blob(&eve_key, &ct_b).is_err());
 }
 
+/// Regression: room group-key distribution must **sign** the inner
+/// `SfuGroupKey` before sealing it in `EncryptedSignal`. The receiver unwraps
+/// the envelope and re-dispatches the inner through the full inbound pipeline
+/// (signature + freshness + replay). An unsigned inner is dropped as
+/// "signature missing", so the peer never installs the epoch key, stays on the
+/// deterministic fallback, and E2E room audio is silenced for both sides
+/// (keyer seals under the real key; peer cannot open). Mirrors
+/// `distribute_group_key` + the inbound `EncryptedSignal` → `SfuGroupKey` path.
+#[test]
+fn sfu_group_key_inner_must_be_signed_to_install() {
+    use crate::crypto::{b64url_decode, b64url_encode, decrypt_blob, encrypt_blob};
+    use crate::group_key::{open_voice_frame, seal_voice_frame, SenderKeysGroup};
+    use crate::identity::Identity;
+    use crate::protocol::{MessageType, SignalingMessage};
+    use base64::Engine;
+    use serde_json::Value;
+
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+    let room_id = "default";
+    let epoch_key = [0x42u8; 32];
+
+    // --- Bug path: unsigned inner is rejected by the inbound pipeline ---
+    let mut unsigned = SignalingMessage::new(MessageType::SfuGroupKey, alice.public_id());
+    unsigned
+        .payload
+        .insert("room_id".into(), Value::String(room_id.into()));
+    unsigned
+        .payload
+        .insert("epoch".into(), Value::Number(0u64.into()));
+    unsigned
+        .payload
+        .insert("key".into(), Value::String(b64url_encode(&epoch_key)));
+    assert!(
+        !ConnectionManager::verify_inbound_signature_for_test(&unsigned),
+        "unsigned SfuGroupKey must fail verify_inbound_signature (the silent-room bug)"
+    );
+
+    // --- Fixed path: sign inner, seal, unwrap, verify, install, open audio ---
+    let mut inner = unsigned.clone();
+    let canonical = inner.canonical_bytes().unwrap();
+    inner.signature =
+        Some(base64::engine::general_purpose::URL_SAFE.encode(alice.sign(&canonical)));
+    assert!(
+        ConnectionManager::verify_inbound_signature_for_test(&inner),
+        "signed SfuGroupKey must pass the inbound signature + freshness checks"
+    );
+
+    let key_a = alice.derive_pairwise_relay_key(&bob.public_id()).unwrap();
+    let ct = encrypt_blob(&key_a, inner.to_json().unwrap().as_bytes()).unwrap();
+    let mut env = SignalingMessage::new(MessageType::EncryptedSignal, alice.public_id());
+    env.target = Some(bob.public_id());
+    env.payload
+        .insert("ciphertext".into(), Value::String(b64url_encode(&ct)));
+    let env_canon = env.canonical_bytes().unwrap();
+    env.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(alice.sign(&env_canon)));
+    assert!(ConnectionManager::verify_inbound_signature_for_test(&env));
+
+    // Bob unwraps the envelope (same steps as the EncryptedSignal arm).
+    let key_b = bob.derive_pairwise_relay_key(&alice.public_id()).unwrap();
+    assert_eq!(key_a, key_b);
+    let ct_b = b64url_decode(env.payload.get("ciphertext").unwrap().as_str().unwrap()).unwrap();
+    let recovered = decrypt_blob(&key_b, &ct_b).unwrap();
+    let inner2 = SignalingMessage::from_json(std::str::from_utf8(&recovered).unwrap()).unwrap();
+    assert_eq!(inner2.msg_type, MessageType::SfuGroupKey);
+    assert!(
+        ConnectionManager::verify_inbound_signature_for_test(&inner2),
+        "unwrapped SfuGroupKey must still verify after EncryptedSignal round-trip"
+    );
+
+    // Install on both sides and prove voice E2E opens both ways.
+    let mut alice_keys = SenderKeysGroup::new();
+    let mut bob_keys = SenderKeysGroup::new();
+    alice_keys.install(room_id, 0, epoch_key);
+    let key_bytes = b64url_decode(inner2.payload.get("key").unwrap().as_str().unwrap()).unwrap();
+    let mut installed = [0u8; 32];
+    installed.copy_from_slice(&key_bytes);
+    bob_keys.install(room_id, 0, installed);
+
+    let opus = b"fake-opus-frame";
+    let sealed = seal_voice_frame(&alice_keys, room_id, &alice.public_id(), 1, opus).unwrap();
+    let opened = open_voice_frame(&bob_keys, room_id, &alice.public_id(), 1, &sealed).unwrap();
+    assert_eq!(opened, opus);
+
+    // Without install, Bob still on deterministic fallback cannot open Alice's real-key frame.
+    let bob_fallback = SenderKeysGroup::new();
+    assert!(
+        open_voice_frame(&bob_fallback, room_id, &alice.public_id(), 1, &sealed).is_none(),
+        "uninstalled peer must not open real-key E2E audio (would hear silence in production)"
+    );
+}
+
 /// Room group-key "elected keyer" tie-break (`is_elected_keyer`), the fix for
 /// the reliability gap in `backlog.md` "Crypto — group key reliability": any
 /// member holding real key material can distribute it, chosen deterministically
