@@ -28,6 +28,7 @@ pub enum MessageKind {
     Text,
     File,
     Image,
+    Video,
     System,
 }
 
@@ -37,6 +38,7 @@ impl MessageKind {
             Self::Text => "text",
             Self::File => "file",
             Self::Image => "image",
+            Self::Video => "video",
             Self::System => "system",
         }
     }
@@ -45,9 +47,41 @@ impl MessageKind {
         match s {
             "file" => Self::File,
             "image" => Self::Image,
+            "video" => Self::Video,
             "system" => Self::System,
             _ => Self::Text,
         }
+    }
+}
+
+/// Classify a filename / path into a chat message kind for attachment embeds.
+pub fn message_kind_for_path(path: &str) -> MessageKind {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" => MessageKind::Image,
+        "mp4" | "webm" | "ogv" | "mov" | "mkv" | "m4v" => MessageKind::Video,
+        _ => MessageKind::File,
+    }
+}
+
+/// Human-readable size for attachment chips (e.g. "1.2 MB").
+pub fn format_byte_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let n = bytes as f64;
+    if n >= GB {
+        format!("{:.1} GB", n / GB)
+    } else if n >= MB {
+        format!("{:.1} MB", n / MB)
+    } else if n >= KB {
+        format!("{:.1} KB", n / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -586,6 +620,35 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].body, "Hello, world!");
         assert_eq!(history[0].sender_handle, "Alice");
+    }
+
+    #[test]
+    fn message_kind_for_path_classifies_media() {
+        assert_eq!(message_kind_for_path("photo.PNG"), MessageKind::Image);
+        assert_eq!(
+            message_kind_for_path(r"C:\tmp\clip.mp4"),
+            MessageKind::Video
+        );
+        assert_eq!(message_kind_for_path("notes.pdf"), MessageKind::File);
+        assert_eq!(format_byte_size(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn attachment_message_round_trips() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let store = ChatStore::open(&id, Some(&dir.path().join(CHAT_DB_FILENAME))).unwrap();
+        let mut msg = make_msg("peer1", "🖼 sunset.png", false);
+        msg.kind = MessageKind::Image;
+        msg.attachment_name = "sunset.png".to_owned();
+        msg.attachment_path = "/tmp/sunset.png".to_owned();
+        msg.size_str = "42 KB".to_owned();
+        store.insert(&msg).unwrap();
+        let history = store.get_history("peer1", 0).unwrap();
+        assert_eq!(history[0].kind, MessageKind::Image);
+        assert_eq!(history[0].attachment_name, "sunset.png");
+        assert_eq!(history[0].attachment_path, "/tmp/sunset.png");
+        assert_eq!(history[0].size_str, "42 KB");
     }
 
     #[test]

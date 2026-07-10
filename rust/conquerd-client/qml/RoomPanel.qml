@@ -7,6 +7,7 @@ Item {
     id: root
 
     signal leaveRoom()
+    signal openAttachment(string path)
 
     property string roomName: "Room"
     property string roomId: ""
@@ -41,7 +42,10 @@ Item {
             "timestamp": msg.timestamp || 0,
             "kind": msg.kind || "text",
             "mine": msg.mine || false,
-            "status": msg.status || "delivered"
+            "status": msg.status || "delivered",
+            "attachmentName": msg.attachment_name || "",
+            "attachmentPath": msg.attachment_path || "",
+            "sizeStr": msg.size_str || ""
         })
     }
 
@@ -126,6 +130,9 @@ Item {
                 mine: !!model.mine
                 timestamp: model.timestamp || 0
                 status: model.status || "delivered"
+                attachmentName: model.attachmentName || ""
+                attachmentPath: model.attachmentPath || ""
+                sizeStr: model.sizeStr || ""
                 isRoom: true
                 inlinePreviewEnabled: root.youtubePreviewEnabled
                 inlinePreviewAck: root.youtubeInlineAck
@@ -138,6 +145,7 @@ Item {
                     }
                 }
                 onCopyRequested: (text) => backend.copyToClipboard(text)
+                onOpenAttachmentRequested: (path) => root.openAttachment(path)
             }
         }
 

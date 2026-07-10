@@ -799,10 +799,21 @@ impl ConnectionManager {
                             ));
                         }
                         ConnectionCommand::SendFile { peer_id, rel_path, data, purpose } => {
+                            let size = data.len();
                             let old = self.file_mgr.get_old_data(&rel_path);
                             let old_ref: Option<&[u8]> = old.as_deref();
                             match self.file_mgr.offer_file(&peer_id, &rel_path, data, &purpose, old_ref, false) {
-                                Ok((_, evs)) => self.dispatch_transfer_events(evs).await,
+                                Ok((transfer_id, evs)) => {
+                                    let _ = self.event_tx.try_send(ConnectionEvent::FileOffered {
+                                        transfer_id,
+                                        peer_id: peer_id.clone(),
+                                        rel_path,
+                                        size,
+                                        purpose,
+                                        is_self: true,
+                                    });
+                                    self.dispatch_transfer_events(evs).await;
+                                }
                                 Err(e) => warn!("SendFile error: {e}"),
                             }
                         }
@@ -3526,7 +3537,8 @@ impl ConnectionManager {
                 }
             }
             MessageType::SfuFileOffer => {
-                self.handle_sfu_file_offer(&msg).await;
+                let sn = inbound_supernode_id.clone().unwrap_or_default();
+                self.handle_sfu_file_offer(&msg, &sn).await;
             }
             MessageType::SfuFileChunk => {
                 self.handle_sfu_file_chunk(&msg).await;
@@ -4970,7 +4982,7 @@ impl ConnectionManager {
         }
     }
 
-    async fn handle_sfu_file_offer(&mut self, msg: &SignalingMessage) {
+    async fn handle_sfu_file_offer(&mut self, msg: &SignalingMessage, supernode_id: &str) {
         if !self.gate_through_feature("room.file.v1", &msg.sender, &[]) {
             return;
         }
@@ -5044,8 +5056,10 @@ impl ConnectionManager {
             .unwrap_or("")
             .to_owned();
 
-        let mut evs = self.room_file_mgr.on_offer_received(
+        let mut evs = self.room_file_mgr.on_offer_received_with_room(
             &msg.sender,
+            &room_id,
+            supernode_id,
             &tid,
             &rel,
             &sha,
@@ -5057,7 +5071,8 @@ impl ConnectionManager {
             &base_sha,
         );
         evs.extend(self.room_file_mgr.accept_transfer_locally(&tid));
-        self.dispatch_room_transfer_events(evs, "", &room_id).await;
+        self.dispatch_room_transfer_events(evs, supernode_id, &room_id)
+            .await;
     }
 
     async fn handle_sfu_file_chunk(&mut self, msg: &SignalingMessage) {
@@ -5195,11 +5210,19 @@ impl ConnectionManager {
                 }
                 TransferEvent::Complete {
                     transfer_id,
+                    peer_id,
+                    room_id,
+                    supernode_id,
+                    purpose,
                     data,
                     rel_path,
                 } => {
                     let _ = self.event_tx.try_send(ConnectionEvent::FileComplete {
                         transfer_id,
+                        peer_id,
+                        room_id,
+                        supernode_id,
+                        purpose,
                         data,
                         rel_path,
                     });
@@ -5298,14 +5321,21 @@ impl ConnectionManager {
                 }
                 TransferEvent::Offered {
                     transfer_id,
+                    peer_id: offered_peer,
                     rel_path,
                     size,
                     purpose,
-                    ..
                 } => {
+                    // Prefer explicit room_id from the dispatch context; fall
+                    // back to the event peer (already remapped for room offers).
+                    let ui_peer = if room_id.is_empty() {
+                        offered_peer
+                    } else {
+                        room_id.to_owned()
+                    };
                     let _ = self.event_tx.try_send(ConnectionEvent::FileOffered {
                         transfer_id,
-                        peer_id: room_id.to_owned(),
+                        peer_id: ui_peer,
                         rel_path,
                         size,
                         purpose,
@@ -5323,11 +5353,29 @@ impl ConnectionManager {
                 }
                 TransferEvent::Complete {
                     transfer_id,
+                    peer_id,
+                    room_id: xfer_room,
+                    supernode_id: xfer_sn,
+                    purpose,
                     data,
                     rel_path,
                 } => {
+                    let rid = if xfer_room.is_empty() {
+                        room_id.to_owned()
+                    } else {
+                        xfer_room
+                    };
+                    let sn = if xfer_sn.is_empty() {
+                        supernode_id.to_owned()
+                    } else {
+                        xfer_sn
+                    };
                     let _ = self.event_tx.try_send(ConnectionEvent::FileComplete {
                         transfer_id,
+                        peer_id,
+                        room_id: rid,
+                        supernode_id: sn,
+                        purpose,
                         data,
                         rel_path,
                     });

@@ -10,6 +10,7 @@ Item {
     signal deleteRequested(string msgId)
     signal retryRequested(string msgId)
     signal inlineAckAccepted()
+    signal openAttachmentRequested(string path)
 
     property string msgId: ""
     property string sender: ""
@@ -24,6 +25,22 @@ Item {
     property bool inlinePreviewEnabled: true
     property bool inlinePreviewAck: false
     property bool allowDelete: true
+    property string attachmentName: ""
+    property string attachmentPath: ""
+    property string sizeStr: ""
+
+    readonly property bool isAttachment: root.kind === "image"
+        || root.kind === "video"
+        || root.kind === "file"
+        || root.attachmentPath !== ""
+
+    function fileUrlFromPath(p) {
+        if (!p || p === "") return ""
+        if (p.indexOf("file:") === 0) return p
+        var n = p.replace(/\\/g, "/")
+        if (n.charAt(0) !== "/") n = "/" + n
+        return "file://" + n
+    }
 
     readonly property string avatarPeerId: root.mine
         ? (backend.public_id || "")
@@ -201,24 +218,186 @@ Item {
         Rectangle {
             id: bubble
             width: parent.width
-            implicitHeight: bodyText.implicitHeight + Theme.spacingMd
+            implicitHeight: bubbleCol.implicitHeight + Theme.spacingMd
             radius: Theme.radiusMd
             color: root.mine ? Theme.accent : Theme.bg2
+            clip: true
 
-            Text {
-                id: bodyText
-                anchors { fill: parent; margins: Theme.spacingSm }
-                text: root.richText(root.body)
-                textFormat: Text.RichText
-                color: root.mine ? Theme.textInv : Theme.text
-                font.pixelSize: Theme.fontSizeBody
-                wrapMode: Text.Wrap
-                onLinkActivated: (link) => Qt.openUrlExternally(link)
+            Column {
+                id: bubbleCol
+                anchors {
+                    left: parent.left
+                    right: parent.right
+                    top: parent.top
+                    margins: Theme.spacingSm
+                }
+                spacing: 6
+
+                // Inline image embed (local file after transfer).
+                Item {
+                    id: imageEmbed
+                    visible: root.kind === "image" && root.attachmentPath !== ""
+                    width: parent.width
+                    height: visible ? Math.min(220, Math.max(120, img.implicitHeight || 160)) : 0
+
+                    Image {
+                        id: img
+                        anchors.fill: parent
+                        source: imageEmbed.visible ? root.fileUrlFromPath(root.attachmentPath) : ""
+                        fillMode: Image.PreserveAspectFit
+                        asynchronous: true
+                        cache: true
+                        smooth: true
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
+                        onClicked: function(mouse) {
+                            if (mouse.button === Qt.RightButton)
+                                menu.popup()
+                            else
+                                root.openAttachmentRequested(root.attachmentPath)
+                        }
+                    }
+                }
+
+                // Inline video card — open full preview on click.
+                Rectangle {
+                    id: videoEmbed
+                    visible: root.kind === "video" && root.attachmentPath !== ""
+                    width: parent.width
+                    height: visible ? 140 : 0
+                    radius: Theme.radiusSm
+                    color: Theme.bg0
+                    border.color: Theme.bg3
+                    border.width: 1
+
+                    Column {
+                        anchors.centerIn: parent
+                        spacing: 8
+                        Image {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            source: "qrc:/qt/qml/ConquerD/Client/icons/play.svg"
+                            sourceSize.width: 28
+                            sourceSize.height: 28
+                            width: 28
+                            height: 28
+                        }
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: root.attachmentName || "Video"
+                            color: Theme.text
+                            font.pixelSize: Theme.fontSizeCaption
+                            elide: Text.ElideMiddle
+                            width: videoEmbed.width - 24
+                            horizontalAlignment: Text.AlignHCenter
+                        }
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            visible: root.sizeStr !== ""
+                            text: root.sizeStr
+                            color: Theme.muted
+                            font.pixelSize: Theme.fontSizeCaption
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
+                        onClicked: function(mouse) {
+                            if (mouse.button === Qt.RightButton)
+                                menu.popup()
+                            else
+                                root.openAttachmentRequested(root.attachmentPath)
+                        }
+                    }
+                }
+
+                // Generic file attachment chip.
+                Rectangle {
+                    id: fileChip
+                    visible: root.kind === "file" && root.attachmentPath !== ""
+                    width: parent.width
+                    height: visible ? fileChipRow.implicitHeight + 12 : 0
+                    radius: Theme.radiusSm
+                    color: root.mine ? Qt.rgba(0, 0, 0, 0.12) : Theme.bg1
+                    border.color: Theme.bg3
+                    border.width: 1
+
+                    RowLayout {
+                        id: fileChipRow
+                        anchors {
+                            left: parent.left
+                            right: parent.right
+                            verticalCenter: parent.verticalCenter
+                            margins: 8
+                        }
+                        spacing: 8
+
+                        Image {
+                            source: "qrc:/qt/qml/ConquerD/Client/icons/attach.svg"
+                            sourceSize.width: 16
+                            sourceSize.height: 16
+                            width: 16
+                            height: 16
+                            Layout.alignment: Qt.AlignVCenter
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+                            Text {
+                                text: root.attachmentName || root.body
+                                color: root.mine ? Theme.textInv : Theme.text
+                                font.pixelSize: Theme.fontSizeBody
+                                elide: Text.ElideMiddle
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                visible: root.sizeStr !== ""
+                                text: root.sizeStr
+                                color: root.mine ? Theme.textInv : Theme.muted
+                                opacity: 0.75
+                                font.pixelSize: Theme.fontSizeCaption
+                            }
+                        }
+                        ToolButton {
+                            icon.source: "qrc:/qt/qml/ConquerD/Client/icons/folder.svg"
+                            icon.width: 14
+                            icon.height: 14
+                            icon.color: root.mine ? Theme.textInv : Theme.muted
+                            implicitWidth: 28
+                            implicitHeight: 24
+                            flat: true
+                            ToolTip.text: "Open"
+                            ToolTip.visible: hovered
+                            onClicked: root.openAttachmentRequested(root.attachmentPath)
+                        }
+                    }
+                }
+
+                Text {
+                    id: bodyText
+                    // Hide the text label when a media/file embed is showing;
+                    // keep it for plain text and for attachments missing a path.
+                    visible: root.attachmentPath === "" ||
+                             (root.kind !== "image" && root.kind !== "video" && root.kind !== "file")
+                    width: parent.width
+                    text: root.richText(root.body)
+                    textFormat: Text.RichText
+                    color: root.mine ? Theme.textInv : Theme.text
+                    font.pixelSize: Theme.fontSizeBody
+                    wrapMode: Text.Wrap
+                    onLinkActivated: (link) => Qt.openUrlExternally(link)
+                }
             }
 
             MouseArea {
                 anchors.fill: parent
                 acceptedButtons: Qt.RightButton
+                z: -1
                 onClicked: function(mouse) {
                     if (mouse.button === Qt.RightButton) {
                         menu.popup()
@@ -416,6 +595,16 @@ Item {
         MenuItem {
             text: "Copy Text"
             onTriggered: root.copyRequested(root.body)
+        }
+        MenuItem {
+            text: "Open Attachment"
+            visible: root.attachmentPath !== ""
+            onTriggered: root.openAttachmentRequested(root.attachmentPath)
+        }
+        MenuItem {
+            text: "Open in System App"
+            visible: root.attachmentPath !== ""
+            onTriggered: Qt.openUrlExternally(root.fileUrlFromPath(root.attachmentPath))
         }
         MenuItem {
             text: "Delete Message"

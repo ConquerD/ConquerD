@@ -9,6 +9,7 @@ Item {
     signal sendMessage(string peerId, string message)
     signal startCall(string peerId)
     signal sendFile(string peerId, string filePath)
+    signal openAttachment(string path)
 
     property string selectedPeerId: ""
     property string selectedPeerName: ""
@@ -324,7 +325,8 @@ Item {
 
             delegate: ChatRichMessageDelegate {
                 property bool searchMatch: root._searchText === "" ||
-                    (model.body || "").toLowerCase().indexOf(root._searchText) !== -1
+                    (model.body || "").toLowerCase().indexOf(root._searchText) !== -1 ||
+                    (model.attachmentName || "").toLowerCase().indexOf(root._searchText) !== -1
                 property string dateSeparator: {
                     if (!searchMatch || (model.timestamp || 0) <= 0)
                         return ""
@@ -340,6 +342,9 @@ Item {
                 mine: !!model.mine
                 timestamp: model.timestamp || 0
                 status: model.status || "delivered"
+                attachmentName: model.attachmentName || ""
+                attachmentPath: model.attachmentPath || ""
+                sizeStr: model.sizeStr || ""
                 inlinePreviewEnabled: root.youtubePreviewEnabled
                 inlinePreviewAck: root.youtubeInlineAck
                 allowDelete: true
@@ -353,6 +358,7 @@ Item {
                 onCopyRequested: (text) => backend.copyToClipboard(text)
                 onDeleteRequested: (id) => backend.deleteMessage(id)
                 onRetryRequested: (id) => backend.retryMessage(id)
+                onOpenAttachmentRequested: (path) => root.openAttachment(path)
             }
         }
 

@@ -95,7 +95,12 @@ impl OutboundTransfer {
 
 pub struct InboundTransfer {
     pub transfer_id: String,
+    /// Wire peer that offered the file (1:1 peer, or room-file originator).
     pub peer_id: String,
+    /// When non-empty, this is a room transfer keyed by room id.
+    pub room_id: String,
+    /// Supernode that hosts the room (empty for 1:1).
+    pub supernode_id: String,
     pub rel_path: String,
     pub expected_sha256: String,
     pub expected_size: usize,
@@ -115,6 +120,8 @@ impl InboundTransfer {
     fn new(
         transfer_id: String,
         peer_id: String,
+        room_id: String,
+        supernode_id: String,
         rel_path: String,
         expected_sha256: String,
         expected_size: usize,
@@ -127,6 +134,8 @@ impl InboundTransfer {
         Self {
             transfer_id,
             peer_id,
+            room_id,
+            supernode_id,
             rel_path,
             expected_sha256,
             expected_size,
@@ -198,6 +207,13 @@ pub enum TransferEvent {
     /// Transfer verified and complete.
     Complete {
         transfer_id: String,
+        /// Offer originator (1:1 peer, or room-file sender).
+        peer_id: String,
+        /// Non-empty when this was a room transfer.
+        room_id: String,
+        /// Supernode for room transfers (empty for 1:1).
+        supernode_id: String,
+        purpose: String,
         data: Vec<u8>,
         rel_path: String,
     },
@@ -406,6 +422,40 @@ impl FileTransferManager {
         is_delta: bool,
         base_sha256: &str,
     ) -> Vec<TransferEvent> {
+        self.on_offer_received_with_room(
+            peer_id,
+            "",
+            "",
+            transfer_id,
+            rel_path,
+            sha256,
+            size,
+            total_chunks,
+            purpose,
+            compressed,
+            is_delta,
+            base_sha256,
+        )
+    }
+
+    /// Like [`on_offer_received`] but records room/supernode context for SFU
+    /// file transfers so completion can embed into the correct room chat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_offer_received_with_room(
+        &mut self,
+        peer_id: &str,
+        room_id: &str,
+        supernode_id: &str,
+        transfer_id: &str,
+        rel_path: &str,
+        sha256: &str,
+        size: usize,
+        total_chunks: usize,
+        purpose: &str,
+        compressed: bool,
+        is_delta: bool,
+        base_sha256: &str,
+    ) -> Vec<TransferEvent> {
         if size > MAX_TRANSFER_SIZE {
             let mut p = serde_json::Map::new();
             p.insert("transfer_id".into(), Value::String(transfer_id.to_owned()));
@@ -437,6 +487,8 @@ impl FileTransferManager {
         let xfer = InboundTransfer::new(
             transfer_id.to_owned(),
             peer_id.to_owned(),
+            room_id.to_owned(),
+            supernode_id.to_owned(),
             rel_path.to_owned(),
             sha256.to_owned(),
             size,
@@ -447,9 +499,15 @@ impl FileTransferManager {
             base_sha256.to_owned(),
         );
 
+        // UI keys room transfers by room_id so chips filter with the room panel.
+        let offered_peer = if room_id.is_empty() {
+            peer_id.to_owned()
+        } else {
+            room_id.to_owned()
+        };
         let mut evs = vec![TransferEvent::Offered {
             transfer_id: transfer_id.to_owned(),
-            peer_id: peer_id.to_owned(),
+            peer_id: offered_peer,
             rel_path: rel_path.to_owned(),
             size,
             purpose: purpose.to_owned(),
@@ -712,10 +770,15 @@ impl FileTransferManager {
         }
 
         // --- Phase 3: mark complete ---
-        let peer_id = match self.inbound.get_mut(transfer_id) {
+        let (peer_id, room_id, supernode_id, purpose) = match self.inbound.get_mut(transfer_id) {
             Some(xfer) => {
                 xfer.state = TransferState::Complete;
-                xfer.peer_id.clone()
+                (
+                    xfer.peer_id.clone(),
+                    xfer.room_id.clone(),
+                    xfer.supernode_id.clone(),
+                    xfer.purpose.clone(),
+                )
             }
             // Transfer was cancelled or completed concurrently between the
             // hash check and the state update — drop silently rather than
@@ -737,12 +800,16 @@ impl FileTransferManager {
 
         vec![
             TransferEvent::SendMessage {
-                peer_id,
+                peer_id: peer_id.clone(),
                 message_type: MessageType::FileTransferAck,
                 payload: p,
             },
             TransferEvent::Complete {
                 transfer_id: transfer_id.to_owned(),
+                peer_id,
+                room_id,
+                supernode_id,
+                purpose,
                 data: assembled,
                 rel_path: rel_path_owned,
             },

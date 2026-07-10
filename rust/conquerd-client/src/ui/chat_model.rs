@@ -15,6 +15,9 @@ mod chat_roles {
     pub const KIND: i32 = 260;
     pub const MINE: i32 = 261;
     pub const STATUS: i32 = 262;
+    pub const ATTACHMENT_NAME: i32 = 263;
+    pub const ATTACHMENT_PATH: i32 = 264;
+    pub const SIZE_STR: i32 = 265;
 }
 
 #[cxx_qt::bridge]
@@ -149,6 +152,9 @@ pub struct ChatEntry {
     pub kind: String,
     pub mine: bool,
     pub status: String,
+    pub attachment_name: String,
+    pub attachment_path: String,
+    pub size_str: String,
 }
 
 #[derive(Default)]
@@ -173,6 +179,13 @@ impl ffi::ChatModel {
             r if r == chat_roles::KIND => (&QString::from(e.kind.as_str())).into(),
             r if r == chat_roles::MINE => QVariant::from(&e.mine),
             r if r == chat_roles::STATUS => (&QString::from(e.status.as_str())).into(),
+            r if r == chat_roles::ATTACHMENT_NAME => {
+                (&QString::from(e.attachment_name.as_str())).into()
+            }
+            r if r == chat_roles::ATTACHMENT_PATH => {
+                (&QString::from(e.attachment_path.as_str())).into()
+            }
+            r if r == chat_roles::SIZE_STR => (&QString::from(e.size_str.as_str())).into(),
             _ => QVariant::default(),
         }
     }
@@ -186,6 +199,15 @@ impl ffi::ChatModel {
         h.insert(chat_roles::KIND, QByteArray::from("kind"));
         h.insert(chat_roles::MINE, QByteArray::from("mine"));
         h.insert(chat_roles::STATUS, QByteArray::from("status"));
+        h.insert(
+            chat_roles::ATTACHMENT_NAME,
+            QByteArray::from("attachmentName"),
+        );
+        h.insert(
+            chat_roles::ATTACHMENT_PATH,
+            QByteArray::from("attachmentPath"),
+        );
+        h.insert(chat_roles::SIZE_STR, QByteArray::from("sizeStr"));
         h
     }
 
@@ -291,6 +313,12 @@ fn parse_chat_entries(json: &str) -> Result<Vec<ChatEntry>, serde_json::Error> {
         mine: bool,
         #[serde(default)]
         status: String,
+        #[serde(default)]
+        attachment_name: String,
+        #[serde(default)]
+        attachment_path: String,
+        #[serde(default)]
+        size_str: String,
     }
     fn default_kind() -> String {
         "text".into()
@@ -316,6 +344,9 @@ fn parse_chat_entries(json: &str) -> Result<Vec<ChatEntry>, serde_json::Error> {
                 kind: r.kind,
                 mine: r.mine,
                 status,
+                attachment_name: r.attachment_name,
+                attachment_path: r.attachment_path,
+                size_str: r.size_str,
             }
         })
         .collect())

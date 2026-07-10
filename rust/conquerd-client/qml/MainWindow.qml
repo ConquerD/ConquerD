@@ -37,6 +37,36 @@ ApplicationWindow {
         Material.theme = useDark ? Material.Dark : Material.Light
     }
 
+    function showFilePreview(path) {
+        if (!path || path === "") return
+        // FilePreviewPanel requires the webengine feature. Fall back to the
+        // system app when the panel module is not linked into this build.
+        function openInSystem() {
+            var n = ("" + path).replace(/\\/g, "/")
+            if (n.charAt(0) !== "/") n = "/" + n
+            Qt.openUrlExternally("file://" + n)
+        }
+        if (filePreviewLoader.item) {
+            filePreviewLoader.item.filePath = path
+            filePreviewLoader.visible = true
+            return
+        }
+        filePreviewLoader.active = true
+        filePreviewLoader.setSource(Qt.resolvedUrl("FilePreviewPanel.qml"), {
+            "filePath": path
+        })
+        // setSource is async; check after a tick. On failure, open externally.
+        Qt.callLater(function() {
+            if (filePreviewLoader.status === Loader.Ready && filePreviewLoader.item) {
+                filePreviewLoader.visible = true
+            } else {
+                filePreviewLoader.active = false
+                filePreviewLoader.source = ""
+                openInSystem()
+            }
+        })
+    }
+
     function canonicalNodeId(nodeId) {
         if (!nodeId || nodeId === "") return ""
         if (!backend.isKnownSupernode(nodeId)) return ""
@@ -2010,6 +2040,7 @@ ApplicationWindow {
                     backend.startCall(peerId)
                 }
                 onSendFile: (peerId, fileUrl) => backend.sendFile(peerId, fileUrl)
+                onOpenAttachment: (path) => root.showFilePreview(path)
                 Component.onCompleted: chatPanel.onActiveFocusChanged.connect(function() {
                     if (chatPanel.activeFocus) backend.clearUnread()
                 })
@@ -2027,6 +2058,27 @@ ApplicationWindow {
                 onLeaveRoom: {
                     backend.leaveRoom()
                     navIndex = 0
+                }
+                onOpenAttachment: (path) => root.showFilePreview(path)
+            }
+
+            // Full-size local media / document preview (images, video, PDF, …).
+            // Loaded lazily so non-webengine builds still parse MainWindow.qml;
+            // showFilePreview() falls back to the system app when unavailable.
+            Loader {
+                id: filePreviewLoader
+                anchors.fill: parent
+                visible: false
+                z: 50
+                active: false
+                onLoaded: {
+                    if (item && item.closeRequested) {
+                        item.closeRequested.connect(function() {
+                            filePreviewLoader.visible = false
+                            if (filePreviewLoader.item)
+                                filePreviewLoader.item.filePath = ""
+                        })
+                    }
                 }
             }
 

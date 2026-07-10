@@ -3347,74 +3347,206 @@ impl ffi::AppBridge {
         }
     }
 
-    fn send_file(self: Pin<&mut Self>, peer_id: &QString, file_url: &QString) {
+    fn send_file(mut self: Pin<&mut Self>, peer_id: &QString, file_url: &QString) {
         let pid = peer_id.to_string();
-        let raw = file_url.to_string();
-        // Accept both file:// URIs and plain absolute paths
-        let path_str = if let Some(stripped) = raw.strip_prefix("file:///") {
-            stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
-        } else if let Some(stripped) = raw.strip_prefix("file://") {
-            stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
-        } else {
-            raw.clone()
-        };
+        let path_str = parse_local_file_path(&file_url.to_string());
         let path = std::path::Path::new(&path_str);
         let rel_path = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_owned();
-        match std::fs::read(path) {
-            Ok(data) => {
-                if let Some(ref tx) = self.rust().conn_cmd_tx {
-                    let _ = tx.try_send(ConnectionCommand::SendFile {
-                        peer_id: pid,
-                        rel_path,
-                        data,
-                        purpose: "file".to_owned(),
-                    });
-                }
+        let kind = crate::chat_store::message_kind_for_path(&rel_path);
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("sendFile: cannot read {:?}: {e}", path);
+                return;
             }
-            Err(e) => warn!("sendFile: cannot read {:?}: {e}", path),
+        };
+        let size_str = crate::chat_store::format_byte_size(data.len() as u64);
+        let sent = match self.rust().conn_cmd_tx {
+            Some(ref tx) => tx
+                .try_send(ConnectionCommand::SendFile {
+                    peer_id: pid.clone(),
+                    rel_path: rel_path.clone(),
+                    data,
+                    purpose: "file".to_owned(),
+                })
+                .is_ok(),
+            None => false,
+        };
+
+        // Local-echo an attachment bubble so the sender sees the image/video
+        // immediately; receiver embeds on FileComplete after download.
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let handle = {
+            let r = self.rust();
+            r.peer_store
+                .as_ref()
+                .and_then(|ps| {
+                    let store = ps.read();
+                    store.get(&r.my_peer_id).map(|rec| rec.display_name())
+                })
+                .unwrap_or_default()
+        };
+        let body = attachment_body_label(&kind, &rel_path);
+        let status = if sent {
+            crate::chat_store::MessageStatus::Sent
+        } else {
+            crate::chat_store::MessageStatus::Failed
+        };
+        let chat_msg = crate::chat_store::ChatMessage {
+            id: message_id.clone(),
+            peer_id: pid.clone(),
+            sender: handle.clone(),
+            recipient: pid.clone(),
+            body: body.clone(),
+            timestamp: now_ts,
+            is_self: true,
+            status: status.clone(),
+            kind: kind.clone(),
+            attachment_name: rel_path.clone(),
+            attachment_path: path_str.clone(),
+            size_str: size_str.clone(),
+            status_note: String::new(),
+            sender_handle: handle.clone(),
+        };
+        if let Some(ref cs) = self.rust().chat_store {
+            if let Err(e) = cs.insert(&chat_msg) {
+                warn!("chat_store insert (outbound file) error: {e}");
+            }
+        }
+        let echo_json = serde_json::json!({
+            "msg_id": message_id,
+            "peer_id": pid,
+            "sender": handle,
+            "body": body,
+            "timestamp": now_ts,
+            "kind": kind.as_str(),
+            "mine": true,
+            "status": status.as_str(),
+            "attachment_name": rel_path,
+            "attachment_path": path_str,
+            "size_str": size_str,
+        })
+        .to_string();
+        if self.rust().selected_peer_id == pid {
+            self.as_mut()
+                .chat_message_received(QString::from(echo_json.as_str()));
         }
     }
 
-    fn send_room_file(self: Pin<&mut Self>, file_url: &QString) {
-        let (sn, rid) = {
+    fn send_room_file(mut self: Pin<&mut Self>, file_url: &QString) {
+        let (sn, rid, handle, sender_id, chat_store_opt) = {
             let r = self.rust();
-            (r.current_supernode_id.clone(), r.current_room_id.clone())
+            let sn = r.current_supernode_id.clone();
+            let rid = r.current_room_id.clone();
+            let handle = r
+                .peer_store
+                .as_ref()
+                .and_then(|ps| {
+                    let store = ps.read();
+                    store.get(&r.my_peer_id).map(|rec| rec.display_name())
+                })
+                .unwrap_or_default();
+            let sender_id = r.my_public_id.clone();
+            let cs = r.chat_store.clone();
+            (sn, rid, handle, sender_id, cs)
         };
         if sn.is_empty() || rid.is_empty() {
             return;
         }
-        let raw = file_url.to_string();
-        let path_str = if let Some(stripped) = raw.strip_prefix("file:///") {
-            stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
-        } else if let Some(stripped) = raw.strip_prefix("file://") {
-            stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
-        } else {
-            raw.clone()
-        };
+        let path_str = parse_local_file_path(&file_url.to_string());
         let path = std::path::Path::new(&path_str);
         let rel_path = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_owned();
-        match std::fs::read(path) {
-            Ok(data) => {
-                if let Some(ref tx) = self.rust().conn_cmd_tx {
-                    let _ = tx.try_send(ConnectionCommand::SendSfuFile {
-                        supernode_id: sn,
-                        room_id: rid,
-                        rel_path,
-                        data,
-                        purpose: "room_file".to_owned(),
-                    });
-                }
+        let kind = crate::chat_store::message_kind_for_path(&rel_path);
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("sendRoomFile: cannot read {:?}: {e}", path);
+                return;
             }
-            Err(e) => warn!("sendRoomFile: cannot read {:?}: {e}", path),
+        };
+        let size_str = crate::chat_store::format_byte_size(data.len() as u64);
+        let sent = match self.rust().conn_cmd_tx {
+            Some(ref tx) => tx
+                .try_send(ConnectionCommand::SendSfuFile {
+                    supernode_id: sn.clone(),
+                    room_id: rid.clone(),
+                    rel_path: rel_path.clone(),
+                    data,
+                    purpose: "room_file".to_owned(),
+                })
+                .is_ok(),
+            None => false,
+        };
+
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let body = attachment_body_label(&kind, &rel_path);
+        let status = if sent {
+            crate::chat_store::MessageStatus::Sent
+        } else {
+            crate::chat_store::MessageStatus::Failed
+        };
+        let json = serde_json::json!({
+            "msg_id": message_id.clone(),
+            "sender": handle.clone(),
+            "sender_id": sender_id.clone(),
+            "body": body.clone(),
+            "timestamp": now_ts,
+            "kind": kind.as_str(),
+            "mine": true,
+            "is_room": true,
+            "status": status.as_str(),
+            "attachment_name": rel_path.clone(),
+            "attachment_path": path_str.clone(),
+            "size_str": size_str.clone(),
+        })
+        .to_string();
+        if let Some(ref cs) = chat_store_opt {
+            let store_key = room_chat_store_peer_id(&sn, &rid);
+            let chat_msg = crate::chat_store::ChatMessage {
+                id: message_id.clone(),
+                peer_id: store_key,
+                sender: sender_id,
+                recipient: rid.clone(),
+                body: body.clone(),
+                timestamp: now_ts,
+                is_self: true,
+                status,
+                kind,
+                attachment_name: rel_path,
+                attachment_path: path_str,
+                size_str,
+                status_note: String::new(),
+                sender_handle: handle,
+            };
+            if let Err(e) = cs.insert(&chat_msg) {
+                warn!("chat_store insert (room outbound file) error: {e}");
+            }
         }
+        let key = room_chat_history_key(&sn, &rid);
+        self.as_mut()
+            .rust_mut()
+            .room_chat_history
+            .entry(key)
+            .or_default()
+            .push(json.clone());
+        self.as_mut()
+            .room_chat_received(QString::from(json.as_str()));
     }
 
     // ── Ollama invokables ────────────────────────────────────────────────
@@ -3736,6 +3868,9 @@ fn chat_message_to_json(msg: &crate::chat_store::ChatMessage) -> serde_json::Val
         "kind": msg.kind.as_str(),
         "mine": msg.is_self,
         "status": msg.status.as_str(),
+        "attachment_name": msg.attachment_name,
+        "attachment_path": msg.attachment_path,
+        "size_str": msg.size_str,
     })
 }
 
@@ -3754,7 +3889,28 @@ fn room_chat_message_to_json(
         "mine": msg.is_self,
         "is_room": true,
         "status": msg.status.as_str(),
+        "attachment_name": msg.attachment_name,
+        "attachment_path": msg.attachment_path,
+        "size_str": msg.size_str,
     })
+}
+
+fn attachment_body_label(kind: &crate::chat_store::MessageKind, name: &str) -> String {
+    match kind {
+        crate::chat_store::MessageKind::Image => format!("🖼 {name}"),
+        crate::chat_store::MessageKind::Video => format!("🎬 {name}"),
+        _ => format!("📎 {name}"),
+    }
+}
+
+fn parse_local_file_path(file_url: &str) -> String {
+    if let Some(stripped) = file_url.strip_prefix("file:///") {
+        stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
+    } else if let Some(stripped) = file_url.strip_prefix("file://") {
+        stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
+    } else {
+        file_url.to_owned()
+    }
 }
 
 fn room_chat_display_sender(
@@ -5544,18 +5700,170 @@ fn dispatch_event(
         }
         ConnectionEvent::FileComplete {
             transfer_id,
+            peer_id,
+            room_id,
+            supernode_id,
+            purpose,
             data,
             rel_path,
         } => {
             // Save the received file to the user's downloads folder.
+            let byte_len = data.len() as u64;
             let saved_path = save_received_file(&rel_path, &data);
+            let kind = crate::chat_store::message_kind_for_path(&rel_path);
+            let size_str = crate::chat_store::format_byte_size(byte_len);
+            let body = attachment_body_label(&kind, &rel_path);
+            let message_id = format!("xfer-{transfer_id}");
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let is_room = !room_id.is_empty() || purpose == "room_file";
             let json = serde_json::json!({
                 "transfer_id": transfer_id,
                 "rel_path": rel_path,
-                "saved_path": saved_path.unwrap_or_default(),
+                "saved_path": saved_path.clone().unwrap_or_default(),
+                "peer_id": peer_id,
+                "room_id": room_id,
+                "purpose": purpose,
             })
             .to_string();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                // Idempotent: same transfer must not produce two bubbles.
+                if let Some(ref cs) = bridge.rust().chat_store {
+                    if cs
+                        .get_by_id(&message_id)
+                        .map(|m| m.is_some())
+                        .unwrap_or(false)
+                    {
+                        bridge.as_mut().file_complete(QString::from(json.as_str()));
+                        return;
+                    }
+                }
+
+                let attachment_path = saved_path.clone().unwrap_or_default();
+                if is_room {
+                    let sn_raw = if supernode_id.is_empty() {
+                        bridge.rust().current_supernode_id.clone()
+                    } else {
+                        supernode_id.clone()
+                    };
+                    let rid = if room_id.is_empty() {
+                        bridge.rust().current_room_id.clone()
+                    } else {
+                        room_id.clone()
+                    };
+                    let sn = bridge
+                        .rust()
+                        .resolve_supernode_node_id_str(&sn_raw)
+                        .unwrap_or(sn_raw);
+                    if !sn.is_empty() && !rid.is_empty() && !attachment_path.is_empty() {
+                        let display_sender = room_chat_display_sender(bridge.rust(), "", &peer_id);
+                        let msg_json = serde_json::json!({
+                            "msg_id": message_id.clone(),
+                            "sender": display_sender.clone(),
+                            "sender_id": peer_id.clone(),
+                            "body": body.clone(),
+                            "timestamp": now_ts,
+                            "kind": kind.as_str(),
+                            "mine": false,
+                            "is_room": true,
+                            "status": "delivered",
+                            "attachment_name": rel_path.clone(),
+                            "attachment_path": attachment_path.clone(),
+                            "size_str": size_str.clone(),
+                        })
+                        .to_string();
+                        if let Some(ref cs) = bridge.rust().chat_store {
+                            let store_key = room_chat_store_peer_id(&sn, &rid);
+                            let chat_msg = crate::chat_store::ChatMessage {
+                                id: message_id.clone(),
+                                peer_id: store_key,
+                                sender: peer_id.clone(),
+                                recipient: rid.clone(),
+                                body: body.clone(),
+                                timestamp: now_ts,
+                                is_self: false,
+                                status: crate::chat_store::MessageStatus::Delivered,
+                                kind: kind.clone(),
+                                attachment_name: rel_path.clone(),
+                                attachment_path: attachment_path.clone(),
+                                size_str: size_str.clone(),
+                                status_note: String::new(),
+                                sender_handle: display_sender,
+                            };
+                            if let Err(e) = cs.insert(&chat_msg) {
+                                warn!("chat_store insert (room file inbound) error: {e}");
+                            }
+                        }
+                        let key = room_chat_history_key(&sn, &rid);
+                        bridge
+                            .as_mut()
+                            .rust_mut()
+                            .room_chat_history
+                            .entry(key)
+                            .or_default()
+                            .push(msg_json.clone());
+                        bridge
+                            .as_mut()
+                            .room_chat_received(QString::from(msg_json.as_str()));
+                    }
+                } else if !attachment_path.is_empty() {
+                    let handle = {
+                        let r = bridge.rust();
+                        r.peer_store
+                            .as_ref()
+                            .and_then(|ps| {
+                                let store = ps.read();
+                                store
+                                    .get(&peer_id)
+                                    .or_else(|| store.get_by_identity(&peer_id))
+                                    .map(|rec| rec.display_name())
+                            })
+                            .unwrap_or_else(|| peer_id.clone())
+                    };
+                    let list_peer = lookup_list_peer_id(bridge.rust(), &peer_id)
+                        .unwrap_or_else(|| peer_id.clone());
+                    let chat_msg = crate::chat_store::ChatMessage {
+                        id: message_id.clone(),
+                        peer_id: list_peer.clone(),
+                        sender: handle.clone(),
+                        recipient: String::new(),
+                        body: body.clone(),
+                        timestamp: now_ts,
+                        is_self: false,
+                        status: crate::chat_store::MessageStatus::Delivered,
+                        kind: kind.clone(),
+                        attachment_name: rel_path.clone(),
+                        attachment_path: attachment_path.clone(),
+                        size_str: size_str.clone(),
+                        status_note: String::new(),
+                        sender_handle: handle.clone(),
+                    };
+                    if let Some(ref cs) = bridge.rust().chat_store {
+                        if let Err(e) = cs.insert(&chat_msg) {
+                            warn!("chat_store insert (file inbound) error: {e}");
+                        }
+                    }
+                    let msg_json = serde_json::json!({
+                        "msg_id": message_id,
+                        "peer_id": list_peer,
+                        "sender": handle,
+                        "body": body,
+                        "timestamp": now_ts,
+                        "kind": kind.as_str(),
+                        "mine": false,
+                        "status": "delivered",
+                        "attachment_name": rel_path,
+                        "attachment_path": attachment_path,
+                        "size_str": size_str,
+                    })
+                    .to_string();
+                    bridge
+                        .as_mut()
+                        .chat_message_received(QString::from(msg_json.as_str()));
+                }
+
                 bridge.as_mut().file_complete(QString::from(json.as_str()));
             });
         }

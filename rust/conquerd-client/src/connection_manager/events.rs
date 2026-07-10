@@ -189,6 +189,13 @@ pub enum ConnectionEvent {
     /// Transfer complete; `data` is the verified original file bytes.
     FileComplete {
         transfer_id: String,
+        /// Offer originator (1:1 peer, or room-file sender public id).
+        peer_id: String,
+        /// Non-empty when this was a room transfer.
+        room_id: String,
+        /// Supernode for room transfers (empty for 1:1).
+        supernode_id: String,
+        purpose: String,
         data: Vec<u8>,
         rel_path: String,
     },
