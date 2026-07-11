@@ -38,6 +38,10 @@ use super::ws::supernode_ws_task;
 const _CONNECT_TIMEOUT_S: f64 = 4.0;
 const WS_RECONNECT_DELAY_S: u64 = 5;
 const PING_INTERVAL_S: u64 = 30;
+/// How often the elected keyer re-sends un-acked `SfuGroupKey` envelopes.
+const GROUP_KEY_RETRY_INTERVAL_MS: u64 = 750;
+/// Stop resealing to a member after this many send attempts (incl. first).
+const GROUP_KEY_MAX_ATTEMPTS: u8 = 16;
 const AUDIO_CHANNEL_TAG: u8 = channel_frame::AUDIO_TAG;
 const DEFAULT_QUIC_LISTENER_PORT: u16 = 61_045;
 const QUIC_PORT_SEARCH_LIMIT: u16 = 128;
@@ -507,6 +511,18 @@ pub struct ConnectionManager {
     /// by `room_id`, attached to the next `SfuJoin` for that room. JSON text
     /// `(space_root, space_proof, space_grant)`; `""` for any absent field.
     pending_join_space_creds: HashMap<String, (String, String, String)>,
+    /// Outstanding group-key distributions awaiting `SfuGroupKeyAck` from the
+    /// member. Keyed by `(room_id, member_public_id)`. Cleared on ACK, leave,
+    /// or max attempts. The elected keyer reseals on a short timer until ACK.
+    pending_group_key_acks: HashMap<(String, String), PendingGroupKeyAck>,
+}
+
+/// One in-flight seal of epoch key material to a room member.
+#[derive(Debug, Clone)]
+struct PendingGroupKeyAck {
+    epoch: u8,
+    last_sent: std::time::Instant,
+    attempts: u8,
 }
 
 impl ConnectionManager {
@@ -596,6 +612,7 @@ impl ConnectionManager {
             room_group_members: HashMap::new(),
             room_audio_seq: 0,
             pending_join_space_creds: HashMap::new(),
+            pending_group_key_acks: HashMap::new(),
         };
         (cmd_tx, event_rx, mgr.run_inner())
     }
@@ -703,6 +720,10 @@ impl ConnectionManager {
         // Main event loop
         let mut ping_interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_S));
         let mut stats_interval = tokio::time::interval(Duration::from_secs(2));
+        let mut group_key_retry =
+            tokio::time::interval(Duration::from_millis(GROUP_KEY_RETRY_INTERVAL_MS));
+        // Don't immediately fire a full retry storm on startup.
+        group_key_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -762,6 +783,12 @@ impl ConnectionManager {
                         } => {
                             self.current_room_id.clear();
                             self.current_supernode_id.clear();
+                            // Drop local key material + pending seals for this room.
+                            self.group_keys.forget(&room_id);
+                            self.pending_group_key_acks
+                                .retain(|(r, _), _| r != &room_id);
+                            let room_key = format!("{supernode_id}:{room_id}");
+                            self.room_group_members.remove(&room_key);
                             self.send_room_leave(&supernode_id, &room_id).await;
                         }
                         ConnectionCommand::RemoveSupernode { supernode_id } => {
@@ -981,6 +1008,9 @@ impl ConnectionManager {
                 }
                 _ = stats_interval.tick() => {
                     self.emit_connection_stats();
+                }
+                _ = group_key_retry.tick() => {
+                    self.retry_pending_group_keys().await;
                 }
             }
         }
@@ -1699,6 +1729,11 @@ impl ConnectionManager {
     /// inner is dropped as "signature missing", so the peer never installs the
     /// epoch key, stays on the deterministic fallback, and E2E room audio is
     /// silenced for both sides (keyer seals under the real key; peer cannot open).
+    ///
+    /// Each successful send is tracked in [`Self::pending_group_key_acks`] until
+    /// the member returns a sealed `SfuGroupKeyAck` (or we give up / they leave).
+    /// Lost envelopes are re-sealed on a short timer — see
+    /// [`Self::retry_pending_group_keys`].
     async fn distribute_group_key(
         &mut self,
         room_id: &str,
@@ -1732,12 +1767,119 @@ impl ConnectionManager {
             inner.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(sig));
             if let Some(env) = self.seal_signal_to_member(&inner, member) {
                 self.dispatch_outbound(env).await;
+                let now = std::time::Instant::now();
+                self.pending_group_key_acks
+                    .entry((room_id.to_owned(), member.clone()))
+                    .and_modify(|p| {
+                        p.epoch = epoch;
+                        p.last_sent = now;
+                        p.attempts = p.attempts.saturating_add(1);
+                    })
+                    .or_insert(PendingGroupKeyAck {
+                        epoch,
+                        last_sent: now,
+                        attempts: 1,
+                    });
             } else {
                 warn!(
                     "[group-key] could not seal group key to {}",
                     &member[..8.min(member.len())]
                 );
             }
+        }
+    }
+
+    /// Member → keyer: confirm we installed `(room_id, epoch)`. Sealed the same
+    /// way as `SfuGroupKey` so the supernode never sees the ack in the clear.
+    async fn send_group_key_ack(&mut self, room_id: &str, epoch: u8, keyer: &str) {
+        let mut inner =
+            SignalingMessage::new(MessageType::SfuGroupKeyAck, self.identity.public_id());
+        inner
+            .payload
+            .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
+        inner
+            .payload
+            .insert("epoch".to_owned(), Value::Number((epoch as u64).into()));
+        let Ok(canonical) = inner.canonical_bytes() else {
+            warn!(
+                "[group-key] could not canonicalize SfuGroupKeyAck for {}",
+                &keyer[..8.min(keyer.len())]
+            );
+            return;
+        };
+        let sig = self.identity.sign(&canonical);
+        use base64::Engine;
+        inner.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(sig));
+        if let Some(env) = self.seal_signal_to_member(&inner, keyer) {
+            self.dispatch_outbound(env).await;
+        } else {
+            warn!(
+                "[group-key] could not seal SfuGroupKeyAck to {}",
+                &keyer[..8.min(keyer.len())]
+            );
+        }
+    }
+
+    /// Reseal any un-acked group keys (lost EncryptedSignal / offline peer).
+    /// Called on a short timer from the connection manager run loop.
+    async fn retry_pending_group_keys(&mut self) {
+        if self.pending_group_key_acks.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let interval = Duration::from_millis(GROUP_KEY_RETRY_INTERVAL_MS);
+        let me = self.identity.public_id();
+
+        let mut drop_keys: Vec<(String, String)> = Vec::new();
+        let mut retries: Vec<(String, String, u8)> = Vec::new();
+
+        for ((room_id, member), pending) in &self.pending_group_key_acks {
+            let union = union_members_for_room(&self.room_group_members, room_id);
+            if !union.contains(member) {
+                drop_keys.push((room_id.clone(), member.clone()));
+                continue;
+            }
+            let mut present: Vec<String> = union.iter().cloned().collect();
+            present.push(me.clone());
+            if !is_elected_keyer(&present, &me) {
+                // Another peer is now keyer — they will distribute.
+                drop_keys.push((room_id.clone(), member.clone()));
+                continue;
+            }
+            if pending.attempts >= GROUP_KEY_MAX_ATTEMPTS {
+                warn!(
+                    "[group-key] giving up waiting for ack from {} room {} epoch {} after {} attempts",
+                    &member[..8.min(member.len())],
+                    &room_id[..8.min(room_id.len())],
+                    pending.epoch,
+                    pending.attempts
+                );
+                drop_keys.push((room_id.clone(), member.clone()));
+                continue;
+            }
+            if now.duration_since(pending.last_sent) >= interval {
+                retries.push((room_id.clone(), member.clone(), pending.epoch));
+            }
+        }
+
+        for k in drop_keys {
+            self.pending_group_key_acks.remove(&k);
+        }
+
+        for (room_id, member, epoch) in retries {
+            let Some(key) = self.group_keys.epoch_key(&room_id, epoch) else {
+                // Key material gone (forgot / rotated out of retention) — stop.
+                self.pending_group_key_acks.remove(&(room_id, member));
+                continue;
+            };
+            debug!(
+                "[group-key] resealing epoch {} to {} for room {} (awaiting ack)",
+                epoch,
+                &member[..8.min(member.len())],
+                &room_id[..8.min(room_id.len())]
+            );
+            self.distribute_group_key(&room_id, epoch, &key, &[member])
+                .await;
         }
     }
 
@@ -1790,6 +1932,10 @@ impl ConnectionManager {
         let removed = union_old.difference(&union_new).count() > 0;
         let added: Vec<String> = union_new.difference(&union_old).cloned().collect();
 
+        // Drop pending acks for members who left this room entirely.
+        self.pending_group_key_acks
+            .retain(|(r, m), _| r != room_id || union_new.contains(m));
+
         if !self.group_keys.has_real_key(room_id) {
             // First keying: generate epoch 0 and seal to everyone present.
             let (epoch, key) = self.group_keys.new_owner_epoch(room_id);
@@ -1800,6 +1946,8 @@ impl ConnectionManager {
             // and reseal to the rest.
             let (epoch, key) = self.group_keys.rotate(room_id);
             let all: Vec<String> = union_new.iter().cloned().collect();
+            // Stale-epoch pendings for this room are obsolete after rotate.
+            self.pending_group_key_acks.retain(|(r, _), _| r != room_id);
             self.distribute_group_key(room_id, epoch, &key, &all).await;
         } else if !added.is_empty() {
             // Pure join(s) → seal the current epoch to the newcomers only.
@@ -3598,11 +3746,64 @@ impl ConnectionManager {
                                 &room_id[..8.min(room_id.len())],
                                 &msg.sender[..8.min(msg.sender.len())]
                             );
+                            // Tell the keyer we have the material so they stop resealing.
+                            self.send_group_key_ack(room_id, epoch as u8, &msg.sender)
+                                .await;
                         }
                         _ => warn!(
                             "[group-key] malformed key from {}",
                             &msg.sender[..8.min(msg.sender.len())]
                         ),
+                    }
+                }
+            }
+            MessageType::SfuGroupKeyAck => {
+                // Keyer side: member confirmed install of `(room_id, epoch)`.
+                let room_id = msg
+                    .payload
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let Some(epoch) = msg
+                    .payload
+                    .get("epoch")
+                    .and_then(Value::as_u64)
+                    .map(|e| e as u8)
+                else {
+                    return;
+                };
+                if room_id.is_empty() {
+                    return;
+                }
+                let key = (room_id.clone(), msg.sender.clone());
+                match self.pending_group_key_acks.get(&key) {
+                    Some(p) if p.epoch == epoch => {
+                        self.pending_group_key_acks.remove(&key);
+                        info!(
+                            "[group-key] ack epoch {} for room {} from {}",
+                            epoch,
+                            &room_id[..8.min(room_id.len())],
+                            &msg.sender[..8.min(msg.sender.len())]
+                        );
+                    }
+                    Some(p) => {
+                        debug!(
+                            "[group-key] stale ack epoch {} (pending {}) from {} room {}",
+                            epoch,
+                            p.epoch,
+                            &msg.sender[..8.min(msg.sender.len())],
+                            &room_id[..8.min(room_id.len())]
+                        );
+                    }
+                    None => {
+                        // Duplicate ack or we already gave up — fine.
+                        debug!(
+                            "[group-key] unexpected ack epoch {} from {} room {}",
+                            epoch,
+                            &msg.sender[..8.min(msg.sender.len())],
+                            &room_id[..8.min(room_id.len())]
+                        );
                     }
                 }
             }
@@ -4219,6 +4420,8 @@ impl ConnectionManager {
                     let room_key = format!("{supernode_id}:{room_id}");
                     self.room_group_members.remove(&room_key);
                     self.group_keys.forget(&room_id);
+                    self.pending_group_key_acks
+                        .retain(|(r, _), _| r != &room_id);
                     self.send_room_join(&supernode_id, &room_id).await;
                     // Join ack (SfuMembers) + supernode broadcast_room_list carry
                     // authoritative counts; an immediate list request can race and

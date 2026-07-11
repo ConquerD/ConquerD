@@ -494,6 +494,64 @@ fn sfu_group_key_inner_must_be_signed_to_install() {
     );
 }
 
+/// Wire type + signed-ack envelope for group-key install confirmation.
+/// Mirrors the SfuGroupKeyAck path: member signs an ack, seals it to the
+/// keyer under the pairwise key (same as SfuGroupKey distribution).
+#[test]
+fn sfu_group_key_ack_round_trips_sealed() {
+    use crate::crypto::{b64url_decode, b64url_encode, decrypt_blob, encrypt_blob};
+    use crate::identity::Identity;
+    use crate::protocol::{MessageType, SignalingMessage};
+    use base64::Engine;
+    use serde_json::Value;
+
+    assert_eq!(
+        MessageType::SfuGroupKeyAck.as_wire_str(),
+        "sfu_group_key_ack"
+    );
+
+    let keyer = Identity::generate();
+    let member = Identity::generate();
+
+    let mut ack = SignalingMessage::new(MessageType::SfuGroupKeyAck, member.public_id());
+    ack.payload
+        .insert("room_id".into(), Value::String("default".into()));
+    ack.payload
+        .insert("epoch".into(), Value::Number(0u64.into()));
+    let canon = ack.canonical_bytes().unwrap();
+    ack.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(member.sign(&canon)));
+    assert!(ConnectionManager::verify_inbound_signature_for_test(&ack));
+
+    let key = member
+        .derive_pairwise_relay_key(&keyer.public_id())
+        .unwrap();
+    let ct = encrypt_blob(&key, ack.to_json().unwrap().as_bytes()).unwrap();
+    let mut env = SignalingMessage::new(MessageType::EncryptedSignal, member.public_id());
+    env.target = Some(keyer.public_id());
+    env.payload
+        .insert("ciphertext".into(), Value::String(b64url_encode(&ct)));
+    let env_canon = env.canonical_bytes().unwrap();
+    env.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(member.sign(&env_canon)));
+
+    let key_k = keyer
+        .derive_pairwise_relay_key(&member.public_id())
+        .unwrap();
+    assert_eq!(key, key_k);
+    let recovered = decrypt_blob(
+        &key_k,
+        &b64url_decode(env.payload.get("ciphertext").unwrap().as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let inner = SignalingMessage::from_json(std::str::from_utf8(&recovered).unwrap()).unwrap();
+    assert_eq!(inner.msg_type, MessageType::SfuGroupKeyAck);
+    assert_eq!(
+        inner.payload.get("room_id").unwrap().as_str().unwrap(),
+        "default"
+    );
+    assert_eq!(inner.payload.get("epoch").unwrap().as_u64().unwrap(), 0);
+    assert!(ConnectionManager::verify_inbound_signature_for_test(&inner));
+}
+
 /// Room group-key "elected keyer" tie-break (`is_elected_keyer`), the fix for
 /// the reliability gap in `backlog.md` "Crypto — group key reliability": any
 /// member holding real key material can distribute it, chosen deterministically

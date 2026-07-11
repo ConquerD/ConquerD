@@ -108,6 +108,8 @@ pub enum MessageType {
 
     // E2E room group-key distribution (sealed per member; supernode forwards blind)
     SfuGroupKey,
+    /// Member → keyer: confirmed install of `(room_id, epoch)` (also EncryptedSignal-sealed).
+    SfuGroupKeyAck,
 
     // Space Merkle tree: owner announces a signed root to its supernode, which
     // stores + cluster-gossips it (authenticated room-set sync).
@@ -211,6 +213,7 @@ impl MessageType {
             Self::SfuFileComplete => "sfu_file_complete",
             Self::SfuAudio => "sfu_audio",
             Self::SfuGroupKey => "sfu_group_key",
+            Self::SfuGroupKeyAck => "sfu_group_key_ack",
             Self::SpaceRootAnnounce => "space_root_announce",
             Self::SfuRoomCreate => "sfu_room_create",
             Self::SfuRoomCreated => "sfu_room_created",
