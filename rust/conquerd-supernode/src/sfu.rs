@@ -350,14 +350,43 @@ impl SFURoom {
         token
     }
 
+    /// Re-seed a client-held invite credential after idle-GC / rematerialize.
+    ///
+    /// Room invite maps are in-memory only; GC wipes them. Clients keep the
+    /// original token in their encrypted `RoomStore` and re-present it on
+    /// materialize so returning members can rejoin without a fresh share.
+    /// `max_uses = 0` means unlimited re-entry uses (the room definition is the
+    /// trust root; rotate by minting a new invite / new room).
+    ///
+    /// Idempotent: re-registering the same token refreshes `created_by` and
+    /// resets use counts so a previously single-use token becomes durable.
+    pub fn reregister_invite_token(&mut self, token: &str, created_by: &str) -> bool {
+        if token.is_empty() {
+            return false;
+        }
+        self.invite_tokens.insert(
+            token.to_string(),
+            InviteToken {
+                created_by: created_by.to_string(),
+                uses: 0,
+                // 0 = unlimited — post-GC rejoin must not burn the credential.
+                max_uses: 0,
+            },
+        );
+        true
+    }
+
     pub fn validate_and_consume_token(&mut self, token: &str, peer_id: &str) -> bool {
         let Some(it) = self.invite_tokens.get_mut(token) else {
             return false;
         };
+        // max_uses == 0 means unlimited (durable re-entry / re-seeded token).
         if it.max_uses > 0 && it.uses >= it.max_uses {
             return false;
         }
-        it.uses += 1;
+        if it.max_uses > 0 {
+            it.uses += 1;
+        }
         self.allowed.insert(peer_id.to_string());
         if it.max_uses > 0 && it.uses >= it.max_uses {
             self.invite_tokens.remove(token);
@@ -656,10 +685,29 @@ impl SFURoomManager {
     }
 
     /// Generate an invite token for a room.
+    ///
+    /// New shareable invites remain single-use (`max_uses = 1`). Returning
+    /// members rejoin via the `allowed` set (or a client re-seeded multi-use
+    /// token after idle GC — see [`SFURoom::reregister_invite_token`]).
     pub fn generate_invite_token(&mut self, room_id: &str, created_by: &str) -> Option<String> {
         self.rooms
             .get_mut(room_id)
             .map(|r| r.generate_invite_token(created_by, 1))
+    }
+
+    /// Re-seed a client-held invite token into an existing room (post-GC
+    /// materialize). Returns `false` if the room is missing or the token is
+    /// empty.
+    pub fn reregister_invite_token(
+        &mut self,
+        room_id: &str,
+        token: &str,
+        created_by: &str,
+    ) -> bool {
+        let Some(room) = self.rooms.get_mut(room_id) else {
+            return false;
+        };
+        room.reregister_invite_token(token, created_by)
     }
 
     /// Generate an invite token if `requester` is authorized under the room's
@@ -974,6 +1022,51 @@ mod tests {
         assert_eq!(removed, vec!["idle".to_string()]);
         assert!(mgr.get_room("idle").is_none());
         assert!(mgr.get_room(DEFAULT_ROOM_ID).is_some());
+    }
+
+    /// After idle GC the invite map is gone. Clients re-seed their stored
+    /// invite token on rematerialize; that credential must admit returning
+    /// members (including multi-use re-entry) without a fresh share.
+    #[test]
+    fn reregister_invite_token_survives_gc_and_readmits_member() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("priv"), "Private", RoomType::Private, "creator");
+        let token = mgr.generate_invite_token("priv", "creator").unwrap();
+        assert!(mgr.validate_room_invite("priv", &token, "friend"));
+        // Single-use mint: second consume fails while the room still exists.
+        assert!(!mgr.validate_room_invite("priv", &token, "other"));
+        // Friend is allowed and can join.
+        assert!(mgr.join_room("friend", "priv").0);
+
+        // Idle-GC the empty room (friend leaves first so empty_since is set).
+        mgr.leave_room("friend", "priv");
+        let now = SFURoom::now_secs();
+        // Force empty_since into the past via GC clock.
+        let removed = mgr.gc_idle_rooms(now + IDLE_ROOM_GC_SECS + 1.0, IDLE_ROOM_GC_SECS);
+        assert!(removed.contains(&"priv".to_string()));
+        assert!(mgr.get_room("priv").is_none());
+
+        // Rematerialize (as after client RoomStore replay).
+        let (_, created) = mgr
+            .create_room(Some("priv"), "Private", RoomType::Private, "creator")
+            .unwrap();
+        assert!(created);
+        // Creator is always allowed; friend is not until re-seed.
+        assert!(!mgr.join_room("friend", "priv").0);
+        assert!(mgr.reregister_invite_token("priv", &token, "creator"));
+        assert!(mgr.allow_peer("priv", "friend"));
+        // Multi-use re-seeded token admits again (and a third time).
+        assert!(mgr.validate_room_invite("priv", &token, "friend"));
+        assert!(mgr.validate_room_invite("priv", &token, "friend"));
+        assert!(mgr.join_room("friend", "priv").0);
+    }
+
+    #[test]
+    fn reregister_empty_token_is_rejected() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("priv"), "Private", RoomType::Private, "creator");
+        assert!(!mgr.reregister_invite_token("priv", "", "creator"));
+        assert!(!mgr.reregister_invite_token("missing", "tok", "creator"));
     }
 
     #[test]

@@ -398,6 +398,10 @@ pub enum ConnectionCommand {
         /// Invite-mint policy: `"owner"` (default) or `"members"`. Empty is
         /// treated as unset (supernode defaults to `"owner"`).
         invite_policy: String,
+        /// Durable invite credential from `RoomStore` (empty on first create).
+        /// Replayed on rematerialize so the supernode can re-seed its in-memory
+        /// token map after idle GC and re-admit returning members.
+        invite_token: String,
     },
     /// Tear down a trusted supernode session and stop WS auto-reconnect.
     RemoveSupernode {

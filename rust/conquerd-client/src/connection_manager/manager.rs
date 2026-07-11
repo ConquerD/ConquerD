@@ -348,6 +348,8 @@ struct RoomCreateRequest<'a> {
     creator_id: Option<&'a str>,
     materialize_only: bool,
     invite_policy: &'a str,
+    /// Client-held invite credential to re-seed post-GC (empty on first create).
+    invite_token: &'a str,
 }
 
 /// What to do with a room whose hosting supernode was just lost, given the
@@ -935,6 +937,7 @@ impl ConnectionManager {
                             creator_id,
                             materialize_only,
                             invite_policy,
+                            invite_token,
                         } => {
                             self.send_room_create(RoomCreateRequest {
                                 supernode_id: &supernode_id,
@@ -944,6 +947,7 @@ impl ConnectionManager {
                                 creator_id: creator_id.as_deref(),
                                 materialize_only,
                                 invite_policy: &invite_policy,
+                                invite_token: &invite_token,
                             })
                             .await;
                         }
@@ -2434,6 +2438,7 @@ impl ConnectionManager {
             creator_id,
             materialize_only,
             invite_policy,
+            invite_token,
         } = req;
         let normalized = match room_type.trim().to_ascii_lowercase().as_str() {
             "private" => "private",
@@ -2466,9 +2471,19 @@ impl ConnectionManager {
                 Value::String(invite_policy.to_owned()),
             );
         }
+        // Re-seed the durable invite credential after idle GC so the supernode
+        // can re-admit this peer (and validate SfuRoomInvite with the same
+        // token). Empty on first create — the supernode mints a fresh token.
+        if !invite_token.is_empty() {
+            msg.payload.insert(
+                "invite_token".to_owned(),
+                Value::String(invite_token.to_owned()),
+            );
+        }
         info!(
-            "[cm] SfuRoomCreate: supernode={} name={room_name} type={normalized} materialize_only={materialize_only}",
-            &supernode_id[..8.min(supernode_id.len())]
+            "[cm] SfuRoomCreate: supernode={} name={room_name} type={normalized} materialize_only={materialize_only} has_token={}",
+            &supernode_id[..8.min(supernode_id.len())],
+            !invite_token.is_empty()
         );
         self.dispatch_outbound(msg).await;
     }

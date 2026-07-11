@@ -2978,6 +2978,7 @@ impl ffi::AppBridge {
                 creator_id: None,
                 materialize_only: false,
                 invite_policy: policy.to_owned(),
+                invite_token: String::new(),
             });
         }
     }
@@ -4621,6 +4622,8 @@ fn replay_saved_rooms_on_supernode_connect(
                 creator_id: Some(creator_id),
                 materialize_only: true,
                 invite_policy: entry.invite_policy.clone(),
+                // Re-seed after idle GC so private-room invite rejoin works.
+                invite_token: entry.invite_token.clone(),
             });
         }
     }

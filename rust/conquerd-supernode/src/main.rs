@@ -2164,6 +2164,17 @@ impl SupernodeHandler {
             }
         }
 
+        // Optional durable invite credential the client kept in RoomStore.
+        // After idle GC the supernode's token map is empty; replaying a saved
+        // definition re-seeds the credential so members can rejoin without a
+        // brand-new share link.
+        let client_invite_token = msg
+            .payload
+            .get("invite_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
         let mut sfu_lock = sfu.write();
         let Some((room, created_new)) = sfu_lock.create_room_with_policy(
             room_id,
@@ -2176,22 +2187,63 @@ impl SupernodeHandler {
         };
         let room_id_out = room.room_id.clone();
         let room_name_out = room.room_name.clone();
+        let room_creator = room.creator_id.clone();
         let is_private = room_type == sfu::RoomType::Private;
         drop(sfu_lock);
 
-        if created_new && is_private {
-            let _ = sfu.write().allow_peer(&room_id_out, &msg.sender);
-            // Replicate the room + creator grant so other cluster members can
-            // admit this peer if it later attaches to them.
-            self.state
-                .replicate_room_grant(&room_id_out, &room_name_out, "private", &msg.sender);
-        }
+        // Private-room re-admit after rematerialize (client-owned defs, ephemeral
+        // SFU). Trust rules:
+        //   * creator (payload or room record) is always re-allowed;
+        //   * any peer presenting a non-empty invite_token re-seeds that token
+        //     as a multi-use credential and is allowed (possession of the saved
+        //     RoomStore entry + token is the membership proof after GC);
+        //   * first create without a client token mints a fresh single-use
+        //     shareable invite for the creator to distribute.
+        // Room-id alone is NOT enough — non-creators without a token are not
+        // admitted on a bare materialize of an already-existing room.
+        let mut invite_token: Option<String> = None;
+        if is_private {
+            let is_creator = msg.sender == room_creator || msg.sender == creator_id;
+            let mut admitted = false;
 
-        let invite_token = if created_new && is_private {
-            sfu.write().generate_invite_token(&room_id_out, creator_id)
-        } else {
-            None
-        };
+            if let Some(ref tok) = client_invite_token {
+                let reseeded = sfu.write().reregister_invite_token(
+                    &room_id_out,
+                    tok,
+                    if room_creator.is_empty() {
+                        creator_id
+                    } else {
+                        &room_creator
+                    },
+                );
+                if reseeded {
+                    let _ = sfu.write().allow_peer(&room_id_out, &msg.sender);
+                    invite_token = Some(tok.clone());
+                    admitted = true;
+                }
+            }
+
+            if !admitted && (is_creator || created_new) {
+                // Creator (or first materializer creating a brand-new room)
+                // self-admits without a token.
+                let _ = sfu.write().allow_peer(&room_id_out, &msg.sender);
+                admitted = true;
+                if created_new && invite_token.is_none() {
+                    invite_token = sfu.write().generate_invite_token(&room_id_out, creator_id);
+                }
+            }
+
+            if admitted {
+                // Replicate the grant so other cluster members admit this peer
+                // on failover (same path as invite accept).
+                self.state.replicate_room_grant(
+                    &room_id_out,
+                    &room_name_out,
+                    "private",
+                    &msg.sender,
+                );
+            }
+        }
 
         self.state.send_signed(
             &msg.sender,
