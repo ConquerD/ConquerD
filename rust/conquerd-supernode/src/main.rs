@@ -1808,30 +1808,58 @@ impl SupernodeHandler {
 
         let (ok, members) = sfu.write().join_room(&msg.sender, room_id);
         if !ok {
-            let reason = {
+            // Machine-readable reason for the client; detail stays in logs only.
+            let (reason, detail) = {
                 let s = sfu.read();
                 match s.get_room(room_id) {
-                    None => "room_absent".to_owned(),
-                    Some(r) => {
-                        let tstr = match r.room_type {
-                            sfu::RoomType::Public => "public",
-                            sfu::RoomType::Private => "private",
-                        };
+                    None => ("room_absent".to_owned(), String::new()),
+                    Some(r) if !r.is_peer_allowed(&msg.sender) => (
+                        "not_allowed".to_owned(),
                         format!(
                             "type={} creator_match={} allowed={} count={}",
-                            tstr,
+                            match r.room_type {
+                                sfu::RoomType::Public => "public",
+                                sfu::RoomType::Private => "private",
+                            },
                             r.creator_id == msg.sender,
                             r.is_peer_allowed(&msg.sender),
                             r.participant_count(),
-                        )
-                    }
+                        ),
+                    ),
+                    Some(r) if r.is_full() => (
+                        "room_full".to_owned(),
+                        format!("count={}", r.participant_count()),
+                    ),
+                    Some(r) => (
+                        "join_failed".to_owned(),
+                        format!(
+                            "type={} count={}",
+                            match r.room_type {
+                                sfu::RoomType::Public => "public",
+                                sfu::RoomType::Private => "private",
+                            },
+                            r.participant_count(),
+                        ),
+                    ),
                 }
             };
             tracing::warn!(
-                "SfuJoin DENIED peer={} room={} [{}]",
+                "SfuJoin DENIED peer={} room={} reason={} [{}]",
                 &msg.sender[..12.min(msg.sender.len())],
                 room_id,
-                reason
+                reason,
+                detail
+            );
+            // Tell the client so optimistic voice/UI can roll back — a silent
+            // deny previously left peers "in room" with no SFU membership.
+            self.state.send_signed(
+                &msg.sender,
+                MessageType::SfuJoinResult,
+                json!({
+                    "room_id": room_id,
+                    "accepted": false,
+                    "reason": reason,
+                }),
             );
             return;
         }

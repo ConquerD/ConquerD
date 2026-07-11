@@ -92,6 +92,8 @@ pub enum MessageType {
     // SFU
     SfuRoomList,
     SfuJoin,
+    /// Supernode → peer: accept/deny for a prior `SfuJoin` (deny was previously silent).
+    SfuJoinResult,
     SfuLeave,
     SfuMembers,
     SfuPeerJoined,
@@ -196,6 +198,7 @@ impl MessageType {
             Self::PunchReady => "punch_ready",
             Self::SfuRoomList => "sfu_room_list",
             Self::SfuJoin => "sfu_join",
+            Self::SfuJoinResult => "sfu_join_result",
             Self::SfuLeave => "sfu_leave",
             Self::SfuMembers => "sfu_members",
             Self::SfuPeerJoined => "sfu_peer_joined",

@@ -76,6 +76,13 @@ pub enum ConnectionEvent {
         room_id: String,
         members: Vec<String>,
     },
+    /// Supernode rejected our `SfuJoin` (`SfuJoinResult` accepted=false).
+    /// UI must roll back optimistic voice / current-room state.
+    RoomJoinRejected {
+        supernode_id: String,
+        room_id: String,
+        reason: String,
+    },
     /// A peer joined an SFU voice room.
     RoomPeerJoined {
         supernode_id: String,

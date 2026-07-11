@@ -5661,6 +5661,65 @@ fn dispatch_event(
                 emit_peers_updated(bridge.as_mut());
             });
         }
+        ConnectionEvent::RoomJoinRejected {
+            supernode_id,
+            room_id,
+            reason,
+        } => {
+            warn!(
+                "[bridge] room join rejected sn={} room={}: {}",
+                &supernode_id[..8.min(supernode_id.len())],
+                room_id,
+                reason
+            );
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let canon = canon_supernode_id(bridge.rust(), &supernode_id);
+                let key = format!("{}:{}", canon, room_id);
+                bridge.as_mut().rust_mut().admitted_rooms.remove(&key);
+                bridge
+                    .as_mut()
+                    .rust_mut()
+                    .pending_room_rosters
+                    .remove(&room_roster_key(canon.as_str(), room_id.as_str()));
+
+                let voice_match = {
+                    let r = bridge.rust();
+                    r.voice_room_id == room_id
+                        && (r.voice_supernode_id == canon || r.voice_supernode_id == supernode_id)
+                };
+                let current_match = {
+                    let r = bridge.rust();
+                    r.current_room_id == room_id
+                        && (r.current_supernode_id == canon
+                            || r.current_supernode_id == supernode_id
+                            || r.current_supernode_id.is_empty())
+                };
+
+                if voice_match {
+                    // Roll back optimistic join_room_with_voice: stop SFU audio
+                    // mode and clear voice scope so we don't look "in call".
+                    if let Some(ref tx) = bridge.rust().call_cmd_tx {
+                        let _ = tx.try_send(CallCommand::ClearRoomMode);
+                        let _ = tx.try_send(CallCommand::StopAudio);
+                    }
+                    {
+                        let mut r = bridge.as_mut().rust_mut();
+                        r.room_participant_ids.clear();
+                        r.voice_supernode_id.clear();
+                        r.voice_room_id.clear();
+                    }
+                    clear_room_member_presence(&mut bridge.as_mut().rust_mut());
+                    bridge.as_mut().set_voice_active(false);
+                    bridge.as_mut().set_in_room(false);
+                }
+                if current_match {
+                    let mut r = bridge.as_mut().rust_mut();
+                    r.current_room_id.clear();
+                    r.current_supernode_id.clear();
+                }
+                emit_peers_updated(bridge.as_mut());
+            });
+        }
         ConnectionEvent::RoomPeerJoined {
             supernode_id,
             room_id,

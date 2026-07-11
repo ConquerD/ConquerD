@@ -4271,7 +4271,73 @@ impl ConnectionManager {
                         room_id,
                         reason
                     );
+                    // Invite failed before SfuJoin — same UI rollback as a join deny
+                    // so optimistic selection doesn't stick on a private room we
+                    // never entered.
+                    if self.current_room_id == room_id
+                        && (self.current_supernode_id == supernode_id
+                            || self.current_supernode_id.is_empty())
+                    {
+                        self.current_room_id.clear();
+                        self.current_supernode_id.clear();
+                    }
+                    let _ = self.event_tx.try_send(ConnectionEvent::RoomJoinRejected {
+                        supernode_id,
+                        room_id,
+                        reason: reason.to_owned(),
+                    });
                 }
+            }
+            MessageType::SfuJoinResult => {
+                let room_id = msg
+                    .payload
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let accepted = msg
+                    .payload
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if room_id.is_empty() || accepted {
+                    // Accept path is SfuMembers; ignore accepted=true if ever sent.
+                    return;
+                }
+                let supernode_id = msg.sender.clone();
+                let reason = msg
+                    .payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("join_failed")
+                    .to_owned();
+                warn!(
+                    "SFU join rejected by {} for room {}: {}",
+                    &supernode_id[..8.min(supernode_id.len())],
+                    room_id,
+                    reason
+                );
+                // Drop optimistic current-room pointer so send_room_audio stops.
+                if self.current_room_id == room_id
+                    && (self.current_supernode_id == supernode_id
+                        || self.current_supernode_id.is_empty())
+                {
+                    self.current_room_id.clear();
+                    self.current_supernode_id.clear();
+                }
+                self.pending_private_room_joins
+                    .remove(&format!("{supernode_id}:{room_id}"));
+                // Failover fan-out may leave cold rejoins armed; clear any
+                // pending rejoin for this room so we don't thrash denied nodes.
+                self.pending_failover_rejoin.retain(|_, r| *r != room_id);
+                if self.failover_pending_room.as_deref() == Some(room_id.as_str()) {
+                    self.failover_pending_room = None;
+                }
+                let _ = self.event_tx.try_send(ConnectionEvent::RoomJoinRejected {
+                    supernode_id,
+                    room_id,
+                    reason,
+                });
             }
             MessageType::PresenceUpdate => {
                 let status = msg

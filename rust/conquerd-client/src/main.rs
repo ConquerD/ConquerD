@@ -607,6 +607,7 @@ async fn handle_event(
         ConnectionEvent::TypingIndicator { .. }
         | ConnectionEvent::HandleUpdated { .. }
         | ConnectionEvent::RoomMembersChanged { .. }
+        | ConnectionEvent::RoomJoinRejected { .. }
         | ConnectionEvent::RoomPeerJoined { .. }
         | ConnectionEvent::RoomPeerLeft { .. }
         | ConnectionEvent::RoomChatMessage { .. }

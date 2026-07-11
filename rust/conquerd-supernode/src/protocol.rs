@@ -138,6 +138,10 @@ pub enum MessageType {
     SfuRoomList,
     #[serde(rename = "sfu_join")]
     SfuJoin,
+    /// Peer join outcome. Sent on deny so clients can roll back optimistic
+    /// voice/UI state (accept is still implied by `SfuMembers`).
+    #[serde(rename = "sfu_join_result")]
+    SfuJoinResult,
     #[serde(rename = "sfu_leave")]
     SfuLeave,
     #[serde(rename = "sfu_members")]
