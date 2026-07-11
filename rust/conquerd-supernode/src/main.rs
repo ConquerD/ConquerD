@@ -347,7 +347,7 @@ impl SupernodeState {
     /// Replicate a locally-received room chat to cluster peers that have local
     /// subscribers for the room. No-op when standalone. Loop-safe: peers deliver
     /// the frame locally and never re-replicate it.
-    fn replicate_room_chat(&self, room_id: &str, msg: &SignalingMessage, raw: &str) {
+    pub(crate) fn replicate_room_chat(&self, room_id: &str, msg: &SignalingMessage, raw: &str) {
         let Some(link) = self.cluster_link.read().clone() else {
             return;
         };
@@ -357,6 +357,17 @@ impl SupernodeState {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         link.replicate(room_id, message_id, raw);
+    }
+
+    /// Replicate a locally-received room audio frame to cluster peers hosting
+    /// members of the same room. Same `Replicate` transport as chat; message id
+    /// is the frame signature (or sender+seq fallback) for dedup. Loop-safe:
+    /// receivers deliver locally and never re-replicate.
+    pub(crate) fn replicate_room_audio(&self, room_id: &str, msg: &SignalingMessage, raw: &str) {
+        let Some(link) = self.cluster_link.read().clone() else {
+            return;
+        };
+        link.replicate(room_id, &audio_replication_id(msg), raw);
     }
 
     /// Deliver a room chat replicated from another cluster member to this node's
@@ -376,6 +387,77 @@ impl SupernodeState {
             {
                 self.signaling.send_to_peer(peer, raw);
             }
+        }
+    }
+
+    /// Deliver a room audio frame replicated from another cluster member to
+    /// this node's local voice participants. Prefer QUIC relay datagrams, fall
+    /// back to WebSocket — same transport preference as the local SFU bridge.
+    /// Deduped by `message_id`; never re-replicated. Skips the active-speaker
+    /// gate (the origin node already applied it; the remote talker is not a
+    /// local participant and must not displace local talker scores).
+    fn deliver_replicated_audio(&self, room_id: &str, message_id: &str, raw: &str) {
+        if !self.replication_seen.write().insert_new(message_id) {
+            return;
+        }
+        let Some(ref sfu) = self.sfu else {
+            return;
+        };
+        // Exclude the original talker if they somehow multi-homed onto this node.
+        let sender = SignalingMessage::from_json(raw)
+            .map(|m| m.sender)
+            .unwrap_or_default();
+        let recipients = sfu
+            .read()
+            .get_room(room_id)
+            .map(|r| r.participant_ids())
+            .unwrap_or_default();
+        if recipients.is_empty() {
+            return;
+        }
+        // Relay path: [sender_index][ROOM_AUDIO_TAG][signed JSON]. Receiver
+        // ignores sender_index and verifies the signed JSON (parity with
+        // native bridge fan-out).
+        use conquerd_features::channel_frame::ROOM_AUDIO_TAG;
+        let mut tagged = Vec::with_capacity(1 + raw.len());
+        tagged.push(ROOM_AUDIO_TAG);
+        tagged.extend_from_slice(raw.as_bytes());
+        let fwd = crate::wire::build_forwarded_datagram(crate::wire::BROADCAST_INDEX, &tagged);
+        let wire_bytes = raw.len();
+        for peer in &recipients {
+            if !sender.is_empty() && peer == &sender {
+                continue;
+            }
+            if let Some(ref relay) = self.relay {
+                // Some(_) = delivered or quota-dropped on relay; None = fall to WS.
+                if relay.send_room_datagram(peer, &fwd).is_some() {
+                    continue;
+                }
+            }
+            if self
+                .features
+                .gate_through_feature("room.audio.sfu", peer, wire_bytes)
+            {
+                self.signaling.send_to_peer(peer, raw);
+            }
+        }
+    }
+
+    /// Route an inbound cluster `Replicate` frame to chat or audio delivery
+    /// based on the wire `type` of the opaque client envelope.
+    fn deliver_replicated_room_frame(&self, room_id: &str, message_id: &str, raw: &str) {
+        let is_audio = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s == "sfu_audio")
+            })
+            .unwrap_or(false);
+        if is_audio {
+            self.deliver_replicated_audio(room_id, message_id, raw);
+        } else {
+            self.deliver_replicated_chat(room_id, message_id, raw);
         }
     }
 
@@ -1265,6 +1347,22 @@ fn sfu_audio_opus_byte_count(msg: &SignalingMessage) -> usize {
         .unwrap_or(0)
 }
 
+/// Stable id for cluster audio-frame dedup. Prefer the Ed25519 signature
+/// (unique per signed frame); fall back to room+sender+seq when unsigned
+/// (should not happen on the production path).
+fn audio_replication_id(msg: &SignalingMessage) -> String {
+    if let Some(sig) = msg.signature.as_deref().filter(|s| !s.is_empty()) {
+        return format!("a:{sig}");
+    }
+    let room = msg
+        .payload
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let seq = msg.payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    format!("a:{room}:{}:{seq}", msg.sender)
+}
+
 /// Payload byte count for `SfuChat` inbound quota accounting.
 ///
 /// Prefer opaque `ciphertext` (E2E envelope) over legacy plaintext `body` so the
@@ -2028,6 +2126,10 @@ impl SupernodeHandler {
                 self.state.signaling.send_to_peer(peer, raw);
             }
         }
+        // Cross-node room members (attached to a sibling supernode) only hear
+        // this talker if we fan the same opaque frame over the cluster link —
+        // parity with room.chat.v1's replicate_room_chat path.
+        self.state.replicate_room_audio(room_id, msg, raw);
     }
 
     /// Relay native WebSocket `SfuChat` with symmetric `room.chat.v1` quotas.
@@ -2620,7 +2722,8 @@ async fn main() -> anyhow::Result<()> {
             sfu_room_policy: manifest::sfu_room_creation_policy(&features),
             cluster,
             cluster_link: RwLock::new(None),
-            replication_seen: RwLock::new(cluster_link::SeenCache::new(4096)),
+            // Sized for chat + multi-talker room audio (~50 Hz) dedup windows.
+            replication_seen: RwLock::new(cluster_link::SeenCache::new(16_384)),
             space_roots: RwLock::new(SpaceRootStore::default()),
         });
 
@@ -2633,7 +2736,7 @@ async fn main() -> anyhow::Result<()> {
             let weak = weak.clone();
             Arc::new(move |m: cluster_link::ReplicatedMsg| {
                 if let Some(state) = weak.upgrade() {
-                    state.deliver_replicated_chat(&m.room_id, &m.message_id, &m.raw);
+                    state.deliver_replicated_room_frame(&m.room_id, &m.message_id, &m.raw);
                 }
             })
         };
@@ -2861,6 +2964,11 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                    }
+                    // Cluster fan-out so members on sibling nodes hear this
+                    // talker (same as the WebSocket SfuAudio path).
+                    if let Ok(parsed) = SignalingMessage::from_json(raw) {
+                        state.replicate_room_audio(&room_id, &parsed, raw);
                     }
                 },
             );
@@ -3302,6 +3410,51 @@ mod identity_normalization_tests {
         assert_eq!(pad_base64url("YWJj"), "YWJj"); // len 4, aligned
         assert_eq!(pad_base64url("YWJjZA=="), "YWJjZA=="); // already padded
         assert_eq!(pad_base64url("YWJjZGU="), "YWJjZGU="); // already padded
+    }
+}
+
+#[cfg(test)]
+mod cluster_audio_replication_tests {
+    use super::*;
+
+    #[test]
+    fn audio_replication_id_prefers_signature() {
+        let mut msg = SignalingMessage::new(
+            MessageType::SfuAudio,
+            "senderPub=",
+            serde_json::json!({"room_id": "default", "seq": 7}),
+        );
+        msg.signature = Some("sigABC".into());
+        assert_eq!(audio_replication_id(&msg), "a:sigABC");
+    }
+
+    #[test]
+    fn audio_replication_id_falls_back_to_room_sender_seq() {
+        let msg = SignalingMessage::new(
+            MessageType::SfuAudio,
+            "senderPub=",
+            serde_json::json!({"room_id": "r1", "seq": 42}),
+        );
+        assert_eq!(audio_replication_id(&msg), "a:r1:senderPub=:42");
+    }
+
+    #[test]
+    fn replicated_frame_type_detection_audio_vs_chat() {
+        let audio = r#"{"type":"sfu_audio","sender":"x","payload":{}}"#;
+        let chat = r#"{"type":"sfu_chat","sender":"x","payload":{}}"#;
+        let is_audio = |raw: &str| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|v| {
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s == "sfu_audio")
+                })
+                .unwrap_or(false)
+        };
+        assert!(is_audio(audio));
+        assert!(!is_audio(chat));
+        assert!(!is_audio("not-json"));
     }
 }
 

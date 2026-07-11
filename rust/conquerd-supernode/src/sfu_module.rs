@@ -116,6 +116,19 @@ impl FeatureModule for SfuRoomModule {
                 state.signaling.send_to_peer(&native, raw);
             }
         }
+        // Cluster fan-out for multi-node rooms (parity with native WS paths).
+        match self.members_kind {
+            MembersKind::Audio => {
+                if let Ok(parsed) = crate::protocol::SignalingMessage::from_json(raw) {
+                    state.replicate_room_audio(&room_id, &parsed, raw);
+                }
+            }
+            MembersKind::Chat => {
+                if let Ok(parsed) = crate::protocol::SignalingMessage::from_json(raw) {
+                    state.replicate_room_chat(&room_id, &parsed, raw);
+                }
+            }
+        }
     }
 }
 
