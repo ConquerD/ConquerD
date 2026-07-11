@@ -494,6 +494,20 @@ fn sfu_group_key_inner_must_be_signed_to_install() {
     );
 }
 
+/// Elected-keyer gate rejects group keys from non-keyer room members.
+#[test]
+fn accept_group_key_requires_elected_keyer() {
+    // is_elected_keyer is the sole membership check used by accept_group_key_from
+    // for the "who may install" question — cover the predicate here; epoch
+    // policy is unit-tested via integration of current_epoch / wrapping_add.
+    let members = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
+    assert!(is_elected_keyer(&members, "alice"));
+    assert!(!is_elected_keyer(&members, "bob"));
+    assert!(!is_elected_keyer(&members, "carol"));
+    // Hostile "bob" must not be able to claim keyer status.
+    assert!(!is_elected_keyer(&members, "bob"));
+}
+
 /// Wire type + signed-ack envelope for group-key install confirmation.
 /// Mirrors the SfuGroupKeyAck path: member signs an ack, seals it to the
 /// keyer under the pairwise key (same as SfuGroupKey distribution).

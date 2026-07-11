@@ -114,13 +114,33 @@ struct InviteToken {
     max_uses: u32,
 }
 
+/// Normalize an Ed25519 `public_id` to padded base64url form used consistently
+/// on the SFU ACL (`allowed`, `creator_id`, participants). Relay peers often
+/// arrive un-padded; without this, `is_peer_allowed` misses and private joins
+/// / grants fail intermittently.
+///
+/// Only rewrites strings that look like 32-byte Ed25519 keys (43 chars unpadded
+/// → 44 padded). Short test identifiers and other non-key strings are left
+/// untouched so callers and unit tests that use plain labels keep working.
+pub(crate) fn normalize_peer_id(peer_id: &str) -> String {
+    let bare = peer_id.trim_end_matches('=');
+    // URL_SAFE base64 of 32 bytes is always 43 unpadded chars (43 % 4 == 3).
+    if bare.len() != 43 {
+        return peer_id.to_string();
+    }
+    let mut s = String::with_capacity(44);
+    s.push_str(bare);
+    s.push('=');
+    s
+}
+
 impl SFURoom {
     pub fn new(room_id: &str, room_name: &str, room_type: RoomType, creator_id: &str) -> Self {
         Self {
             room_id: room_id.to_string(),
             room_name: room_name.to_string(),
             room_type,
-            creator_id: creator_id.to_string(),
+            creator_id: normalize_peer_id(creator_id),
             invite_policy: "owner".to_string(),
             participants: HashMap::new(),
             speaker_scores: HashMap::new(),
@@ -163,10 +183,11 @@ impl SFURoom {
     }
 
     pub fn is_peer_allowed(&self, peer_id: &str) -> bool {
+        let peer_id = normalize_peer_id(peer_id);
         self.is_public()
-            || self.allowed.contains(peer_id)
+            || self.allowed.contains(&peer_id)
             || self.creator_id == peer_id
-            || self.participants.contains_key(peer_id)
+            || self.participants.contains_key(&peer_id)
     }
 
     /// Whether `peer_id` counts as a "member" of this room for the
@@ -176,15 +197,15 @@ impl SFURoom {
     /// *public* room) — invite-minting eligibility is about actual membership,
     /// not room visibility.
     pub fn is_invite_eligible_member(&self, peer_id: &str) -> bool {
+        let peer_id = normalize_peer_id(peer_id);
         self.creator_id == peer_id
-            || self.allowed.contains(peer_id)
-            || self.participants.contains_key(peer_id)
-            || self.subscribers.contains(peer_id)
+            || self.allowed.contains(&peer_id)
+            || self.participants.contains_key(&peer_id)
+            || self.subscribers.contains(&peer_id)
     }
 
-    #[allow(dead_code)]
     pub fn allow_peer(&mut self, peer_id: &str) {
-        self.allowed.insert(peer_id.to_string());
+        self.allowed.insert(normalize_peer_id(peer_id));
     }
 
     pub fn participant_count(&self) -> usize {
@@ -200,11 +221,12 @@ impl SFURoom {
     }
 
     pub fn add_participant(&mut self, peer_id: &str) -> bool {
+        let peer_id = normalize_peer_id(peer_id);
         // Idempotent: if the peer is already a voice participant (common
         // reconnect race where the old WS hasn't been cleaned up yet), return
         // true so the caller still sends a fresh SfuMembers snapshot back to
         // the joiner.  This prevents the "don't see myself in the room" bug.
-        if self.participants.contains_key(peer_id) {
+        if self.participants.contains_key(&peer_id) {
             return true;
         }
         if self.is_full() {
@@ -212,19 +234,20 @@ impl SFURoom {
         }
         let idx = self.next_index;
         self.next_index = self.next_index.wrapping_add(1).max(1);
-        self.participants.insert(peer_id.to_string(), idx);
+        self.participants.insert(peer_id.clone(), idx);
         // Promoted to full participant — remove from text-only subscribers.
-        self.subscribers.remove(peer_id);
+        self.subscribers.remove(&peer_id);
         self.mark_in_use();
         true
     }
 
     pub fn remove_participant(&mut self, peer_id: &str) -> bool {
-        let removed = self.participants.remove(peer_id).is_some();
+        let peer_id = normalize_peer_id(peer_id);
+        let removed = self.participants.remove(&peer_id).is_some();
         if removed {
             self.mark_unused_if_empty();
-            self.speaker_scores.remove(peer_id);
-            self.active_speakers.retain(|id| id != peer_id);
+            self.speaker_scores.remove(&peer_id);
+            self.active_speakers.retain(|id| id != &peer_id);
         }
         removed
     }
@@ -300,27 +323,30 @@ impl SFURoom {
 
     /// Subscribe a peer to text chat (without voice join).
     pub fn subscribe(&mut self, peer_id: &str) {
+        let peer_id = normalize_peer_id(peer_id);
         // No-op if already a voice participant (they already receive chat).
-        if !self.participants.contains_key(peer_id) {
-            self.subscribers.insert(peer_id.to_string());
+        if !self.participants.contains_key(&peer_id) {
+            self.subscribers.insert(peer_id);
             self.mark_in_use();
         }
     }
 
     /// Unsubscribe a peer from text chat.
     pub fn unsubscribe(&mut self, peer_id: &str) {
-        if self.subscribers.remove(peer_id) {
+        let peer_id = normalize_peer_id(peer_id);
+        if self.subscribers.remove(&peer_id) {
             self.mark_unused_if_empty();
         }
     }
 
     /// Remove a peer from both participants and subscribers.
     pub fn remove_peer_entirely(&mut self, peer_id: &str) -> bool {
-        let was_participant = self.participants.remove(peer_id).is_some();
-        let was_subscriber = self.subscribers.remove(peer_id);
+        let peer_id = normalize_peer_id(peer_id);
+        let was_participant = self.participants.remove(&peer_id).is_some();
+        let was_subscriber = self.subscribers.remove(&peer_id);
         if was_participant {
-            self.speaker_scores.remove(peer_id);
-            self.active_speakers.retain(|id| id != peer_id);
+            self.speaker_scores.remove(&peer_id);
+            self.active_speakers.retain(|id| id != &peer_id);
         }
         if was_participant || was_subscriber {
             self.mark_unused_if_empty();
@@ -387,7 +413,7 @@ impl SFURoom {
         if it.max_uses > 0 {
             it.uses += 1;
         }
-        self.allowed.insert(peer_id.to_string());
+        self.allowed.insert(normalize_peer_id(peer_id));
         if it.max_uses > 0 && it.uses >= it.max_uses {
             self.invite_tokens.remove(token);
         }
@@ -474,13 +500,14 @@ impl SFURoomManager {
 
     /// Join a peer to a room. Returns (success, member_list).
     pub fn join_room(&mut self, peer_id: &str, room_id: &str) -> (bool, Vec<String>) {
+        let peer_id = normalize_peer_id(peer_id);
         let Some(room) = self.rooms.get_mut(room_id) else {
             return (false, vec![]);
         };
-        if !room.is_peer_allowed(peer_id) {
+        if !room.is_peer_allowed(&peer_id) {
             return (false, vec![]);
         }
-        let ok = room.add_participant(peer_id);
+        let ok = room.add_participant(&peer_id);
         let members = room.participant_ids();
         (ok, members)
     }
@@ -1067,6 +1094,30 @@ mod tests {
         mgr.create_room(Some("priv"), "Private", RoomType::Private, "creator");
         assert!(!mgr.reregister_invite_token("priv", "", "creator"));
         assert!(!mgr.reregister_invite_token("missing", "tok", "creator"));
+    }
+
+    #[test]
+    fn allow_and_join_normalize_peer_id_padding() {
+        let mut mgr = SFURoomManager::new();
+        // Exactly 43 chars (unpadded base64url of 32 bytes).
+        let unpadded: String = std::iter::repeat('A').take(43).collect();
+        assert_eq!(unpadded.len(), 43);
+        let padded = normalize_peer_id(&unpadded);
+        assert_eq!(padded.len(), 44);
+        assert_eq!(&padded[..43], unpadded.as_str());
+        assert!(padded.ends_with('='));
+        // Already-padded form is stable.
+        assert_eq!(normalize_peer_id(&padded), padded);
+
+        mgr.create_room(Some("priv"), "Private", RoomType::Private, "creator");
+        assert!(mgr.allow_peer("priv", &unpadded));
+        // Lookup with either form must succeed.
+        assert!(mgr.get_room("priv").unwrap().is_peer_allowed(&unpadded));
+        assert!(mgr.get_room("priv").unwrap().is_peer_allowed(&padded));
+        assert!(mgr.join_room(&unpadded, "priv").0);
+        assert!(mgr.join_room(&padded, "priv").0); // idempotent
+                                                   // Short labels are not rewritten.
+        assert_eq!(normalize_peer_id("peer1"), "peer1");
     }
 
     #[test]

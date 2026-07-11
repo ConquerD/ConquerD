@@ -1789,6 +1789,30 @@ impl ConnectionManager {
         }
     }
 
+    /// Whether to install a sealed `SfuGroupKey` from `sender` for `room_id` at
+    /// `epoch`. Requires the sender to be the elected keyer for the current
+    /// membership view (including the sender if our snapshot is still empty —
+    /// join race) and the epoch to be the current one, the next rotation, or
+    /// any epoch when we have no real key yet.
+    fn accept_group_key_from(&self, sender: &str, room_id: &str, epoch: u8) -> bool {
+        let me = self.identity.public_id();
+        let union = union_members_for_room(&self.room_group_members, room_id);
+        let mut present: Vec<String> = union.iter().cloned().collect();
+        present.push(me);
+        if !present.iter().any(|m| m == sender) {
+            present.push(sender.to_owned());
+        }
+        if !is_elected_keyer(&present, sender) {
+            return false;
+        }
+        if !self.group_keys.has_real_key(room_id) {
+            return true;
+        }
+        let cur = self.group_keys.current_epoch(room_id);
+        // Same epoch = reseal after reconnect; +1 = legitimate rotation.
+        epoch == cur || epoch == cur.wrapping_add(1)
+    }
+
     /// Member → keyer: confirm we installed `(room_id, epoch)`. Sealed the same
     /// way as `SfuGroupKey` so the supernode never sees the ack in the clear.
     async fn send_group_key_ack(&mut self, room_id: &str, epoch: u8, keyer: &str) {
@@ -1926,6 +1950,10 @@ impl ConnectionManager {
         let mut present: Vec<String> = union_new.iter().cloned().collect();
         present.push(me.clone());
         if !is_elected_keyer(&present, &me) {
+            // Not the keyer: drop any pending seals we queued while we briefly
+            // thought we were (solo bootstrap race). Keep installed key material
+            // until a legitimate keyer's SfuGroupKey overwrites it.
+            self.pending_group_key_acks.retain(|(r, _), _| r != room_id);
             return;
         }
 
@@ -1936,7 +1964,15 @@ impl ConnectionManager {
         self.pending_group_key_acks
             .retain(|(r, m), _| r != room_id || union_new.contains(m));
 
+        // Defer first real-key generation until at least one *other* member is
+        // present. Solo minting was the dual-keyer bootstrap race: both peers
+        // join alone, each mint a different epoch-0 key, then cannot open each
+        // other's audio until a later reseal. Waiting for a non-empty union
+        // means only the elected keyer mints once both are visible.
         if !self.group_keys.has_real_key(room_id) {
+            if union_new.is_empty() {
+                return;
+            }
             // First keying: generate epoch 0 and seal to everyone present.
             let (epoch, key) = self.group_keys.new_owner_epoch(room_id);
             let all: Vec<String> = union_new.iter().cloned().collect();
@@ -2761,13 +2797,14 @@ impl ConnectionManager {
         let supernode_id = self.current_supernode_id.clone();
         use base64::Engine;
 
-        // E2E-seal the Opus frame under the room's group key: the base64 `audio`
-        // field carries `[epoch][nonce][aesgcm(opus)]` instead of plaintext
-        // Opus, with `AAD = room_id ‖ sender ‖ seq`. The relay forwards the
-        // signed envelope blind. With real sender keys, no key means we haven't
-        // been keyed into the room yet (or are mid-rekey) — drop the frame
-        // rather than leak plaintext; a 20 ms gap is inaudible and keying is
-        // near-instant at join.
+        // E2E-seal under real group-key material only. The deterministic
+        // fallback is not supernode-opaque (key = f(room_id)); drop until the
+        // elected keyer's SfuGroupKey is installed. A few 20 ms frames of
+        // silence at join is preferable to content the relay can derive.
+        if !self.group_keys.has_real_key(&room_id) {
+            warn!("[room.audio.sfu] no real group key yet; dropping frame");
+            return;
+        }
         let seq = self.room_audio_seq;
         let Some(sealed) = crate::group_key::seal_voice_frame(
             &self.group_keys,
@@ -2776,7 +2813,7 @@ impl ConnectionManager {
             seq,
             &opus_data,
         ) else {
-            debug!("[room.audio.sfu] no group key for room yet; dropping frame");
+            warn!("[room.audio.sfu] seal failed; dropping frame");
             return;
         };
         self.room_audio_seq = self.room_audio_seq.wrapping_add(1);
@@ -2885,31 +2922,31 @@ impl ConnectionManager {
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
         // E2E-seal the body under the room group key (`AAD = room_id ‖ sender ‖
-        // message_id`), carrying `nonce ‖ aesgcm(body)` in `body` plus `e2e`/
-        // `epoch`. If we have no key yet (race right after join), fall back to
-        // cleartext so the message isn't lost — the receiver auto-detects.
-        match crate::group_key::seal_chat_body(
+        // message_id`). Fail closed until real (distributed) key material is
+        // installed — the deterministic fallback is not confidential vs. the
+        // supernode (it knows `room_id`), and cleartext is worse. Keying is
+        // near-instant at join with ACK/reseal.
+        if !self.group_keys.has_real_key(room_id) {
+            warn!("[room.chat] no real group key for room yet; dropping outbound message");
+            return;
+        }
+        let Some((epoch, sealed)) = crate::group_key::seal_chat_body(
             &self.group_keys,
             room_id,
             &sender,
             message_id,
             body.as_bytes(),
-        ) {
-            Some((epoch, sealed)) => {
-                msg.payload.insert(
-                    "body".to_owned(),
-                    Value::String(crate::crypto::b64url_encode(&sealed)),
-                );
-                msg.payload.insert("e2e".to_owned(), Value::Bool(true));
-                msg.payload
-                    .insert("epoch".to_owned(), Value::Number((epoch as u64).into()));
-            }
-            None => {
-                warn!("[room.chat] no group key for room yet; sending cleartext body");
-                msg.payload
-                    .insert("body".to_owned(), Value::String(body.to_owned()));
-            }
-        }
+        ) else {
+            warn!("[room.chat] seal failed; dropping outbound message");
+            return;
+        };
+        msg.payload.insert(
+            "body".to_owned(),
+            Value::String(crate::crypto::b64url_encode(&sealed)),
+        );
+        msg.payload.insert("e2e".to_owned(), Value::Bool(true));
+        msg.payload
+            .insert("epoch".to_owned(), Value::Number((epoch as u64).into()));
         msg.payload.insert(
             "sender_handle".to_owned(),
             Value::String(sender_handle.to_owned()),
@@ -3481,13 +3518,13 @@ impl ConnectionManager {
             );
             return;
         }
-        // Positive mutual-trust gate for chat/call-class signaling. These
+        // Positive mutual-trust gate for chat/call/file-class signaling. These
         // message types are only honoured from peers we already trust (present
         // in the local store, not revoked/blocked). This both closes the
         // blocked-peer hole and — crucially — bounds the supernode relay
         // fallback: a supernode forwards anything peer-targeted, so without a
         // receiver-side trust check an untrusted peer sharing the same
-        // supernode could inject chat/call messages. With it, relay assist
+        // supernode could inject chat/call/file messages. With it, relay assist
         // works *only* between two mutually-trusted peers.
         if matches!(
             msg.msg_type,
@@ -3495,9 +3532,19 @@ impl ConnectionManager {
                 | MessageType::ChatAck
                 | MessageType::ChatTyping
                 | MessageType::CallRequest
+                | MessageType::CallAccept
+                | MessageType::CallReject
+                | MessageType::CallEnd
+                | MessageType::FileTransferOffer
+                | MessageType::FileTransferAccept
+                | MessageType::FileTransferReject
+                | MessageType::FileTransferChunk
+                | MessageType::FileTransferComplete
+                | MessageType::FileTransferAck
+                | MessageType::FileTransferError
         ) && !Self::is_trusted_sender(&self.peer_store, &msg.sender)
         {
-            debug!(
+            warn!(
                 "[signaling] dropping {:?} from untrusted or blocked peer {}",
                 msg.msg_type,
                 &msg.sender[..8.min(msg.sender.len())],
@@ -3720,13 +3767,13 @@ impl ConnectionManager {
                 }
             }
             MessageType::SfuGroupKey => {
-                // A room group key sealed to us by the room owner. This arm only
-                // runs after the outer `EncryptedSignal` was decrypted with our
-                // pairwise key (see the `EncryptedSignal` handler), so the key
-                // material never reached the supernode in the clear. We install
-                // it keyed by `(room_id, epoch)`; a wrong/hostile key only breaks
-                // our own decrypt (a DoS a room peer could already cause), not
-                // confidentiality. Owner authenticity hardens with Space grants.
+                // A room group key sealed to us by the elected keyer. Outer
+                // EncryptedSignal already proved pairwise possession of
+                // msg.sender's identity; we additionally require that sender
+                // is the elected keyer for this room's membership snapshot
+                // (or can be, once we include them) and that the epoch is
+                // plausible — rejecting random room peers who would otherwise
+                // pin us on a hostile key and silence decrypt (DoS).
                 let room_id = msg
                     .payload
                     .get("room_id")
@@ -3735,19 +3782,29 @@ impl ConnectionManager {
                 let epoch = msg.payload.get("epoch").and_then(Value::as_u64);
                 let key_b64 = msg.payload.get("key").and_then(Value::as_str);
                 if let (false, Some(epoch), Some(key_b64)) = (room_id.is_empty(), epoch, key_b64) {
+                    let epoch_u8 = epoch as u8;
+                    if !self.accept_group_key_from(&msg.sender, room_id, epoch_u8) {
+                        warn!(
+                            "[group-key] rejecting key epoch {} for room {} from {} (not elected keyer or bad epoch)",
+                            epoch_u8,
+                            &room_id[..8.min(room_id.len())],
+                            &msg.sender[..8.min(msg.sender.len())]
+                        );
+                        return;
+                    }
                     match crate::crypto::b64url_decode(key_b64) {
                         Ok(bytes) if bytes.len() == 32 => {
                             let mut key = [0u8; 32];
                             key.copy_from_slice(&bytes);
-                            self.group_keys.install(room_id, epoch as u8, key);
+                            self.group_keys.install(room_id, epoch_u8, key);
                             info!(
                                 "[group-key] installed epoch {} for room {} from {}",
-                                epoch,
+                                epoch_u8,
                                 &room_id[..8.min(room_id.len())],
                                 &msg.sender[..8.min(msg.sender.len())]
                             );
                             // Tell the keyer we have the material so they stop resealing.
-                            self.send_group_key_ack(room_id, epoch as u8, &msg.sender)
+                            self.send_group_key_ack(room_id, epoch_u8, &msg.sender)
                                 .await;
                         }
                         _ => warn!(
@@ -3988,7 +4045,7 @@ impl ConnectionManager {
                     match plaintext.and_then(|p| String::from_utf8(p).ok()) {
                         Some(s) => s,
                         None => {
-                            debug!(
+                            warn!(
                                 "[room.chat.v1] failed to open E2E body from {}; dropping",
                                 &msg.sender[..8.min(msg.sender.len())]
                             );
@@ -5707,7 +5764,7 @@ impl ConnectionManager {
                     data_owned.as_str()
                 }
                 None => {
-                    debug!(
+                    warn!(
                         "[room.file.v1] failed to open E2E chunk from {}; dropping",
                         &msg.sender[..8.min(msg.sender.len())]
                     );
@@ -5830,15 +5887,16 @@ impl ConnectionManager {
                     };
                     payload.insert("room_id".into(), Value::String(room_id.to_owned()));
                     let sender = self.identity.public_id();
-                    // E2E-seal the chunk `data` under the room group key
-                    // (`AAD = room_id ‖ sender ‖ transfer_id ‖ chunk_index`),
-                    // mirroring `room.chat.v1` body sealing. Falls back to
-                    // cleartext if no key is available yet (race right after
-                    // join) so the transfer isn't lost — the receiver
-                    // auto-detects via the `e2e` flag.
+                    // E2E-seal chunk data under real group-key material only
+                    // (deterministic fallback is not supernode-opaque). Drop
+                    // the chunk until keyed — receiver never gets cleartext.
                     if room_msg_type == MessageType::SfuFileChunk {
                         use base64::Engine;
                         let b64 = base64::engine::general_purpose::STANDARD;
+                        if !self.group_keys.has_real_key(room_id) {
+                            warn!("[room.file.v1] no real group key yet; dropping outbound chunk");
+                            continue;
+                        }
                         let transfer_id = payload
                             .get("transfer_id")
                             .and_then(Value::as_str)
@@ -5873,9 +5931,8 @@ impl ConnectionManager {
                                     );
                                 }
                                 None => {
-                                    warn!(
-                                        "[room.file.v1] no group key for room yet; sending cleartext chunk"
-                                    );
+                                    warn!("[room.file.v1] seal failed; dropping outbound chunk");
+                                    continue;
                                 }
                             }
                         }
