@@ -2053,10 +2053,7 @@ impl ConnectionManager {
             let (epoch, key) = self.group_keys.new_owner_epoch(room_id);
             let all: Vec<String> = union_new.iter().cloned().collect();
             self.distribute_group_key(room_id, epoch, &key, &all).await;
-        } else if !has_real {
-            // Elected but alone (or still no real key and no others) — wait.
-            return;
-        } else if removed {
+        } else if has_real && removed {
             // A member left the cluster entirely → rotate for forward secrecy
             // and reseal to the rest.
             let (epoch, key) = self.group_keys.rotate(room_id);
@@ -2064,7 +2061,7 @@ impl ConnectionManager {
             // Stale-epoch pendings for this room are obsolete after rotate.
             self.pending_group_key_acks.retain(|(r, _), _| r != room_id);
             self.distribute_group_key(room_id, epoch, &key, &all).await;
-        } else if !added.is_empty() {
+        } else if has_real && !added.is_empty() {
             // Pure join(s) → seal the current epoch to the newcomers only.
             let epoch = self.group_keys.current_epoch(room_id);
             if let Some(key) = self.group_keys.epoch_key(room_id, epoch) {
@@ -2072,6 +2069,7 @@ impl ConnectionManager {
                     .await;
             }
         }
+        // else: elected but alone (or still no real key and no others) — wait.
     }
 
     // -- QUIC direct connect ------------------------------------------------
