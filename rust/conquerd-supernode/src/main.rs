@@ -461,17 +461,10 @@ impl SupernodeState {
         }
     }
 
-    /// Broadcast a room-membership grant to cluster peers so any member admits
-    /// `allowed_peer` after a client fails over. No-op when standalone.
-    fn replicate_room_grant(&self, room_id: &str, room_name: &str, room_type: &str, peer: &str) {
-        if let Some(link) = self.cluster_link.read().clone() {
-            link.replicate_room_grant(room_id, room_name, room_type, peer);
-        }
-    }
-
-    /// Apply a room grant replicated from another cluster member: materialize the
-    /// room locally if absent and authorize the peer. Idempotent.
-    fn apply_room_grant(&self, room_id: &str, room_name: &str, room_type: &str, peer: &str) {
+    /// Local-only room admit: materialize the room if absent and authorize
+    /// `peer` on *this* node. Does **not** cluster-replicate membership —
+    /// cold members admit via Space proof (or creator / rematerialized token).
+    fn local_allow_room_peer(&self, room_id: &str, room_name: &str, room_type: &str, peer: &str) {
         let Some(ref sfu) = self.sfu else {
             return;
         };
@@ -481,7 +474,7 @@ impl SupernodeState {
         };
         let mut s = sfu.write();
         // creator "" → no implicit creator privileges; access is via the
-        // explicit allow below, mirroring the granting node's ACL.
+        // explicit allow below.
         s.create_room(Some(room_id), room_name, rtype, "");
         s.allow_peer(room_id, peer);
     }
@@ -489,8 +482,9 @@ impl SupernodeState {
     /// Materialize a durable room advertised in a peer's `RoomRoster` so this
     /// member can accept a failed-over join for it. Idempotent — `create_room`
     /// leaves an existing room untouched. Preserves the advertised `creator_id`
-    /// so the room owner retains self-admit/invite authority on any member; a
-    /// private room's other members still gain access via replicated `RoomGrant`.
+    /// so the room owner retains self-admit/invite authority on any member.
+    /// Non-owner private members re-admit via Space proof on join (or local
+    /// invite-token rematerialize) — not via cluster ACL push.
     fn apply_room_roster(&self, desc: &cluster_link::RoomDescriptor) {
         let Some(ref sfu) = self.sfu else {
             return;
@@ -523,12 +517,13 @@ impl SupernodeState {
         accepted
     }
 
-    /// Coexist proof-based admission (SPACE-MERKLE-DESIGN §5). If `payload`
-    /// carries space fields that verify against the current signed root for the
-    /// space, authorize `sender`, materialize the room from the proven node, and
-    /// return `true`. Returns `false` to fall through to the legacy token/ACL
-    /// path — absence or verification failure just means "not admitted by proof",
-    /// never an outright denial.
+    /// Proof-based admission (SPACE-MERKLE-DESIGN §5). If `payload` carries space
+    /// fields that verify against the current signed root for the space,
+    /// authorize `sender`, materialize the room from the proven node, and return
+    /// `true`. Returns `false` to fall through to the local invite-token path —
+    /// absence or verification failure just means "not admitted by proof", never
+    /// an outright denial. Cluster-wide membership is proof-carried; there is no
+    /// supernode-to-supernode room ACL push.
     fn try_space_admission(
         &self,
         sender: &str,
@@ -570,8 +565,8 @@ impl SupernodeState {
         // The proof shows the room provably exists in the signed Space, so
         // **materialize** it from the proven node if absent (§5.1: a proof is an
         // equally authoritative description) — even when entry is still gated by
-        // the legacy token below. This is the roster-free existence guarantee:
-        // any cluster member the joiner reaches can now serve/validate the room.
+        // a local invite token below. This is the roster-free existence
+        // guarantee: any cluster member the joiner reaches can serve the room.
         let rtype = if proof.node.node_type == "private" {
             "private"
         } else {
@@ -611,7 +606,7 @@ impl SupernodeState {
         }
 
         // Admission decision: public → proof-only; private → owner-signed grant
-        // bound to this peer. Only on a full pass do we allow + replicate.
+        // bound to this peer. Only on a full pass do we allow locally.
         let grant = payload
             .get("space_grant")
             .cloned()
@@ -622,12 +617,11 @@ impl SupernodeState {
             .unwrap_or(0);
         if !space_admission_ok(&root, &proof, grant.as_ref(), sender, room_id, now) {
             // Materialized but not admitted by proof (e.g. private room via a
-            // shareable link carrying no grant) → fall through to the token path,
-            // which can now validate against the just-materialized room.
+            // shareable link carrying no grant) → fall through to the local
+            // token path, which can now validate against the just-materialized room.
             return false;
         }
-        self.apply_room_grant(room_id, &proof.node.name, rtype, sender);
-        self.replicate_room_grant(room_id, &proof.node.name, rtype, sender);
+        self.local_allow_room_peer(room_id, &proof.node.name, rtype, sender);
         true
     }
 
@@ -2335,23 +2329,12 @@ impl SupernodeHandler {
 
             if !admitted && (is_creator || created_new) {
                 // Creator (or first materializer creating a brand-new room)
-                // self-admits without a token.
+                // self-admits without a token. Local allow only — cold cluster
+                // members re-admit via Space proof or rematerialize + token re-seed.
                 let _ = sfu.write().allow_peer(&room_id_out, &msg.sender);
-                admitted = true;
                 if created_new && invite_token.is_none() {
                     invite_token = sfu.write().generate_invite_token(&room_id_out, creator_id);
                 }
-            }
-
-            if admitted {
-                // Replicate the grant so other cluster members admit this peer
-                // on failover (same path as invite accept).
-                self.state.replicate_room_grant(
-                    &room_id_out,
-                    &room_name_out,
-                    "private",
-                    &msg.sender,
-                );
             }
         }
 
@@ -2386,16 +2369,15 @@ impl SupernodeHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Proof-based admission first (coexist): it materializes + allows +
-        // replicates on its own. Otherwise fall back to the legacy token.
+        // Proof-based admission first (cluster-portable). Otherwise fall back
+        // to the local invite token or already-allowed re-entry on this node.
         let has_proof = msg.payload.get("space_proof").is_some();
         let room_exists = sfu.read().get_room(room_id).is_some();
-        // Re-entry: a peer previously admitted to this private room is still in
-        // its `allowed` set (grants replicate cluster-wide). The single-use
-        // invite token is consumed on the first join, so on every subsequent
-        // re-entry the client re-sends a now-spent token and would otherwise be
-        // rejected — stranding the member out of a room they already belong to
-        // (they never even reach `SfuJoin`). Admit already-allowed peers directly.
+        // Re-entry: a peer previously admitted on *this* node is still in its
+        // local `allowed` set. The single-use invite token is consumed on first
+        // use, so subsequent re-entry re-sends a spent token — admit already-
+        // allowed peers directly (same node only; cold nodes need Space proof
+        // or token rematerialize).
         let already_member = sfu
             .read()
             .get_room(room_id)
@@ -2424,19 +2406,6 @@ impl SupernodeHandler {
             .read()
             .get_room(room_id)
             .map(|r| (r.room_name.clone(), r.room_type, r.participant_count()));
-
-        // Replicate the accepted grant so any cluster member admits this peer.
-        // The proof path already replicated inside `try_space_admission`.
-        if valid && !by_proof {
-            if let Some((ref name, rtype, _)) = room_info {
-                let type_str = match rtype {
-                    sfu::RoomType::Public => "public",
-                    sfu::RoomType::Private => "private",
-                };
-                self.state
-                    .replicate_room_grant(room_id, name, type_str, &msg.sender);
-            }
-        }
 
         if let Some((name, rtype, count)) = room_info {
             self.state.send_signed(
@@ -2720,14 +2689,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             })
         };
-        let on_room_grant: cluster_link::OnRoomGrantFn = {
-            let weak = weak.clone();
-            Arc::new(move |g: cluster_link::RoomGrant| {
-                if let Some(state) = weak.upgrade() {
-                    state.apply_room_grant(&g.room_id, &g.room_name, &g.room_type, &g.allowed_peer);
-                }
-            })
-        };
         let on_room_roster: cluster_link::OnRoomRosterFn = {
             let weak = weak.clone();
             Arc::new(move |desc: cluster_link::RoomDescriptor| {
@@ -2803,7 +2764,6 @@ async fn main() -> anyhow::Result<()> {
             identity.clone(),
             membership,
             on_replicate,
-            on_room_grant,
             on_room_roster,
             on_peer_auth,
             on_space_root,

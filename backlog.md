@@ -43,13 +43,14 @@ audio now fail closed (drop) instead of falling back to cleartext when no real k
 `docs/SPACE-MERKLE-DESIGN.md` is the authoritative not-done list (Layer 1 shipped). In brief:
 
 - **Layer 1 gaps:** `"members"` invite-policy widening, client UI toggle for invite policy, periodic
-  Space-root re-broadcast, root-equivocation flagging (lighter mitigation), and deeper nesting
-  (sub-rooms under any existing room, arbitrary depth via `parent_id`) are all **done** — see the
-  "Already shipped" section of `docs/SPACE-MERKLE-DESIGN.md`. Still open: legacy-roster-path removal
-  + migration criteria (gated on production verification, not actionable yet) and the CT-style
-  append-only history tree redesign (the heavier alternative to the shipped equivocation-logging
-  mitigation). The backlog's `Closet` idea (a distinct node `kind` for a different semantic, e.g.
-  text-only sub-channels) remains a separate, unbuilt, additive refinement — not required for depth.
+  Space-root re-broadcast, root-equivocation flagging (lighter mitigation), deeper nesting
+  (sub-rooms under any existing room, arbitrary depth via `parent_id`), and **legacy cluster
+  RoomGrant ACL removal** (per-peer room membership no longer cluster-replicated; cold nodes admit
+  via Space proof / local token rematerialize / creator self-admit; `RoomRoster` remains existence-
+  only) are all **done** — see `docs/SPACE-MERKLE-DESIGN.md`. Still open: the CT-style append-only
+  history tree redesign (heavier alternative to the shipped equivocation-logging mitigation). The
+  backlog's `Closet` idea (a distinct node `kind` for a different semantic, e.g. text-only
+  sub-channels) remains a separate, unbuilt, additive refinement — not required for depth.
 - **Layer 2:** per-node epoch secrets, HKDF inheritance down `inherit=true` edges
   (`child_key = HKDF(parent_epoch_secret, "space-node" ‖ node_id)`, grants downward only),
   `inherit=false` compartments sealed with their own pairwise-distributed group key (owner → each

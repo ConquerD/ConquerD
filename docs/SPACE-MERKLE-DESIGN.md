@@ -30,16 +30,20 @@ re-track shipped status; do not re-design any of the above without a reason logg
 
 ## Open items
 
-### 1. Legacy roster-path removal + migration criteria (§5, deferred by decision — not actionable yet)
+### 1. Legacy cluster RoomGrant path — **shipped / removed** (pre-release, 2026-07)
 
-Proofs are currently added **beside** the token/ACL flow (`SFURoom.allowed`,
-`generate_invite_token`/`validate_and_consume_token`, `RoomGrant`/`PeerAuth` replication), all
-unchanged. Removal of the roster path is gated on: (a) failover joins succeeding on cluster members
-that never saw the room's `RoomGrant`s, verified on the acdc dev cluster; (b) golden tests locked;
-(c) no schema bump for one full client/supernode release cycle. Until then room creation keeps
-emitting `RoomGrant` replication in parallel. **Status: criteria not yet met** — this is a
-production-verification gate, not an engineering task, and must not be actioned until (a)–(c) are
-satisfied on the live cluster over a full release cycle.
+Cluster no longer replicates per-peer private-room ACLs (`ClusterMsgKind::RoomGrant` deleted).
+Admission model:
+
+| Path | Scope |
+|---|---|
+| **Space proof + grant** (`try_space_admission`) | Cluster-portable: materialize + local `allow_peer` on any node |
+| **RoomRoster** gossip | Room *existence* + `creator_id` / `invite_policy` on every member |
+| **Local invite token** + local `allowed` | Same-node rejoin, shareable links, GC rematerialize re-seed |
+| **Creator self-admit** | Owner joins without token/proof |
+| **PeerAuth** | Unrelated: client trust / relay auth (kept) |
+
+Pre-release: all cluster nodes redeploy together; mixed-version RoomGrant is not supported.
 
 ### 2. Root-equivocation: append-only history tree redesign (§9, heavier alternative — deferred)
 
