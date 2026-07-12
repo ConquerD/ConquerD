@@ -1387,14 +1387,12 @@ impl ConnectionManager {
     /// Fixed first-party channel tag for a message type, if it rides a
     /// dedicated channel rather than the control/signaling channel.
     ///
-    /// Chat (`core.chat.v1` → `CHAT_TAG`) and file transfer
-    /// (`core.file.v1` → `FILE_TAG`) are multiplexed onto their own tags on
-    /// the QUIC peer stream; everything else stays on the untagged control
-    /// channel.
-    fn channel_tag_for(msg_type: MessageType) -> Option<u8> {
+    /// Channel tag for a message on the QUIC peer stream. Chat and file ride
+    /// dedicated tags; everything else uses the control channel tag.
+    fn channel_tag_for(msg_type: MessageType) -> u8 {
         match msg_type {
             MessageType::ChatMessage | MessageType::ChatAck | MessageType::ChatTyping => {
-                Some(channel_frame::CHAT_TAG)
+                channel_frame::CHAT_TAG
             }
             MessageType::FileTransferOffer
             | MessageType::FileTransferAccept
@@ -1402,8 +1400,8 @@ impl ConnectionManager {
             | MessageType::FileTransferChunk
             | MessageType::FileTransferComplete
             | MessageType::FileTransferAck
-            | MessageType::FileTransferError => Some(channel_frame::FILE_TAG),
-            _ => None,
+            | MessageType::FileTransferError => channel_frame::FILE_TAG,
+            _ => channel_frame::CONTROL_TAG,
         }
     }
 
@@ -1582,15 +1580,10 @@ impl ConnectionManager {
                 }
             });
             if let Some(sig_tx) = quic_sig_tx {
-                // Chat and file ride dedicated channel tags on the
-                // QUIC peer stream instead of the pure (control)
-                // signaling channel. Control messages stay untagged
-                // (raw JSON) for backward compatibility — the inbound
-                // classifier treats a leading `{` as control.
-                let bytes = match Self::channel_tag_for(msg_type.clone()) {
-                    Some(tag) => channel_frame::encode_frame(tag, json.as_bytes()),
-                    None => json.as_bytes().to_vec(),
-                };
+                // Every peer-stream frame is tagged: chat/file dedicated
+                // tags, control for all other signaling.
+                let tag = Self::channel_tag_for(msg_type.clone());
+                let bytes = channel_frame::encode_frame(tag, json.as_bytes());
                 if sig_tx.try_send(bytes).is_ok() {
                     return;
                 }
@@ -2280,10 +2273,8 @@ impl ConnectionManager {
             }
             InternalEvent::QuicSignalingData { peer_id, data } => {
                 let canonical_peer_id = self.resolve_quic_peer_alias(&peer_id);
-                // The QUIC peer stream multiplexes several channels via a
-                // 1-byte leading tag. `classify` accepts both the tagged
-                // framing and legacy untagged JSON (leading `{`) so a peer
-                // that predates tagging still interoperates on control.
+                // The QUIC peer stream multiplexes channels via a 1-byte
+                // leading tag. Untagged frames are rejected.
                 match channel_frame::classify(&data) {
                     // Direct peer audio: `[AUDIO_TAG][id_len][peer_id][opus]`.
                     Some(FrameClass::Audio(rest)) if rest.len() > 1 => {
@@ -2316,10 +2307,7 @@ impl ConnectionManager {
                     // freshness checks, then feature dispatch). The channel
                     // tag selects the transport lane, not the validation.
                     Some(
-                        FrameClass::Chat(body)
-                        | FrameClass::File(body)
-                        | FrameClass::Control(body)
-                        | FrameClass::UntaggedControl(body),
+                        FrameClass::Chat(body) | FrameClass::File(body) | FrameClass::Control(body),
                     ) => {
                         if let Ok(text) = std::str::from_utf8(body) {
                             if let Ok(msg) = SignalingMessage::from_json(text) {
@@ -4087,47 +4075,49 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
-                // E2E: when `e2e`, `body` is `b64(nonce ‖ aesgcm(body))` sealed
-                // under the room group key with `AAD = room_id ‖ sender ‖
-                // message_id`. Decrypt before surfacing; drop on failure. Absent
-                // `e2e` → legacy cleartext (interop).
-                let is_e2e = msg
+                // Room chat is E2E-only: `body` is `b64(nonce ‖ aesgcm(body))`
+                // under the room group key (AAD = room_id ‖ sender ‖
+                // message_id). Cleartext (missing `e2e`) is rejected.
+                if !msg
                     .payload
                     .get("e2e")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let body = if is_e2e {
-                    let epoch = msg
-                        .payload
-                        .get("epoch")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(u64::MAX);
-                    let sealed = match crate::crypto::b64url_decode(&raw_body) {
-                        Ok(b) => b,
-                        Err(_) => return,
-                    };
-                    let plaintext = epoch.try_into().ok().and_then(|e: u8| {
-                        crate::group_key::open_chat_body(
-                            &self.group_keys,
-                            &room_id,
-                            &msg.sender,
-                            &message_id,
-                            e,
-                            &sealed,
-                        )
-                    });
-                    match plaintext.and_then(|p| String::from_utf8(p).ok()) {
-                        Some(s) => s,
-                        None => {
-                            warn!(
-                                "[room.chat.v1] failed to open E2E body from {}; dropping",
-                                &msg.sender[..8.min(msg.sender.len())]
-                            );
-                            return;
-                        }
+                    .unwrap_or(false)
+                {
+                    warn!(
+                        "[room.chat.v1] cleartext body rejected from {}; dropping",
+                        &msg.sender[..8.min(msg.sender.len())]
+                    );
+                    return;
+                }
+                let epoch = msg
+                    .payload
+                    .get("epoch")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX);
+                let sealed = match crate::crypto::b64url_decode(&raw_body) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let plaintext = epoch.try_into().ok().and_then(|e: u8| {
+                    crate::group_key::open_chat_body(
+                        &self.group_keys,
+                        &room_id,
+                        &msg.sender,
+                        &message_id,
+                        e,
+                        &sealed,
+                    )
+                });
+                let body = match plaintext.and_then(|p| String::from_utf8(p).ok()) {
+                    Some(s) => s,
+                    None => {
+                        warn!(
+                            "[room.chat.v1] failed to open E2E body from {}; dropping",
+                            &msg.sender[..8.min(msg.sender.len())]
+                        );
+                        return;
                     }
-                } else {
-                    raw_body
                 };
                 if !body.is_empty() {
                     // Enforce the room.chat.v1 per-sender inbound quota,
@@ -4186,48 +4176,51 @@ impl ConnectionManager {
                 if raw.is_empty() {
                     return;
                 }
-                // When the sender marked the frame E2E, `raw` is the sealed
-                // `[epoch][nonce][aesgcm(opus)]`; open it under the room group
-                // key, reconstructing `AAD = room_id ‖ sender ‖ seq` from the
-                // (signature-authenticated) envelope. `e2e`/`seq` absent →
-                // legacy cleartext Opus (interop / pre-E2E peers).
-                let is_e2e = msg
+                // Room audio is E2E-only: `raw` is sealed
+                // `[epoch][nonce][aesgcm(opus)]` under the room group key
+                // (AAD = room_id ‖ sender ‖ seq from the signature-
+                // authenticated envelope). Cleartext (missing `e2e`) is
+                // rejected.
+                if !msg
                     .payload
                     .get("e2e")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let opus_data = if is_e2e {
-                    let room_id = msg
-                        .payload
-                        .get("room_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let seq = msg
-                        .payload
-                        .get("seq")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(u64::MAX);
-                    match crate::group_key::open_voice_frame(
-                        &self.group_keys,
-                        room_id,
-                        &msg.sender,
-                        seq,
-                        &raw,
-                    ) {
-                        Some(opus) => opus,
-                        None => {
-                            // warn: a persistent open failure means group-key
-                            // desync (missed/unsigned SfuGroupKey install) —
-                            // audio is fully silent until keys reconverge.
-                            warn!(
-                                "[room.audio.sfu] failed to open E2E frame from {}; dropping",
-                                &msg.sender[..8.min(msg.sender.len())]
-                            );
-                            return;
-                        }
+                    .unwrap_or(false)
+                {
+                    warn!(
+                        "[room.audio.sfu] cleartext frame rejected from {}; dropping",
+                        &msg.sender[..8.min(msg.sender.len())]
+                    );
+                    return;
+                }
+                let room_id = msg
+                    .payload
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let seq = msg
+                    .payload
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX);
+                let opus_data = match crate::group_key::open_voice_frame(
+                    &self.group_keys,
+                    room_id,
+                    &msg.sender,
+                    seq,
+                    &raw,
+                ) {
+                    Some(opus) => opus,
+                    None => {
+                        // Persistent open failure means group-key desync
+                        // (missed/unsigned SfuGroupKey install) — audio is
+                        // silent until keys reconverge.
+                        warn!(
+                            "[room.audio.sfu] failed to open E2E frame from {}; dropping",
+                            &msg.sender[..8.min(msg.sender.len())]
+                        );
+                        return;
                     }
-                } else {
-                    raw
                 };
                 if opus_data.is_empty() {
                     return;
@@ -4854,9 +4847,6 @@ impl ConnectionManager {
                         } else {
                             vec![pending.relay_hint.clone()]
                         };
-                        if pending.is_supernode && !pending.relay_hint.is_empty() {
-                            store.grandfather_supernode_ws_hint_sharing(&pending.relay_hint);
-                        }
                         store.upsert_from_invite(crate::peer_store::PeerRecord {
                             peer_id: inviter_peer_id.clone(),
                             identity_pub: inviter_identity_pub.clone(),
@@ -5362,7 +5352,6 @@ impl ConnectionManager {
         // restart / shows in the Nodes tab. Mirrors the supernode-invite path.
         if !supernode_hint.is_empty() {
             let mut store = self.peer_store.write();
-            store.grandfather_supernode_ws_hint_sharing(&supernode_hint);
             store.upsert_from_invite(crate::peer_store::PeerRecord {
                 peer_id: supernode_id.clone(),
                 identity_pub: supernode_id.clone(),
@@ -5551,9 +5540,6 @@ impl ConnectionManager {
                 } else {
                     vec![supernode_hint.clone()]
                 };
-                if !supernode_hint.is_empty() {
-                    store.grandfather_supernode_ws_hint_sharing(&supernode_hint);
-                }
                 store.upsert_from_invite(crate::peer_store::PeerRecord {
                     peer_id: inviter_peer_id.clone(),
                     identity_pub: inviter_identity_pub.clone(),
@@ -5794,61 +5780,60 @@ impl ConnectionManager {
         if !self.gate_through_feature("room.file.v1", &msg.sender, &probe) {
             return;
         }
-        // E2E: when `e2e`, `data` is `base64(nonce ‖ aesgcm(data))` sealed
-        // under the room group key with `AAD = room_id ‖ sender ‖
-        // transfer_id ‖ chunk_index`. Decrypt and re-encode as plain base64
-        // (the format `FileTransferManager::on_chunk_received` expects)
-        // before handing off; drop on failure. Absent `e2e` → legacy
-        // cleartext (interop).
-        let is_e2e = msg
+        // Room file chunks are E2E-only: `data` is
+        // `base64(nonce ‖ aesgcm(data))` under the room group key
+        // (AAD = room_id ‖ sender ‖ transfer_id ‖ chunk_index). Decrypt and
+        // re-encode as plain base64 for `FileTransferManager::on_chunk_received`.
+        // Cleartext (missing `e2e`) is rejected.
+        if !msg
             .payload
             .get("e2e")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let data_owned;
-        let data: &str = if is_e2e {
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let room_id = msg
-                .payload
-                .get("room_id")
-                .and_then(Value::as_str)
-                .unwrap_or("default");
-            let epoch = msg
-                .payload
-                .get("epoch")
-                .and_then(Value::as_u64)
-                .unwrap_or(u64::MAX);
-            let Ok(sealed) = b64.decode(raw_data) else {
-                return;
-            };
-            let plaintext = epoch.try_into().ok().and_then(|e: u8| {
-                crate::group_key::open_file_chunk(
-                    &self.group_keys,
-                    room_id,
-                    &msg.sender,
-                    &tid,
-                    idx as u64,
-                    e,
-                    &sealed,
-                )
-            });
-            match plaintext {
-                Some(p) => {
-                    data_owned = b64.encode(p);
-                    data_owned.as_str()
-                }
-                None => {
-                    warn!(
-                        "[room.file.v1] failed to open E2E chunk from {}; dropping",
-                        &msg.sender[..8.min(msg.sender.len())]
-                    );
-                    return;
-                }
-            }
-        } else {
-            raw_data
+            .unwrap_or(false)
+        {
+            warn!(
+                "[room.file.v1] cleartext chunk rejected from {}; dropping",
+                &msg.sender[..8.min(msg.sender.len())]
+            );
+            return;
+        }
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let room_id = msg
+            .payload
+            .get("room_id")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        let epoch = msg
+            .payload
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        let Ok(sealed) = b64.decode(raw_data) else {
+            return;
         };
+        let plaintext = epoch.try_into().ok().and_then(|e: u8| {
+            crate::group_key::open_file_chunk(
+                &self.group_keys,
+                room_id,
+                &msg.sender,
+                &tid,
+                idx as u64,
+                e,
+                &sealed,
+            )
+        });
+        let data_owned = match plaintext {
+            Some(p) => b64.encode(p),
+            None => {
+                warn!(
+                    "[room.file.v1] failed to open E2E chunk from {}; dropping",
+                    &msg.sender[..8.min(msg.sender.len())]
+                );
+                return;
+            }
+        };
+        let data: &str = data_owned.as_str();
         let evs = self.room_file_mgr.on_chunk_received(&tid, idx, data);
         self.dispatch_room_transfer_events(evs, "", "").await;
     }

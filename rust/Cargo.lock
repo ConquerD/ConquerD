@@ -687,7 +687,6 @@ dependencies = [
  "futures-util",
  "hex",
  "hkdf",
- "hmac",
  "parking_lot",
  "quinn",
  "rand 0.8.6",

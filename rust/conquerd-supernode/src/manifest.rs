@@ -27,9 +27,9 @@
 //! kind = "request"
 //! ```
 //!
-//! When the file is missing the manifest is *derived* from the legacy
-//! env-var toggles in [`crate::config::Config`] for back-compat. New
-//! installs should commit a `supernode.toml` and stop relying on env vars.
+//! When the file is missing the loader returns a full first-party
+//! [`SupernodeManifest::default_manifest`]. Operators and the supernode-manager
+//! should write `supernode.toml` for durable control.
 
 use std::path::Path;
 
@@ -159,44 +159,33 @@ impl SupernodeManifest {
         Ok(m)
     }
 
-    /// Load `<data_dir>/supernode.toml` if it exists, else derive a
-    /// manifest from the env-var-driven [`Config`] for back-compat.
-    pub fn load_or_derive(data_dir: &Path, config: &Config) -> Result<Self, ManifestError> {
+    /// Load `<data_dir>/supernode.toml` if it exists, else return the full
+    /// first-party [`default_manifest`].
+    pub fn load_or_default(data_dir: &Path) -> Result<Self, ManifestError> {
         let path = data_dir.join("supernode.toml");
         if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
             return Self::from_toml_str(&raw);
         }
-        Ok(Self::from_legacy_config(config))
+        Ok(Self::default_manifest())
     }
 
-    /// Build a manifest reflecting today's env-var toggles. Used when no
-    /// `supernode.toml` is present so operators can upgrade in place.
-    pub fn from_legacy_config(config: &Config) -> Self {
-        let mut features = vec![
-            // Transport capabilities are always hosted — they describe
-            // the wire format, not optional functionality.
-            FeatureEntry::just("transport.quic.relay.v1"),
-            FeatureEntry::just("transport.quic.stream.v1"),
-            FeatureEntry::just("transport.quic.feature_datagram.v1"),
-        ];
-        if config.chat_enabled {
-            features.push(FeatureEntry::just("core.chat.v1"));
-            features.push(FeatureEntry::just("room.chat.v1"));
-        }
-        if config.files_enabled {
-            features.push(FeatureEntry::just("core.file.v1"));
-            features.push(FeatureEntry::just("room.file.v1"));
-        }
-        if config.sfu_enabled {
-            features.push(FeatureEntry::just("room.audio.sfu"));
-        }
-        // Portal surfaces ship enabled by default on every supernode.
-        features.push(FeatureEntry::just("web.host.h3.v1"));
-        features.push(FeatureEntry::just("web.host.app.v1"));
+    /// Full first-party capability set used when no `supernode.toml` is present.
+    pub fn default_manifest() -> Self {
         SupernodeManifest {
             schema_version: SCHEMA_VERSION,
-            features,
+            features: vec![
+                FeatureEntry::just("transport.quic.relay.v1"),
+                FeatureEntry::just("transport.quic.stream.v1"),
+                FeatureEntry::just("transport.quic.feature_datagram.v1"),
+                FeatureEntry::just("core.chat.v1"),
+                FeatureEntry::just("room.chat.v1"),
+                FeatureEntry::just("core.file.v1"),
+                FeatureEntry::just("room.file.v1"),
+                FeatureEntry::just("room.audio.sfu"),
+                FeatureEntry::just("web.host.h3.v1"),
+                FeatureEntry::just("web.host.app.v1"),
+            ],
             ..Default::default()
         }
     }
@@ -687,69 +676,43 @@ mod tests {
     }
 
     #[test]
-    fn legacy_config_includes_chat_when_enabled() {
-        let mut config = Config {
-            signaling_port: 0,
-            relay_port: 0,
-            web_port: None,
-            chat_enabled: true,
-            files_enabled: false,
-            sfu_enabled: false,
-            updates_enabled: false,
-            auto_restart: false,
-            invite_ttl_seconds: -1,
-            web_title: String::new(),
-            access_mode: crate::config::AccessMode::Open,
-            access_code: String::new(),
-            ad_duration: 0,
-            tos_text: String::new(),
-            ad_content: String::new(),
-            demo_links: false,
-            external_host: None,
-            data_dir: std::path::PathBuf::from("."),
-            web_localhost_only: false,
-        };
-        let m = SupernodeManifest::from_legacy_config(&config);
+    fn default_manifest_includes_first_party_stack() {
+        let m = SupernodeManifest::default_manifest();
         let ids: Vec<&str> = m.features.iter().map(|f| f.id.as_str()).collect();
-        assert!(ids.contains(&"core.chat.v1"));
-        assert!(ids.contains(&"room.chat.v1"));
-        assert!(!ids.contains(&"core.file.v1"));
-        assert!(!ids.contains(&"room.file.v1"));
-        assert!(!ids.contains(&"room.audio.sfu"));
-        assert!(ids.contains(&"web.host.h3.v1"));
-        assert!(ids.contains(&"web.host.app.v1"));
-
-        config.files_enabled = true;
-        config.sfu_enabled = true;
-        let m = SupernodeManifest::from_legacy_config(&config);
-        let ids: Vec<&str> = m.features.iter().map(|f| f.id.as_str()).collect();
-        assert!(ids.contains(&"core.file.v1"));
-        assert!(ids.contains(&"room.file.v1"));
-        assert!(ids.contains(&"room.audio.sfu"));
-        assert!(!ids.contains(&"web.host.https"));
-        assert!(ids.contains(&"web.host.h3.v1"));
-        assert!(ids.contains(&"web.host.app.v1"));
+        for expected in [
+            "core.chat.v1",
+            "room.chat.v1",
+            "core.file.v1",
+            "room.file.v1",
+            "room.audio.sfu",
+            "web.host.h3.v1",
+            "web.host.app.v1",
+            "transport.quic.relay.v1",
+        ] {
+            assert!(ids.contains(&expected), "missing {expected}");
+        }
     }
 
     #[test]
-    fn load_or_derive_falls_back_when_missing() {
+    fn load_or_default_when_missing() {
         let tmp = tempdir();
-        let config = legacy_config_for(&tmp);
-        let m = SupernodeManifest::load_or_derive(&tmp, &config).unwrap();
-        // Default Config has chat+files+sfu enabled (env defaults).
+        let m = SupernodeManifest::load_or_default(&tmp).unwrap();
         assert!(!m.features.is_empty());
+        assert_eq!(
+            m.features.len(),
+            SupernodeManifest::default_manifest().features.len()
+        );
     }
 
     #[test]
-    fn load_or_derive_reads_existing_file() {
+    fn load_or_default_reads_existing_file() {
         let tmp = tempdir();
         std::fs::write(
             tmp.join("supernode.toml"),
             "schema_version = 1\n[[feature]]\nid = \"core.chat.v1\"\n",
         )
         .unwrap();
-        let config = legacy_config_for(&tmp);
-        let m = SupernodeManifest::load_or_derive(&tmp, &config).unwrap();
+        let m = SupernodeManifest::load_or_default(&tmp).unwrap();
         assert_eq!(m.features.len(), 1);
         assert_eq!(m.features[0].id, "core.chat.v1");
     }

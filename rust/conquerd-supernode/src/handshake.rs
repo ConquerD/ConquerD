@@ -365,66 +365,47 @@ impl HandshakeManager {
             .and_then(|v| v.as_str())
             .ok_or("missing joiner_peer_id")?;
 
-        let (transcript_hash, session_key) =
-            match payload.get("joiner_ephemeral_pub").and_then(|v| v.as_str()) {
-                Some(joiner_ephemeral_pub_b64) => {
-                    // Decode joiner's ephemeral X25519 public key
-                    let joiner_eph_bytes =
-                        b64url_decode(joiner_ephemeral_pub_b64).map_err(|e| e.to_string())?;
-                    if joiner_eph_bytes.len() != 32 {
-                        return Err("joiner_ephemeral_pub must be 32 bytes".into());
-                    }
-                    let mut eph_arr = [0u8; 32];
-                    eph_arr.copy_from_slice(&joiner_eph_bytes);
-                    let joiner_eph_pub = x25519_dalek::PublicKey::from(eph_arr);
+        // X25519 ECDH is required — no legacy path without joiner_ephemeral_pub.
+        let joiner_ephemeral_pub_b64 = payload
+            .get("joiner_ephemeral_pub")
+            .and_then(|v| v.as_str())
+            .ok_or("missing joiner_ephemeral_pub")?;
+        // Decode joiner's ephemeral X25519 public key
+        let joiner_eph_bytes =
+            b64url_decode(joiner_ephemeral_pub_b64).map_err(|e| e.to_string())?;
+        if joiner_eph_bytes.len() != 32 {
+            return Err("joiner_ephemeral_pub must be 32 bytes".into());
+        }
+        let mut eph_arr = [0u8; 32];
+        eph_arr.copy_from_slice(&joiner_eph_bytes);
+        let joiner_eph_pub = x25519_dalek::PublicKey::from(eph_arr);
 
-                    // ECDH
-                    let shared_secret = x25519_exchange(&pending.ephemeral_secret, &joiner_eph_pub);
-                    // A zero shared secret means the joiner supplied a low-order X25519 point
-                    // (small-subgroup attack).  Abort before deriving any key material.
-                    if shared_secret.iter().all(|&b| b == 0) {
-                        return Err("low-order X25519 point rejected".into());
-                    }
+        // ECDH
+        let shared_secret = x25519_exchange(&pending.ephemeral_secret, &joiner_eph_pub);
+        // A zero shared secret means the joiner supplied a low-order X25519 point
+        // (small-subgroup attack).  Abort before deriving any key material.
+        if shared_secret.iter().all(|&b| b == 0) {
+            return Err("low-order X25519 point rejected".into());
+        }
 
-                    // Transcript
-                    let transcript = serde_json::json!({
-                        "invite_id": invite_id,
-                        "inviter_ephemeral_pub": b64url_encode(pending.ephemeral_public.as_bytes()),
-                        "inviter_identity_pub": self.identity.public_id(),
-                        "joiner_ephemeral_pub": joiner_ephemeral_pub_b64,
-                        "joiner_identity_pub": joiner_identity_pub,
-                    });
-                    let transcript_bytes =
-                        serde_json::to_vec(&transcript).map_err(|e| e.to_string())?;
-                    let transcript_hash = sha256_hex(&transcript_bytes);
+        // Transcript
+        let transcript = serde_json::json!({
+            "invite_id": invite_id,
+            "inviter_ephemeral_pub": b64url_encode(pending.ephemeral_public.as_bytes()),
+            "inviter_identity_pub": self.identity.public_id(),
+            "joiner_ephemeral_pub": joiner_ephemeral_pub_b64,
+            "joiner_identity_pub": joiner_identity_pub,
+        });
+        let transcript_bytes = serde_json::to_vec(&transcript).map_err(|e| e.to_string())?;
+        let transcript_hash = sha256_hex(&transcript_bytes);
 
-                    // Session key via HKDF
-                    let mut ikm = Vec::new();
-                    ikm.extend_from_slice(&(shared_secret.len() as u32).to_be_bytes());
-                    ikm.extend_from_slice(&shared_secret);
-                    ikm.extend_from_slice(&(transcript_bytes.len() as u32).to_be_bytes());
-                    ikm.extend_from_slice(&transcript_bytes);
-                    let session_key = hkdf_sha256(&ikm, SESSION_KEY_INFO, 32);
-                    (transcript_hash, session_key)
-                }
-                None => {
-                    // Legacy Rust desktop client: signed INIT without X25519.
-                    // Trust is already established by the signed invite + Ed25519 INIT.
-                    tracing::warn!(
-                        "invite {invite_id}: legacy handshake init without joiner_ephemeral_pub"
-                    );
-                    let transcript = serde_json::json!({
-                        "invite_id": invite_id,
-                        "inviter_ephemeral_pub": b64url_encode(pending.ephemeral_public.as_bytes()),
-                        "inviter_identity_pub": self.identity.public_id(),
-                        "joiner_identity_pub": joiner_identity_pub,
-                        "legacy": true,
-                    });
-                    let transcript_bytes =
-                        serde_json::to_vec(&transcript).map_err(|e| e.to_string())?;
-                    (sha256_hex(&transcript_bytes), Vec::new())
-                }
-            };
+        // Session key via HKDF
+        let mut ikm = Vec::new();
+        ikm.extend_from_slice(&(shared_secret.len() as u32).to_be_bytes());
+        ikm.extend_from_slice(&shared_secret);
+        ikm.extend_from_slice(&(transcript_bytes.len() as u32).to_be_bytes());
+        ikm.extend_from_slice(&transcript_bytes);
+        let session_key = hkdf_sha256(&ikm, SESSION_KEY_INFO, 32);
 
         // Build INVITE_HANDSHAKE_ACCEPT payload
         let accept_payload = serde_json::json!({
@@ -629,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn process_init_accepts_legacy_init_without_ephemeral_key() {
+    fn process_init_rejects_missing_ephemeral_key() {
         let id = Identity::generate();
         let mut mgr = HandshakeManager::new(id, "ws://127.0.0.1:34935".into(), -1);
         let invite = mgr.create_invite(Some("TestNode"));
@@ -638,10 +619,8 @@ mod tests {
             "joiner_peer_id": "peer-joiner",
             "joiner_identity_pub": "JoinerPubIdExample",
         });
-        let (accept, session_key, joiner_pub) = mgr.process_init(&init_payload).unwrap();
-        assert_eq!(joiner_pub, "JoinerPubIdExample");
-        assert!(session_key.is_empty());
-        assert!(accept.get("transcript_hash").is_some());
+        let err = mgr.process_init(&init_payload).unwrap_err();
+        assert_eq!(err, "missing joiner_ephemeral_pub");
     }
 
     #[test]

@@ -93,28 +93,6 @@ pub fn hkdf_sha256(ikm: &[u8], info: &[u8], length: usize) -> Vec<u8> {
     okm
 }
 
-/// HMAC-SHA256 for web session tokens.
-/// Used by future portal session management; suppressed until wired up.
-#[allow(dead_code)]
-pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key length");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
-}
-
-/// Verify HMAC-SHA256 (constant-time).
-/// Used by future portal session management; suppressed until wired up.
-#[allow(dead_code)]
-pub fn hmac_sha256_verify(key: &[u8], data: &[u8], expected: &[u8]) -> bool {
-    use hmac::{Hmac, Mac};
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key length");
-    mac.update(data);
-    mac.verify_slice(expected).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,14 +120,5 @@ mod tests {
         let pub_key = [0u8; 32];
         let pid = derive_peer_id(&pub_key);
         assert_eq!(pid.len(), 64);
-    }
-
-    #[test]
-    fn test_hmac_sha256() {
-        let key = b"secret";
-        let data = b"message";
-        let mac = hmac_sha256(key, data);
-        assert!(hmac_sha256_verify(key, data, &mac));
-        assert!(!hmac_sha256_verify(key, b"wrong", &mac));
     }
 }

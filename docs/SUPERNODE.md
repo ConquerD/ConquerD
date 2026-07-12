@@ -67,7 +67,7 @@ Supported local package suffixes: `linux-x86_64`, `linux-aarch64`, `macos-arm64`
 
 CI validates packaging on all three release targets (`test-supernode-linux-x86_64`, `test-linux-arm64`, `test-supernode-windows` in `.github/workflows/ci.yml`).
 
-Hosted feature declarations are read from `<data_dir>/supernode.toml` (see below). Legacy environment variables are supported for backward compatibility, and built-in first-party descriptors are always present in the registry for quota and relay accounting.
+Hosted feature declarations are read from `<data_dir>/supernode.toml` (see below). If the file is missing, a full first-party default manifest is used. Built-in first-party descriptors are always present in the registry for quota and relay accounting.
 
 ## Configuration (supernode.toml)
 

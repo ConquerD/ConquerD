@@ -55,11 +55,10 @@ const RENEWAL_CHECK_INTERVAL_S: u64 = 60;
 const ENDPOINT_MAX_AGE_S: f64 = 86400.0;
 
 /// Build the supernode's [`FeatureRegistry`] from the manifest at
-/// `<data_dir>/supernode.toml`, falling back to the legacy env-var
-/// `Config` toggles when the file is absent. The manifest is the single
-/// source for operator-declared hosted features. Built-in first-party
-/// descriptors are upserted later so relay/quota accounting can still classify
-/// core, room, and game traffic when the manifest omits those entries.
+/// `<data_dir>/supernode.toml`, or the full first-party default when the file
+/// is absent / unreadable. Built-in first-party descriptors are upserted later
+/// so relay/quota accounting can still classify core, room, and game traffic
+/// when the manifest omits those entries.
 ///
 /// After registering well-known capabilities, any manifest entries with a
 /// `cdylib_manifest` path are loaded via [`NativeModuleLoader`]. Signer
@@ -67,14 +66,14 @@ const ENDPOINT_MAX_AGE_S: f64 = 86400.0;
 /// keys cause the entry to be skipped with a warning (no interactive
 /// prompt on the supernode — add keys to the file to pre-authorise them).
 fn load_manifest(config: &Config) -> manifest::SupernodeManifest {
-    match manifest::SupernodeManifest::load_or_derive(&config.data_dir, config) {
+    match manifest::SupernodeManifest::load_or_default(&config.data_dir) {
         Ok(m) => m,
         Err(e) => {
             warn!(
-                "[features] failed to load supernode.toml ({}); falling back to legacy env-var toggles",
+                "[features] failed to load supernode.toml ({}); using default first-party manifest",
                 e
             );
-            manifest::SupernodeManifest::from_legacy_config(config)
+            manifest::SupernodeManifest::default_manifest()
         }
     }
 }
@@ -1090,8 +1089,7 @@ impl SupernodeState {
     }
 
     /// Load endpoint mailbox from disk (filtering entries older than 24h).
-    /// Accepts both current format (JSON array of {peer_id, raw, stored_at})
-    /// and legacy format (JSON object {peer_id: {timestamp, ...raw_msg}}).
+    /// Expects a JSON array of `{peer_id, raw, stored_at}`.
     fn load_endpoint_mailbox(data_dir: &std::path::Path) -> HashMap<String, String> {
         let path = data_dir.join("supernode_endpoints.json");
         let mut result = HashMap::new();
@@ -1111,40 +1109,24 @@ impl SupernodeState {
             .unwrap()
             .as_secs_f64();
 
-        if let Some(entries) = parsed.as_array() {
-            // Rust format: [{peer_id, raw, stored_at}, ...]
-            for entry in entries {
-                let peer_id = entry.get("peer_id").and_then(|v| v.as_str()).unwrap_or("");
-                let raw = entry.get("raw").and_then(|v| v.as_str()).unwrap_or("");
-                let stored_at = entry
-                    .get("stored_at")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                if peer_id.is_empty() || raw.is_empty() {
-                    continue;
-                }
-                if now - stored_at > ENDPOINT_MAX_AGE_S {
-                    continue;
-                }
-                result.insert(peer_id.to_string(), raw.to_string());
+        let Some(entries) = parsed.as_array() else {
+            warn!("Unexpected endpoint mailbox format (expected JSON array)");
+            return result;
+        };
+        for entry in entries {
+            let peer_id = entry.get("peer_id").and_then(|v| v.as_str()).unwrap_or("");
+            let raw = entry.get("raw").and_then(|v| v.as_str()).unwrap_or("");
+            let stored_at = entry
+                .get("stored_at")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            if peer_id.is_empty() || raw.is_empty() {
+                continue;
             }
-        } else if let Some(obj) = parsed.as_object() {
-            // Legacy format: {peer_id: {timestamp: ..., ...raw_msg}}
-            for (peer_id, value) in obj {
-                let stored_at = value
-                    .get("timestamp")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                if now - stored_at > ENDPOINT_MAX_AGE_S {
-                    continue;
-                }
-                // Store the entire raw message JSON string for replay
-                if let Ok(raw) = serde_json::to_string(value) {
-                    result.insert(peer_id.clone(), raw);
-                }
+            if now - stored_at > ENDPOINT_MAX_AGE_S {
+                continue;
             }
-        } else {
-            warn!("Unexpected endpoint mailbox format");
+            result.insert(peer_id.to_string(), raw.to_string());
         }
 
         info!("Loaded {} endpoint mailbox entries", result.len());
@@ -1359,19 +1341,12 @@ fn audio_replication_id(msg: &SignalingMessage) -> String {
 
 /// Payload byte count for `SfuChat` inbound quota accounting.
 ///
-/// Prefer opaque `ciphertext` (E2E envelope) over legacy plaintext `body` so the
-/// supernode never needs to parse message content for quota.
+/// Payload byte count for `SfuChat` inbound quota (opaque sealed `body` length).
 fn sfu_chat_byte_count(msg: &SignalingMessage) -> usize {
     msg.payload
-        .get("ciphertext")
+        .get("body")
         .and_then(|v| v.as_str())
         .map(str::len)
-        .or_else(|| {
-            msg.payload
-                .get("body")
-                .and_then(|v| v.as_str())
-                .map(str::len)
-        })
         .unwrap_or(0)
 }
 
@@ -3440,13 +3415,12 @@ mod build_feature_registry_tests {
     }
 
     #[test]
-    fn falls_back_to_legacy_config_when_no_manifest() {
+    fn default_manifest_when_no_file() {
         let dir = tempdir();
         let config = cfg(dir);
         let manifest = load_manifest(&config);
         let registry = build_feature_registry(&manifest, &config);
         let ids: Vec<String> = registry.snapshot().iter().map(|c| c.id.clone()).collect();
-        // Legacy config has all toggles on => chat+files+sfu+portal present.
         assert!(ids.iter().any(|i| i == "core.chat.v1"));
         assert!(ids.iter().any(|i| i == "core.file.v1"));
         assert!(ids.iter().any(|i| i == "room.audio.sfu"));
@@ -3455,7 +3429,7 @@ mod build_feature_registry_tests {
     }
 
     #[test]
-    fn manifest_file_overrides_legacy_toggles() {
+    fn manifest_file_controls_advertised_features() {
         let dir = tempdir();
         std::fs::write(
             dir.join("supernode.toml"),

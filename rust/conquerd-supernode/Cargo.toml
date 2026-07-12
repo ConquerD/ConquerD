@@ -25,7 +25,6 @@ ed25519-dalek = { version = "2", features = ["rand_core", "pem", "serde"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ring = "0.17"
 sha2 = "0.10"
-hmac = "0.12"
 hkdf = "0.12"
 aes-gcm = "0.10"
 

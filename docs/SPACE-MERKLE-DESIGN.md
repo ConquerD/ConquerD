@@ -12,11 +12,12 @@ ecosystem) against ConquerD, plus the "Space hierarchy" / "Trustless access proo
 
 Authenticated room tree: data model + hashing (`space.rs`, byte-identical on client + supernode),
 signed wire structs (`SignedSpaceRoot`, `SpaceInclusionProof`, `SpaceGrant`), owner builder, cluster
-gossip + `SpaceRootStore`, coexist admission (`try_space_admission`) alongside the legacy token/ACL
-path, invite envelope fields, the §6.1 invite-minting fix, and client persistence
-(`RoomEntry.{space_id, parent_id, invite_policy}` in `my_rooms.dat`) — plus the `"members"`
-invite-policy widening (§6.4), its client UI toggle, periodic Space-root re-broadcast (§8),
-root-equivocation flagging (§9, lighter mitigation), and arbitrary-depth sub-room nesting (§3.1, §10).
+gossip + `SpaceRootStore`, proof-based admission (`try_space_admission`) with local invite-token /
+creator self-admit fallbacks (no cluster per-peer ACL push), invite envelope fields, the §6.1
+invite-minting fix, and client persistence (`RoomEntry.{space_id, parent_id, invite_policy}` in
+`my_rooms.dat`) — plus the `"members"` invite-policy widening (§6.4), its client UI toggle, periodic
+Space-root re-broadcast (§8), root-equivocation flagging (§9, lighter mitigation), and arbitrary-depth
+sub-room nesting (§3.1, §10).
 
 The `inherit`, `key_commit`, and invite `space_node_key` fields are **reserved** (present, defaulted
 empty/false) so Layer 2 changes leaf *values*, not leaf *shape* — no `v1` label bump when it lands.

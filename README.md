@@ -358,7 +358,7 @@ auth    = "trusted-peer"
 params  = { config_path = "etc/matchmaker.json" }
 ```
 
-Disabled entries are kept on disk so an operator can flip them back on without retyping the descriptor. When `supernode.toml` is missing the manifest is derived from legacy env vars for back-compat.
+Disabled entries are kept on disk so an operator can flip them back on without retyping the descriptor. When `supernode.toml` is missing the supernode uses a full first-party default capability set (prefer committing a real manifest).
 
 ### Authoring a Feature Module (Rust)
 
@@ -641,15 +641,15 @@ Runtime ports and access settings are read from environment variables; hosted fe
 | `supernode_host` | *(unset)* | Public DNS name or IP used in invite URLs, relay tickets, and WebTransport URLs for remote clients |
 | `CONQUERD_HOME` | `~/.conquerd` | Data directory for identity, settings, files |
 
-#### Feature Toggles (legacy)
+#### Feature / process toggles
 
-Prefer `supernode.toml` for feature enablement (see [Enabling Features on a Supernode](#enabling-features-on-a-supernode)). The variables below are retained for backward compatibility when no manifest is present:
+Prefer `supernode.toml` for capability advertisement (see [Enabling Features on a Supernode](#enabling-features-on-a-supernode)). These env vars still gate runtime subsystems (e.g. whether the SFU process starts) and stats labels — they do **not** synthesize a capability list when the manifest is absent.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `supernode_chat` | `1` | Enable chat relay (`0` to disable) |
-| `supernode_files` | `1` | Enable file transfer relay (`0` to disable) |
-| `supernode_sfu` | `1` | Enable SFU group voice rooms (`0` to disable) |
+| `supernode_chat` | `1` | Report chat as enabled in stats (`0` to hide) |
+| `supernode_files` | `1` | Report files as enabled in stats (`0` to hide) |
+| `supernode_sfu` | `1` | Start the in-process SFU room manager (`0` to disable) |
 | `supernode_updates` | `1` | Enable P2P auto-update distribution (`0` to disable) |
 | `supernode_auto_restart` | `1` | Auto-restart after applying an update (`0` to disable) |
 

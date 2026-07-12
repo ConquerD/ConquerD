@@ -31,10 +31,8 @@
 //! same `[tag:u8][payload…]` with the datagram boundary as the frame
 //! boundary.
 //!
-//! Control frames (tag `0x00`) carry signed `SignalingMessage` JSON, which
-//! always begins with `{` (`0x7B`) — outside the reserved tag range — so a
-//! legacy *untagged* JSON frame is unambiguously distinguishable from a
-//! tagged one. [`classify`] exploits this for backward-compatible decode.
+//! Control frames (tag `0x00`) carry signed `SignalingMessage` JSON. Every
+//! peer-stream frame is tagged; untagged leading-`{` payloads are rejected.
 
 /// Control / signaling channel (handshake, capability announce, presence).
 pub const CONTROL_TAG: u8 = 0x00;
@@ -107,9 +105,6 @@ pub fn decode_frame(frame: &[u8]) -> Option<(u8, &[u8])> {
 /// How an inbound frame on the QUIC peer fabric should be interpreted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameClass<'a> {
-    /// A legacy *untagged* control frame (raw signed JSON, starts with `{`).
-    /// Routed as control/signaling for backward compatibility.
-    UntaggedControl(&'a [u8]),
     /// A tagged control frame (`0x00`); payload is the signed JSON body.
     Control(&'a [u8]),
     /// Audio datagram (`0x01`); payload is the audio frame body.
@@ -122,18 +117,10 @@ pub enum FrameClass<'a> {
     Other(u8, &'a [u8]),
 }
 
-/// Classify an inbound frame, transparently accepting both the new tagged
-/// framing and legacy untagged JSON control frames.
-///
-/// A frame whose first byte is `{` (`0x7B`) is treated as an untagged
-/// control frame — this keeps a peer that has not yet adopted tagging
-/// interoperable on the control channel. Otherwise the leading byte is the
-/// channel tag.
+/// Classify an inbound tagged frame. The leading byte is always the channel
+/// tag; untagged JSON is not accepted.
 pub fn classify(frame: &[u8]) -> Option<FrameClass<'_>> {
     let (&first, rest) = frame.split_first()?;
-    if first == b'{' {
-        return Some(FrameClass::UntaggedControl(frame));
-    }
     Some(match first {
         CONTROL_TAG => FrameClass::Control(rest),
         AUDIO_TAG => FrameClass::Audio(rest),
@@ -191,9 +178,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_untagged_json_is_control() {
+    fn classify_untagged_json_is_other_not_control() {
+        // Leading `{` is not a reserved tag — pre-release peers must tag control.
         let json = br#"{"type":"chat_message"}"#;
-        assert_eq!(classify(json), Some(FrameClass::UntaggedControl(json)));
+        assert_eq!(classify(json), Some(FrameClass::Other(b'{', &json[1..])));
     }
 
     #[test]
