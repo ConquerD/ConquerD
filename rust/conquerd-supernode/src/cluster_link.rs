@@ -454,7 +454,7 @@ impl ClusterLink {
         // Periodic subscription + Space-root re-advertisement. Roots are
         // otherwise only gossiped on-change (`replicate_space_root`), so a
         // member that missed that gossip (or joined the cluster later) would
-        // never converge without this (SPACE-MERKLE-DESIGN §8, open item 3).
+        // never converge without this.
         {
             let this = Arc::clone(self);
             let shutdown = Arc::clone(&self.shutdown);
@@ -1107,10 +1107,10 @@ mod tests {
         link_b.shutdown();
     }
 
-    /// SPACE-MERKLE-DESIGN §8 open item 3: a freshly-established cluster link
-    /// advertises the owner's currently-held Space roots immediately (not just
-    /// on-change via `replicate_space_root`), so a member that joins the
-    /// cluster later converges without waiting for a client resend.
+    /// A freshly-established cluster link advertises the owner's currently-held
+    /// Space roots immediately (not just on-change via `replicate_space_root`),
+    /// so a member that joins the cluster later converges without waiting for a
+    /// client resend.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_node_cluster_advertises_space_root_on_link_establish() {
         let _ = rustls::crypto::ring::default_provider().install_default();

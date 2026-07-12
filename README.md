@@ -41,7 +41,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Private rooms can enable **"Members can invite"** so any current member — not just the creator — can mint new invite tokens for that room.
 - Peer room invites with accept/decline flow.
 - Up to 32 participants per room.
-- Room (and sub-room) membership is backed by a client-signed, authenticated **Space** tree (Merkle inclusion proofs over room definitions) so any cluster member can admit a proven joiner even if it never saw the room's original grant; see `docs/SPACE-MERKLE-DESIGN.md`.
+- Room (and sub-room) membership is backed by a client-signed, authenticated **Space** tree (Merkle inclusion proofs over room definitions) so any cluster member can admit a proven joiner even if it never saw the room's original grant; remaining Space work is tracked in `backlog.md`.
 - Invited members of a private room can always rejoin, even after the supernode's temporary room state was cleared (idle timeout or restart) — no need to request a fresh invite link.
 - If a room join is refused (full, private without access, etc.), the app now tells you rather than leaving you looking stuck "in" a room you never actually entered.
 - On a clustered deployment (multiple supernodes hosting the same room), voice now carries across every node in the cluster, matching how room chat already worked.

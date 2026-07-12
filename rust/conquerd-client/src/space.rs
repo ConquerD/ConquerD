@@ -4,9 +4,8 @@
 //! per-supernode room namespace. The node set hashes into a single signed
 //! **epoch root** ([`SignedSpaceRoot`]); any leaf is provable with a compact
 //! [`SpaceInclusionProof`]. This module is Layer 1 only — node records, RFC 6962
-//! hashing, owner-signed roots, and proof verification. Proof-based admission,
-//! cluster gossip, and the Layer-2 key hierarchy are deferred (see
-//! `docs/SPACE-MERKLE-DESIGN.md`).
+//! hashing, owner-signed roots, and proof verification. Layer 2 key hierarchy
+//! and remaining Space work are tracked in `backlog.md`.
 //!
 //! Leaves are sorted by `node_id` so the root is a pure function of the node
 //! set — two parties with the same set compute the same root (a reconciliation

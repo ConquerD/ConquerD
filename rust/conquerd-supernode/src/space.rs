@@ -2,10 +2,10 @@
 //!
 //! Byte-for-byte identical to `conquerd-client/src/space.rs` so signed roots,
 //! inclusion proofs, and grants produced by a client verify here unchanged (the
-//! project's established duplicated-crypto convention — see the client copy and
-//! `docs/SPACE-MERKLE-DESIGN.md`). The supernode only *verifies* (roots, proofs,
-//! grants) and materializes rooms from proven nodes; the `Space` builder is
-//! retained for parity + tests, hence the module-level `dead_code` allowance.
+//! project's established duplicated-crypto convention — see the client copy).
+//! The supernode only *verifies* (roots, proofs, grants) and materializes rooms
+//! from proven nodes; the `Space` builder is retained for parity + tests, hence
+//! the module-level `dead_code` allowance. Remaining Space work: `backlog.md`.
 //!
 //! The cross-crate KAT ([`tests::kat_canonical_leaf_and_root_hashes`]) asserts
 //! the SAME hashes as the client's copy — the guard against silent divergence.
