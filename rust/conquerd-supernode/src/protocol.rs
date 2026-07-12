@@ -215,6 +215,14 @@ pub enum MessageType {
     #[serde(rename = "capability_invoke")]
     CapabilityInvoke,
 
+    // Portal game relay (native identity path — no WebTransport cert)
+    #[serde(rename = "game_relay_join")]
+    GameRelayJoin,
+    #[serde(rename = "game_relay_leave")]
+    GameRelayLeave,
+    #[serde(rename = "game_relay_joined")]
+    GameRelayJoined,
+
     // Error
     #[serde(rename = "error")]
     Error,

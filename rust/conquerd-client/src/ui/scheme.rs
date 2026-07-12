@@ -22,15 +22,19 @@
 //! `std::free()`. `Box<[u8]>` uses the global allocator, which on all
 //! supported platforms (MSVC, GCC, Clang) is compatible with `free()`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
+use base64::Engine;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::connection_manager::ConnectionCommand;
 use crate::web_app_client::WebAppResponse;
+
+/// Max queued inbound game datagrams per supernode (portal poll drain).
+const PORTAL_GAME_QUEUE_CAP: usize = 256;
 
 // ── Global state ──────────────────────────────────────────────────────────────
 
@@ -118,6 +122,39 @@ fn get_supernode_cert_fingerprint(supernode_id: &str) -> Option<String> {
         .cloned()
 }
 
+/// Inbound portal game datagrams keyed by supernode id (base64url payloads).
+static PORTAL_GAME_INBOUND: OnceLock<Mutex<HashMap<String, VecDeque<Vec<u8>>>>> = OnceLock::new();
+
+fn portal_game_queues() -> &'static Mutex<HashMap<String, VecDeque<Vec<u8>>>> {
+    PORTAL_GAME_INBOUND.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Push an opaque `game.relay.v1` frame for the portal page to poll.
+/// Called from the AppBridge event path when the QUIC relay delivers a frame.
+pub fn push_portal_game_datagram(supernode_id: &str, payload: Vec<u8>) {
+    if payload.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = portal_game_queues().lock() {
+        let q = map.entry(supernode_id.to_owned()).or_default();
+        if q.len() >= PORTAL_GAME_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(payload);
+    }
+}
+
+fn drain_portal_game_datagrams(supernode_id: &str, max: usize) -> Vec<Vec<u8>> {
+    let Ok(mut map) = portal_game_queues().lock() else {
+        return Vec::new();
+    };
+    let Some(q) = map.get_mut(supernode_id) else {
+        return Vec::new();
+    };
+    let n = max.min(q.len());
+    q.drain(..n).collect()
+}
+
 /// Store our peer ID for injection into portal pages via `/_conquerd/ctx.json`.
 /// Called from `AppBridge` after the identity is unlocked.
 pub fn set_portal_peer_id(peer_id: &str) {
@@ -195,6 +232,8 @@ pub unsafe extern "C" fn conquerd_fetch_sync(
     // conquerd://<any_supernode>/_conquerd/ctx.json
     //   Returns the client's own peer ID and version so portal JS can
     //   populate `window.conquerd` without an extra network hop.
+    //   `nativeTransport: true` tells the SDK to use identity-path game
+    //   relay APIs instead of WebTransport + self-signed certs.
     if path == "/_conquerd/ctx.json" {
         let peer_id = PORTAL_PEER_ID.get().map(String::as_str).unwrap_or("");
         let wt_base = get_supernode_wt_url(&supernode_id).unwrap_or_default();
@@ -210,7 +249,7 @@ pub unsafe extern "C" fn conquerd_fetch_sync(
             format!(",\"wtCertHash\":\"{}\"", cert_fp.replace('"', "\\\""))
         };
         let json = format!(
-            "{{\"myPeerId\":\"{}\",\"version\":\"{}\"{}{}}}",
+            "{{\"myPeerId\":\"{}\",\"version\":\"{}\",\"nativeTransport\":true{}{}}}",
             peer_id.replace('"', "\\\""),
             env!("CARGO_PKG_VERSION"),
             wt_field,
@@ -224,6 +263,24 @@ pub unsafe extern "C" fn conquerd_fetch_sync(
             *out_body_len = json.len();
         }
         return true;
+    }
+
+    // Portal game channel (identity QUIC relay — no WebTransport cert).
+    // Paths:
+    //   /_conquerd/channel/open?room=<lobby>
+    //   /_conquerd/channel/send?b64=<base64url payload>
+    //   /_conquerd/channel/poll
+    //   /_conquerd/channel/close
+    if path.starts_with("/_conquerd/channel/") {
+        return serve_portal_channel(
+            &supernode_id,
+            &path,
+            query.as_deref(),
+            out_content_type,
+            out_ct_len,
+            out_body,
+            out_body_len,
+        );
     }
 
     // ── Fetch via ConnectionManager ───────────────────────────────────────
@@ -289,6 +346,162 @@ pub unsafe extern "C" fn conquerd_fetch_sync(
     }
 
     true
+}
+
+/// Local portal channel API for identity-path `game.relay.v1`.
+unsafe fn serve_portal_channel(
+    supernode_id: &str,
+    path: &str,
+    query: Option<&str>,
+    out_content_type: *mut *mut u8,
+    out_ct_len: *mut usize,
+    out_body: *mut *mut u8,
+    out_body_len: *mut usize,
+) -> bool {
+    let (cmd_tx, rt) = match (CMD_TX.get(), RT_HANDLE.get()) {
+        (Some(tx), Some(rt)) => (tx, rt),
+        _ => {
+            error!("[scheme] portal channel: fetch callback not registered");
+            return false;
+        }
+    };
+
+    let params: HashMap<String, String> = query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            Some((
+                k.to_owned(),
+                urlencoding_decode(v).unwrap_or_else(|| v.to_owned()),
+            ))
+        })
+        .collect();
+
+    let json_ok = |body: String| -> bool {
+        let ct = b"application/json; charset=utf-8";
+        unsafe {
+            *out_content_type = libc_alloc(ct);
+            *out_ct_len = ct.len();
+            *out_body = libc_alloc(body.as_bytes());
+            *out_body_len = body.len();
+        }
+        true
+    };
+
+    match path {
+        "/_conquerd/channel/open" => {
+            let room = params
+                .get("room")
+                .cloned()
+                .unwrap_or_else(|| "default".to_owned());
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let cmd = ConnectionCommand::PortalGameOpen {
+                supernode_id: supernode_id.to_owned(),
+                room,
+                reply_tx,
+            };
+            if cmd_tx.blocking_send(cmd).is_err() {
+                return false;
+            }
+            match rt.block_on(reply_rx) {
+                Ok(Ok(())) => json_ok(r#"{"ok":true}"#.to_owned()),
+                Ok(Err(e)) => {
+                    error!("[scheme] portal game open failed: {e}");
+                    json_ok(format!(
+                        r#"{{"ok":false,"error":"{}"}}"#,
+                        e.replace('"', "'")
+                    ))
+                }
+                Err(_) => false,
+            }
+        }
+        "/_conquerd/channel/send" => {
+            let Some(b64) = params.get("b64") else {
+                return json_ok(r#"{"ok":false,"error":"missing b64"}"#.to_owned());
+            };
+            let payload = match base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(b64.as_bytes())
+            {
+                Ok(p) => p,
+                Err(_) => {
+                    // Also accept standard URL_SAFE with padding.
+                    match base64::engine::general_purpose::URL_SAFE.decode(b64.as_bytes()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return json_ok(format!(r#"{{"ok":false,"error":"bad b64: {e}"}}"#));
+                        }
+                    }
+                }
+            };
+            if payload.len() > 64 * 1024 {
+                return json_ok(r#"{"ok":false,"error":"payload too large"}"#.to_owned());
+            }
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let cmd = ConnectionCommand::PortalGameSend {
+                supernode_id: supernode_id.to_owned(),
+                payload,
+                reply_tx,
+            };
+            if cmd_tx.blocking_send(cmd).is_err() {
+                return false;
+            }
+            match rt.block_on(reply_rx) {
+                Ok(Ok(())) => json_ok(r#"{"ok":true}"#.to_owned()),
+                Ok(Err(e)) => json_ok(format!(
+                    r#"{{"ok":false,"error":"{}"}}"#,
+                    e.replace('"', "'")
+                )),
+                Err(_) => false,
+            }
+        }
+        "/_conquerd/channel/poll" => {
+            let frames = drain_portal_game_datagrams(supernode_id, 64);
+            let b64s: Vec<String> = frames
+                .into_iter()
+                .map(|p| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(p))
+                .collect();
+            let body = serde_json::json!({ "frames": b64s }).to_string();
+            json_ok(body)
+        }
+        "/_conquerd/channel/close" => {
+            let cmd = ConnectionCommand::PortalGameClose {
+                supernode_id: supernode_id.to_owned(),
+            };
+            let _ = cmd_tx.blocking_send(cmd);
+            json_ok(r#"{"ok":true}"#.to_owned())
+        }
+        _ => {
+            error!("[scheme] unknown portal channel path: {path}");
+            false
+        }
+    }
+}
+
+/// Minimal percent-decode for query values (space as `+` or `%20`).
+fn urlencoding_decode(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let h = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                let v = u8::from_str_radix(h, 16).ok()?;
+                out.push(v);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Allocate a copy of `src` using the Rust global allocator (compatible with

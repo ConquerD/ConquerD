@@ -23,7 +23,7 @@ use crate::group_key::{GroupKeySource, SenderKeysGroup};
 use crate::identity::Identity;
 use crate::peer_store::PeerStore;
 use crate::protocol::{MessageType, SignalingMessage};
-use crate::quic_relay_client::{QuicRelayClient, RelaySignalingInbound};
+use crate::quic_relay_client::{QuicRelayClient, RelayGameInbound, RelaySignalingInbound};
 use crate::quic_tls;
 use crate::web_app_client::{self, WebAppResponse};
 
@@ -214,9 +214,9 @@ pub(super) struct RoomInvitePayload {
     pub room_type: String,
     pub invite_token: String,
     pub expires_at: u64,
-    /// Space-tree proof-based admission (SPACE-MERKLE-DESIGN §4.4), each a JSON
-    /// object as text; empty when the inviter didn't include one. Carried to the
-    /// joiner, who forwards them on `SfuJoin` for the supernode to verify.
+    /// Space-tree proof-based admission fields, each a JSON object as text;
+    /// empty when the inviter didn't include one. Carried to the joiner, who
+    /// forwards them on `SfuJoin` for the supernode to verify.
     pub space_root: String,
     pub space_proof: String,
     pub space_grant: String,
@@ -575,6 +575,10 @@ pub struct ConnectionManager {
     relay_signaling_tx: mpsc::UnboundedSender<RelaySignalingInbound>,
     /// Receiver side of [`Self::relay_signaling_tx`], polled in the run loop.
     relay_signaling_rx: mpsc::UnboundedReceiver<RelaySignalingInbound>,
+    /// Sender for opaque portal `game.relay.v1` datagrams from the relay.
+    relay_game_tx: mpsc::UnboundedSender<RelayGameInbound>,
+    /// Receiver side of [`Self::relay_game_tx`], polled in the run loop.
+    relay_game_rx: mpsc::UnboundedReceiver<RelayGameInbound>,
     /// Sender-keys group keying for E2E room audio + room chat. The room's
     /// elected keyer (see [`Self::sync_room_membership`]) generates/rotates
     /// epoch keys and seals them to members over `SfuGroupKey`; every member
@@ -652,6 +656,7 @@ impl ConnectionManager {
         let (internal_tx, internal_rx) = mpsc::channel::<InternalEvent>(128);
         let (relay_signaling_tx, relay_signaling_rx) =
             mpsc::unbounded_channel::<RelaySignalingInbound>();
+        let (relay_game_tx, relay_game_rx) = mpsc::unbounded_channel::<RelayGameInbound>();
 
         let mgr = Self {
             identity,
@@ -686,6 +691,8 @@ impl ConnectionManager {
             pending_room_invite_entries: HashMap::new(),
             relay_signaling_tx,
             relay_signaling_rx,
+            relay_game_tx,
+            relay_game_rx,
             room_relay_fail_streak: 0,
             room_relay_cooldown_frames: 0,
             group_keys: SenderKeysGroup::new(),
@@ -1024,6 +1031,17 @@ impl ConnectionManager {
                         ConnectionCommand::FetchWebApp { supernode_id, path, query, reply_tx } => {
                             self.handle_fetch_web_app(supernode_id, path, query, reply_tx).await;
                         }
+                        ConnectionCommand::PortalGameOpen { supernode_id, room, reply_tx } => {
+                            let result = self.handle_portal_game_open(&supernode_id, &room).await;
+                            let _ = reply_tx.send(result);
+                        }
+                        ConnectionCommand::PortalGameSend { supernode_id, payload, reply_tx } => {
+                            let result = self.handle_portal_game_send(&supernode_id, &payload);
+                            let _ = reply_tx.send(result);
+                        }
+                        ConnectionCommand::PortalGameClose { supernode_id } => {
+                            self.handle_portal_game_close(&supernode_id).await;
+                        }
                         ConnectionCommand::BroadcastAvatarConfig { peer_id, config_json } => {
                             self.send_avatar_config(&peer_id, &config_json).await;
                         }
@@ -1071,6 +1089,12 @@ impl ConnectionManager {
                 // dispatch run exactly as for the WebSocket route.
                 Some(frame) = self.relay_signaling_rx.recv() => {
                     self.handle_relay_reinject(frame).await;
+                }
+                Some(game) = self.relay_game_rx.recv() => {
+                    let _ = self.event_tx.try_send(ConnectionEvent::PortalGameDatagram {
+                        supernode_id: game.supernode_id,
+                        payload: game.payload,
+                    });
                 }
                 // Accept incoming QUIC connections
                 incoming = async {
@@ -2486,6 +2510,7 @@ impl ConnectionManager {
         let endpoint = endpoint.clone();
         let internal_tx = self.internal_tx.clone();
         let relay_signaling_tx = self.relay_signaling_tx.clone();
+        let relay_game_tx = self.relay_game_tx.clone();
         let sn_id_for_task = supernode_id.clone();
         tokio::spawn(async move {
             let client = match QuicRelayClient::connect(
@@ -2494,6 +2519,7 @@ impl ConnectionManager {
                 &relay_host,
                 relay_port,
                 relay_signaling_tx,
+                Some(relay_game_tx),
             )
             .await
             {
@@ -2513,6 +2539,64 @@ impl ConnectionManager {
                 })
                 .await;
         });
+    }
+
+    /// Ensure relay + `GameRelayJoin` for a portal game lobby.
+    async fn handle_portal_game_open(
+        &mut self,
+        supernode_id: &str,
+        room: &str,
+    ) -> Result<(), String> {
+        self.ensure_room_relay(supernode_id).await;
+        // Wait briefly for the relay grant to land so the first datagrams
+        // are not sent before game-session membership is useful.
+        for _ in 0..20 {
+            if self
+                .quic_relays
+                .get(supernode_id)
+                .is_some_and(|r| r.is_alive())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::GameRelayJoin, sender);
+        msg.target = Some(supernode_id.to_owned());
+        msg.payload.insert(
+            "room".to_owned(),
+            Value::String(if room.is_empty() {
+                "default".to_owned()
+            } else {
+                room.to_owned()
+            }),
+        );
+        self.dispatch_outbound(msg).await;
+        Ok(())
+    }
+
+    fn handle_portal_game_send(&self, supernode_id: &str, payload: &[u8]) -> Result<(), String> {
+        let Some(relay) = self.quic_relays.get(supernode_id).filter(|r| r.is_alive()) else {
+            return Err("no live QUIC relay to supernode".into());
+        };
+        if !self
+            .feature_registry
+            .gate_through_feature("game.relay.v1", supernode_id, payload.len())
+        {
+            return Err("game.relay.v1 outbound quota exceeded".into());
+        }
+        if relay.send_game_relay(payload) {
+            Ok(())
+        } else {
+            Err("relay send_game_relay failed".into())
+        }
+    }
+
+    async fn handle_portal_game_close(&mut self, supernode_id: &str) {
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::GameRelayLeave, sender);
+        msg.target = Some(supernode_id.to_owned());
+        self.dispatch_outbound(msg).await;
     }
 
     /// Service a `FetchWebApp` command by opening a fresh QUIC bidi stream

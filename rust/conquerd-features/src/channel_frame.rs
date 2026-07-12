@@ -19,6 +19,7 @@
 //! | `0x02` | text chat              | `core.chat.v1`    |
 //! | `0x03` | file transfer          | `core.file.v1`    |
 //! | `0x04` | room (SFU) audio       | `room.audio.sfu`  |
+//! | `0x05` | game relay             | `game.relay.v1`   |
 //!
 //! The room-audio tag (`0x04`) only appears on the *relayed* datagram path
 //! (a peer's QUIC relay session to a supernode that fans the frame out to
@@ -26,6 +27,11 @@
 //! leaves it in [`FrameClass::Other`]; the relay client decodes it manually.
 //! It exists as a fixed tag purely so relay quota accounting attributes the
 //! frame to `room.audio.sfu` rather than the direct `core.audio.opus`.
+//!
+//! The game-relay tag (`0x05`) is likewise relay-only: native portal pages
+//! send opaque `game.relay.v1` datagrams over the identity QUIC relay (no
+//! WebTransport / self-signed cert). Fan-out is scoped to a **game session**
+//! membership table on the supernode, independent of SFU voice rooms.
 //! Frame layout on a reliable stream is `[tag:u8][payload…]` *inside* the
 //! transport's existing length-prefixed envelope. On a datagram it is the
 //! same `[tag:u8][payload…]` with the datagram boundary as the frame
@@ -46,6 +52,10 @@ pub const FILE_TAG: u8 = 0x03;
 /// session. Distinct from [`AUDIO_TAG`] so the relay attributes the frame to
 /// the room feature's quota bucket rather than the direct-call one.
 pub const ROOM_AUDIO_TAG: u8 = 0x04;
+/// Game relay (`game.relay.v1`) — opaque unreliable datagrams on a relay
+/// session for in-app portal games. Distinct from room audio so quota and
+/// fan-out stay scoped to game sessions (not SFU voice rooms).
+pub const GAME_RELAY_TAG: u8 = 0x05;
 
 /// Highest fixed first-party tag. Tags above this up to
 /// [`DYNAMIC_TAG_START`](crate::channel_tag::DYNAMIC_TAG_START) stay
@@ -73,6 +83,7 @@ pub fn fixed_tag_for(feature_id: &str) -> Option<u8> {
         "core.chat.v1" => Some(CHAT_TAG),
         "core.file.v1" => Some(FILE_TAG),
         "room.audio.sfu" => Some(ROOM_AUDIO_TAG),
+        "game.relay.v1" => Some(GAME_RELAY_TAG),
         _ => None,
     }
 }
@@ -84,6 +95,7 @@ pub fn feature_for_fixed_tag(tag: u8) -> Option<&'static str> {
         CHAT_TAG => Some("core.chat.v1"),
         FILE_TAG => Some("core.file.v1"),
         ROOM_AUDIO_TAG => Some("room.audio.sfu"),
+        GAME_RELAY_TAG => Some("game.relay.v1"),
         _ => None,
     }
 }
@@ -141,6 +153,7 @@ mod tests {
             ("core.chat.v1", CHAT_TAG),
             ("core.file.v1", FILE_TAG),
             ("room.audio.sfu", ROOM_AUDIO_TAG),
+            ("game.relay.v1", GAME_RELAY_TAG),
         ] {
             assert_eq!(fixed_tag_for(fid), Some(tag));
             assert_eq!(feature_for_fixed_tag(tag), Some(fid));
@@ -151,7 +164,14 @@ mod tests {
 
     #[test]
     fn fixed_tags_are_in_reserved_range() {
-        for tag in [CONTROL_TAG, AUDIO_TAG, CHAT_TAG, FILE_TAG, ROOM_AUDIO_TAG] {
+        for tag in [
+            CONTROL_TAG,
+            AUDIO_TAG,
+            CHAT_TAG,
+            FILE_TAG,
+            ROOM_AUDIO_TAG,
+            GAME_RELAY_TAG,
+        ] {
             assert!(tag <= MAX_FIRST_PARTY_TAG);
             assert!(tag < crate::channel_tag::DYNAMIC_TAG_START);
         }

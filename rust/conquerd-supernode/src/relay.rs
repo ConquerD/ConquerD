@@ -49,6 +49,12 @@ pub struct RelayState {
     index_to_peer: HashMap<u8, String>,
     /// Room membership: room_id → set of identity_pubs.
     rooms: HashMap<String, HashSet<String>>,
+    /// Game-session membership (independent of SFU voice rooms): session_id → peers.
+    /// Portal games join here via `GameRelayJoin` so voice room membership is
+    /// not displaced when a peer opens a game demo.
+    game_sessions: HashMap<String, HashSet<String>>,
+    /// peer → active game session id (at most one portal game session per peer).
+    peer_game_session: HashMap<String, String>,
     /// Next available peer index.
     next_index: u8,
     /// Total bytes relayed since start.
@@ -62,6 +68,8 @@ impl RelayState {
             peers: HashMap::new(),
             index_to_peer: HashMap::new(),
             rooms: HashMap::new(),
+            game_sessions: HashMap::new(),
+            peer_game_session: HashMap::new(),
             next_index: 1,
             total_bytes_relayed: 0,
         }
@@ -110,6 +118,20 @@ impl RelayState {
             members.remove(peer_id);
             !members.is_empty()
         });
+        // Drop game-session membership so fan-out never targets a dead peer.
+        if let Some(session_id) = self.peer_game_session.remove(peer_id) {
+            if let Some(members) = self.game_sessions.get_mut(&session_id) {
+                members.remove(peer_id);
+                if members.is_empty() {
+                    self.game_sessions.remove(&session_id);
+                }
+            }
+        } else {
+            self.game_sessions.retain(|_, members| {
+                members.remove(peer_id);
+                !members.is_empty()
+            });
+        }
     }
 }
 
@@ -311,6 +333,51 @@ impl QUICRelayServer {
                     if members.is_empty() {
                         state.rooms.remove(room_id);
                     }
+                }
+            }
+        }
+    }
+
+    /// Join a portal game session for opaque `game.relay.v1` fan-out.
+    ///
+    /// Independent of SFU / voice room membership — a peer may be in a voice
+    /// room and a game session at the same time. Replacing the active game
+    /// session leaves the previous one.
+    pub fn join_game_session(&self, peer_id: &str, session_id: &str) {
+        let peer_id = peer_id.trim_end_matches('=');
+        if session_id.is_empty() || session_id.len() > 128 {
+            return;
+        }
+        let mut state = self.state.write();
+        if let Some(old) = state.peer_game_session.remove(peer_id) {
+            if old != session_id {
+                if let Some(members) = state.game_sessions.get_mut(&old) {
+                    members.remove(peer_id);
+                    if members.is_empty() {
+                        state.game_sessions.remove(&old);
+                    }
+                }
+            }
+        }
+        state
+            .game_sessions
+            .entry(session_id.to_owned())
+            .or_default()
+            .insert(peer_id.to_owned());
+        state
+            .peer_game_session
+            .insert(peer_id.to_owned(), session_id.to_owned());
+    }
+
+    /// Leave the peer's active portal game session (if any).
+    pub fn leave_game_session(&self, peer_id: &str) {
+        let peer_id = peer_id.trim_end_matches('=');
+        let mut state = self.state.write();
+        if let Some(session_id) = state.peer_game_session.remove(peer_id) {
+            if let Some(members) = state.game_sessions.get_mut(&session_id) {
+                members.remove(peer_id);
+                if members.is_empty() {
+                    state.game_sessions.remove(&session_id);
                 }
             }
         }
@@ -688,6 +755,38 @@ fn handle_datagram(
     }
 
     let mut relayed = 0u64;
+
+    // Portal game relay: fan-out within the sender's active game session
+    // (independent of SFU voice room membership).
+    if target_idx == wire::BROADCAST_INDEX && feature_id == "game.relay.v1" {
+        let Some(session_id) = st.peer_game_session.get(from_peer).cloned() else {
+            return;
+        };
+        let Some(members) = st.game_sessions.get(&session_id) else {
+            return;
+        };
+        let fwd = wire::build_forwarded_datagram(sender_index, payload);
+        for member_id in members {
+            if member_id == from_peer {
+                continue;
+            }
+            if let Some(member) = st.peers.get(member_id) {
+                if try_forward_datagram(features, feature_id, member_id, &fwd, member) {
+                    relayed += fwd.len() as u64;
+                }
+            }
+        }
+        if relayed == 0 {
+            return;
+        }
+        drop(st);
+        let mut st = state.write();
+        st.total_bytes_relayed += relayed;
+        if let Some(peer) = st.peers.get_mut(from_peer) {
+            peer.bytes_relayed += relayed;
+        }
+        return;
+    }
 
     if target_idx == wire::BROADCAST_INDEX {
         // Broadcast to all room members except sender
@@ -1233,6 +1332,14 @@ mod tests {
         ));
         assert_eq!(fid, "room.audio.sfu");
 
+        // Portal game relay has a fixed first-party tag (identity path).
+        let (fid, _) = relay_datagram_feature(&encode_frame(
+            conquerd_features::channel_frame::GAME_RELAY_TAG,
+            b"opaque-game",
+        ));
+        assert_eq!(fid, "game.relay.v1");
+
+        // Untagged opaque payload still accounts as game.relay for quota.
         let (fid, _) = relay_datagram_feature(b"opaque-game-payload");
         assert_eq!(fid, "game.relay.v1");
     }

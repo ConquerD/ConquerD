@@ -75,6 +75,8 @@ export const ChannelTag = Object.freeze({
     FILE: 0x03,
     /** Room (SFU) audio (`room.audio.sfu`) on a relay session. */
     ROOM_AUDIO: 0x04,
+    /** Game relay (`game.relay.v1`) on a relay session (portal native path). */
+    GAME_RELAY: 0x05,
 });
 
 /** Fixed channel tag for a first-party feature id, or `undefined`. */
@@ -84,6 +86,7 @@ export function fixedTagFor(featureId) {
         case "core.chat.v1": return ChannelTag.CHAT;
         case "core.file.v1": return ChannelTag.FILE;
         case "room.audio.sfu": return ChannelTag.ROOM_AUDIO;
+        case "game.relay.v1": return ChannelTag.GAME_RELAY;
         default: return undefined;
     }
 }
@@ -95,6 +98,7 @@ export function featureForFixedTag(tag) {
         case ChannelTag.CHAT: return "core.chat.v1";
         case ChannelTag.FILE: return "core.file.v1";
         case ChannelTag.ROOM_AUDIO: return "room.audio.sfu";
+        case ChannelTag.GAME_RELAY: return "game.relay.v1";
         default: return null;
     }
 }
@@ -449,15 +453,93 @@ export const _internal = {
 // signed room.* envelopes from the browser.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** base64url-encode without padding (portal native channel wire). */
+function b64urlEncodeNoPad(bytes) {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const b64 = btoa(bin);
+    return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** base64url-decode (with or without padding). */
+function b64urlDecodeNoPad(s) {
+    const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+    const b64 = (s + pad).replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+/**
+ * Identity-path portal transport: game.relay over the native client's
+ * already-authenticated QUIC relay session. No WebTransport, no TLS cert.
+ */
+class PortalNativeTransport {
+    constructor(api, room) {
+        this.api = api;
+        this.room = room || "default";
+        this.peerId = api.myPeerId || "";
+        this._pollTimer = null;
+        this.onDatagram = null; // (featureId, Uint8Array)
+        this._closed = false;
+    }
+
+    async connect() {
+        const res = await this.api.openChannel(this.room);
+        if (res && res.ok === false) {
+            throw new Error(res.error || "portal channel open failed");
+        }
+        this._closed = false;
+        // Short poll — portal demos are low rate; 33ms ≈ 30 Hz.
+        this._pollTimer = setInterval(() => { this._poll(); }, 33);
+    }
+
+    async _poll() {
+        if (this._closed || !this.api.pollDatagrams) return;
+        try {
+            const res = await this.api.pollDatagrams();
+            const frames = res?.frames || [];
+            for (const b64 of frames) {
+                try {
+                    const body = b64urlDecodeNoPad(b64);
+                    if (this.onDatagram) this.onDatagram("game.relay.v1", body);
+                } catch { /* skip bad frame */ }
+            }
+        } catch { /* transient poll errors */ }
+    }
+
+    async sendRawDatagram(_featureId, payload) {
+        if (this._closed) throw new Error("not connected");
+        const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+        const b64 = b64urlEncodeNoPad(bytes);
+        const res = await this.api.sendDatagramB64(b64);
+        if (res && res.ok === false) {
+            throw new Error(res.error || "portal send failed");
+        }
+    }
+
+    close() {
+        this._closed = true;
+        if (this._pollTimer) {
+            clearInterval(this._pollTimer);
+            this._pollTimer = null;
+        }
+        try { this.api.closeChannel?.(); } catch { /* ignore */ }
+    }
+}
+
 export class ConquerdClient {
     constructor({ host, port, features, room }) {
-        if (!host) throw new Error("host is required");
-        this.host = host;
+        // host is required for standalone WebTransport; optional in portal
+        // when nativeTransport is available.
+        this.host = host || "localhost";
         this.port = port || 8443;
         this.features = Array.isArray(features) ? features : [];
         this.room = room || null;
 
-        this._raw = null;           // RawConquerdClient instance
+        this._raw = null;           // RawConquerdClient or PortalNativeTransport
+        this._portal = false;
         this._peerId = null;
         this._handlers = Object.create(null); // event -> Set<fn>
         this._connected = false;
@@ -483,18 +565,36 @@ export class ConquerdClient {
     get peerId() { return this._peerId; }
 
     async connect() {
+        // Prefer identity-path portal transport when running inside the
+        // native client (conquerd:// + window.conquerd.nativeTransport).
+        // Games were never intended to open WebTransport outside this shell.
+        try {
+            if (typeof window !== "undefined" && window?.conquerd?.ready) {
+                const ctx = await window.conquerd.ready;
+                if (ctx?.nativeTransport && typeof ctx.openChannel === "function") {
+                    const portal = new PortalNativeTransport(ctx, this.room);
+                    await portal.connect();
+                    this._raw = portal;
+                    this._portal = true;
+                    this._peerId = portal.peerId;
+                    portal.onDatagram = (featureId, body) => {
+                        this._emit("datagram", featureId || "unknown", body);
+                    };
+                    this._connected = true;
+                    this._emit("connected", this._peerId);
+                    return;
+                }
+            }
+        } catch (e) {
+            // Fall through to WebTransport only when not in portal-native mode.
+            if (typeof window !== "undefined" && window?.conquerd) {
+                this._emit("error", e);
+                throw e;
+            }
+        }
+
         let url = `https://${this.host}:${this.port}`;
         let certHash = null;
-        // When loaded inside the native client portal (conquerd:// scheme),
-        // window.conquerd.ready contains the actual WebTransport base URL
-        // sent by the supernode in SUPERNODE_INFO.  location.hostname in that
-        // context is the supernode's base64url peer ID — not a real hostname.
-        // Two-step resolution:
-        //   1. ctx.wtBaseUrl  — set when supernode advertises wt_url in
-        //                       SUPERNODE_INFO (requires external_host config)
-        //   2. /api/wt-url    — queried directly from the supernode; works
-        //                       for local dev (falls back to localhost) without
-        //                       needing external_host to be configured.
         let inPortal = false;
         const fallbackUrl = url;
         try {
@@ -508,27 +608,17 @@ export class ConquerdClient {
                         .then(r => r.ok ? r.json() : null)
                         .catch(() => null);
                     if (wtCfg?.url) url = wtCfg.url;
-                    // Fingerprint is also included in the /api/wt-url response
-                    // so the fallback path can also use serverCertificateHashes.
                     if (wtCfg?.certHash) certHash = wtCfg.certHash;
                 }
-                // Cert fingerprint is delivered via the ConquerD trust chain
-                // (SUPERNODE_INFO → ctx.json → bridge script).  No CA needed.
                 if (ctx?.wtCertHash) certHash = ctx.wtCertHash;
             }
         } catch { /* not in portal context — fall back to host:port */ }
-        // When inside the native portal but neither SUPERNODE_INFO nor
-        // /api/wt-url provided a real WebTransport URL, the fallback URL
-        // contains the base64url peer-id as hostname — unreachable — so
-        // surface a clear error immediately instead of a 10-second timeout.
         if (inPortal && url === fallbackUrl) {
             throw new Error(
-                "WebTransport unavailable: supernode does not advertise " +
-                "web.host.h3.v1 — enable it in supernode.toml to use game relay features"
+                "No portal native transport and WebTransport unavailable: " +
+                "supernode does not advertise web.host.h3.v1"
             );
         }
-        // 10-second hard timeout so the status never hangs at "Connecting…"
-        // forever when the WebTransport endpoint is unreachable.
         const timeoutMs = 10_000;
         const abort = new Promise((_, rej) =>
             setTimeout(() => rej(new Error(`WebTransport connection timed out after ${timeoutMs / 1000} s (url: ${url})`)), timeoutMs)
@@ -543,9 +633,9 @@ export class ConquerdClient {
                 }),
                 abort,
             ]);
+            this._portal = false;
             this._peerId = this._raw.peerId;
 
-            // Wire raw datagrams → high-level "datagram" events with featureId
             this._raw.onDatagram = (tag, body, featureId) => {
                 this._emit("datagram", featureId || "unknown", body);
             };
@@ -553,7 +643,6 @@ export class ConquerdClient {
             this._connected = true;
             this._emit("connected", this._peerId);
 
-            // Watch for underlying close
             this._raw.closed().then(() => {
                 if (this._connected) {
                     this._connected = false;
@@ -568,6 +657,9 @@ export class ConquerdClient {
 
     sendDatagram(featureId, payload) {
         if (!this._raw) throw new Error("not connected");
+        if (this._portal) {
+            return this._raw.sendRawDatagram(featureId, payload);
+        }
         // Always use the raw (opaque) path — correct for game.relay.v1 and
         // any other game.* relay feature. The supernode fans the bytes as-is.
         return this._raw.sendRawDatagram(featureId, payload);
@@ -575,7 +667,10 @@ export class ConquerdClient {
 
     disconnect() {
         if (this._raw) {
-            try { this._raw.close("client disconnect"); } catch {}
+            try {
+                if (this._portal) this._raw.close();
+                else this._raw.close("client disconnect");
+            } catch {}
         }
         if (this._connected) {
             this._connected = false;

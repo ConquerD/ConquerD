@@ -4631,12 +4631,12 @@ fn replay_saved_rooms_on_supernode_connect(
             });
         }
     }
-    // Periodic Space-root re-broadcast (SPACE-MERKLE-DESIGN §8, open item 3):
-    // reconnect is the one guaranteed convergence point (the supernode may have
-    // restarted and lost its in-memory `SpaceRootStore`), so re-announce our
-    // owned Space root here rather than only on room create/adopt. Best-effort —
-    // no identity, no Space owned for this supernode, or a signing hiccup must
-    // not block the reconnect flow.
+    // Periodic Space-root re-broadcast on reconnect: the one guaranteed
+    // convergence point (the supernode may have restarted and lost its
+    // in-memory `SpaceRootStore`), so re-announce our owned Space root here
+    // rather than only on room create/adopt. Best-effort — no identity, no
+    // Space owned for this supernode, or a signing hiccup must not block the
+    // reconnect flow.
     if let Some(identity) = identity {
         let space_id = crate::room_store::RoomStore::space_id_for(my_public_id, supernode_id);
         if let Some(space) = room_store.get_space(&space_id) {
@@ -6240,6 +6240,15 @@ fn dispatch_event(
                     .connection_stats(QString::from(json.as_str()));
             });
         }
+        #[cfg(feature = "webengine")]
+        ConnectionEvent::PortalGameDatagram {
+            supernode_id,
+            payload,
+        } => {
+            crate::ui::scheme::push_portal_game_datagram(&supernode_id, payload);
+        }
+        #[cfg(not(feature = "webengine"))]
+        ConnectionEvent::PortalGameDatagram { .. } => {}
         _ => {}
     }
 }

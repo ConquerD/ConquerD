@@ -154,6 +154,12 @@ pub enum ConnectionEvent {
         /// True when the supernode's SFU policy allows public room creation.
         public_rooms_enabled: bool,
     },
+    /// Opaque `game.relay.v1` datagram from a portal peer via the QUIC relay
+    /// (identity path — delivered to the in-app game page).
+    PortalGameDatagram {
+        supernode_id: String,
+        payload: Vec<u8>,
+    },
     /// Supernode requires a portal visit before granting relay access.
     RelayPaymentRequired {
         supernode_id: String,
@@ -435,6 +441,24 @@ pub enum ConnectionCommand {
         path: String,
         query: Option<String>,
         reply_tx: tokio::sync::oneshot::Sender<std::result::Result<WebAppResponse, String>>,
+    },
+    /// Open a portal game session (`game.relay.v1`) on the identity QUIC
+    /// relay — no WebTransport / self-signed cert. Ensures a relay grant,
+    /// then sends `GameRelayJoin` for lobby `room`.
+    PortalGameOpen {
+        supernode_id: String,
+        room: String,
+        reply_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Send an opaque game.relay datagram for the portal page.
+    PortalGameSend {
+        supernode_id: String,
+        payload: Vec<u8>,
+        reply_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Leave the portal game session on the supernode.
+    PortalGameClose {
+        supernode_id: String,
     },
     /// Broadcast our avatar config to a specific trusted peer.
     BroadcastAvatarConfig {

@@ -632,6 +632,7 @@ async fn handle_event(
         | ConnectionEvent::AvatarConfigUpdated { .. }
         | ConnectionEvent::ClusterMembersUpdated { .. }
         | ConnectionEvent::RoomFailedOver { .. }
-        | ConnectionEvent::ConnectionStats { .. } => {}
+        | ConnectionEvent::ConnectionStats { .. }
+        | ConnectionEvent::PortalGameDatagram { .. } => {}
     }
 }

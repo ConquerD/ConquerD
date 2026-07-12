@@ -148,6 +148,14 @@ pub enum MessageType {
     CapabilityAnnounce,
     CapabilityInvoke,
 
+    // Portal game relay (native identity path — no WebTransport cert)
+    /// Peer → supernode: join opaque game session for `game.relay.v1` fan-out.
+    GameRelayJoin,
+    /// Peer → supernode: leave active game session.
+    GameRelayLeave,
+    /// Supernode → peer: join accepted (optional ack).
+    GameRelayJoined,
+
     // Errors
     Error,
 }
@@ -232,6 +240,9 @@ impl MessageType {
             Self::AttestationResponse => "attestation_response",
             Self::CapabilityAnnounce => "capability_announce",
             Self::CapabilityInvoke => "capability_invoke",
+            Self::GameRelayJoin => "game_relay_join",
+            Self::GameRelayLeave => "game_relay_leave",
+            Self::GameRelayJoined => "game_relay_joined",
             Self::Error => "error",
         }
     }

@@ -33,7 +33,8 @@ pub mod wellknown;
 
 pub use channel_frame::{
     classify, decode_frame, encode_frame, feature_for_fixed_tag, fixed_tag_for, FrameClass,
-    AUDIO_TAG, CHAT_TAG, CONTROL_TAG, FILE_TAG, MAX_FIRST_PARTY_TAG,
+    AUDIO_TAG, CHAT_TAG, CONTROL_TAG, FILE_TAG, GAME_RELAY_TAG, MAX_FIRST_PARTY_TAG,
+    ROOM_AUDIO_TAG,
 };
 pub use channel_tag::{ChannelTagError, ChannelTagRegistry};
 pub use client_modules::register_client_modules;

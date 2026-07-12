@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
-use conquerd_features::channel_frame::{RELAY_SIGNAL_STREAM_MAGIC, ROOM_AUDIO_TAG};
+use conquerd_features::channel_frame::{GAME_RELAY_TAG, RELAY_SIGNAL_STREAM_MAGIC, ROOM_AUDIO_TAG};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::Notify;
@@ -61,6 +61,13 @@ const SIGNAL_OUT_CAPACITY: usize = 512;
 pub struct RelaySignalingInbound {
     pub supernode_id: String,
     pub json: Vec<u8>,
+}
+
+/// Opaque `game.relay.v1` payload received over a QUIC relay (portal games).
+#[derive(Debug, Clone)]
+pub struct RelayGameInbound {
+    pub supernode_id: String,
+    pub payload: Vec<u8>,
 }
 
 /// Datagram target index meaning "broadcast to all room members"
@@ -111,12 +118,16 @@ impl QuicRelayClient {
     /// supernode's identity pubkey. The connection manager owns the receiver
     /// and re-injects each frame on its normal inbound path (signature
     /// verification + freshness + replay + quota + dispatch).
+    ///
+    /// `game_tx`, when set, receives opaque `game.relay.v1` payloads for
+    /// in-app portal games (identity path; no WebTransport cert).
     pub async fn connect(
         endpoint: &Endpoint,
         supernode_id: impl Into<String>,
         host: &str,
         port: u16,
         reinject_tx: UnboundedSender<RelaySignalingInbound>,
+        game_tx: Option<UnboundedSender<RelayGameInbound>>,
     ) -> anyhow::Result<Self> {
         let supernode_id = supernode_id.into();
         let addr: SocketAddr = format!("{host}:{port}")
@@ -154,9 +165,8 @@ impl QuicRelayClient {
             drain_relay_commands(conn_drain, shutdown_drain, sn_short).await;
         });
 
-        // Datagram receive loop — extracts `room.audio.sfu` frames and hands
-        // the signed JSON to the connection manager. Other tags are ignored
-        // here (the relay only forwards room-scoped datagrams to us today).
+        // Datagram receive loop — `room.audio.sfu` → signaling reinject;
+        // `game.relay.v1` → portal game queue.
         let conn_dgram = connection.clone();
         let shutdown_dgram = shutdown.clone();
         let sn_id_dgram = supernode_id.clone();
@@ -167,6 +177,7 @@ impl QuicRelayClient {
                 conn_dgram,
                 shutdown_dgram,
                 reinject_dgram,
+                game_tx,
                 sn_id_dgram,
                 sn_short_dgram,
             )
@@ -245,25 +256,36 @@ impl QuicRelayClient {
     /// then falls back to the WebSocket SFU path so audio is never dropped
     /// solely because the relay datagram couldn't be sent.
     pub fn send_room_audio(&self, signed_json: &[u8]) -> bool {
+        self.send_broadcast_tagged(ROOM_AUDIO_TAG, signed_json)
+    }
+
+    /// Send an opaque `game.relay.v1` payload as a broadcast relay datagram.
+    ///
+    /// Builds `[BROADCAST_INDEX][GAME_RELAY_TAG][payload]`. The supernode fans
+    /// the frame to peers in the sender's active portal game session.
+    pub fn send_game_relay(&self, payload: &[u8]) -> bool {
+        self.send_broadcast_tagged(GAME_RELAY_TAG, payload)
+    }
+
+    fn send_broadcast_tagged(&self, tag: u8, payload: &[u8]) -> bool {
         if self.connection.close_reason().is_some() {
             return false;
         }
-        // Respect the peer's advertised datagram limit; oversized frames
-        // would error anyway, so bail early and let the caller use WS.
         if let Some(max) = self.connection.max_datagram_size() {
-            if signed_json.len() + 2 > max {
+            if payload.len() + 2 > max {
                 debug!(
-                    "[relay] room-audio frame {}B exceeds datagram max {}B — WS fallback",
-                    signed_json.len() + 2,
+                    "[relay] frame {}B (tag={:#04x}) exceeds datagram max {}B",
+                    payload.len() + 2,
+                    tag,
                     max
                 );
                 return false;
             }
         }
-        let mut buf = Vec::with_capacity(2 + signed_json.len());
+        let mut buf = Vec::with_capacity(2 + payload.len());
         buf.push(BROADCAST_INDEX);
-        buf.push(ROOM_AUDIO_TAG);
-        buf.extend_from_slice(signed_json);
+        buf.push(tag);
+        buf.extend_from_slice(payload);
         self.connection.send_datagram(Bytes::from(buf)).is_ok()
     }
 
@@ -351,13 +373,13 @@ async fn drain_relay_commands(conn: Connection, shutdown: Arc<Notify>, sn_short:
     debug!("[relay {}] drain task exiting", sn_short);
 }
 
-/// Receive forwarded room-audio datagrams and forward the signed JSON to the
-/// connection manager. Frames look like `[sender_index][ROOM_AUDIO_TAG][json]`;
-/// `sender_index` is ignored because the signed JSON is self-describing.
+/// Receive forwarded relay datagrams: room-audio JSON → signaling reinject;
+/// game-relay opaque payloads → portal queue.
 async fn recv_room_datagrams(
     conn: Connection,
     shutdown: Arc<Notify>,
     reinject_tx: UnboundedSender<RelaySignalingInbound>,
+    game_tx: Option<UnboundedSender<RelayGameInbound>>,
     supernode_id: String,
     sn_short: String,
 ) {
@@ -367,24 +389,37 @@ async fn recv_room_datagrams(
             dgram = conn.read_datagram() => {
                 match dgram {
                     Ok(data) => {
-                        // [sender_index:1][tag:1][payload…]; require both
-                        // prefix bytes and the room-audio tag.
-                        if data.len() < 2 || data[1] != ROOM_AUDIO_TAG {
+                        // [sender_index:1][tag:1][payload…]
+                        if data.len() < 2 {
                             continue;
                         }
-                        let json = data[2..].to_vec();
-                        if json.is_empty() {
+                        let tag = data[1];
+                        let body = &data[2..];
+                        if body.is_empty() {
                             continue;
                         }
-                        if reinject_tx
-                            .send(RelaySignalingInbound {
-                                supernode_id: supernode_id.clone(),
-                                json,
-                            })
-                            .is_err()
-                        {
-                            // Manager dropped the receiver — nothing left to do.
-                            break;
+                        if tag == ROOM_AUDIO_TAG {
+                            if reinject_tx
+                                .send(RelaySignalingInbound {
+                                    supernode_id: supernode_id.clone(),
+                                    json: body.to_vec(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if tag == GAME_RELAY_TAG {
+                            if let Some(ref gtx) = game_tx {
+                                if gtx
+                                    .send(RelayGameInbound {
+                                        supernode_id: supernode_id.clone(),
+                                        payload: body.to_vec(),
+                                    })
+                                    .is_err()
+                                {
+                                    // Portal queue dropped — keep reading for audio.
+                                }
+                            }
                         }
                     }
                     Err(quinn::ConnectionError::ApplicationClosed(_))

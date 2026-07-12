@@ -229,8 +229,8 @@ struct SupernodeState {
 
 /// Highest verified [`space::SignedSpaceRoot`] per `space_id`. `space_id` embeds
 /// the owner (`derive_node_id("", owner_pub, …)`), so it is effectively bound to
-/// one signer; we still pin the signer and refuse epoch regression (monotonic,
-/// equivocation containment — SPACE-MERKLE-DESIGN §8).
+/// one signer; we still pin the signer and refuse epoch regression (monotonic
+/// for equivocation containment).
 #[derive(Default)]
 struct SpaceRootStore {
     roots: HashMap<String, space::SignedSpaceRoot>,
@@ -238,11 +238,10 @@ struct SpaceRootStore {
     /// validly-signed roots seen for the same `(space_id, epoch)`). We chose a
     /// set tree, not an append-only log, so there is no consistency proof
     /// between epochs — a malicious owner *can* sign two roots for one epoch.
-    /// This is the lighter of the two SPACE-MERKLE-DESIGN §9 mitigations
-    /// (flag conflicts instead of building a CT-style history tree): we cannot
-    /// tell which root is "true", so we keep the first-seen one (unchanged
-    /// behavior) but make the conflict observable for operators instead of
-    /// silently dropping it.
+    /// Lighter mitigation (flag conflicts; CT-style history tree is deferred in
+    /// `backlog.md`): we cannot tell which root is "true", so we keep the
+    /// first-seen one (unchanged behavior) but make the conflict observable for
+    /// operators instead of silently dropping it.
     equivocations: HashMap<String, u32>,
 }
 
@@ -286,8 +285,8 @@ impl SpaceRootStore {
     }
 
     /// All currently-held roots (one per `space_id`), for periodic cluster
-    /// re-gossip (SPACE-MERKLE-DESIGN §8) so members that missed the on-change
-    /// gossip, or joined the cluster later, converge without a client resend.
+    /// re-gossip so members that missed the on-change gossip, or joined the
+    /// cluster later, converge without a client resend.
     fn all(&self) -> Vec<space::SignedSpaceRoot> {
         self.roots.values().cloned().collect()
     }
@@ -516,10 +515,10 @@ impl SupernodeState {
         accepted
     }
 
-    /// Proof-based admission (SPACE-MERKLE-DESIGN §5). If `payload` carries space
-    /// fields that verify against the current signed root for the space,
-    /// authorize `sender`, materialize the room from the proven node, and return
-    /// `true`. Returns `false` to fall through to the local invite-token path —
+    /// Proof-based Space admission. If `payload` carries space fields that
+    /// verify against the current signed root for the space, authorize
+    /// `sender`, materialize the room from the proven node, and return `true`.
+    /// Returns `false` to fall through to the local invite-token path —
     /// absence or verification failure just means "not admitted by proof", never
     /// an outright denial. Cluster-wide membership is proof-carried; there is no
     /// supernode-to-supernode room ACL push.
@@ -1641,6 +1640,12 @@ impl SignalingHandler for SupernodeHandler {
                     );
                 }
             }
+            MessageType::GameRelayJoin => {
+                self.handle_game_relay_join(&msg);
+            }
+            MessageType::GameRelayLeave => {
+                self.handle_game_relay_leave(&msg);
+            }
             _ => {
                 // Unexpected message type — log for diagnostics.
                 debug!(
@@ -1854,6 +1859,50 @@ impl SupernodeHandler {
                     json!({"reason": e}),
                 );
             }
+        }
+    }
+
+    /// Portal game session join — relay membership only (no SFU voice room).
+    /// Session id is taken from `payload.room` / `payload.room_id` (game lobby).
+    fn handle_game_relay_join(&self, msg: &SignalingMessage) {
+        let room = msg
+            .payload
+            .get("room")
+            .or_else(|| msg.payload.get("room_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        // Namespace so game lobbies never collide with SFU voice room ids.
+        let session_id = if room.starts_with("game:") {
+            room.to_owned()
+        } else {
+            format!("game:{room}")
+        };
+        let trusted = self.state.peer_store.read().is_trusted(&msg.sender);
+        if !trusted {
+            debug!(
+                "[game.relay] join from untrusted {} — dropped",
+                &msg.sender[..12.min(msg.sender.len())]
+            );
+            return;
+        }
+        if let Some(ref relay) = self.state.relay {
+            relay.join_game_session(&msg.sender, &session_id);
+        }
+        self.state.send_signed(
+            &msg.sender,
+            MessageType::GameRelayJoined,
+            json!({ "room": room, "session_id": session_id, "accepted": true }),
+        );
+        info!(
+            "[game.relay] peer {} joined session {}",
+            &msg.sender[..12.min(msg.sender.len())],
+            session_id
+        );
+    }
+
+    fn handle_game_relay_leave(&self, msg: &SignalingMessage) {
+        if let Some(ref relay) = self.state.relay {
+            relay.leave_game_session(&msg.sender);
         }
     }
 
@@ -2414,7 +2463,7 @@ impl SupernodeHandler {
             .unwrap_or("");
         // Owner-only invite minting: only the room's creator may mint a token.
         // Closes the hole where any authenticated peer could mint an invite for
-        // any room and add themselves (SPACE-MERKLE-DESIGN §6.1).
+        // any room and add themselves.
         fn short(s: &str) -> &str {
             &s[..12.min(s.len())]
         }
@@ -3154,15 +3203,53 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
     }
 }
 
+/// Rotate WebTransport certs after this many seconds of age (cert PEM mtime).
+/// Chromium caps `serverCertificateHashes` at 14 days; we mint 13-day certs and
+/// rotate at 7 days so a restart within the second week always regenerates
+/// before expiry.
+const WEB_CERT_ROTATE_SECS: u64 = 7 * 24 * 3600;
+/// Not-after window for newly minted self-signed WebTransport certs.
+const WEB_CERT_VALIDITY_DAYS: i64 = 13;
+
+/// True when `web_cert.pem` exists and its mtime is younger than the rotate
+/// threshold. Age is always taken from the **cert PEM** (written only when a
+/// cert is minted), never from the fingerprint cache — rewriting the `.hex`
+/// sidecar on reuse used to refresh mtime and permanently skip rotation.
+fn web_cert_still_fresh(cert_path: &std::path::Path) -> bool {
+    std::fs::metadata(cert_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
+        .map(|age| age.as_secs() < WEB_CERT_ROTATE_SECS)
+        .unwrap_or(false)
+}
+
+/// Sync the fingerprint sidecar only when missing or content differs.
+/// Avoids a no-op rewrite that would bump mtime (historically used as the
+/// freshness clock, and still useful for operator tooling that watches the file).
+fn sync_web_cert_fingerprint_cache(fp_path: &std::path::Path, fingerprint: &str) {
+    let needs_write = match std::fs::read_to_string(fp_path) {
+        Ok(existing) => existing.trim() != fingerprint,
+        Err(_) => true,
+    };
+    if needs_write {
+        if let Err(e) = std::fs::write(fp_path, fingerprint) {
+            // Non-fatal: cert/key are authoritative; the .hex cache is advisory.
+            warn!("[web-cert] write fingerprint cache failed (non-fatal): {e}");
+        }
+    }
+}
+
 /// Ensure a self-signed TLS cert exists for the WebTransport listener.
 ///
 /// Returns the SHA-256 fingerprint (lowercase hex) of the cert's DER bytes.
 /// The fingerprint is the trust anchor: it is delivered to native clients via
 /// the already Ed25519-verified `SUPERNODE_INFO` message, so no CA is needed.
 ///
-/// Validity is capped at 13 days to stay within Chromium's 14-day maximum
-/// for `serverCertificateHashes`.  The cert is rotated when it is older than
-/// 7 days (the fingerprint file's mtime is used as a cheap age check).
+/// Validity is capped at [`WEB_CERT_VALIDITY_DAYS`] (13) to stay within
+/// Chromium's 14-day maximum for `serverCertificateHashes`. The cert is
+/// rotated on startup when `web_cert.pem` is older than
+/// [`WEB_CERT_ROTATE_SECS`] (7 days), measured from the cert file's mtime.
 ///
 /// **Always** re-derives the fingerprint from the on-disk cert DER rather
 /// than reading the stored `.hex` file, so the advertised hash is never stale
@@ -3193,16 +3280,10 @@ fn ensure_web_cert(data_dir: &std::path::Path) -> Option<String> {
         Some((fp, der))
     };
 
-    // Reuse existing cert if it is still fresh (< 7 days old) AND it
-    // carries the serverAuth EKU that Chrome WebTransport requires.
+    // Reuse existing cert if it is still fresh (< 7 days by cert PEM mtime)
+    // AND it carries the serverAuth EKU that Chrome WebTransport requires.
     // Certs generated before the EKU was added are silently rotated.
-    let still_fresh = std::fs::metadata(&fp_path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
-        .map(|age| age.as_secs() < 7 * 24 * 3600)
-        .unwrap_or(false);
-    if still_fresh && cert_path.exists() && key_path.exists() {
+    if web_cert_still_fresh(&cert_path) && key_path.exists() {
         // Re-derive the fingerprint from the actual cert DER so the
         // advertised hash is always in sync with what wtransport presents.
         if let Some((fp, der)) = derive_fp_and_der_from_disk() {
@@ -3214,8 +3295,7 @@ fn ensure_web_cert(data_dir: &std::path::Path) -> Option<String> {
                 .windows(SERVER_AUTH_OID.len())
                 .any(|w| w == SERVER_AUTH_OID);
             if has_server_auth {
-                // Keep the .hex cache file up to date.
-                let _ = std::fs::write(&fp_path, &fp);
+                sync_web_cert_fingerprint_cache(&fp_path, &fp);
                 info!(
                     "[web-cert] reusing existing cert (fingerprint {}…)",
                     &fp[..16.min(fp.len())]
@@ -3232,15 +3312,23 @@ fn ensure_web_cert(data_dir: &std::path::Path) -> Option<String> {
             // Cert PEM unreadable — fall through to regeneration.
             warn!("[web-cert] existing cert unreadable — regenerating");
         }
+    } else if cert_path.exists() {
+        // Stale, missing key, or unreadable mtime — log so operators see why
+        // a restart regenerates (and so frequent restarts cannot "refresh"
+        // a fingerprint sidecar into permanent reuse of an expired cert).
+        info!(
+            "[web-cert] rotating WebTransport cert (PEM age ≥ {} days or incomplete material)",
+            WEB_CERT_ROTATE_SECS / 86400
+        );
     }
 
-    // Generate a fresh self-signed ECDSA cert valid for 13 days.
+    // Generate a fresh self-signed ECDSA cert valid for WEB_CERT_VALIDITY_DAYS.
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
 
     let now = time::OffsetDateTime::now_utc();
     let mut params = CertificateParams::default();
     params.not_before = now;
-    params.not_after = now + time::Duration::days(13);
+    params.not_after = now + time::Duration::days(WEB_CERT_VALIDITY_DAYS);
     // Chromium WebTransport with serverCertificateHashes bypasses hostname
     // verification, but it still requires the certificate to be valid for
     // TLS server authentication.  Add the serverAuth EKU explicitly so
@@ -3274,11 +3362,8 @@ fn ensure_web_cert(data_dir: &std::path::Path) -> Option<String> {
         warn!("[web-cert] write key failed: {e}");
         return None;
     }
+    // Fingerprint cache is advisory for operators; age checks use cert PEM mtime.
     if let Err(e) = std::fs::write(&fp_path, &fingerprint) {
-        // Non-fatal: the cert and key were written; we have the fingerprint
-        // in memory. The .hex cache is only used to check freshness on the
-        // next restart. Without it the next startup regenerates the cert
-        // one restart early — acceptable, not a reason to drop the fingerprint.
         warn!("[web-cert] write fingerprint cache failed (non-fatal): {e}");
     }
 
@@ -3287,6 +3372,116 @@ fn ensure_web_cert(data_dir: &std::path::Path) -> Option<String> {
         &fingerprint[..16.min(fingerprint.len())]
     );
     Some(fingerprint)
+}
+
+#[cfg(test)]
+mod web_cert_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn set_mtime(path: &std::path::Path, when: SystemTime) {
+        let f = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime");
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("set_modified");
+    }
+
+    #[test]
+    fn ensure_web_cert_generates_and_reuses_when_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp1 = ensure_web_cert(dir.path()).expect("generate");
+        assert_eq!(fp1.len(), 64, "sha256 hex");
+        assert!(dir.path().join("web_cert.pem").exists());
+        assert!(dir.path().join("web_key.pem").exists());
+        assert!(dir.path().join("web_cert_fingerprint.hex").exists());
+
+        let fp2 = ensure_web_cert(dir.path()).expect("reuse");
+        assert_eq!(fp1, fp2, "fresh cert must be reused across restarts");
+        let pem1 = std::fs::read_to_string(dir.path().join("web_cert.pem")).unwrap();
+        let fp3 = ensure_web_cert(dir.path()).expect("reuse again");
+        assert_eq!(fp1, fp3);
+        let pem2 = std::fs::read_to_string(dir.path().join("web_cert.pem")).unwrap();
+        assert_eq!(pem1, pem2, "reuse must not rewrite cert PEM");
+    }
+
+    #[test]
+    fn ensure_web_cert_rotates_when_pem_older_than_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp_old = ensure_web_cert(dir.path()).expect("generate");
+        let cert_path = dir.path().join("web_cert.pem");
+        let key_path = dir.path().join("web_key.pem");
+        let fp_path = dir.path().join("web_cert_fingerprint.hex");
+
+        // Backdate the cert PEM past the rotate window. Also backdate the
+        // fingerprint sidecar so a regression that keys off .hex mtime still
+        // fails this test (the PEM is the authoritative clock).
+        let eight_days_ago = SystemTime::now() - Duration::from_secs(WEB_CERT_ROTATE_SECS + 86_400);
+        set_mtime(&cert_path, eight_days_ago);
+        set_mtime(&key_path, eight_days_ago);
+        set_mtime(&fp_path, eight_days_ago);
+        assert!(!web_cert_still_fresh(&cert_path));
+
+        let fp_new = ensure_web_cert(dir.path()).expect("rotate");
+        assert_ne!(fp_old, fp_new, "stale PEM must force a new cert");
+        assert!(web_cert_still_fresh(&cert_path));
+    }
+
+    #[test]
+    fn ensure_web_cert_rotates_even_if_fingerprint_cache_is_fresh() {
+        // Regression: previously age was taken from web_cert_fingerprint.hex,
+        // and every reuse rewrote that file — so frequent restarts kept the
+        // cache "fresh" forever while the PEM aged past notAfter.
+        let dir = tempfile::tempdir().unwrap();
+        let fp_old = ensure_web_cert(dir.path()).expect("generate");
+        let cert_path = dir.path().join("web_cert.pem");
+        let fp_path = dir.path().join("web_cert_fingerprint.hex");
+
+        let fourteen_days_ago = SystemTime::now() - Duration::from_secs(14 * 24 * 3600);
+        set_mtime(&cert_path, fourteen_days_ago);
+        // Leave fingerprint cache at "now" (just written) — the bug path.
+        assert!(
+            std::fs::metadata(&fp_path)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .elapsed()
+                .unwrap()
+                < Duration::from_secs(60)
+        );
+        assert!(!web_cert_still_fresh(&cert_path));
+
+        let fp_new = ensure_web_cert(dir.path()).expect("rotate despite fresh cache");
+        assert_ne!(
+            fp_old, fp_new,
+            "fresh fingerprint sidecar must not block PEM-age rotation"
+        );
+    }
+
+    #[test]
+    fn sync_fingerprint_cache_skips_identical_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp_path = dir.path().join("web_cert_fingerprint.hex");
+        std::fs::write(&fp_path, "abc").unwrap();
+        let old_mtime = std::fs::metadata(&fp_path).unwrap().modified().unwrap();
+        // Brief sleep so a spurious rewrite would advance mtime on coarse FS.
+        std::thread::sleep(Duration::from_millis(20));
+        sync_web_cert_fingerprint_cache(&fp_path, "abc");
+        let new_mtime = std::fs::metadata(&fp_path).unwrap().modified().unwrap();
+        assert_eq!(
+            old_mtime, new_mtime,
+            "identical fingerprint must not rewrite (mtime preserved)"
+        );
+        sync_web_cert_fingerprint_cache(&fp_path, "def");
+        assert_eq!(std::fs::read_to_string(&fp_path).unwrap().trim(), "def");
+    }
+
+    #[test]
+    fn web_cert_still_fresh_false_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!web_cert_still_fresh(&dir.path().join("nope.pem")));
+    }
 }
 
 #[cfg(test)]
@@ -3551,9 +3746,9 @@ mod space_admission_tests {
     fn space_root_store_flags_same_epoch_content_conflict_as_equivocation() {
         // Same owner key, same space_id, same epoch — but two different node
         // sets produce two different `root_hash`es. A malicious (or buggy)
-        // owner signing both is exactly the equivocation SPACE-MERKLE-DESIGN §9
-        // says a set tree cannot prevent structurally; we can only detect and
-        // flag it (lighter mitigation), which is what this test verifies.
+        // owner signing both is exactly the equivocation a set tree cannot
+        // prevent structurally; we can only detect and flag it (lighter
+        // mitigation; CT-style history is deferred in `backlog.md`).
         let (_owner, key, sp, root_a) = fixture();
         let mut sp_fork = sp.clone();
         sp_fork.upsert_node(space::SpaceNode {

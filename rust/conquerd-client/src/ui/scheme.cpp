@@ -196,24 +196,44 @@ extern "C" void conquerd_install_scheme_handler()
     // Defines window.conquerd with:
     //   .supernodeId  — extracted from window.location.hostname (sync)
     //   .ready        — Promise that resolves with the full API object
-    //       .myPeerId     our own Ed25519 public key (base64url)
-    //       .version      client version string
-    //       .fetch(path)  fetch() relative to the current conquerd:// origin
+    //       .myPeerId         our own Ed25519 public key (base64url)
+    //       .version          client version string
+    //       .nativeTransport  true → use identity-path game channel (no WT cert)
+    //       .openChannel(room) / sendDatagramB64 / pollDatagrams / closeChannel
+    //       .fetch(path)      fetch() relative to the current conquerd:// origin
     //
     // Portal pages should use:  conquerd.ready.then(api => { ... })
     static const QString kBridgeJs = QStringLiteral(
         "(function(){\n"
         "  var sn = window.location.hostname;\n"
         "  var ctxUrl = 'conquerd://' + sn + '/_conquerd/ctx.json';\n"
+        "  function ch(path, qs){\n"
+        "    var u = 'conquerd://' + sn + path;\n"
+        "    if (qs) u += (path.indexOf('?') >= 0 ? '&' : '?') + qs;\n"
+        "    return fetch(u).then(function(r){ return r.json(); });\n"
+        "  }\n"
         "  var ready = fetch(ctxUrl)\n"
         "    .then(function(r){return r.json();})\n"
         "    .then(function(ctx){\n"
         "      return Object.freeze({\n"
         "        myPeerId:    ctx.myPeerId,\n"
         "        version:     ctx.version,\n"
+        "        nativeTransport: !!ctx.nativeTransport,\n"
         "        wtBaseUrl:   ctx.wtBaseUrl  || '',\n"
         "        wtCertHash:  ctx.wtCertHash || '',\n"
         "        supernodeId: sn,\n"
+        "        openChannel: function(room){\n"
+        "          return ch('/_conquerd/channel/open', 'room=' + encodeURIComponent(room || 'default'));\n"
+        "        },\n"
+        "        sendDatagramB64: function(b64){\n"
+        "          return ch('/_conquerd/channel/send', 'b64=' + encodeURIComponent(b64));\n"
+        "        },\n"
+        "        pollDatagrams: function(){\n"
+        "          return ch('/_conquerd/channel/poll');\n"
+        "        },\n"
+        "        closeChannel: function(){\n"
+        "          return ch('/_conquerd/channel/close');\n"
+        "        },\n"
         "        fetch: function(path,opts){\n"
         "          var base='conquerd://'+sn;\n"
         "          var url=path.charAt(0)==='/'?base+path:base+'/'+path;\n"

@@ -537,11 +537,11 @@ pub async fn run_listener(bridge: BrowserBridge, data_dir: PathBuf, port: u16) {
     let cert_path = data_dir.join("web_cert.pem");
     let key_path = data_dir.join("web_key.pem");
 
-    // Warn early when the cert on disk is stale. Chrome's WebTransport rejects
-    // certs outside their validity window even when serverCertificateHashes is
-    // used, so an expired cert causes "Opening handshake failed" in game demos.
-    // Rotation only happens at restart — operators should restart every ≤7 days,
-    // or implement runtime rotation.
+    // Safety-net log if an expired cert somehow reaches the listener.
+    // Startup `ensure_web_cert` rotates when `web_cert.pem` mtime is ≥7 days
+    // (cert PEM is authoritative — not the fingerprint sidecar). Chrome still
+    // rejects certs past notAfter even with serverCertificateHashes, which
+    // surfaces as "Opening handshake failed" in game demos.
     if let Ok(meta) = std::fs::metadata(&cert_path) {
         if let Ok(mtime) = meta.modified() {
             if let Ok(age) = std::time::SystemTime::now().duration_since(mtime) {
@@ -550,13 +550,13 @@ pub async fn run_listener(bridge: BrowserBridge, data_dir: PathBuf, port: u16) {
                     tracing::error!(
                         "[web.host.h3.v1] WebTransport cert is {} days old and has EXPIRED — \
                          browser clients will see \"Opening handshake failed\". \
-                         Restart the supernode to regenerate the cert.",
+                         Restart the supernode so ensure_web_cert can regenerate it.",
                         age_days
                     );
                 } else if age_days >= 7 {
                     tracing::warn!(
                         "[web.host.h3.v1] WebTransport cert is {} days old (rotation threshold \
-                         is 7 days). Restart the supernode soon to avoid cert expiry.",
+                         is 7 days). Next restart will regenerate it.",
                         age_days
                     );
                 }
