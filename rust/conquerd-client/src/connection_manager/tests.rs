@@ -1,8 +1,10 @@
 use super::internal::{host_from_url, is_loopback_or_wildcard, rewrite_loopback_wt_url};
 use super::manager::{
-    build_room_invite_url, is_elected_keyer, parse_quic_lan_hint, parse_room_invite,
-    peer_quic_endpoint, plan_cluster_failover, union_members_for_room, FailoverPlan,
-    RoomInvitePayload, ROOM_INVITE_SCHEMA,
+    accept_group_key_epoch, build_room_invite_url, is_elected_keyer, may_send_room_e2e_content,
+    normalize_room_type, parse_quic_lan_hint, parse_room_invite, peer_quic_endpoint,
+    plan_cluster_failover, room_scope_key, should_auto_join_on_room_created,
+    should_mint_first_room_key, should_track_pending_materialize, should_use_private_room_invite,
+    union_members_for_room, FailoverPlan, RoomInvitePayload, ROOM_INVITE_SCHEMA,
 };
 use super::ConnectionManager;
 use std::collections::{HashMap, HashSet};
@@ -499,13 +501,159 @@ fn sfu_group_key_inner_must_be_signed_to_install() {
 fn accept_group_key_requires_elected_keyer() {
     // is_elected_keyer is the sole membership check used by accept_group_key_from
     // for the "who may install" question — cover the predicate here; epoch
-    // policy is unit-tested via integration of current_epoch / wrapping_add.
+    // policy is unit-tested separately via `accept_group_key_epoch`.
     let members = vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()];
     assert!(is_elected_keyer(&members, "alice"));
     assert!(!is_elected_keyer(&members, "bob"));
     assert!(!is_elected_keyer(&members, "carol"));
     // Hostile "bob" must not be able to claim keyer status.
     assert!(!is_elected_keyer(&members, "bob"));
+}
+
+/// Epoch policy for installing a sealed SfuGroupKey (security: no hostile jumps).
+#[test]
+fn accept_group_key_epoch_allows_bootstrap_and_adjacent_only() {
+    // No real key yet → first install accepts any offered epoch.
+    assert!(accept_group_key_epoch(false, 0, 0));
+    assert!(accept_group_key_epoch(false, 0, 7));
+    assert!(accept_group_key_epoch(false, 0, 255));
+
+    // With real key at epoch 3: same epoch (reseal) and +1 (rotation) only.
+    assert!(accept_group_key_epoch(true, 3, 3));
+    assert!(accept_group_key_epoch(true, 3, 4));
+    assert!(!accept_group_key_epoch(true, 3, 5));
+    assert!(!accept_group_key_epoch(true, 3, 2));
+    assert!(!accept_group_key_epoch(true, 3, 0));
+
+    // u8 wrap: current 255, next rotation is 0.
+    assert!(accept_group_key_epoch(true, 255, 255));
+    assert!(accept_group_key_epoch(true, 255, 0));
+    assert!(!accept_group_key_epoch(true, 255, 1));
+}
+
+/// Solo key defer closes the dual-keyer bootstrap race (architecture + opacity).
+#[test]
+fn should_mint_first_room_key_defers_when_solo_or_not_elected() {
+    // Elected + no real key + another member present → mint.
+    assert!(should_mint_first_room_key(true, false, 1));
+    assert!(should_mint_first_room_key(true, false, 3));
+
+    // Alone (union empty of others) → wait (fail-closed until peer arrives).
+    assert!(!should_mint_first_room_key(true, false, 0));
+
+    // Already have real key → not a "first mint".
+    assert!(!should_mint_first_room_key(true, true, 1));
+
+    // Non-elected never mints.
+    assert!(!should_mint_first_room_key(false, false, 2));
+    assert!(!should_mint_first_room_key(false, false, 0));
+}
+
+/// Outbound room audio/chat/file must not ship under the deterministic fallback.
+#[test]
+fn may_send_room_e2e_content_requires_real_key() {
+    assert!(!may_send_room_e2e_content(false));
+    assert!(may_send_room_e2e_content(true));
+}
+
+/// Wire reason strings the client rolls back on (`SfuJoinResult` / create deny)
+/// stay stable — renames would break UX without a protocol bump.
+#[test]
+fn sfu_deny_and_join_result_wire_strings_are_stable() {
+    use crate::protocol::MessageType;
+    assert_eq!(MessageType::SfuJoinResult.as_wire_str(), "sfu_join_result");
+    assert_eq!(
+        MessageType::SfuRoomCreated.as_wire_str(),
+        "sfu_room_created"
+    );
+    // Reason tokens (supernode → client) used by RoomJoinRejected / create deny.
+    for reason in [
+        "room_absent",
+        "not_allowed",
+        "room_full",
+        "join_failed",
+        "public_rooms_disabled",
+        "private_rooms_disabled",
+    ] {
+        assert!(!reason.is_empty());
+        assert!(reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+    }
+}
+
+/// Deterministic seal still works without real key — which is exactly why
+/// `may_send_room_e2e_content` must gate outbound paths before seal.
+#[test]
+fn deterministic_seal_without_real_key_is_why_outbound_gate_exists() {
+    use crate::group_key::{seal_voice_frame, SenderKeysGroup};
+    let keys = SenderKeysGroup::new();
+    assert!(!keys.has_real_key("room-x"));
+    // Seal would succeed under the non-opaque deterministic key if we allowed it.
+    let sealed = seal_voice_frame(&keys, "room-x", "sender", 1, b"opus");
+    assert!(
+        sealed.is_some(),
+        "deterministic fallback still seals — outbound must check has_real_key first"
+    );
+    assert!(
+        !may_send_room_e2e_content(keys.has_real_key("room-x")),
+        "gate must block before that seal is ever transmitted"
+    );
+}
+
+// ── Materialize / auto-join / private-invite policy ─────────────────────────
+//
+// Regression surface for: reconnect rematerialize must not auto-join voice;
+// user create must auto-join; denied create must no-op; invite path only for
+// non-creator private rooms with a token and not yet admitted.
+
+#[test]
+fn room_scope_key_is_stable_composite() {
+    assert_eq!(room_scope_key("sn-A", "room-1"), "sn-A:room-1");
+}
+
+#[test]
+fn normalize_room_type_private_or_public() {
+    assert_eq!(normalize_room_type("private"), "private");
+    assert_eq!(normalize_room_type("PRIVATE"), "private");
+    assert_eq!(normalize_room_type(" private "), "private");
+    assert_eq!(normalize_room_type("public"), "public");
+    assert_eq!(normalize_room_type(""), "public");
+    assert_eq!(normalize_room_type("garbage"), "public");
+}
+
+#[test]
+fn pending_materialize_tracking_requires_id_and_flag() {
+    assert!(should_track_pending_materialize(true, Some("abc")));
+    assert!(!should_track_pending_materialize(true, Some("")));
+    assert!(!should_track_pending_materialize(true, None));
+    assert!(!should_track_pending_materialize(false, Some("abc")));
+}
+
+#[test]
+fn auto_join_on_room_created_decision_table() {
+    // User-initiated create → auto-join.
+    assert!(should_auto_join_on_room_created(false, false, false));
+    // Materialize-only reconnect → list only, no join.
+    assert!(!should_auto_join_on_room_created(false, false, true));
+    // Denied create → never join.
+    assert!(!should_auto_join_on_room_created(true, false, false));
+    assert!(!should_auto_join_on_room_created(true, false, true));
+    // Empty room_id → never join.
+    assert!(!should_auto_join_on_room_created(false, true, false));
+    assert!(!should_auto_join_on_room_created(false, true, true));
+}
+
+#[test]
+fn private_room_invite_path_decision_table() {
+    // Non-creator private with token, not yet admitted → invite path.
+    assert!(should_use_private_room_invite(false, true, false, true));
+    // Already admitted this session → plain join (token spent).
+    assert!(!should_use_private_room_invite(true, true, false, true));
+    // Creator → plain join (self-admit).
+    assert!(!should_use_private_room_invite(false, true, true, true));
+    // Public room → plain join.
+    assert!(!should_use_private_room_invite(false, false, false, true));
+    // Private non-creator but no token → plain join (may be denied server-side).
+    assert!(!should_use_private_room_invite(false, true, false, false));
 }
 
 /// Wire type + signed-ack envelope for group-key install confirmation.

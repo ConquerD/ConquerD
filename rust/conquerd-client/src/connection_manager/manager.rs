@@ -64,6 +64,86 @@ pub(super) fn is_elected_keyer(members: &[String], me: &str) -> bool {
     members.iter().any(|m| m == me) && !members.iter().any(|m| m.as_str() < me)
 }
 
+/// Epoch acceptance once the sender is known to be the elected keyer.
+///
+/// * No real key yet → accept any epoch (first install / dual-join race heal).
+/// * Otherwise only the current epoch (reseal after reconnect) or the next
+///   rotation (`cur.wrapping_add(1)`) — rejects hostile epoch jumps.
+pub(super) fn accept_group_key_epoch(has_real_key: bool, current_epoch: u8, offered: u8) -> bool {
+    if !has_real_key {
+        return true;
+    }
+    offered == current_epoch || offered == current_epoch.wrapping_add(1)
+}
+
+/// Whether the elected keyer should mint the first real room key now.
+///
+/// Defers until at least one *other* member is visible so two solo joiners
+/// cannot each mint a different epoch-0 key (dual-keyer bootstrap race).
+pub(super) fn should_mint_first_room_key(
+    is_elected: bool,
+    has_real_key: bool,
+    other_member_count: usize,
+) -> bool {
+    is_elected && !has_real_key && other_member_count > 0
+}
+
+/// Fail-closed gate for outbound room E2E content (audio / chat / file chunks).
+///
+/// Real (distributed) key material is required so the supernode cannot derive
+/// the content key from `room_id` alone. The deterministic epoch-0 fallback is
+/// intentionally *not* used for outbound sends.
+pub(super) fn may_send_room_e2e_content(has_real_key: bool) -> bool {
+    has_real_key
+}
+
+/// Composite key for pending materialize / private-join / room-store maps.
+pub(super) fn room_scope_key(supernode_id: &str, room_id: &str) -> String {
+    format!("{supernode_id}:{room_id}")
+}
+
+/// Normalize client-supplied `room_type` for `SfuRoomCreate` (unknown → public).
+pub(super) fn normalize_room_type(room_type: &str) -> &'static str {
+    match room_type.trim().to_ascii_lowercase().as_str() {
+        "private" => "private",
+        _ => "public",
+    }
+}
+
+/// Track `pending_materialize` only when replaying a client-owned definition
+/// with a known room id (reconnect / GC rematerialize).
+pub(super) fn should_track_pending_materialize(
+    materialize_only: bool,
+    room_id: Option<&str>,
+) -> bool {
+    materialize_only && room_id.is_some_and(|s| !s.is_empty())
+}
+
+/// After a successful `SfuRoomCreated` ack: auto-join + emit `RoomCreated` only
+/// for user-initiated creates. Materialize-only, denied, and empty room_id
+/// must never auto-join (reconnect must not steal the active voice room).
+pub(super) fn should_auto_join_on_room_created(
+    denied: bool,
+    room_id_empty: bool,
+    materialize_only: bool,
+) -> bool {
+    !denied && !room_id_empty && !materialize_only
+}
+
+/// Whether `join_room` should take the private invite round-trip
+/// (`JoinRoomWithInvite`) instead of a plain `SfuJoin`.
+///
+/// Creators and already-admitted peers skip the single-use token path.
+/// Shared with the Qt bridge so UI and CM cannot diverge on this policy.
+pub fn should_use_private_room_invite(
+    already_admitted: bool,
+    is_private: bool,
+    is_creator: bool,
+    has_invite_token: bool,
+) -> bool {
+    !already_admitted && is_private && !is_creator && has_invite_token
+}
+
 /// Cluster-wide union of a room's members across every supernode snapshot.
 ///
 /// `snapshots` is keyed by `"{supernode_id}:{room_id}"` (per-node last-seen
@@ -1805,12 +1885,9 @@ impl ConnectionManager {
         if !is_elected_keyer(&present, sender) {
             return false;
         }
-        if !self.group_keys.has_real_key(room_id) {
-            return true;
-        }
+        let has_real = self.group_keys.has_real_key(room_id);
         let cur = self.group_keys.current_epoch(room_id);
-        // Same epoch = reseal after reconnect; +1 = legitimate rotation.
-        epoch == cur || epoch == cur.wrapping_add(1)
+        accept_group_key_epoch(has_real, cur, epoch)
     }
 
     /// Member → keyer: confirm we installed `(room_id, epoch)`. Sealed the same
@@ -1969,14 +2046,16 @@ impl ConnectionManager {
         // join alone, each mint a different epoch-0 key, then cannot open each
         // other's audio until a later reseal. Waiting for a non-empty union
         // means only the elected keyer mints once both are visible.
-        if !self.group_keys.has_real_key(room_id) {
-            if union_new.is_empty() {
-                return;
-            }
+        let has_real = self.group_keys.has_real_key(room_id);
+        if should_mint_first_room_key(true, has_real, union_new.len()) {
             // First keying: generate epoch 0 and seal to everyone present.
+            // (Caller already established we are elected keyer.)
             let (epoch, key) = self.group_keys.new_owner_epoch(room_id);
             let all: Vec<String> = union_new.iter().cloned().collect();
             self.distribute_group_key(room_id, epoch, &key, &all).await;
+        } else if !has_real {
+            // Elected but alone (or still no real key and no others) — wait.
+            return;
         } else if removed {
             // A member left the cluster entirely → rotate for forward secrecy
             // and reseal to the rest.
@@ -2624,14 +2703,11 @@ impl ConnectionManager {
             invite_policy,
             invite_token,
         } = req;
-        let normalized = match room_type.trim().to_ascii_lowercase().as_str() {
-            "private" => "private",
-            _ => "public",
-        };
-        if materialize_only {
+        let normalized = normalize_room_type(room_type);
+        if should_track_pending_materialize(materialize_only, room_id) {
             if let Some(rid) = room_id.filter(|s| !s.is_empty()) {
-                let key = format!("{supernode_id}:{rid}");
-                self.pending_materialize.insert(key);
+                self.pending_materialize
+                    .insert(room_scope_key(supernode_id, rid));
             }
         }
         let sender = self.identity.public_id();
@@ -2801,7 +2877,7 @@ impl ConnectionManager {
         // fallback is not supernode-opaque (key = f(room_id)); drop until the
         // elected keyer's SfuGroupKey is installed. A few 20 ms frames of
         // silence at join is preferable to content the relay can derive.
-        if !self.group_keys.has_real_key(&room_id) {
+        if !may_send_room_e2e_content(self.group_keys.has_real_key(&room_id)) {
             warn!("[room.audio.sfu] no real group key yet; dropping frame");
             return;
         }
@@ -2926,7 +3002,7 @@ impl ConnectionManager {
         // installed — the deterministic fallback is not confidential vs. the
         // supernode (it knows `room_id`), and cleartext is worse. Keying is
         // near-instant at join with ACK/reseal.
-        if !self.group_keys.has_real_key(room_id) {
+        if !may_send_room_e2e_content(self.group_keys.has_real_key(room_id)) {
             warn!("[room.chat] no real group key for room yet; dropping outbound message");
             return;
         }
@@ -4407,12 +4483,12 @@ impl ConnectionManager {
                 });
             }
             MessageType::SfuRoomCreated => {
-                if msg
+                let denied = msg
                     .payload
                     .get("denied")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                if denied {
                     let reason = msg
                         .payload
                         .get("reason")
@@ -4461,9 +4537,10 @@ impl ConnectionManager {
                     return;
                 }
                 let supernode_id = msg.sender.clone();
-                let materialize_key = format!("{supernode_id}:{room_id}");
+                let materialize_key = room_scope_key(&supernode_id, &room_id);
                 let materialize_only = self.pending_materialize.remove(&materialize_key);
-                if materialize_only {
+                if !should_auto_join_on_room_created(denied, room_id.is_empty(), materialize_only) {
+                    // Materialize-only replay: refresh sidebar counts, do not join.
                     self.send_room_list_request(&supernode_id).await;
                 } else {
                     self.current_supernode_id = supernode_id.clone();
@@ -4474,7 +4551,7 @@ impl ConnectionManager {
                     // Reset any stale local state in case this room_id was reused
                     // (room ids are derived from creator+name, so recreating with
                     // the same name can repeat one).
-                    let room_key = format!("{supernode_id}:{room_id}");
+                    let room_key = room_scope_key(&supernode_id, &room_id);
                     self.room_group_members.remove(&room_key);
                     self.group_keys.forget(&room_id);
                     self.pending_group_key_acks
@@ -5893,7 +5970,7 @@ impl ConnectionManager {
                     if room_msg_type == MessageType::SfuFileChunk {
                         use base64::Engine;
                         let b64 = base64::engine::general_purpose::STANDARD;
-                        if !self.group_keys.has_real_key(room_id) {
+                        if !may_send_room_e2e_content(self.group_keys.has_real_key(room_id)) {
                             warn!("[room.file.v1] no real group key yet; dropping outbound chunk");
                             continue;
                         }

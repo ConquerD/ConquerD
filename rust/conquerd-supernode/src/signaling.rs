@@ -515,4 +515,77 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["peer-a".to_string(), "peer-b".to_string()]);
     }
+
+    /// Architecture: room broadcasts prefer QUIC signaling stream over WS so
+    /// control traffic avoids TCP head-of-line blocking when a relay session exists.
+    #[test]
+    fn send_to_peer_prefers_quic_sender_over_websocket() {
+        let srv = SignalingServer::new("supernode-id".into());
+        let (quic_tx, mut quic_rx) = mpsc::unbounded_channel::<String>();
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
+        {
+            let mut st = srv.state.write();
+            st.quic_senders.insert("peer-a".into(), quic_tx);
+            st.peer_sockets.insert("peer-a".into(), ws_tx);
+        }
+        assert!(srv.send_to_peer("peer-a", r#"{"type":"ping"}"#));
+        assert_eq!(
+            quic_rx.try_recv().expect("delivered on QUIC path"),
+            r#"{"type":"ping"}"#
+        );
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "must not also fan out to WebSocket when QUIC succeeds"
+        );
+    }
+
+    /// If the preferred QUIC channel is closed, fall back to WebSocket.
+    #[test]
+    fn send_to_peer_falls_back_to_ws_when_quic_closed() {
+        let srv = SignalingServer::new("supernode-id".into());
+        let (quic_tx, quic_rx) = mpsc::unbounded_channel::<String>();
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
+        drop(quic_rx);
+        {
+            let mut st = srv.state.write();
+            st.quic_senders.insert("peer-a".into(), quic_tx);
+            st.peer_sockets.insert("peer-a".into(), ws_tx);
+        }
+        assert!(srv.send_to_peer("peer-a", r#"{"type":"ping"}"#));
+        assert_eq!(ws_rx.try_recv().expect("WS fallback"), r#"{"type":"ping"}"#);
+    }
+
+    /// accept_signed: unsigned / malformed frames are dropped (security).
+    #[test]
+    fn accept_signed_rejects_unsigned_and_malformed() {
+        let srv = SignalingServer::new("supernode-id".into());
+        assert!(srv.accept_signed("not-json").is_none());
+        assert!(srv
+            .accept_signed(r#"{"type":"ping","sender":"x","timestamp":1.0,"v":2}"#)
+            .is_none());
+    }
+
+    /// accept_signed: valid signed fresh message is accepted once; replay denied.
+    #[test]
+    fn accept_signed_accepts_fresh_and_rejects_replay() {
+        use crate::identity::Identity;
+        use crate::protocol::{MessageType, SignalingMessage};
+
+        let srv = SignalingServer::new("supernode-id".into());
+        let id = Identity::generate();
+        let msg = SignalingMessage::new(MessageType::Ping, &id.public_id(), serde_json::json!({}))
+            .sign(&id);
+        let raw = msg.to_json();
+
+        let first = srv
+            .accept_signed(&raw)
+            .expect("fresh signed frame must be accepted");
+        assert_eq!(first.msg_type, MessageType::Ping);
+
+        // Same signature within the freshness window is a replay.
+        assert!(
+            srv.accept_signed(&raw).is_none(),
+            "replay of the same signed frame must be dropped"
+        );
+    }
 }

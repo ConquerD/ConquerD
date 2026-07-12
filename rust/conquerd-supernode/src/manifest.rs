@@ -347,6 +347,21 @@ impl Default for SfuRoomCreationPolicy {
     }
 }
 
+impl SfuRoomCreationPolicy {
+    /// Denial reason for creating a *new* room of the given kind.
+    /// `public == true` → public room; `false` → private.
+    /// Returns `None` when the create is allowed under this operator policy.
+    pub fn deny_reason_for_new_room(&self, public: bool) -> Option<&'static str> {
+        if public && !self.allow_public {
+            Some("public_rooms_disabled")
+        } else if !public && !self.allow_private {
+            Some("private_rooms_disabled")
+        } else {
+            None
+        }
+    }
+}
+
 /// Read a boolean operator param from a merged capability params object.
 pub fn param_bool(params: &Value, key: &str, default: bool) -> bool {
     params.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
@@ -551,6 +566,50 @@ mod tests {
         config.web_port = None;
         m.apply_to_config(&mut config);
         assert_eq!(config.web_port, Some(8443));
+    }
+
+    #[test]
+    fn room_create_deny_table_matches_acdc_defaults() {
+        // acdc / default operator policy: private ok, public denied.
+        let policy = SfuRoomCreationPolicy::default();
+        assert_eq!(
+            policy.deny_reason_for_new_room(true),
+            Some("public_rooms_disabled")
+        );
+        assert_eq!(policy.deny_reason_for_new_room(false), None);
+
+        // Fully open.
+        let open = SfuRoomCreationPolicy {
+            allow_public: true,
+            allow_private: true,
+        };
+        assert_eq!(open.deny_reason_for_new_room(true), None);
+        assert_eq!(open.deny_reason_for_new_room(false), None);
+
+        // Fully closed.
+        let closed = SfuRoomCreationPolicy {
+            allow_public: false,
+            allow_private: false,
+        };
+        assert_eq!(
+            closed.deny_reason_for_new_room(true),
+            Some("public_rooms_disabled")
+        );
+        assert_eq!(
+            closed.deny_reason_for_new_room(false),
+            Some("private_rooms_disabled")
+        );
+
+        // Public-only (unusual but allowed by the table).
+        let public_only = SfuRoomCreationPolicy {
+            allow_public: true,
+            allow_private: false,
+        };
+        assert_eq!(public_only.deny_reason_for_new_room(true), None);
+        assert_eq!(
+            public_only.deny_reason_for_new_room(false),
+            Some("private_rooms_disabled")
+        );
     }
 
     #[test]

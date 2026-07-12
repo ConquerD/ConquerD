@@ -512,6 +512,20 @@ impl SFURoomManager {
         (ok, members)
     }
 
+    /// Machine-readable reason for a failed `join_room` (feeds `SfuJoinResult`).
+    ///
+    /// Call after `join_room` returns `ok == false`. Order matches the
+    /// production deny path: absent → not allowed → full → generic failure.
+    pub fn classify_join_denial(&self, peer_id: &str, room_id: &str) -> &'static str {
+        let peer_id = normalize_peer_id(peer_id);
+        match self.get_room(room_id) {
+            None => "room_absent",
+            Some(r) if !r.is_peer_allowed(&peer_id) => "not_allowed",
+            Some(r) if r.is_full() => "room_full",
+            Some(_) => "join_failed",
+        }
+    }
+
     /// Leave a room. Returns remaining member list.
     pub fn leave_room(&mut self, peer_id: &str, room_id: &str) -> Vec<String> {
         let Some(room) = self.rooms.get_mut(room_id) else {
@@ -1094,6 +1108,89 @@ mod tests {
         mgr.create_room(Some("priv"), "Private", RoomType::Private, "creator");
         assert!(!mgr.reregister_invite_token("priv", "", "creator"));
         assert!(!mgr.reregister_invite_token("missing", "tok", "creator"));
+    }
+
+    /// Private room: creator is admitted via creator_id without a prior
+    /// allow_peer (invite-only ACL still blocks strangers).
+    #[test]
+    fn private_room_creator_joins_without_explicit_allow() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("priv"), "Private", RoomType::Private, "owner-pub")
+            .expect("room");
+        assert!(
+            mgr.join_room("owner-pub", "priv").0,
+            "creator must join private room without allow_peer"
+        );
+        assert!(
+            !mgr.join_room("stranger", "priv").0,
+            "stranger must not join private room without allow/invite"
+        );
+    }
+
+    /// Rematerialize of an existing private room is not a new create: ACL is
+    /// empty until re-admit, so non-creators stay out (security after idle GC).
+    #[test]
+    fn rematerialize_existing_private_room_is_not_created_new() {
+        let mut mgr = SFURoomManager::new();
+        let (_, first) = mgr
+            .create_room(Some("priv"), "Private", RoomType::Private, "owner")
+            .unwrap();
+        assert!(first);
+        mgr.allow_peer("priv", "friend");
+        assert!(mgr.join_room("friend", "priv").0);
+
+        // Second create with same id returns the existing room, created=false.
+        let (_, second) = mgr
+            .create_room(Some("priv"), "Private", RoomType::Private, "owner")
+            .unwrap();
+        assert!(!second);
+        // Friend still allowed from prior ACL; a new stranger is not.
+        assert!(mgr.join_room("friend", "priv").0);
+        assert!(!mgr.join_room("stranger", "priv").0);
+    }
+
+    /// Public rooms admit anyone without an allow list (architecture: public tier).
+    #[test]
+    fn public_room_admits_any_peer() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("pub"), "Public", RoomType::Public, "creator")
+            .expect("room");
+        assert!(mgr.join_room("anyone", "pub").0);
+        assert!(mgr.join_room("else", "pub").0);
+        assert_eq!(mgr.get_room("pub").unwrap().participant_count(), 2);
+    }
+
+    /// Absent room join fails closed (client gets room_absent on SfuJoin).
+    #[test]
+    fn join_absent_room_fails() {
+        let mut mgr = SFURoomManager::new();
+        let (ok, members) = mgr.join_room("peer", "no-such-room");
+        assert!(!ok);
+        assert!(members.is_empty());
+    }
+
+    /// Join-deny reason table → stable wire strings for `SfuJoinResult.reason`.
+    #[test]
+    fn classify_join_denial_reasons() {
+        let mut mgr = SFURoomManager::new();
+        assert_eq!(mgr.classify_join_denial("peer", "missing"), "room_absent");
+
+        mgr.create_room(Some("priv"), "Private", RoomType::Private, "owner")
+            .expect("room");
+        assert_eq!(mgr.classify_join_denial("stranger", "priv"), "not_allowed");
+        // Creator is allowed; not a denial path.
+        assert!(mgr.join_room("owner", "priv").0);
+
+        // Fill the room to capacity (MAX_ROOM_SIZE includes the creator).
+        for i in 0..(MAX_ROOM_SIZE - 1) {
+            let id = format!("p{i}");
+            assert!(mgr.allow_peer("priv", &id));
+            assert!(mgr.join_room(&id, "priv").0, "join {id}");
+        }
+        assert!(mgr.get_room("priv").unwrap().is_full());
+        assert!(mgr.allow_peer("priv", "overflow"));
+        assert!(!mgr.join_room("overflow", "priv").0);
+        assert_eq!(mgr.classify_join_denial("overflow", "priv"), "room_full");
     }
 
     #[test]

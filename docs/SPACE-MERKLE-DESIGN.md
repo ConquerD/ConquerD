@@ -8,69 +8,23 @@ ecosystem) against ConquerD, plus the "Space hierarchy" / "Trustless access proo
 
 ---
 
-## Already shipped (Layer 1 — do not re-design; see `agents.md` Roadmap)
+## Layer 1 — shipped
 
-Byte-identical `space.rs` on client + supernode (cross-crate KAT guards divergence):
-
-- **Data model + hashing**: `SpaceNode`, `derive_node_id`, canonical leaf encoding
-  (`conquerd-space-leaf-v1`), RFC 6962 leaf/interior hashing, `merkle_root` / `audit_path` /
-  `root_from_audit`, `MAX_PROOF_DEPTH = 32`.
-- **Signed wire structs** (all owner-Ed25519-signed, domain-separated): `SignedSpaceRoot` + `verify`,
-  `SpaceInclusionProof` + `verify_against`, `SpaceGrant` + `verify`.
-- **Owner builder**: `Space::{new_server, upsert_node, remove_node, root_hash, signed_root, prove,
-  grant}`, epoch bump per mutation, node_id-sorted set tree.
-- **Cluster + transport**: `ClusterMsgKind::SpaceRoot` gossip + `replicate_space_root` +
-  `OnSpaceRootFn`; supernode `SpaceRootStore` (highest-epoch-per-space, cross-signer rejection) via
-  `accept_and_gossip_space_root`; client→host `SpaceRootAnnounce` + `handle_space_root_announce`.
-- **Coexist admission**: `try_space_admission` — materializes rooms from proven nodes, accepts the
-  client-carried root (MTC fallback-cert / staleness path), enforces current-epoch-only + grant
-  expiry, then falls through to the legacy token/ACL path unchanged.
-- **Invite envelope**: `space_root` / `space_proof` / `space_grant` fields (`build_space_invite_fields`).
-- **§6.1 invite-minting hole closed**: `generate_invite_token_checked` is owner-only (`InviteMint`).
-- **Client persistence**: `RoomEntry.{space_id, parent_id, invite_policy}` (`#[serde(default)]`,
-  golden-field test, no schema bump), `StoreData.spaces` in `my_rooms.dat`,
-  `RoomStore::{space_id_for, get_space, adopt_room_into_space, set_space_linkage}`, sidebar nesting.
+Authenticated room tree: data model + hashing (`space.rs`, byte-identical on client + supernode),
+signed wire structs (`SignedSpaceRoot`, `SpaceInclusionProof`, `SpaceGrant`), owner builder, cluster
+gossip + `SpaceRootStore`, coexist admission (`try_space_admission`) alongside the legacy token/ACL
+path, invite envelope fields, the §6.1 invite-minting fix, and client persistence
+(`RoomEntry.{space_id, parent_id, invite_policy}` in `my_rooms.dat`) — plus the `"members"`
+invite-policy widening (§6.4), its client UI toggle, periodic Space-root re-broadcast (§8),
+root-equivocation flagging (§9, lighter mitigation), and arbitrary-depth sub-room nesting (§3.1, §10).
 
 The `inherit`, `key_commit`, and invite `space_node_key` fields are **reserved** (present, defaulted
 empty/false) so Layer 2 changes leaf *values*, not leaf *shape* — no `v1` label bump when it lands.
 
-**Also shipped (moved here from "Open items" — see `agents.md` Roadmap "Last reviewed" note):**
-
-- **`"members"` invite-policy enforcement (§6.4)**: `generate_invite_token_checked` resolves the
-  room's effective `invite_policy` (from `SFURoom`, set at create time from the `SfuRoomCreate`
-  payload or a proven `SpaceNode`) and mints for the creator under `"owner"`, or for the creator
-  **or** any eligible member (participant, subscriber, or in `allowed`) under `"members"`;
-  unknown/empty policy values normalize to `"owner"` (safe default). Rooms materialized from a proof
-  still cannot widen minting (empty `creator_id`) — real member-*signed* capabilities arrive with
-  Layer 2. See `sfu.rs::{normalize_invite_policy, is_invite_eligible_member, create_room_with_policy,
-  generate_invite_token_checked}`.
-- **Client UI for invite policy (§6.4)**: `CreateRoomDialog.qml` has a "members can invite" toggle
-  (private rooms only), wired through `createRoom`/`createSubRoom` → `AppBridge::create_room_impl` →
-  `ConnectionCommand::CreateRoom` → `SfuRoomCreate.invite_policy`. The creator's client persists the
-  chosen policy in `RoomEntry.invite_policy` (`RoomStore::with_invite_policy`) and replays it on
-  supernode reconnect (`replay_saved_rooms_on_supernode_connect`).
-- **Periodic Space-root re-broadcast (§8)**: on top of the existing on-change gossip
-  (`AnnounceSpaceRoot` / `replicate_space_root`) — cluster-side, `ClusterLink` carries a
-  `LocalSpaceRootsFn` (mirroring `LocalRoomsFn`) and re-gossips every currently-held
-  `SpaceRootStore` root on the same `SUBSCRIPTION_REFRESH` cadence as `broadcast_subscriptions`,
-  plus once immediately when a link is freshly established (`run_link`); client-side,
-  `replay_saved_rooms_on_supernode_connect` re-announces the owner's current signed Space root on
-  every supernode (re)connect, covering a supernode restart with no cluster peer to re-gossip from.
-- **Root-equivocation flagging — lighter mitigation (§9)**: `SpaceRootStore::accept` (supernode,
-  `main.rs`) distinguishes a same-epoch/same-content resend (idempotent, unchanged) from a
-  same-epoch/**different**-`root_hash` conflict — the latter is logged as a `space root equivocation
-  detected` warning and counted per `space_id`, surfaced via `/api/stats`
-  (`space_root_equivocations`) for operator visibility. The first-seen root is still retained since
-  there is no consistency proof to say which root is "true". The heavier alternative (append-only
-  history tree with consistency proofs) remains open — see below.
-- **Deeper trees beyond Server → Room (§3.1, §10)**: sub-room creation and nesting is built and
-  shipped — `CreateRoomDialog.qml` "Create Sub-room" → `AppBridge::create_sub_room` /
-  `create_room_impl` → `RoomStore::adopt_room_into_space` nests the new room under any existing room
-  node via `parent_node_id` (not just the Server root), and `MainWindow.qml` renders
-  expand/collapse for rooms with children. No new `kind` value was needed for this — `parent_id`
-  already points at any node id, so the existing `"room"` kind already supports arbitrary depth.
-  The backlog's `Closet` idea (a *distinct* node kind, e.g. for a different semantic like text-only
-  sub-channels) is a separate, still-unbuilt, additive refinement — it is not required for depth.
+Durable invariants, exact function/file locations, and test coverage live in `agents.md` — see
+Architecture Notes ("Room ownership invariant"), the UX/UI Agent role (`CreateRoomDialog.qml`), the
+Supernode Opacity section, and the Roadmap & Status "Last reviewed" entries. This file does not
+re-track shipped status; do not re-design any of the above without a reason logged here first.
 
 ---
 

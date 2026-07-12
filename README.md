@@ -42,6 +42,9 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Peer room invites with accept/decline flow.
 - Up to 32 participants per room.
 - Room (and sub-room) membership is backed by a client-signed, authenticated **Space** tree (Merkle inclusion proofs over room definitions) so any cluster member can admit a proven joiner even if it never saw the room's original grant; see `docs/SPACE-MERKLE-DESIGN.md`.
+- Invited members of a private room can always rejoin, even after the supernode's temporary room state was cleared (idle timeout or restart) — no need to request a fresh invite link.
+- If a room join is refused (full, private without access, etc.), the app now tells you rather than leaving you looking stuck "in" a room you never actually entered.
+- On a clustered deployment (multiple supernodes hosting the same room), voice now carries across every node in the cluster, matching how room chat already worked.
 
 ### In-App Supernode Portal & Browser Games
 - Supernodes with `web_port` configured serve an in-app portal over a QUIC bidi-stream channel (`web.host.app.v1`). The native client browses `conquerd://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no CA needed.
@@ -933,6 +936,30 @@ cargo test
 ```
 
 See `agents.md` (Roadmap & Status) for the current authoritative test counts, coverage areas, and P0–P2 delivery status. The test suite emphasises capability negotiation, quota symmetry (inbound/outbound), replay protection, relay/SFU/room flows, and installer manifest verification.
+
+### Coverage % (line / region)
+
+LLVM source coverage via [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) for the high-ROI packages (`conquerd-features`, `conquerd-supernode`, headless `conquerd-client`). Native Opus/DNN and Qt/QML UI are out of scope for the default report.
+
+```powershell
+# Windows — default "hot" scope; writes coverage/summary.md + .lcov/.json
+powershell -ExecutionPolicy Bypass -File scripts/coverage.ps1
+
+# Full product crates (adds installer); optional HTML
+powershell -ExecutionPolicy Bypass -File scripts/coverage.ps1 -Scope all -Html
+
+# Fail the process if any package is under N% lines (0 = report only)
+powershell -ExecutionPolicy Bypass -File scripts/coverage.ps1 -FailUnderLines 50
+```
+
+```bash
+# Linux / macOS
+bash scripts/coverage.sh
+bash scripts/coverage.sh --scope all --html
+bash scripts/coverage.sh --scope features --fail-under-lines 50
+```
+
+CI runs the same hot-scope report on every push/PR (`Rust coverage %` job) and uploads `coverage/` as an artifact. Floors are report-only until a baseline is chosen; raise them with `--fail-under-lines` / `-FailUnderLines` when ready.
 
 ### Local CI
 

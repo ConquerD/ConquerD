@@ -43,6 +43,9 @@ Thumbs.db
 .pytest_cache/
 htmlcov/
 .coverage
+# cargo-llvm-cov outputs from scripts/coverage.ps1 / coverage.sh
+/coverage/
+*.lcov
 test_results.txt
 test_run_output.txt
 test_check.txt

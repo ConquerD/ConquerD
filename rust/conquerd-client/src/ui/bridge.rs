@@ -2547,10 +2547,14 @@ impl ffi::AppBridge {
         // session: the single-use token is spent on first use, and we're now in
         // the supernode's `allowed` set, so a plain `SfuJoin` is accepted.
         let already_admitted = self.rust().admitted_rooms.contains(&format!("{sid}:{rid}"));
-        let use_invite = !already_admitted
-            && stored.as_ref().is_some_and(|e| {
-                e.room_type == "private" && !e.is_creator && !e.invite_token.is_empty()
-            });
+        // Same predicate as `connection_manager::should_use_private_room_invite`
+        // (kept inlined here to avoid pulling CM into the QObject surface).
+        let use_invite = crate::connection_manager::should_use_private_room_invite(
+            already_admitted,
+            stored.as_ref().is_some_and(|e| e.room_type == "private"),
+            stored.as_ref().is_some_and(|e| e.is_creator),
+            stored.as_ref().is_some_and(|e| !e.invite_token.is_empty()),
+        );
         debug!(
             "join_room rid={} type={} is_creator={} token_len={} -> {}",
             rid,

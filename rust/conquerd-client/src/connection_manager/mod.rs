@@ -16,4 +16,4 @@ mod ws;
 mod tests;
 
 pub use events::{ConnectionCommand, ConnectionEvent};
-pub use manager::ConnectionManager;
+pub use manager::{should_use_private_room_invite, ConnectionManager};

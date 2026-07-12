@@ -1909,37 +1909,21 @@ impl SupernodeHandler {
             // Machine-readable reason for the client; detail stays in logs only.
             let (reason, detail) = {
                 let s = sfu.read();
-                match s.get_room(room_id) {
-                    None => ("room_absent".to_owned(), String::new()),
-                    Some(r) if !r.is_peer_allowed(&msg.sender) => (
-                        "not_allowed".to_owned(),
-                        format!(
-                            "type={} creator_match={} allowed={} count={}",
-                            match r.room_type {
-                                sfu::RoomType::Public => "public",
-                                sfu::RoomType::Private => "private",
-                            },
-                            r.creator_id == msg.sender,
-                            r.is_peer_allowed(&msg.sender),
-                            r.participant_count(),
-                        ),
+                let reason = s.classify_join_denial(&msg.sender, room_id);
+                let detail = match s.get_room(room_id) {
+                    None => String::new(),
+                    Some(r) => format!(
+                        "type={} creator_match={} allowed={} count={}",
+                        match r.room_type {
+                            sfu::RoomType::Public => "public",
+                            sfu::RoomType::Private => "private",
+                        },
+                        r.creator_id == msg.sender,
+                        r.is_peer_allowed(&msg.sender),
+                        r.participant_count(),
                     ),
-                    Some(r) if r.is_full() => (
-                        "room_full".to_owned(),
-                        format!("count={}", r.participant_count()),
-                    ),
-                    Some(r) => (
-                        "join_failed".to_owned(),
-                        format!(
-                            "type={} count={}",
-                            match r.room_type {
-                                sfu::RoomType::Public => "public",
-                                sfu::RoomType::Private => "private",
-                            },
-                            r.participant_count(),
-                        ),
-                    ),
-                }
+                };
+                (reason, detail)
             };
             tracing::warn!(
                 "SfuJoin DENIED peer={} room={} reason={} [{}]",
@@ -2267,12 +2251,8 @@ impl SupernodeHandler {
         let exists = sfu.read().get_room(&resolved_id).is_some();
         if !exists && !is_default {
             let policy = self.state.sfu_room_policy;
-            let (denied, reason) = match room_type {
-                sfu::RoomType::Public if !policy.allow_public => (true, "public_rooms_disabled"),
-                sfu::RoomType::Private if !policy.allow_private => (true, "private_rooms_disabled"),
-                _ => (false, ""),
-            };
-            if denied {
+            let is_public = matches!(room_type, sfu::RoomType::Public);
+            if let Some(reason) = policy.deny_reason_for_new_room(is_public) {
                 warn!(
                     "Denied SFU room create from {}: {} ({})",
                     &msg.sender[..12.min(msg.sender.len())],

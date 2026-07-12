@@ -29,6 +29,15 @@ ownerless built-in `default` room — is now closed:
   before either observes the other (documented in code); it self-heals on the next shared membership
   snapshot.
 
+**Follow-up hardening — shipped (2026-07-10):** the dual-keyer variant of the bootstrap race (two lone
+joiners each mint a different epoch-0 key) is closed by deferring first-key minting until a second
+member is visible. Installing a received `SfuGroupKey` now requires the sender to be the current
+elected keyer at a plausible epoch (`accept_group_key_from`) — closes the "any room peer can push a
+bogus key" DoS caveat. Delivery is now acked (`SfuGroupKeyAck`) with a 750ms/16-attempt reseal loop so
+a lost `EncryptedSignal` envelope self-heals instead of permanently desyncing a member. Room chat/file/
+audio now fail closed (drop) instead of falling back to cleartext when no real key exists yet. See
+`agents.md` Supernode Opacity section.
+
 ## Space Merkle tree — remaining
 
 `docs/SPACE-MERKLE-DESIGN.md` is the authoritative not-done list (Layer 1 shipped). In brief:
