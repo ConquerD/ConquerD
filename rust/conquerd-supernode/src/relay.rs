@@ -756,36 +756,39 @@ fn handle_datagram(
 
     let mut relayed = 0u64;
 
-    // Portal game relay: fan-out within the sender's active game session
-    // (independent of SFU voice room membership).
+    // Portal game relay: when the sender has an active game session (from
+    // `GameRelayJoin`), fan-out only within that session — independent of SFU
+    // voice room membership. Untagged opaque payloads still classified as
+    // `game.relay.v1` for *quota* fall through to the SFU-room broadcast path
+    // below so voice-room smoke tests and legacy room-scoped datagrams keep
+    // working without a portal game join.
     if target_idx == wire::BROADCAST_INDEX && feature_id == "game.relay.v1" {
-        let Some(session_id) = st.peer_game_session.get(from_peer).cloned() else {
-            return;
-        };
-        let Some(members) = st.game_sessions.get(&session_id) else {
-            return;
-        };
-        let fwd = wire::build_forwarded_datagram(sender_index, payload);
-        for member_id in members {
-            if member_id == from_peer {
-                continue;
-            }
-            if let Some(member) = st.peers.get(member_id) {
-                if try_forward_datagram(features, feature_id, member_id, &fwd, member) {
-                    relayed += fwd.len() as u64;
+        if let Some(session_id) = st.peer_game_session.get(from_peer).cloned() {
+            if let Some(members) = st.game_sessions.get(&session_id) {
+                let fwd = wire::build_forwarded_datagram(sender_index, payload);
+                for member_id in members {
+                    if member_id == from_peer {
+                        continue;
+                    }
+                    if let Some(member) = st.peers.get(member_id) {
+                        if try_forward_datagram(features, feature_id, member_id, &fwd, member) {
+                            relayed += fwd.len() as u64;
+                        }
+                    }
                 }
+                if relayed == 0 {
+                    return;
+                }
+                drop(st);
+                let mut st = state.write();
+                st.total_bytes_relayed += relayed;
+                if let Some(peer) = st.peers.get_mut(from_peer) {
+                    peer.bytes_relayed += relayed;
+                }
+                return;
             }
         }
-        if relayed == 0 {
-            return;
-        }
-        drop(st);
-        let mut st = state.write();
-        st.total_bytes_relayed += relayed;
-        if let Some(peer) = st.peers.get_mut(from_peer) {
-            peer.bytes_relayed += relayed;
-        }
-        return;
+        // No active portal game session → SFU room broadcast below.
     }
 
     if target_idx == wire::BROADCAST_INDEX {
