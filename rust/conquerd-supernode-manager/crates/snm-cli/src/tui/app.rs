@@ -4,9 +4,9 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use ratatui::layout::Rect;
 use snm_core::{
-    apply_room_policy_to_features, default_instance_features, default_relay_port, default_web_port,
-    default_ws_port, features_from_csv, resolve_supernode_config, room_policy_from_features,
-    FeatureSpec, FirewallMode, Instance, Inventory, PrivilegeMode, KNOWN_FEATURES,
+    apply_room_policy_to_features, default_instance_features, default_relay_port, default_ws_port,
+    features_from_csv, resolve_supernode_config, room_policy_from_features, FeatureSpec,
+    FirewallMode, Instance, Inventory, PrivilegeMode, KNOWN_FEATURES,
 };
 use snm_supernode::{HostProbe, InstanceStatus, LifecycleAction};
 
@@ -82,17 +82,15 @@ pub enum FormField {
     PublicHost = 3,
     RelayPort = 4,
     WsPort = 5,
-    WebPort = 6,
 }
 
-pub const NODE_FORM_FIELDS: [FormField; 7] = [
+pub const NODE_FORM_FIELDS: [FormField; 6] = [
     FormField::HostName,
     FormField::Ssh,
     FormField::InstanceId,
     FormField::PublicHost,
     FormField::RelayPort,
     FormField::WsPort,
-    FormField::WebPort,
 ];
 
 pub const CONFIG_TEXT_FIELDS: usize = 4;
@@ -264,7 +262,6 @@ impl FormField {
             Self::PublicHost => "Public host",
             Self::RelayPort => "Relay port (optional)",
             Self::WsPort => "WS port (optional)",
-            Self::WebPort => "Web port (optional)",
         }
     }
 
@@ -342,7 +339,6 @@ pub struct NodeForm {
     pub public_host: String,
     pub relay_port: String,
     pub ws_port: String,
-    pub web_port: String,
     pub focused_field: usize,
     pub scroll: u16,
     pub error: Option<String>,
@@ -358,7 +354,6 @@ impl NodeForm {
             public_host: String::new(),
             relay_port: String::new(),
             ws_port: String::new(),
-            web_port: String::new(),
             focused_field: 0,
             scroll: 0,
             error: None,
@@ -385,7 +380,6 @@ impl NodeForm {
             FormField::PublicHost => &mut self.public_host,
             FormField::RelayPort => &mut self.relay_port,
             FormField::WsPort => &mut self.ws_port,
-            FormField::WebPort => &mut self.web_port,
         }
     }
 
@@ -519,7 +513,6 @@ impl NodeConfigForm {
         label: &str,
         relay_port: u16,
         ws_port: u16,
-        web_port: Option<u16>,
     ) -> Option<Self> {
         let host = inv.host.iter().find(|h| h.name == host_name)?;
         let instance = host.instances.iter().find(|i| i.id == instance_id)?;
@@ -548,15 +541,13 @@ impl NodeConfigForm {
         } else if let Some(v) = inv.defaults.supernode.allow_private_rooms {
             allow_private = v;
         }
-        let resolved =
-            resolve_supernode_config(&inv.defaults, instance, relay_port, ws_port, web_port);
+        let resolved = resolve_supernode_config(&inv.defaults, instance, relay_port, ws_port);
         let effective_hint = format!(
-            "Effective: listen {}:{}  ws {}:{}  web {:?}  access {}",
+            "Effective: listen {}:{}  ws {}:{}  access {}",
             resolved.listen_bind,
             resolved.relay_port,
             resolved.listen_bind,
             resolved.ws_port,
-            resolved.web_port,
             resolved.access_mode,
         );
         Some(Self {
@@ -729,7 +720,6 @@ pub struct InstanceRow {
     pub public_host: String,
     pub relay_port: u16,
     pub ws_port: u16,
-    pub web_port: Option<u16>,
     pub status: RowStatus,
     pub platform: Option<String>,
     /// Cluster this instance belongs to, if any.
@@ -946,7 +936,6 @@ impl App {
             public_host: row.public_host,
             relay_port: row.relay_port.to_string(),
             ws_port: row.ws_port.to_string(),
-            web_port: row.web_port.map(|p| p.to_string()).unwrap_or_default(),
             focused_field: 0,
             scroll: 0,
             error: None,
@@ -971,7 +960,6 @@ impl App {
             &row.label(),
             row.relay_port,
             row.ws_port,
-            row.web_port,
         ) else {
             self.status_line = "could not load supernode config for selected node".into();
             return;
@@ -1134,13 +1122,12 @@ impl App {
             bail!("host name, SSH target, instance ID, and public host are required");
         }
 
-        let (relay_port, ws_port, web_port) = match &form.mode {
+        let (relay_port, ws_port) = match &form.mode {
             NodeFormMode::Add => {
                 let index = self.inventory.instance_count();
                 (
                     parse_optional_port(&form.relay_port, default_relay_port(index))?,
                     parse_optional_port(&form.ws_port, default_ws_port(index))?,
-                    parse_optional_port_opt(&form.web_port, default_web_port(index))?,
                 )
             }
             NodeFormMode::Edit {
@@ -1154,20 +1141,9 @@ impl App {
                         r.host_name == *original_host && r.instance_id == *original_instance_id
                     })
                     .ok_or_else(|| anyhow::anyhow!("edited node no longer exists"))?;
-                let web_port = if form.web_port.trim().is_empty() {
-                    row.web_port
-                } else {
-                    Some(
-                        form.web_port
-                            .trim()
-                            .parse()
-                            .with_context(|| format!("invalid web port: {}", form.web_port))?,
-                    )
-                };
                 (
                     parse_optional_port(&form.relay_port, row.relay_port)?,
                     parse_optional_port(&form.ws_port, row.ws_port)?,
-                    web_port,
                 )
             }
         };
@@ -1190,7 +1166,6 @@ impl App {
             public_host: public_host.into(),
             relay_port: Some(relay_port),
             ws_port: Some(ws_port),
-            web_port,
             listen_bind: preserved.and_then(|i| i.listen_bind.clone()),
             access_mode: preserved.and_then(|i| i.access_mode.clone()),
             identity_file: preserved.and_then(|i| i.identity_file.clone()),
@@ -1601,18 +1576,6 @@ fn parse_firewall(raw: &str) -> Result<FirewallMode> {
     }
 }
 
-fn parse_optional_port_opt(raw: &str, default: u16) -> Result<Option<u16>> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(Some(default));
-    }
-    Ok(Some(
-        trimmed
-            .parse()
-            .with_context(|| format!("invalid port: {trimmed}"))?,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1762,7 +1725,6 @@ mod tests {
             public_host: "edge1-new.example.net".into(),
             relay_port: "3479".into(),
             ws_port: "34936".into(),
-            web_port: "8444".into(),
             focused_field: 0,
             scroll: 0,
             error: None,
@@ -1794,7 +1756,6 @@ pub fn build_rows(inventory: &Inventory) -> Vec<InstanceRow> {
                 public_host: resolved.instance.public_host.clone(),
                 relay_port: resolved.relay_port,
                 ws_port: resolved.ws_port,
-                web_port: resolved.web_port,
                 status: RowStatus::Unknown,
                 platform: resolved.host.arch.clone(),
                 cluster_id,

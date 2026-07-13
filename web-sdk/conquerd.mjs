@@ -147,19 +147,17 @@ class PortalNativeTransport {
 /**
  * High-level client for in-app portal games.
  *
- *   new ConquerdClient({ features, room })  // host/port ignored (portal-only)
+ *   new ConquerdClient({ features, room })
  *   .on("connected", peerId => ...)
  *   .on("datagram", (featureId, data) => ...)
  *   await .connect()
  *   .sendDatagram(featureId, bytes)
  *   .disconnect()
+ *
+ * Transport is always the native portal bridge (`window.conquerd`).
  */
 export class ConquerdClient {
-    constructor({ host, port, features, room } = {}) {
-        // host/port retained for call-site compatibility with older demos;
-        // transport is always the native portal bridge.
-        this.host = host || "";
-        this.port = port || 0;
+    constructor({ features, room } = {}) {
         this.features = Array.isArray(features) ? features : [];
         this.room = room || null;
 

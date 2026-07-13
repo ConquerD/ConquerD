@@ -36,7 +36,6 @@ impl InstanceLayout {
 pub struct NetworkEnv {
     pub relay_port: u16,
     pub ws_port: u16,
-    pub web_port: Option<u16>,
     pub public_host: String,
     pub access_mode: String,
 }
@@ -46,7 +45,6 @@ impl NetworkEnv {
         Self {
             relay_port: resolved.relay_port,
             ws_port: resolved.ws_port,
-            web_port: resolved.web_port,
             public_host: resolved.instance.public_host.clone(),
             access_mode: resolved.defaults.access_mode.clone(),
         }

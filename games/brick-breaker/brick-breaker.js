@@ -52,16 +52,6 @@ const PALETTE = [
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function resolveHost() {
-  const p = new URLSearchParams(location.search);
-  return p.get("host") || location.hostname;
-}
-
-function resolvePort() {
-  const p = new URLSearchParams(location.search);
-  return parseInt(p.get("port") || location.port || "8443", 10);
-}
-
 function resolveRoom() {
   const p = new URLSearchParams(location.search);
   return p.get("room") || "brick-lobby";
@@ -537,16 +527,12 @@ const PADDLE_THROTTLE = 32;
 let simLast = Date.now();
 
 async function main() {
-  const host = resolveHost();
-  const port = resolvePort();
   const roomId = resolveRoom();
 
   myColorIdx = Math.floor(Math.random() * PALETTE.length);
 
   try {
     client = new ConquerdClient({
-      host,
-      port,
       features: [FEATURE_ID],
       room: roomId,
     });

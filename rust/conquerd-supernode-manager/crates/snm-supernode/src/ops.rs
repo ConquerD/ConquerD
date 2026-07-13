@@ -11,6 +11,7 @@ use snm_transport::{
 use crate::binary_probe::{
     binary_probe_command, format_pinned_version_display, parse_binary_probe_output,
 };
+use crate::cluster_cache::ClusterCache;
 use crate::firewall::{
     apply_cluster_firewall_report, apply_firewall_on_install_report,
     apply_firewall_on_uninstall_report,
@@ -20,7 +21,6 @@ use crate::layout::{
     instance_label, journalctl_command, privilege_prefix, systemctl_command, InstanceLayout,
     NetworkEnv,
 };
-use crate::cluster_cache::ClusterCache;
 use crate::manifest::{render_supernode_toml_with_cluster, ClusterMemberEntry, ClusterRoster};
 use crate::release::{download_supernode_artifact, DownloadedSupernode};
 use crate::systemd::{
@@ -109,7 +109,6 @@ pub async fn install_instance_report(
         resolved.instance,
         network.relay_port,
         network.ws_port,
-        network.web_port,
     );
     let manifest = render_supernode_toml_with_cluster(&config, cluster_roster);
     upload_text_file(transport, prefix, &layout.manifest_path, &manifest, 0o644)
@@ -213,7 +212,6 @@ pub async fn push_config_instance_report(
         resolved.instance,
         network.relay_port,
         network.ws_port,
-        network.web_port,
     );
     let manifest = render_supernode_toml_with_cluster(&config, cluster_roster);
     upload_text_file(transport, prefix, &layout.manifest_path, &manifest, 0o644)
@@ -630,16 +628,24 @@ pub async fn cluster_sync_report(
     let mut report = Vec::new();
 
     // ---- Phase 1: collect identity keys ---------------------------------
-    report.push(format!("cluster {}: collecting identity keys …", cluster.id));
+    report.push(format!(
+        "cluster {}: collecting identity keys …",
+        cluster.id
+    ));
     let mut identity_pubs: Vec<String> = Vec::with_capacity(members.len());
     for resolved in &members {
         let layout = InstanceLayout::from_resolved(resolved);
         let label = instance_label(&resolved.host.name, resolved.instance);
         let transport = SshTransport::new(&resolved.host.ssh, backend);
-        let pub_key = collect_identity_pub(&transport, &layout).await.with_context(|| {
-            format!("collect identity for {label} (must have started at least once)")
-        })?;
-        report.push(format!("  {label}: identity_pub={}", &pub_key[..pub_key.len().min(16)]));
+        let pub_key = collect_identity_pub(&transport, &layout)
+            .await
+            .with_context(|| {
+                format!("collect identity for {label} (must have started at least once)")
+            })?;
+        report.push(format!(
+            "  {label}: identity_pub={}",
+            &pub_key[..pub_key.len().min(16)]
+        ));
         identity_pubs.push(pub_key);
     }
 
@@ -652,7 +658,6 @@ pub async fn cluster_sync_report(
             relay_addr: format!("{}:{}", r.instance.public_host, r.relay_port),
             cluster_addr: format!("{}:{}", r.instance.public_host, r.cluster_port),
             ws_addr: format!("{}:{}", r.instance.public_host, r.ws_port),
-            web_port: r.web_port,
         })
         .collect();
     let roster = ClusterRoster {
@@ -686,7 +691,6 @@ pub async fn cluster_sync_report(
             resolved.instance,
             network.relay_port,
             network.ws_port,
-            network.web_port,
         );
         let manifest = render_supernode_toml_with_cluster(&config, Some(&roster));
         upload_text_file(&transport, prefix, &layout.manifest_path, &manifest, 0o644)
@@ -716,10 +720,7 @@ pub async fn cluster_sync_report(
 
         run_checked(
             &transport,
-            &systemctl_command(
-                resolved.defaults,
-                &format!("restart {}", layout.unit_name),
-            ),
+            &systemctl_command(resolved.defaults, &format!("restart {}", layout.unit_name)),
         )
         .await
         .with_context(|| format!("restart {label}"))?;

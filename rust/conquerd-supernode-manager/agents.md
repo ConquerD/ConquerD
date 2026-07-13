@@ -52,7 +52,7 @@ Resolved from `CONQUERD_HOME` (manager sets this per instance). Default layout: 
 
 - **Preferred:** `<data_dir>/supernode.toml` — manager generates per instance via `snm-supernode::manifest::render_supernode_toml`.
 - **SFU room policy:** `[defaults.supernode]` / per-instance overrides for `allow_public_rooms` / `allow_private_rooms` are emitted as **inline** `params = { … }` on the `room.audio.sfu` feature row (not a separate `[feature.params]` table).
-- **Legacy env vars** (still written in systemd drop-ins): `supernode_host`, `supernode_port`, `supernode_signaling_port`. Manifest fields (`listen_addr`, `ws_listen_addr`) are authoritative in `supernode.toml`. Do **not** set `web_port` / `supernode_web_port` — the in-app portal uses QUIC (`web.host.app.v1`), not a public HTTP/WebTransport port.
+- **Legacy env vars** (still written in systemd drop-ins): `supernode_host`, `supernode_port`, `supernode_signaling_port`. Manifest fields (`listen_addr`, `ws_listen_addr`) are authoritative in `supernode.toml`. The in-app portal uses QUIC (`web.host.app.v1`) — no public HTTP port.
 - **Clustering:** an optional `[cluster]` section (with `[[cluster.member]]` rows) links several supernodes into one logical node. Additive to `schema_version = 1` — the manager renders and pushes the shared roster to every member. Full contract, provisioning flow, and firewalling in §8.
 - `CONQUERD_BUILD_ID` is compiled into the binary; status probes it via `strings` when present.
 
@@ -66,7 +66,7 @@ Each instance binds at minimum:
 
 There is **no** public web/game port. The in-app portal is served over the peer's existing QUIC session (`web.host.app.v1`).
 
-Omitted relay/ws/cluster ports in inventory are auto-allocated at resolve time (`snm-core::inventory::default_*_port`). They are **not** written back into `inventory.toml` automatically — pin ports explicitly for stability. `web_port` is never auto-allocated.
+Omitted relay/ws/cluster ports in inventory are auto-allocated at resolve time (`snm-core::inventory::default_*_port`). They are **not** written back into `inventory.toml` automatically — pin ports explicitly for stability.
 
 `public_host` on each instance must be the address remote clients use for relay tickets.
 

@@ -26,8 +26,6 @@ pub struct CachedMember {
     pub relay_addr: String,
     pub cluster_addr: String,
     pub ws_addr: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_port: Option<u16>,
 }
 
 impl ClusterCache {
@@ -38,15 +36,13 @@ impl ClusterCache {
         }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read cluster cache {}", path.display()))?;
-        toml::from_str(&raw)
-            .with_context(|| format!("parse cluster cache {}", path.display()))
+        toml::from_str(&raw).with_context(|| format!("parse cluster cache {}", path.display()))
     }
 
     /// Persist the cache to disk, overwriting the existing file.
     pub fn save(&self, path: &Path) -> Result<()> {
         let raw = toml::to_string_pretty(self).context("serialize cluster cache")?;
-        std::fs::write(path, raw)
-            .with_context(|| format!("write cluster cache {}", path.display()))
+        std::fs::write(path, raw).with_context(|| format!("write cluster cache {}", path.display()))
     }
 
     /// Insert or replace the entry for this roster's cluster_id.
@@ -61,7 +57,6 @@ impl ClusterCache {
                     relay_addr: m.relay_addr.clone(),
                     cluster_addr: m.cluster_addr.clone(),
                     ws_addr: m.ws_addr.clone(),
-                    web_port: m.web_port,
                 })
                 .collect(),
         };
@@ -90,7 +85,6 @@ impl ClusterCache {
                         relay_addr: m.relay_addr.clone(),
                         cluster_addr: m.cluster_addr.clone(),
                         ws_addr: m.ws_addr.clone(),
-                        web_port: m.web_port,
                     })
                     .collect(),
             })

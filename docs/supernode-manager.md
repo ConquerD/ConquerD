@@ -52,7 +52,7 @@ Resolved from `CONQUERD_HOME` (manager sets this per instance). Default layout: 
 
 - **Preferred:** `<data_dir>/supernode.toml` — manager generates per instance via `snm-supernode::manifest::render_supernode_toml`.
 - **SFU room policy:** `[defaults.supernode]` / per-instance overrides for `allow_public_rooms` / `allow_private_rooms` are emitted as **inline** `params = { … }` on the `room.audio.sfu` feature row (not a separate `[feature.params]` table).
-- **Legacy env vars** (still written in systemd drop-ins): `supernode_host`, `supernode_port`, `supernode_signaling_port`. Manifest fields (`listen_addr`, `ws_listen_addr`) are authoritative. Do not set public `web_port` — portal is QUIC-only.
+- **Legacy env vars** (still written in systemd drop-ins): `supernode_host`, `supernode_port`, `supernode_signaling_port`. Manifest fields (`listen_addr`, `ws_listen_addr`) are authoritative. Portal is QUIC-only (`web.host.app.v1`) — no public HTTP/web port.
 - **Clustering:** an optional `[cluster]` section (with `[[cluster.member]]` rows) links several supernodes into one logical node. Additive to `schema_version = 1` — the manager renders and pushes the shared roster to every member. Full contract, provisioning flow, and firewalling in §8.
 - `CONQUERD_BUILD_ID` is compiled into the binary; status probes it via `strings` when present.
 
@@ -66,7 +66,7 @@ Each instance binds at minimum:
 
 No public web/game port. In-app portal uses `web.host.app.v1` over QUIC.
 
-Omitted relay/ws/cluster ports are auto-allocated at resolve time. `web_port` is never auto-allocated.
+Omitted relay/ws/cluster ports are auto-allocated at resolve time.
 
 `public_host` on each instance must be the address remote clients use for relay tickets.
 
@@ -262,7 +262,6 @@ identity_pub = "BASE64URL_ED25519"        # the member node's public_id
 relay_addr   = "node-a.example:3478"      # client relay attach point
 cluster_addr = "node-a.example:4478"      # dedicated supernode↔supernode QUIC link
 ws_addr      = "node-a.example:34935"     # client signaling / failover attach point
-web_port     = 8443                       # optional
 
 [[cluster.member]]
 identity_pub = "..."

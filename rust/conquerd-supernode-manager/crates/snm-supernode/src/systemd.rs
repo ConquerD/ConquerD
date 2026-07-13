@@ -30,7 +30,7 @@ WantedBy=multi-user.target
 /// Per-instance override: data dir and public relay ticket host.
 /// Ports and access mode live in `supernode.toml`.
 pub fn render_unit_dropin(layout: &InstanceLayout, network: &NetworkEnv) -> String {
-    let mut lines = vec![
+    let lines = vec![
         "[Service]".into(),
         format!(
             "Environment=CONQUERD_HOME={}",
@@ -43,9 +43,6 @@ pub fn render_unit_dropin(layout: &InstanceLayout, network: &NetworkEnv) -> Stri
         format!("Environment=supernode_port={}", network.relay_port),
         format!("Environment=supernode_signaling_port={}", network.ws_port),
     ];
-    if let Some(web_port) = network.web_port {
-        lines.push(format!("Environment=supernode_web_port={web_port}"));
-    }
     format!("{}\n", lines.join("\n"))
 }
 
@@ -86,7 +83,6 @@ mod tests {
         NetworkEnv {
             relay_port: 3478,
             ws_port: 34935,
-            web_port: Some(8443),
             public_host: "edge1.example.net".into(),
             access_mode: "open".into(),
         }
@@ -108,7 +104,7 @@ mod tests {
         assert!(dropin.contains("Environment=supernode_host=edge1.example.net"));
         assert!(dropin.contains("Environment=supernode_port=3478"));
         assert!(dropin.contains("Environment=supernode_signaling_port=34935"));
-        assert!(dropin.contains("Environment=supernode_web_port=8443"));
+        assert!(!dropin.contains("supernode_web_port"));
     }
 
     #[test]

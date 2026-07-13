@@ -12,7 +12,7 @@ pub struct PortRule {
 }
 
 pub fn port_rules(network: &NetworkEnv) -> Vec<PortRule> {
-    let mut rules = vec![
+    vec![
         PortRule {
             port: network.relay_port,
             proto: "udp",
@@ -23,20 +23,7 @@ pub fn port_rules(network: &NetworkEnv) -> Vec<PortRule> {
             proto: "tcp",
             tag: "ws",
         },
-    ];
-    if let Some(web_port) = network.web_port {
-        rules.push(PortRule {
-            port: web_port,
-            proto: "udp",
-            tag: "web-udp",
-        });
-        rules.push(PortRule {
-            port: web_port,
-            proto: "tcp",
-            tag: "web-tcp",
-        });
-    }
-    rules
+    ]
 }
 
 pub fn format_port_list(network: &NetworkEnv) -> String {
@@ -243,7 +230,10 @@ pub async fn apply_cluster_firewall_report(
                 }
             }
             if output.exit_code != 0 {
-                bail!("cluster ufw setup failed for {label}: {}", output.stderr.trim());
+                bail!(
+                    "cluster ufw setup failed for {label}: {}",
+                    output.stderr.trim()
+                );
             }
             report.push(format!(
                 "{label}: cluster ufw rules ensured (port {cluster_port}/udp from {} peers)",
@@ -278,7 +268,6 @@ pub fn render_cluster_ufw_script(
     lines.join("\n")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,7 +276,6 @@ mod tests {
         NetworkEnv {
             relay_port: 3578,
             ws_port: 35035,
-            web_port: None, // no public web port (portal is QUIC-only)
             public_host: "155.138.244.189".into(),
             access_mode: "open".into(),
         }

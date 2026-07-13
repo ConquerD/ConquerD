@@ -858,7 +858,6 @@ mod tests {
             relay_addr: addr.to_string(),
             cluster_addr: Some(addr.to_string()),
             ws_addr: None,
-            web_port: None,
         };
         let cfg = crate::cluster::ClusterConfig {
             cluster_id: "test".into(),

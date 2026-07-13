@@ -130,8 +130,6 @@ pub struct Instance {
     pub relay_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_port: Option<u16>,
     /// Override `[defaults.supernode].listen_bind` for this instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_bind: Option<String>,
@@ -166,7 +164,6 @@ pub struct ResolvedInstance<'a> {
     pub defaults: &'a Defaults,
     pub relay_port: u16,
     pub ws_port: u16,
-    pub web_port: Option<u16>,
     /// Resolved cluster QUIC port (only meaningful when the instance is in a cluster).
     pub cluster_port: u16,
 }
@@ -318,9 +315,6 @@ impl Inventory {
                     .relay_port
                     .unwrap_or_else(|| default_relay_port(index));
                 let ws_port = instance.ws_port.unwrap_or_else(|| default_ws_port(index));
-                // web_port is legacy (former WebTransport). Never auto-allocate —
-                // in-app portal uses QUIC only. Operators must set explicitly if needed.
-                let web_port = instance.web_port;
                 let cluster_port = instance
                     .cluster_port
                     .unwrap_or_else(|| default_cluster_port(index));
@@ -330,7 +324,6 @@ impl Inventory {
                     defaults: &self.defaults,
                     relay_port,
                     ws_port,
-                    web_port,
                     cluster_port,
                 });
             }
@@ -351,36 +344,42 @@ impl Inventory {
     ) -> Result<Vec<ResolvedInstance<'a>>> {
         let mut out = Vec::new();
         for key in &cluster.members {
-            let (host_name, inst_id) = key
-                .split_once('/')
-                .ok_or_else(|| anyhow::anyhow!("cluster member key {key:?} must be 'hostname/instance_id'"))?;
+            let (host_name, inst_id) = key.split_once('/').ok_or_else(|| {
+                anyhow::anyhow!("cluster member key {key:?} must be 'hostname/instance_id'")
+            })?;
             let host = self
                 .host
                 .iter()
                 .find(|h| h.name == host_name)
-                .ok_or_else(|| anyhow::anyhow!("cluster member {key}: host {host_name:?} not found in inventory"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cluster member {key}: host {host_name:?} not found in inventory"
+                    )
+                })?;
             let (index, instance) = host
                 .instances
                 .iter()
                 .enumerate()
                 .find(|(_, i)| i.id == inst_id)
-                .ok_or_else(|| anyhow::anyhow!("cluster member {key}: instance {inst_id:?} not found on host {host_name}"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cluster member {key}: instance {inst_id:?} not found on host {host_name}"
+                    )
+                })?;
             let relay_port = instance
                 .relay_port
                 .unwrap_or_else(|| default_relay_port(index));
             let ws_port = instance.ws_port.unwrap_or_else(|| default_ws_port(index));
-            let web_port = instance.web_port;
             // Use the cluster's base port if the instance doesn't pin its own.
-            let cluster_port = instance.cluster_port.unwrap_or_else(|| {
-                cluster.cluster_port.unwrap_or(4478) + (index as u16) * 100
-            });
+            let cluster_port = instance
+                .cluster_port
+                .unwrap_or_else(|| cluster.cluster_port.unwrap_or(4478) + (index as u16) * 100);
             out.push(ResolvedInstance {
                 host,
                 instance,
                 defaults: &self.defaults,
                 relay_port,
                 ws_port,
-                web_port,
                 cluster_port,
             });
         }
@@ -390,7 +389,10 @@ impl Inventory {
     /// Return the cluster(s) that contain `"hostname/instance_id"`.
     pub fn clusters_for_instance(&self, host_name: &str, instance_id: &str) -> Vec<&ClusterDef> {
         let key = format!("{host_name}/{instance_id}");
-        self.clusters.iter().filter(|c| c.members.contains(&key)).collect()
+        self.clusters
+            .iter()
+            .filter(|c| c.members.contains(&key))
+            .collect()
     }
 }
 
@@ -400,12 +402,6 @@ pub fn default_relay_port(index: usize) -> u16 {
 
 pub fn default_ws_port(index: usize) -> u16 {
     34935 + (index as u16) * 100
-}
-
-/// Legacy helper retained for tests/callers that still pass an explicit port.
-/// Prefer leaving `web_port` unset (in-app portal needs no public HTTP port).
-pub fn default_web_port(index: usize) -> u16 {
-    8443 + (index as u16) * 100
 }
 
 pub fn default_cluster_port(index: usize) -> u16 {
@@ -551,7 +547,6 @@ pub fn scaffold_inventory() -> Inventory {
                 public_host: "edge1.example.net".into(),
                 relay_port: Some(3478),
                 ws_port: Some(34935),
-                web_port: Some(8443),
                 listen_bind: None,
                 access_mode: None,
                 identity_file: None,
@@ -689,7 +684,6 @@ ssh = "root@1.2.3.4"
                 public_host: "edge2.example.net".into(),
                 relay_port: Some(3578),
                 ws_port: Some(35935),
-                web_port: Some(8543),
                 cluster_port: None,
                 listen_bind: None,
                 access_mode: None,
@@ -725,7 +719,6 @@ ssh = "root@1.2.3.4"
                 public_host: "edge1-new.example.net".into(),
                 relay_port: Some(3479),
                 ws_port: Some(34936),
-                web_port: Some(8444),
                 cluster_port: None,
                 listen_bind: None,
                 access_mode: None,
@@ -761,7 +754,6 @@ ssh = "root@1.2.3.4"
                 public_host: "edge2.example.net".into(),
                 relay_port: Some(3578),
                 ws_port: Some(35935),
-                web_port: Some(8543),
                 cluster_port: None,
                 listen_bind: None,
                 access_mode: None,

@@ -139,7 +139,6 @@ pub struct ResolvedSupernodeConfig {
     pub listen_bind: String,
     pub relay_port: u16,
     pub ws_port: u16,
-    pub web_port: Option<u16>,
     pub public_host: String,
     pub identity_file: String,
     pub access_mode: String,
@@ -151,14 +150,13 @@ pub fn resolve_supernode_config(
     instance: &crate::Instance,
     relay_port: u16,
     ws_port: u16,
-    web_port: Option<u16>,
 ) -> ResolvedSupernodeConfig {
     let features = if instance.features.is_empty() {
         default_instance_features()
     } else {
         instance.features.clone()
     };
-    let features = enrich_feature_params(features, web_port, &defaults.supernode, instance);
+    let features = enrich_feature_params(features, &defaults.supernode, instance);
 
     ResolvedSupernodeConfig {
         listen_bind: instance
@@ -167,7 +165,6 @@ pub fn resolve_supernode_config(
             .unwrap_or_else(|| defaults.supernode.listen_bind.clone()),
         relay_port,
         ws_port,
-        web_port,
         public_host: instance.public_host.clone(),
         identity_file: instance
             .identity_file
@@ -181,14 +178,12 @@ pub fn resolve_supernode_config(
     }
 }
 
-/// Attach derived manifest params (web port, SFU room policy) to features.
+/// Attach derived manifest params (SFU room policy) to features.
 pub fn enrich_feature_params(
     mut features: Vec<FeatureSpec>,
-    web_port: Option<u16>,
     sn_defaults: &SupernodeDefaults,
     instance: &crate::Instance,
 ) -> Vec<FeatureSpec> {
-    let _ = web_port; // legacy field; WebTransport removed — port no longer attached to features
     for feature in &mut features {
         if feature.id == "room.audio.sfu" && feature.enabled {
             apply_sfu_room_policy(feature, sn_defaults, instance);
@@ -360,28 +355,6 @@ ssh = "root@1.2.3.4"
     }
 
     #[test]
-    fn enrich_feature_params_ignores_legacy_web_port() {
-        let features = vec![FeatureSpec::enabled("web.host.app.v1")];
-        let sn_defaults = SupernodeDefaults::default();
-        let instance = Instance {
-            id: "a".into(),
-            public_host: "h.example.net".into(),
-            relay_port: None,
-            ws_port: None,
-            web_port: None,
-            cluster_port: None,
-            listen_bind: None,
-            access_mode: None,
-            identity_file: None,
-            allow_public_rooms: None,
-            allow_private_rooms: None,
-            features: vec![],
-        };
-        let out = enrich_feature_params(features, Some(8543), &sn_defaults, &instance);
-        assert!(out[0].params.is_none());
-    }
-
-    #[test]
     fn default_instance_features_include_chat_portal_and_room_policy() {
         let features = default_instance_features();
         assert!(features.iter().any(|f| f.id == "room.chat.v1"));
@@ -409,7 +382,6 @@ ssh = "root@1.2.3.4"
             public_host: "h.example.net".into(),
             relay_port: None,
             ws_port: None,
-            web_port: None,
             cluster_port: None,
             listen_bind: None,
             access_mode: None,
@@ -418,7 +390,7 @@ ssh = "root@1.2.3.4"
             allow_private_rooms: None,
             features: vec![],
         };
-        let out = enrich_feature_params(features, None, &sn_defaults, &instance);
+        let out = enrich_feature_params(features, &sn_defaults, &instance);
         let params = out[0].params.as_ref().unwrap();
         assert_eq!(
             params.get("allow_public_rooms").and_then(|v| v.as_bool()),
@@ -436,7 +408,6 @@ ssh = "root@1.2.3.4"
             public_host: "edge.example.net".into(),
             relay_port: Some(3478),
             ws_port: Some(34935),
-            web_port: Some(8443),
             cluster_port: None,
             listen_bind: Some("127.0.0.1".into()),
             access_mode: Some("access_code".into()),
@@ -445,7 +416,7 @@ ssh = "root@1.2.3.4"
             allow_private_rooms: None,
             features: default_instance_features(),
         };
-        let resolved = resolve_supernode_config(&defaults, &instance, 3478, 34935, Some(8443));
+        let resolved = resolve_supernode_config(&defaults, &instance, 3478, 34935);
         assert_eq!(resolved.listen_bind, "127.0.0.1");
         assert_eq!(resolved.access_mode, "access_code");
     }

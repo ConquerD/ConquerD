@@ -277,13 +277,7 @@ fn install_source(app: &App) -> String {
 }
 
 fn ports_label(row: &InstanceRow) -> String {
-    match row.web_port {
-        Some(web) => format!(
-            "relay {} / ws {} / web {}",
-            row.relay_port, row.ws_port, web
-        ),
-        None => format!("relay {} / ws {}", row.relay_port, row.ws_port),
-    }
+    format!("relay {} / ws {}", row.relay_port, row.ws_port)
 }
 
 fn draw_fleet_table(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -344,10 +338,7 @@ fn draw_fleet_table(frame: &mut Frame, area: Rect, app: &mut App) {
                 }
                 _ => format!("{} {}", row.status.glyph(), row.status.state_label()),
             };
-            let ports = match row.web_port {
-                Some(web) => format!("{}/{}/{}", row.relay_port, row.ws_port, web),
-                None => format!("{}/{}", row.relay_port, row.ws_port),
-            };
+            let ports = format!("{}/{}", row.relay_port, row.ws_port);
             let platform = row.platform.as_deref().unwrap_or("-");
             let marker = if i == app.selected { ">" } else { " " };
 
@@ -1194,12 +1185,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     let detail = app.selected_row().map(|row| {
         format!(
-            "{}  |  {}  |  {}/{}{}",
+            "{}  |  {}  |  {}/{}",
             row.label(),
             row.public_host,
             row.relay_port,
             row.ws_port,
-            row.web_port.map(|p| format!("/{p}")).unwrap_or_default()
         )
     });
 

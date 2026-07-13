@@ -1,5 +1,5 @@
 /**
- * Cursor Relay — example game using `game.relay.v1` over WebTransport.
+ * Cursor Relay — example game using `game.relay.v1` over the identity QUIC relay.
  *
  * Wire format (opaque to the supernode relay):
  *   [1 byte type][2 bytes x f16][2 bytes y f16][1-16 bytes color utf-8]
@@ -13,9 +13,8 @@
  * The supernode relays these verbatim to every other peer in the same
  * game session; it never reads or modifies the payload.
  *
- * Setup: host the supernode with `game.relay.v1` enabled in supernode.toml,
- * then open this page at:
- *   https://<host>:<web_port>/games/example/?room=<lobby>
+ * Open from the native portal only:
+ *   conquerd://<supernode_id>/games/example/?room=<lobby>
  */
 
 import { ConquerdClient } from "../../web-sdk/conquerd.mjs";
@@ -23,17 +22,6 @@ import { ConquerdClient } from "../../web-sdk/conquerd.mjs";
 // ── Config ───────────────────────────────────────────────────────────────────
 
 const FEATURE_ID = "game.relay.v1";
-
-/** Resolve the supernode WebTransport host from query params or origin. */
-function resolveHost() {
-  const p = new URLSearchParams(location.search);
-  return p.get("host") || location.hostname;
-}
-
-function resolvePort() {
-  const p = new URLSearchParams(location.search);
-  return parseInt(p.get("port") || location.port || "8443", 10);
-}
 
 function resolveRoom() {
   const p = new URLSearchParams(location.search);
@@ -179,8 +167,6 @@ const myColor = PALETTE[Math.floor(Math.random() * PALETTE.length)];
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const host   = resolveHost();
-  const port   = resolvePort();
   const roomId = resolveRoom();
 
   roomLabelEl.textContent = `room: ${roomId}`;
@@ -188,8 +174,6 @@ async function main() {
   let client;
   try {
     client = new ConquerdClient({
-      host,
-      port,
       features: [FEATURE_ID],
       room: roomId,
     });

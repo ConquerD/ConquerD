@@ -44,16 +44,14 @@ impl LocalBuildTool {
             "cargo" => Ok(Self::Cargo),
             "zigbuild" | "cargo-zigbuild" => Ok(Self::Zigbuild),
             "cross" => Ok(Self::Cross),
-            other => bail!(
-                "unknown build tool {other:?}; expected one of: cargo, zigbuild, cross"
-            ),
+            other => bail!("unknown build tool {other:?}; expected one of: cargo, zigbuild, cross"),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cargo => "cargo",
-            Self::Zigbuild => "cargo",   // cargo zigbuild is a cargo subcommand
+            Self::Zigbuild => "cargo", // cargo zigbuild is a cargo subcommand
             Self::Cross => "cross",
         }
     }
@@ -147,13 +145,16 @@ pub fn build_local_binary(
         // Extract the most useful lines: error[…] and ^^ lines, capped at 40 lines.
         let error_lines: Vec<&str> = stderr
             .lines()
-            .filter(|l| {
-                l.contains("error[") || l.contains("error:") || l.starts_with("  -->")
-            })
+            .filter(|l| l.contains("error[") || l.contains("error:") || l.starts_with("  -->"))
             .take(40)
             .collect();
         let detail = if error_lines.is_empty() {
-            stderr.trim().lines().take(30).collect::<Vec<_>>().join("\n")
+            stderr
+                .trim()
+                .lines()
+                .take(30)
+                .collect::<Vec<_>>()
+                .join("\n")
         } else {
             error_lines.join("\n")
         };

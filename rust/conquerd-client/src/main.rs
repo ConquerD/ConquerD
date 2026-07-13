@@ -141,28 +141,11 @@ fn run_qt_ui() {
 
     // Register the conquerd:// URL scheme BEFORE QGuiApplication is
     // created — this is a QtWebEngine requirement. No-op without webengine.
+    // Portal pages use web.host.app.v1 over the native QUIC session (no
+    // browser WebTransport / Chromium QUIC flags required).
     #[cfg(feature = "webengine")]
     unsafe {
         ui::scheme::conquerd_register_scheme();
-    }
-
-    // Enable the Chromium QUIC stack so the embedded QtWebEngine can speak
-    // HTTP/3 / WebTransport.  QtWebEngine ships with QUIC DISABLED by default,
-    // so `new WebTransport(...)` constructs fine but the underlying QUIC
-    // handshake never completes ("Opening handshake failed").  The flags must
-    // be present in QTWEBENGINE_CHROMIUM_FLAGS before QtWebEngine reads the
-    // Chromium command line (which happens during QGuiApplication setup).
-    // We append to any user-provided value rather than overwrite it.
-    #[cfg(feature = "webengine")]
-    {
-        let extra = "--enable-quic --enable-features=WebTransport";
-        let merged = match std::env::var("QTWEBENGINE_CHROMIUM_FLAGS") {
-            Ok(existing) if !existing.trim().is_empty() => {
-                format!("{existing} {extra}")
-            }
-            _ => extra.to_owned(),
-        };
-        std::env::set_var("QTWEBENGINE_CHROMIUM_FLAGS", merged);
     }
 
     let mut app = QGuiApplication::new();

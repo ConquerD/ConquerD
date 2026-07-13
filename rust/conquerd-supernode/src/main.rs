@@ -1198,7 +1198,6 @@ impl SupernodeState {
             "ad_duration": self.config.ad_duration,
             "tos_text": self.config.tos_text,
             "ad_content": self.config.ad_content,
-            "web_localhost_only": self.config.web_localhost_only,
         })
     }
 
@@ -2508,8 +2507,8 @@ async fn main() -> anyhow::Result<()> {
     let manifest = load_manifest(&config);
     manifest.apply_to_config(&mut config);
     info!(
-        "ConquerD Supernode v{} starting (signaling={}, relay={}, web={:?})",
-        APP_VERSION, config.signaling_port, config.relay_port, config.web_port
+        "ConquerD Supernode v{} starting (signaling={}, relay={})",
+        APP_VERSION, config.signaling_port, config.relay_port
     );
 
     // Ensure data directory
@@ -3168,7 +3167,6 @@ mod build_feature_registry_tests {
         Config {
             signaling_port: 0,
             relay_port: 0,
-            web_port: None,
             chat_enabled: true,
             files_enabled: true,
             sfu_enabled: true,
@@ -3184,7 +3182,6 @@ mod build_feature_registry_tests {
             demo_links: false,
             external_host: None,
             data_dir,
-            web_localhost_only: false,
         }
     }
 

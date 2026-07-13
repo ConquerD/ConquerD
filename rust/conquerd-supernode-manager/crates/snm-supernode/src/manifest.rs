@@ -19,8 +19,6 @@ pub struct ClusterMemberEntry {
     pub cluster_addr: String,
     /// Client-facing WebSocket signaling address `host:port`.
     pub ws_addr: String,
-    /// Optional WebTransport/portal port.
-    pub web_port: Option<u16>,
 }
 
 /// The full cluster roster injected into a member's `supernode.toml`.
@@ -115,9 +113,6 @@ pub fn render_supernode_toml_with_cluster(
         "ws_listen_addr".into(),
         toml::Value::String(format!("{}:{}", config.listen_bind, config.ws_port)),
     );
-    if let Some(web_port) = config.web_port {
-        root.insert("web_port".into(), toml::Value::Integer(i64::from(web_port)));
-    }
     root.insert(
         "identity_file".into(),
         toml::Value::String(config.identity_file.clone()),
@@ -153,9 +148,6 @@ fn render_cluster_section(roster: &ClusterRoster) -> String {
         lines.push(format!("relay_addr   = {:?}", member.relay_addr));
         lines.push(format!("cluster_addr = {:?}", member.cluster_addr));
         lines.push(format!("ws_addr      = {:?}", member.ws_addr));
-        if let Some(web_port) = member.web_port {
-            lines.push(format!("web_port     = {web_port}"));
-        }
         lines.push(String::new());
     }
     lines.join("\n")
@@ -172,7 +164,6 @@ mod tests {
             listen_bind: "0.0.0.0".into(),
             relay_port: 3478,
             ws_port: 34935,
-            web_port: Some(8443),
             public_host: "edge1.example.net".into(),
             identity_file: "identity.json".into(),
             access_mode: "open".into(),
@@ -186,7 +177,7 @@ mod tests {
         assert!(raw.contains("schema_version = 1"));
         assert!(raw.contains("listen_addr = \"0.0.0.0:3478\""));
         assert!(raw.contains("ws_listen_addr = \"0.0.0.0:34935\""));
-        assert!(raw.contains("web_port = 8443"));
+        assert!(!raw.contains("web_port"));
         assert!(raw.contains("access_mode = \"open\""));
         assert!(raw.contains("core.chat.v1"));
         assert!(raw.contains("transport.quic.relay.v1"));

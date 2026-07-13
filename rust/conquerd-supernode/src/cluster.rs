@@ -23,7 +23,6 @@
 //! identity_pub = "BASE64URL_ED25519_PUBKEY"
 //! relay_addr   = "node-a.acme.example:3478"
 //! ws_addr      = "node-a.acme.example:34935"   # optional
-//! web_port     = 8443                          # optional
 //! ```
 //!
 //! Every member lists the **full** member set (operators coordinate the list);
@@ -53,9 +52,6 @@ pub struct ClusterMember {
     /// Optional WebSocket signaling address (`host:port`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_addr: Option<String>,
-    /// Optional WebTransport/portal port.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_port: Option<u16>,
 }
 
 impl ClusterMember {
@@ -251,7 +247,6 @@ mod tests {
             relay_addr: addr.to_string(),
             cluster_addr: Some(addr.to_string()),
             ws_addr: None,
-            web_port: None,
         }
     }
 

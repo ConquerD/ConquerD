@@ -170,7 +170,12 @@ async fn config_push_one(
     let result = match resolve_row(inventory, row).await {
         Ok(resolved) => {
             let transport = SshTransport::new(&resolved.host.ssh, backend);
-            let roster = resolve_worker_roster(inventory, &cache, &resolved.host.name, &resolved.instance.id);
+            let roster = resolve_worker_roster(
+                inventory,
+                &cache,
+                &resolved.host.name,
+                &resolved.instance.id,
+            );
             push_config_instance_report(&transport, &resolved, true, roster.as_ref()).await
         }
         Err(e) => Err(e),
@@ -218,10 +223,21 @@ async fn install_one(
             let transport = SshTransport::new(&resolved.host.ssh, backend);
             let cache_path = inventory_path.with_file_name("cluster_cache.toml");
             let cache = ClusterCache::load(&cache_path).unwrap_or_default();
-            let roster = resolve_worker_roster(inventory, &cache, &resolved.host.name, &resolved.instance.id);
+            let roster = resolve_worker_roster(
+                inventory,
+                &cache,
+                &resolved.host.name,
+                &resolved.instance.id,
+            );
             match resolve_install_binary(&transport, &resolved).await {
                 Ok(download) if download.binary_path.exists() => {
-                    install_instance_report(&transport, &resolved, &download.binary_path, roster.as_ref()).await
+                    install_instance_report(
+                        &transport,
+                        &resolved,
+                        &download.binary_path,
+                        roster.as_ref(),
+                    )
+                    .await
                 }
                 Ok(download) => Err(anyhow::anyhow!(
                     "binary not found at {}",
@@ -288,7 +304,7 @@ async fn fetch_invite_one(
             invite_instance(&transport, &resolved)
                 .await
                 .map(|invite| {
-                    let mut text =
+                    let text =
                         format!("source: {}\n\n{}", invite.source_path, invite.invite_url);
 
                     text
@@ -470,17 +486,19 @@ async fn build_deploy_one(
         }
     };
 
-    let build_msg = format!(
-        "built: {}",
-        binary_path.display()
-    );
+    let build_msg = format!("built: {}", binary_path.display());
 
     let result = match resolve_row(inventory, row).await {
         Ok(resolved) => {
             let transport = SshTransport::new(&resolved.host.ssh, backend);
             let cache_path = inventory_path.with_file_name("cluster_cache.toml");
             let cache = ClusterCache::load(&cache_path).unwrap_or_default();
-            let roster = resolve_worker_roster(inventory, &cache, &resolved.host.name, &resolved.instance.id);
+            let roster = resolve_worker_roster(
+                inventory,
+                &cache,
+                &resolved.host.name,
+                &resolved.instance.id,
+            );
             install_instance_report(&transport, &resolved, &binary_path, roster.as_ref()).await
         }
         Err(e) => Err(e),

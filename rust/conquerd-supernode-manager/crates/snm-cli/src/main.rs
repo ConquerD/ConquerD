@@ -312,7 +312,8 @@ async fn cmd_config_push(
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
         let transport = ssh_transport(&resolved.host.ssh, backend);
-        let roster = resolve_cluster_roster(&inv, &cache, &resolved.host.name, &resolved.instance.id);
+        let roster =
+            resolve_cluster_roster(&inv, &cache, &resolved.host.name, &resolved.instance.id);
         push_config_instance(&transport, &resolved, restart, roster.as_ref()).await?;
     }
     Ok(())
@@ -328,8 +329,15 @@ async fn cmd_install(path: &PathBuf, args: TargetArgs, backend: SshBackend) -> R
         if !download.binary_path.exists() {
             bail!("binary not found: {}", download.binary_path.display());
         }
-        let roster = resolve_cluster_roster(&inv, &cache, &resolved.host.name, &resolved.instance.id);
-        install_instance(&transport, &resolved, &download.binary_path, roster.as_ref()).await?;
+        let roster =
+            resolve_cluster_roster(&inv, &cache, &resolved.host.name, &resolved.instance.id);
+        install_instance(
+            &transport,
+            &resolved,
+            &download.binary_path,
+            roster.as_ref(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -396,7 +404,6 @@ async fn cmd_invite(path: &PathBuf, args: TargetArgs, backend: SshBackend) -> Re
         println!("{}", invite.label);
         println!("  source: {}", invite.source_path);
         println!("  invite: {}", invite.invite_url);
-
     }
     Ok(())
 }
@@ -546,10 +553,7 @@ async fn cmd_build_deploy(
 ) -> Result<()> {
     let tool = LocalBuildTool::parse(build_tool_str).map_err(|e| anyhow::anyhow!(e))?;
 
-    println!(
-        "building conquerd-supernode from {} …",
-        source.display()
-    );
+    println!("building conquerd-supernode from {} …", source.display());
     if let Some(triple) = target_triple {
         println!("  target: {triple}");
     }
@@ -563,7 +567,8 @@ async fn cmd_build_deploy(
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
         let transport = ssh_transport(&resolved.host.ssh, backend);
-        let roster = resolve_cluster_roster(&inv, &cache, &resolved.host.name, &resolved.instance.id);
+        let roster =
+            resolve_cluster_roster(&inv, &cache, &resolved.host.name, &resolved.instance.id);
         install_instance(&transport, &resolved, &binary, roster.as_ref()).await?;
     }
     Ok(())

@@ -3015,7 +3015,7 @@ impl ffi::AppBridge {
             return;
         };
         // The id from the sidebar is the cluster's representative, which may be a
-        // member that is currently down. The portal (relay + WebTransport + cert)
+        // member that is currently down. The portal (identity QUIC + web.host.app.v1)
         // is served per-member, so open it against any live member of the cluster.
         // Assumes members serve the same web assets (true for a provisioned
         // cluster). Falls back to the representative when none are live, degrading

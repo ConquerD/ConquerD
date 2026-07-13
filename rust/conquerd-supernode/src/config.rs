@@ -9,7 +9,6 @@ pub struct Config {
     // Networking
     pub signaling_port: u16,
     pub relay_port: u16,
-    pub web_port: Option<u16>,
 
     // Features
     pub chat_enabled: bool,
@@ -23,7 +22,7 @@ pub struct Config {
     // Invite
     pub invite_ttl_seconds: i64, // -1 = never expires
 
-    // Web portal
+    // In-app portal presentation (web.host.app.v1 over QUIC — no public HTTP port)
     pub web_title: String,
     pub access_mode: AccessMode,
     pub access_code: String,
@@ -34,9 +33,6 @@ pub struct Config {
 
     // External host/IP for relay tickets (required for clients to connect)
     pub external_host: Option<String>,
-
-    // Bind web portal to 127.0.0.1 only (disable for public-facing nodes).
-    pub web_localhost_only: bool,
 
     // Data directory
     pub data_dir: std::path::PathBuf,
@@ -73,9 +69,6 @@ impl Config {
         Config {
             signaling_port: env_u16("supernode_signaling_port", 34935),
             relay_port: env_u16("supernode_port", 3478),
-            web_port: env::var("supernode_web_port")
-                .ok()
-                .and_then(|v| v.parse().ok()),
             chat_enabled: env_bool("supernode_chat", true),
             files_enabled: env_bool("supernode_files", true),
             sfu_enabled: env_bool("supernode_sfu", true),
@@ -101,7 +94,6 @@ impl Config {
             ad_content: env::var("supernode_ad_content").unwrap_or_default(),
             demo_links: env_bool("supernode_demo_links", false),
             external_host: env::var("supernode_host").ok().filter(|s| !s.is_empty()),
-            web_localhost_only: env_bool("supernode_web_localhost_only", false),
             data_dir,
         }
     }

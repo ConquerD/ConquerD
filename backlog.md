@@ -62,14 +62,13 @@ classical (not pure-PQ cutover).
 
 1. **Hybrid PQ TLS (transport only; real engineering cost, still a sensible first step).** Switch
    rustls 0.23 from the pinned `ring` provider to `aws-lc-rs` in client + supernode for the
-   `X25519MLKEM768` hybrid group on QUIC / WebSocket / WebTransport TLS. **Not free:** hard-coded
+   `X25519MLKEM768` hybrid group on QUIC / WebSocket TLS. **Not free:** hard-coded
    `rustls::crypto::ring::default_provider()` call sites (`quic_tls.rs`, `relay.rs`, `main.rs`,
-   cluster-link tests), `wtransport` 0.7 currently features `ring` (must confirm aws-lc/PQ parity
-   or WT stays classical while QUIC moves), larger/slower builds (AWS-LC native toolchain), bigger
-   binaries, possible dual-provider graph via `reqwest` / `tokio-tungstenite`, and CI matrix risk
-   (win64 + linux-x86_64 + linux-aarch64). **Scope of protection is narrow:** only transport TLS
-   HNDL between upgraded peers; app-layer invite X25519, pairwise relay keys, and room AES keys stay
-   classical. No invite/protocol change, but do not market as “PQ-ready.”
+   cluster-link tests), larger/slower builds (AWS-LC native toolchain), bigger binaries, possible
+   dual-provider graph via `reqwest` / `tokio-tungstenite`, and CI matrix risk (win64 + linux-x86_64
+   + linux-aarch64). **Scope of protection is narrow:** only transport TLS HNDL between upgraded
+   peers; app-layer invite X25519, pairwise relay keys, and room AES keys stay classical. No
+   invite/protocol change, but do not market as “PQ-ready.”
 2. **Structural casualty — `derive_pairwise_relay_key` cannot be ported.** It relies on the
    Ed25519→Montgomery birational map so one identity key does both signing and static DH
    (`crypto.rs`); ML-DSA keys have no map to ML-KEM. Replacement is KEM-DEM: each identity carries

@@ -59,10 +59,6 @@ pub struct SupernodeManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_listen_addr: Option<String>,
 
-    /// WebTransport / portal UDP-TCP port. Written by supernode-manager.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_port: Option<u16>,
-
     /// Relative path to the node identity inside `CONQUERD_HOME`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_file: Option<String>,
@@ -221,17 +217,10 @@ impl SupernodeManifest {
             .collect()
     }
 
-    /// Legacy optional port field (formerly WebTransport). Unused for the
-    /// in-app `web.host.app.v1` portal; retained so older `supernode.toml`
-    /// files still parse. Prefer ignoring this value.
-    pub fn resolved_web_port(&self) -> Option<u16> {
-        self.web_port
-    }
-
     /// Merge network fields from the manifest into runtime [`Config`].
     ///
-    /// Env vars win when the manifest omits a field. When portal features are
-    /// enabled but no web port is declared anywhere, defaults to `8443`.
+    /// Env vars win when the manifest omits a field. Portal traffic uses
+    /// `web.host.app.v1` on the identity QUIC session — no public HTTP port.
     pub fn apply_to_config(&self, config: &mut Config) {
         if let Some(addr) = &self.listen_addr {
             if let Some(port) = parse_socket_port(addr) {
@@ -242,10 +231,6 @@ impl SupernodeManifest {
             if let Some(port) = parse_socket_port(addr) {
                 config.signaling_port = port;
             }
-        }
-        // Optional legacy field only — not required for in-app portal (QUIC).
-        if let Some(port) = self.resolved_web_port() {
-            config.web_port = Some(port);
         }
     }
 
@@ -437,7 +422,6 @@ mod tests {
             [[cluster.member]]
             identity_pub = "NODE_B"
             relay_addr = "b.example:3478"
-            web_port = 8443
         "#;
         let m = SupernodeManifest::from_toml_str(toml).unwrap();
         let cluster = m.cluster.expect("cluster section present");
@@ -448,7 +432,7 @@ mod tests {
             cluster.members[0].ws_addr.as_deref(),
             Some("a.example:34935")
         );
-        assert_eq!(cluster.members[1].web_port, Some(8443));
+        assert_eq!(cluster.members[1].relay_addr, "b.example:3478");
     }
 
     #[test]
@@ -516,7 +500,6 @@ mod tests {
             schema_version = 1
             listen_addr = "0.0.0.0:3578"
             ws_listen_addr = "0.0.0.0:35035"
-            web_port = 8543
             [[feature]]
             id = "web.host.app.v1"
         "#;
@@ -524,26 +507,25 @@ mod tests {
         let mut config = legacy_config_for(std::path::Path::new("."));
         config.relay_port = 3478;
         config.signaling_port = 34935;
-        config.web_port = None;
         m.apply_to_config(&mut config);
         assert_eq!(config.relay_port, 3578);
         assert_eq!(config.signaling_port, 35035);
-        assert_eq!(config.web_port, Some(8543));
     }
 
     #[test]
-    fn apply_to_config_does_not_default_web_port_for_in_app_portal() {
-        // In-app portal uses web.host.app.v1 over QUIC — no HTTP/WebTransport port.
+    fn apply_to_config_ignores_legacy_web_port_key() {
+        // Older manifests may still list web_port; it is no longer a Config field.
         let toml = r#"
             schema_version = 1
+            web_port = 8543
             [[feature]]
             id = "web.host.app.v1"
         "#;
         let m = SupernodeManifest::from_toml_str(toml).unwrap();
         let mut config = legacy_config_for(std::path::Path::new("."));
-        config.web_port = None;
+        config.relay_port = 3478;
         m.apply_to_config(&mut config);
-        assert_eq!(config.web_port, None);
+        assert_eq!(config.relay_port, 3478);
     }
 
     #[test]
@@ -729,7 +711,6 @@ mod tests {
         Config {
             signaling_port: 0,
             relay_port: 0,
-            web_port: None,
             chat_enabled: true,
             files_enabled: true,
             sfu_enabled: true,
@@ -745,7 +726,6 @@ mod tests {
             demo_links: false,
             external_host: None,
             data_dir: data_dir.to_path_buf(),
-            web_localhost_only: false,
         }
     }
 

@@ -30,16 +30,6 @@ const DEFAULT_STROKE_WIDTH = 4;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function resolveHost() {
-  const p = new URLSearchParams(location.search);
-  return p.get("host") || location.hostname;
-}
-
-function resolvePort() {
-  const p = new URLSearchParams(location.search);
-  return parseInt(p.get("port") || location.port || "8443", 10);
-}
-
 function resolveRoom() {
   const p = new URLSearchParams(location.search);
   return p.get("room") || "drawing-lobby";
@@ -328,14 +318,10 @@ clearBtn.addEventListener("click", (e) => {
 let client = null;
 
 async function main() {
-  const host = resolveHost();
-  const port = resolvePort();
   const roomId = resolveRoom();
 
   try {
     client = new ConquerdClient({
-      host,
-      port,
       features: [FEATURE_ID],
       room: roomId,
     });

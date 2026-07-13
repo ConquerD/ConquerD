@@ -45,8 +45,8 @@ fn parse_identity_pub(raw: &str) -> Result<String> {
         public_key: Option<String>,
         public_id: Option<String>,
     }
-    let identity: IdentityFile = serde_json::from_str(raw.trim())
-        .context("identity.json is not valid JSON")?;
+    let identity: IdentityFile =
+        serde_json::from_str(raw.trim()).context("identity.json is not valid JSON")?;
     // Prefer `public_key`; fall back to `public_id` (some builds use that name).
     let key = identity
         .public_key
@@ -132,8 +132,6 @@ fn build_conquerd_invite_url(root: &serde_json::Value) -> Result<String> {
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
     Ok(format!("conquerd://{encoded}"))
 }
-
-
 
 fn extract_conquerd_url(text: &str) -> Option<String> {
     let start = text.find("conquerd://")?;

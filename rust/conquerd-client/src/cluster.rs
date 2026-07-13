@@ -27,9 +27,6 @@ pub struct ClusterMember {
     /// WebSocket signaling address (`host:port`) — the failover attach point.
     #[serde(default)]
     pub ws_addr: Option<String>,
-    /// WebTransport/portal port, if any.
-    #[serde(default)]
-    pub web_port: Option<u16>,
 }
 
 /// A cluster roster signed by one member, as carried in `SUPERNODE_INFO`.
@@ -122,7 +119,6 @@ mod tests {
             relay_addr: "host:3478".to_string(),
             cluster_addr: None,
             ws_addr: Some("host:34935".to_string()),
-            web_port: None,
         }
     }
 

@@ -406,30 +406,6 @@ impl SignalingMessage {
     }
 }
 
-/// Verify that *payload* is a UTF-8 JSON [`SignalingMessage`] whose
-/// `sender` matches *expected_sender* and whose Ed25519 signature is
-/// valid. Returns the parsed message on success, `None` otherwise.
-///
-/// Validate a fully-signed signaling envelope from a peer-controlled page.
-/// Retained for unit tests and any future in-app bridge that reuses the
-/// same signed JSON shape. External WebTransport is no longer used.
-#[allow(dead_code)]
-pub fn verify_browser_envelope(
-    expected_sender: Option<&str>,
-    payload: &[u8],
-) -> Option<SignalingMessage> {
-    let raw = std::str::from_utf8(payload).ok()?;
-    let msg = SignalingMessage::from_json(raw).ok()?;
-    let expected = expected_sender?;
-    if msg.sender != expected {
-        return None;
-    }
-    if !msg.verify() {
-        return None;
-    }
-    Some(msg)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,102 +629,6 @@ mod tests {
             let back: MessageType = serde_json::from_value(v).unwrap();
             assert_eq!(back, mt);
         }
-    }
-
-    fn signed_envelope(id: &Identity, target: &str) -> String {
-        SignalingMessage::new(
-            MessageType::SfuAudio,
-            &id.public_id(),
-            serde_json::json!({"opus": "frame"}),
-        )
-        .with_target(target)
-        .sign(id)
-        .to_json()
-    }
-
-    #[test]
-    fn verify_envelope_accepts_matching_signed_payload() {
-        let id = Identity::generate();
-        let raw = signed_envelope(&id, "native-1");
-        let pk = id.public_id();
-        let msg =
-            verify_browser_envelope(Some(&pk), raw.as_bytes()).expect("valid envelope must verify");
-        assert_eq!(msg.sender, pk);
-        assert_eq!(msg.target.as_deref(), Some("native-1"));
-    }
-
-    #[test]
-    fn verify_envelope_rejects_when_no_verified_identity() {
-        let id = Identity::generate();
-        let raw = signed_envelope(&id, "native-1");
-        assert!(verify_browser_envelope(None, raw.as_bytes()).is_none());
-    }
-
-    #[test]
-    fn verify_envelope_rejects_sender_mismatch() {
-        let id = Identity::generate();
-        let other = Identity::generate();
-        let raw = signed_envelope(&id, "native-1");
-        // Verified identity is "other" but envelope claims `id`.
-        assert!(verify_browser_envelope(Some(&other.public_id()), raw.as_bytes()).is_none());
-    }
-
-    #[test]
-    fn verify_envelope_rejects_unsigned_payload() {
-        let id = Identity::generate();
-        let raw = SignalingMessage::new(
-            MessageType::SfuAudio,
-            &id.public_id(),
-            serde_json::json!({}),
-        )
-        .to_json();
-        assert!(verify_browser_envelope(Some(&id.public_id()), raw.as_bytes()).is_none());
-    }
-
-    #[test]
-    fn verify_envelope_rejects_garbage() {
-        assert!(verify_browser_envelope(Some("anyone"), b"not json").is_none());
-        assert!(verify_browser_envelope(Some("anyone"), &[0xff, 0xfe]).is_none());
-    }
-
-    /// Mirrors what the browser SDK in `web-sdk/conquerd.mjs` puts on
-    /// the wire: integer-second `timestamp`, signature computed over
-    /// canonical (alpha-sorted) JSON, but the *transmitted* JSON keys
-    /// in a different order. The verifier must still accept it because
-    /// `from_json` preserves `timestamp_raw` and `canonical_bytes()`
-    /// re-sorts.
-    #[test]
-    fn verify_envelope_matches_js_sdk_wire_format() {
-        use crate::crypto::{b64url_decode, b64url_encode};
-        use crate::identity::Identity;
-
-        let id = Identity::generate();
-        let sender = id.public_id();
-        let pub_bytes = b64url_decode(&sender).unwrap();
-
-        // Canonical layout (alpha-sorted, no spaces) the JS SDK signs.
-        let canonical = format!(
-            r#"{{"payload":{{"opus":"frame"}},"sender":"{}","target":"native-1","timestamp":1714512345,"type":"sfu_audio","v":2}}"#,
-            sender
-        );
-        let sig = id.sign(canonical.as_bytes());
-        let sig_b64 = b64url_encode(&sig);
-
-        // On-wire layout: `type` first (matches `to_json`), `signature`
-        // last. Verifier must canonicalise before checking.
-        let wire = format!(
-            r#"{{"type":"sfu_audio","sender":"{}","payload":{{"opus":"frame"}},"timestamp":1714512345,"v":2,"target":"native-1","signature":"{}"}}"#,
-            sender, sig_b64
-        );
-
-        let msg = verify_browser_envelope(Some(&sender), wire.as_bytes())
-            .expect("JS-formatted envelope must verify");
-        assert_eq!(msg.target.as_deref(), Some("native-1"));
-        assert!(crate::identity::Identity::verify_with_pub(
-            &pub_bytes,
-            &b64url_decode(&sig_b64).unwrap(),
-            canonical.as_bytes()
-        ));
     }
 
     // --- Replay / signature edge-case tests ---
