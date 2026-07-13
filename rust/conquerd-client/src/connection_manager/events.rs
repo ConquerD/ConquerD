@@ -142,13 +142,6 @@ pub enum ConnectionEvent {
         supernode_id: String,
         homepage_url: String,
         title: String,
-        /// WebTransport base URL (e.g. `https://host:8443`) from the supernode;
-        /// empty string when the supernode does not advertise `web.host.h3.v1`.
-        wt_url: String,
-        /// SHA-256 fingerprint (lowercase hex) of the supernode's self-signed
-        /// WebTransport TLS cert.  Passed to game pages so they can use
-        /// `serverCertificateHashes` — no CA cert needed.
-        cert_fingerprint: String,
         /// True when the supernode advertises `room.audio.sfu` (SFU room hosting).
         sfu_enabled: bool,
         /// True when the supernode's SFU policy allows public room creation.

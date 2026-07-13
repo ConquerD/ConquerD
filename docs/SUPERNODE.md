@@ -2,7 +2,7 @@
 
 This guide covers running a production or volunteer `conquerd-supernode`.
 
-The supernode provides optional transport assistance (QUIC relay, SFU rooms, WebTransport) and hosts opt-in feature modules. It is **never** an identity or trust authority — all trust comes from the invite + handshake between peers.
+The supernode provides optional transport assistance (QUIC relay, SFU rooms) and hosts opt-in feature modules including an **in-app portal** (`web.host.app.v1`). It is **never** an identity or trust authority — all trust comes from the invite + handshake between peers. There is no public WebTransport / HTTPS game surface.
 
 ## Quick Start
 
@@ -79,9 +79,8 @@ Example:
 schema_version = 1
 
 # Basic network
-listen_addr = "0.0.0.0:3478"          # QUIC relay + feature ports
-ws_listen_addr = "0.0.0.0:3479"       # WebSocket signaling (optional)
-web_port = 8443                       # For web.host.h3.v1 (WebTransport)
+listen_addr = "0.0.0.0:3478"          # QUIC relay
+ws_listen_addr = "0.0.0.0:34935"      # WebSocket signaling
 
 # Feature manifest (recommended)
 [[feature]]
@@ -97,12 +96,11 @@ id = "room.file.v1"
 enabled = true
 
 [[feature]]
-id = "web.host.h3.v1"
+id = "web.host.app.v1"
 enabled = true
-params = { port = 8443 }
 
 [[feature]]
-id = "web.host.app.v1"
+id = "game.relay.v1"
 enabled = true
 
 # Bespoke / third-party modules (x.*)
@@ -123,7 +121,7 @@ See `rust/conquerd-supernode/src/manifest.rs` for the full schema. The example a
 
 ### SFU Rooms (`room.audio.sfu` + `room.chat.v1` + `room.file.v1`)
 - Up to 32 participants per room.
-- Native + WebTransport (browser) clients supported.
+- Native desktop clients only (in-app portal games do not carry room voice/chat).
 - Room file broadcasts use signed `SfuFile*` frames and are verified by recipients before saving.
 - Room membership is enforced at the capability layer (`room-member` auth tier).
 - Operators can restrict which room types peers may **create** via `room.audio.sfu` manifest params:
@@ -141,12 +139,10 @@ enabled = true
 params = { allow_public_rooms = false, allow_private_rooms = true }
 ```
 
-### Web Hosting
-- `web.host.app.v1` and `web.host.h3.v1` ship **enabled by default** (legacy-derived manifests and supernode-manager installs). Set `web_port` in `supernode.toml` (or `supernode_web_port` env) to bind WebTransport.
-- `web.host.app.v1`: In-app portal for the desktop client's embedded browser (`conquerd://` scheme).
-- `web.host.h3.v1`: WebTransport bridge so browser clients can participate in the same channel fabric as native peers.
-
-Static assets live in `<data_dir>/web/` and `<data_dir>/games/<slug>/`.
+### In-app portal (`web.host.app.v1` + `game.relay.v1`)
+- `web.host.app.v1` ships enabled by default: portal pages for the desktop client's embedded browser (`conquerd://` scheme over QUIC bidi streams).
+- `game.relay.v1`: opaque game-session datagram fan-out on the identity QUIC relay (fixed channel tag). Games open only from the native portal — **no public HTTP/WebTransport port, no TLS certs**.
+- Static assets live in `<data_dir>/web/` and `<data_dir>/games/<slug>/` (seeded by the binary).
 
 ### Plugin / Bespoke Modules (`x.<vendor>.*`)
 - Native cdylib plugins are loaded at startup from paths declared in the manifest.
@@ -223,7 +219,7 @@ WantedBy=multi-user.target
 For more details, see the source:
 - `src/main.rs` (startup & wiring)
 - `src/manifest.rs` (typed config)
-- `src/relay.rs`, `src/sfu.rs`, `src/webtransport.rs`
+- `src/relay.rs`, `src/sfu.rs`, `src/web_app_module.rs`
 
 ## Contributing
 

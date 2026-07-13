@@ -72,8 +72,7 @@ graph TD
         REL_S[relay.rs — QUIC forwarder]
         SFU_S[sfu.rs — SFU room mux]
         TICKET[ticket.rs — relay tickets]
-        WT[webtransport.rs — H3 listener]
-        WAM[web_app_module.rs]
+        WAM[web_app_module.rs — portal over QUIC]
         ACCESS[access.rs — attestation policy]
         PS_S[peer_store — endpoint mailbox]
         CFG[config.rs — TOML]
@@ -89,7 +88,8 @@ core.audio.opus
 core.chat.v1
 core.file.v1
 room.audio.sfu
-web.host.*"]
+web.host.app.v1
+game.relay.v1"]
     end
 
     subgraph OPUS_LIB["conquerd-opus  (Audio Codec)"]
@@ -105,7 +105,7 @@ web.host.*"]
         SIGN[sign-release-manifest]
     end
 
-    subgraph BROWSER["Browser Clients"]
+    subgraph PORTAL["In-app portal games"]
         SDK[web-sdk / conquerd.mjs]
         GAMES["games/
 brick-breaker
@@ -173,16 +173,15 @@ example"]
     HS_S --> ACCESS
     REL_S --> TICKET & ACCESS
     SFU_S --> ACCESS & WK
-    WT --> WAM
     WAM --> WK
     CFG --> SIG & REL_S & SFU_S
 
     %% ── Supernode uses features ──────────────────────────
     SFU_S & WAM --> REG
 
-    %% ── Browser Clients ──────────────────────────────────
+    %% ── In-app portal games ──────────────────────────────
     GAMES --> SDK
-    SDK -->|"WebTransport H3"| WT
+    SDK -->|"portal channel + QUIC relay"| REL_S
     BP -.->|"renders conquerd:// pages"| GAMES
 
     %% ── Installer ────────────────────────────────────────
@@ -206,7 +205,7 @@ example"]
     class ID_C,CRYPTO_C,HS_C,TLS_C box
     class PS_C,CS,RS,SET box
     class CPAL_IO,AEC_R,JB box
-    class SIG,HS_S,REL_S,SFU_S,TICKET,WT,WAM,ACCESS,PS_S,CFG box
+    class SIG,HS_S,REL_S,SFU_S,TICKET,WAM,ACCESS,PS_S,CFG box
     class REG,DESC,QUOTA,CF,WK shared
     class ENC,DEC,LIBOPUS shared
     class IGUI,GH_API,EXTRACT,SIGN box
@@ -219,12 +218,12 @@ example"]
 | Crate / Module | Role |
 |---|---|
 | **conquerd-client** | Rust/QML desktop app; owns all UI, audio, and peer-to-peer logic |
-| **conquerd-supernode** | Standalone server: WebSocket signaling, QUIC relay, SFU, WebTransport portal |
+| **conquerd-supernode** | Standalone server: WebSocket signaling, QUIC relay, SFU, in-app portal |
 | **conquerd-features** | Shared capability registry, channel framing, quota enforcement |
 | **conquerd-opus** | Rust wrapper around libopus (DRED / OSCE neural models) |
 | **conquerd-installer** | Cross-platform egui updater GUI; polls GitHub Releases |
-| **web-sdk** | Browser-side JS client using WebTransport + Ed25519 handshake |
-| **games/** | Demo multiplayer games served via the supernode web portal |
+| **web-sdk** | In-app portal game SDK (identity QUIC channel APIs) |
+| **games/** | Demo multiplayer games opened only via `conquerd://` portal |
 
 ## Key Data Flows
 
@@ -234,6 +233,6 @@ example"]
 | Direct voice audio | CPAL mic → AEC/noise/VAD → OpusEncoder → direct QUIC datagram → peer → JitterBuffer → OpusDecoder → CPAL speaker |
 | Room voice audio | CPAL mic → OpusEncoder → QuicRelayClient room datagram → supernode SFU/relay fan-out → peers |
 | File transfer | FileTransfer module → FeatureRegistry quota gate → `core.file.v1` / `room.file.v1` reliable signaling path |
-| Browser game | games/index.html → web-sdk.mjs → WebTransport H3 → webtransport.rs → relay |
+| Portal game | games/index.html → web-sdk.mjs → window.conquerd channel → client QUIC relay → supernode game session fan-out |
 | Identity handshake | identity.rs (Ed25519) → handshake.rs (X25519 ECDH) → HKDF → AES-GCM session |
 | Auto-update | GithubUpdater → GitHub Releases API → conquerd-installer (extract + apply) |

@@ -168,14 +168,6 @@ impl WebAppHostModule {
                     let json = state.portal_config();
                     return self.send_json(send, peer_id, 200, &json).await;
                 }
-                "/api/wt-url" => {
-                    // WebTransport base URL for game pages loaded inside the
-                    // native portal (conquerd:// scheme), where
-                    // location.hostname is the base64url supernode ID and
-                    // cannot be used as a WebTransport target directly.
-                    let json = state.wt_url_json();
-                    return self.send_json(send, peer_id, 200, &json).await;
-                }
                 "/api/cluster" => {
                     let json = state.cluster_stats();
                     if json.is_null() {

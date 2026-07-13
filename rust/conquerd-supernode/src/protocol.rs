@@ -410,11 +410,10 @@ impl SignalingMessage {
 /// `sender` matches *expected_sender* and whose Ed25519 signature is
 /// valid. Returns the parsed message on success, `None` otherwise.
 ///
-/// Used by the WebTransport bridge to gate browser-originated envelopes
-/// before relaying them onto the native signaling fabric. The supernode
-/// never re-signs: browsers must present a fully-signed envelope and
-/// the verified identity captured at handshake time must be the
-/// envelope's `sender`.
+/// Validate a fully-signed signaling envelope from a peer-controlled page.
+/// Retained for unit tests and any future in-app bridge that reuses the
+/// same signed JSON shape. External WebTransport is no longer used.
+#[allow(dead_code)]
 pub fn verify_browser_envelope(
     expected_sender: Option<&str>,
     payload: &[u8],

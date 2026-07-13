@@ -1,4 +1,4 @@
-use super::internal::{host_from_url, is_loopback_or_wildcard, rewrite_loopback_wt_url};
+use super::internal::{host_from_url, is_loopback_or_wildcard};
 use super::manager::{
     accept_group_key_epoch, build_room_invite_url, is_elected_keyer, may_send_room_e2e_content,
     normalize_room_type, parse_quic_lan_hint, parse_room_invite, peer_quic_endpoint,
@@ -222,30 +222,6 @@ fn loopback_detection() {
     for h in ["1.2.3.4", "relay.example", "example.com"] {
         assert!(!is_loopback_or_wildcard(h), "{h} should be routable");
     }
-}
-
-#[test]
-fn rewrites_loopback_host_using_signaling_url() {
-    let fixed = rewrite_loopback_wt_url("https://localhost:8443", "ws://203.0.113.7:34935/sig");
-    assert_eq!(fixed.as_deref(), Some("https://203.0.113.7:8443"));
-}
-
-#[test]
-fn rewrites_wildcard_host_and_preserves_port() {
-    let fixed = rewrite_loopback_wt_url("https://0.0.0.0:9000", "wss://relay.example:443");
-    assert_eq!(fixed.as_deref(), Some("https://relay.example:9000"));
-}
-
-#[test]
-fn no_rewrite_when_wt_host_already_routable() {
-    assert!(
-        rewrite_loopback_wt_url("https://relay.example:8443", "ws://203.0.113.7:34935",).is_none()
-    );
-}
-
-#[test]
-fn no_rewrite_when_signaling_host_is_also_loopback() {
-    assert!(rewrite_loopback_wt_url("https://localhost:8443", "ws://127.0.0.1:34935",).is_none());
 }
 
 #[test]

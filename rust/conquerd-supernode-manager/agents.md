@@ -45,15 +45,14 @@ Resolved from `CONQUERD_HOME` (manager sets this per instance). Default layout: 
 | `sfu_rooms.json` | Room persistence (when SFU not ephemeral) | Persistent; restart behavior depends on supernode build |
 | `supernode_endpoints.json` | Endpoint mailbox | Persistent |
 | `reusable_invite.json` | Invite payload | Read by `invite` command |
-| `web_cert.pem` / `web_key.pem` / `web_cert_fingerprint.hex` | WebTransport cert | Persistent; fingerprint surfaced in `invite` |
-| `web/`, `games/<slug>/` | Static assets | Not synced by manager yet |
+| `web/`, `games/<slug>/` | In-app portal assets | Seeded by supernode binary; not synced by manager yet |
 | `trusted_module_keys.txt` | Plugin signer keys | Not pushed by manager yet |
 
 ### Configuration surface
 
 - **Preferred:** `<data_dir>/supernode.toml` — manager generates per instance via `snm-supernode::manifest::render_supernode_toml`.
 - **SFU room policy:** `[defaults.supernode]` / per-instance overrides for `allow_public_rooms` / `allow_private_rooms` are emitted as **inline** `params = { … }` on the `room.audio.sfu` feature row (not a separate `[feature.params]` table).
-- **Legacy env vars** (still written in systemd drop-ins): `supernode_host`, `supernode_port`, `supernode_signaling_port`, `supernode_web_port`. Manifest fields (`listen_addr`, `ws_listen_addr`, `web_port`) are authoritative in `supernode.toml`.
+- **Legacy env vars** (still written in systemd drop-ins): `supernode_host`, `supernode_port`, `supernode_signaling_port`. Manifest fields (`listen_addr`, `ws_listen_addr`) are authoritative in `supernode.toml`. Do **not** set `web_port` / `supernode_web_port` — the in-app portal uses QUIC (`web.host.app.v1`), not a public HTTP/WebTransport port.
 - **Clustering:** an optional `[cluster]` section (with `[[cluster.member]]` rows) links several supernodes into one logical node. Additive to `schema_version = 1` — the manager renders and pushes the shared roster to every member. Full contract, provisioning flow, and firewalling in §8.
 - `CONQUERD_BUILD_ID` is compiled into the binary; status probes it via `strings` when present.
 
@@ -63,10 +62,11 @@ Each instance binds at minimum:
 
 - QUIC relay (UDP): default `3478 + 100×index`
 - WS signaling (TCP): default `34935 + 100×index`
-- Web / WebTransport: default `8443 + 100×index` when a `web.host.*` feature is enabled
 - **Cluster QUIC link (UDP): only when the instance is part of a cluster** — a dedicated port distinct from the relay port, set via `cluster_addr`. Suggested default `4478 + 100×index` (relay + 1000). Reachable **between cluster members only**, not the public. See §8.
 
-Omitted ports in inventory are auto-allocated at resolve time (`snm-core::inventory::default_*_port`). They are **not** written back into `inventory.toml` automatically — pin ports explicitly for stability.
+There is **no** public web/game port. The in-app portal is served over the peer's existing QUIC session (`web.host.app.v1`).
+
+Omitted relay/ws/cluster ports in inventory are auto-allocated at resolve time (`snm-core::inventory::default_*_port`). They are **not** written back into `inventory.toml` automatically — pin ports explicitly for stability. `web_port` is never auto-allocated.
 
 `public_host` on each instance must be the address remote clients use for relay tickets.
 
@@ -78,7 +78,7 @@ Omitted ports in inventory are auto-allocated at resolve time (`snm-core::invent
 
 ### Health / observability
 
-Status today comes from `systemctl is-active`, binary identity probe (SHA-256 + mtime + optional embedded build id), and `journalctl`. HTTP `/health` scraping is not implemented (WebTransport portal is not plain HTTPS).
+Status today comes from `systemctl is-active`, binary identity probe (SHA-256 + mtime + optional embedded build id), and `journalctl`. There is no public HTTP health endpoint (portal is in-app over QUIC).
 
 ---
 
@@ -165,8 +165,7 @@ ssh = "root@155.138.244.189"
   public_host = "155.138.244.189"
   relay_port = 3478
   ws_port = 34935
-  web_port = 8433
-  features = ["core.chat.v1", "room.audio.sfu", "web.host.app.v1", ...]
+  features = ["core.chat.v1", "room.audio.sfu", "web.host.app.v1", "game.relay.v1", ...]
 ```
 
 Rules:
@@ -263,7 +262,6 @@ identity_pub = "BASE64URL_ED25519"        # the member node's public_id
 relay_addr   = "node-a.example:3478"      # client relay attach point
 cluster_addr = "node-a.example:4478"      # dedicated supernode↔supernode QUIC link
 ws_addr      = "node-a.example:34935"     # client signaling / failover attach point
-web_port     = 8443                       # optional
 
 [[cluster.member]]
 identity_pub = "..."
@@ -462,7 +460,7 @@ If a manifest somehow loses the cluster section (e.g. manual edit), just re-run 
 .\launch.ps1 invite --host acdc --instance a
 ```
 
-Prints the reusable invite URL and WebTransport cert fingerprint. Paste the invite into the ConquerD client to join the cluster via node a; the client will receive the full cluster roster in `SUPERNODE_INFO` and can fail over to b or c automatically.
+Prints the reusable invite URL. Paste the invite into the ConquerD client to join the cluster via node a; the client will receive the full cluster roster in `SUPERNODE_INFO` and can fail over to b or c automatically.
 
 ---
 

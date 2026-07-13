@@ -183,8 +183,8 @@ impl SupernodeManifest {
                 FeatureEntry::just("core.file.v1"),
                 FeatureEntry::just("room.file.v1"),
                 FeatureEntry::just("room.audio.sfu"),
-                FeatureEntry::just("web.host.h3.v1"),
                 FeatureEntry::just("web.host.app.v1"),
+                FeatureEntry::just("game.relay.v1"),
             ],
             ..Default::default()
         }
@@ -214,29 +214,18 @@ impl SupernodeManifest {
         self.features
             .iter()
             .filter(|f| f.enabled)
+            // Drop removed external WebTransport capability if still listed
+            // in an older operator manifest.
+            .filter(|f| f.id != "web.host.h3.v1")
             .map(FeatureEntry::resolve)
             .collect()
     }
 
-    /// Whether the manifest enables any `web.host.*` portal capability.
-    pub fn portal_enabled(&self) -> bool {
-        self.features
-            .iter()
-            .any(|f| f.enabled && f.id.starts_with("web.host"))
-    }
-
-    /// Resolve the effective WebTransport port from top-level `web_port` or
-    /// `web.host.h3.v1` feature params.
+    /// Legacy optional port field (formerly WebTransport). Unused for the
+    /// in-app `web.host.app.v1` portal; retained so older `supernode.toml`
+    /// files still parse. Prefer ignoring this value.
     pub fn resolved_web_port(&self) -> Option<u16> {
-        self.web_port.or_else(|| {
-            self.features
-                .iter()
-                .find(|f| f.enabled && f.id == "web.host.h3.v1")
-                .and_then(|f| f.params.get("port"))
-                .and_then(|v| v.as_u64())
-                .filter(|&p| p <= u16::MAX as u64)
-                .map(|p| p as u16)
-        })
+        self.web_port
     }
 
     /// Merge network fields from the manifest into runtime [`Config`].
@@ -254,10 +243,9 @@ impl SupernodeManifest {
                 config.signaling_port = port;
             }
         }
+        // Optional legacy field only — not required for in-app portal (QUIC).
         if let Some(port) = self.resolved_web_port() {
             config.web_port = Some(port);
-        } else if self.portal_enabled() && config.web_port.is_none() {
-            config.web_port = Some(8443);
         }
     }
 
@@ -404,7 +392,9 @@ fn wellknown_for(id: &str) -> Option<CapabilityDescriptor> {
         "room.chat.v1" => Some(wellknown::room_chat_v1()),
         "room.file.v1" => Some(wellknown::room_file_v1()),
         "web.host.app.v1" => Some(wellknown::web_host_app_v1()),
-        "web.host.h3.v1" => Some(wellknown::web_host_h3_v1()),
+        // Removed: external WebTransport (`web.host.h3.v1`). Ignore if still
+        // present in an operator's supernode.toml so old manifests keep loading.
+        "web.host.h3.v1" => None,
         "game.relay.v1" => Some(wellknown::game_relay_v1()),
         _ => None,
     }
@@ -542,19 +532,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_to_config_defaults_web_port_when_portal_enabled() {
+    fn apply_to_config_does_not_default_web_port_for_in_app_portal() {
+        // In-app portal uses web.host.app.v1 over QUIC — no HTTP/WebTransport port.
         let toml = r#"
             schema_version = 1
             [[feature]]
             id = "web.host.app.v1"
-            [[feature]]
-            id = "web.host.h3.v1"
         "#;
         let m = SupernodeManifest::from_toml_str(toml).unwrap();
         let mut config = legacy_config_for(std::path::Path::new("."));
         config.web_port = None;
         m.apply_to_config(&mut config);
-        assert_eq!(config.web_port, Some(8443));
+        assert_eq!(config.web_port, None);
     }
 
     #[test]
@@ -685,12 +674,16 @@ mod tests {
             "core.file.v1",
             "room.file.v1",
             "room.audio.sfu",
-            "web.host.h3.v1",
             "web.host.app.v1",
+            "game.relay.v1",
             "transport.quic.relay.v1",
         ] {
             assert!(ids.contains(&expected), "missing {expected}");
         }
+        assert!(
+            !ids.contains(&"web.host.h3.v1"),
+            "WebTransport capability must not be in the default stack"
+        );
     }
 
     #[test]

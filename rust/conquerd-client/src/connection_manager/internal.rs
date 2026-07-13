@@ -119,18 +119,6 @@ pub(super) fn is_loopback_or_wildcard(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "::")
 }
 
-pub(super) fn rewrite_loopback_wt_url(wt_url: &str, signaling_url: &str) -> Option<String> {
-    let wt_host = host_from_url(wt_url)?;
-    if !is_loopback_or_wildcard(&wt_host) {
-        return None;
-    }
-    let real_host = host_from_url(signaling_url)?;
-    if is_loopback_or_wildcard(&real_host) || real_host == wt_host {
-        return None;
-    }
-    Some(wt_url.replacen(&wt_host, &real_host, 1))
-}
-
 // ---------------------------------------------------------------------------
 // PendingInvite
 // ---------------------------------------------------------------------------

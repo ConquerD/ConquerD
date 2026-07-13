@@ -8,13 +8,13 @@ Core scope:
 - Invite + handshake bootstraps a signed, end-to-end secure session.
 - Every QUIC primitive (reliable streams, unidirectional streams, datagrams) is exposed as a generic `Channel`.
 - Capability-based feature negotiation: peers and supernodes advertise typed capability sets; consumers pick from what's enabled.
-- Supernodes are optional volunteer peers that provide QUIC relay, SFU rooms, web/WebTransport hosting, and bespoke feature modules.
+- Supernodes are optional volunteer peers that provide QUIC relay, SFU rooms, in-app portal hosting (`web.host.app.v1`), and bespoke feature modules.
 
 Transport stack:
 - **Direct sessions**: QUIC peer-to-peer via `ConnectionManager` + embedded `quinn::Endpoint` (conquerd-client) — generic streams + datagrams + channel multiplexer.
 - **Relay sessions**: QUIC relay (`QuicRelayClient` → supernode `QUICRelayServer`); same channel multiplexer; WebSocket used for membership/signaling fallback only.
 - **Signaling**: Signed, transcript-bound messages; prefers QUIC signaling stream when a peer session is connected, falls back to WebSocket.
-- **Web/games**: WebTransport (QUIC, via `wtransport`) and QUIC reliable streams on supernodes let browser game clients (via `web-sdk/conquerd.mjs` and the Ed25519 identity handshake) participate in the same channel fabric as native peers. Games opened in the native portal receive trust-chain context automatically; standalone browser access requires the SDK plus cert fingerprint (see README).
+- **Web/games**: In-app portal pages and games load only inside the native client (`conquerd://` + `web.host.app.v1` over the authenticated QUIC session). `game.relay.v1` rides identity QUIC relay datagrams (fixed `GAME_RELAY_TAG`); there is no external WebTransport / self-signed TLS game path.
 - **Capability exchange**: `CAPABILITY_ANNOUNCE` after handshake; `CAPABILITY_INVOKE` opens feature channels.
 
 ## Agent Roles
@@ -70,7 +70,7 @@ Responsibilities:
 - Keep Ed25519 `public_id` **padding normalized** on the SFU room ACL (`normalize_peer_id` in `sfu.rs`): relay-sourced ids arrive un-padded (`URL_SAFE_NO_PAD`) while SFU/WS-sourced ids are padded (`URL_SAFE`) — `allowed`/`creator_id`/participant lookups must resolve both to the same identity or private-room admission misses intermittently.
 - Review the **capability/feature trust model**: per-feature `auth` tiers, no implicit escalation across features, user-consent prompts for non-`core.*` namespaces, per-feature byte/stream/datagram quotas.
 - Review third-party feature module signing and load-time trust prompts (native cdylib now; WASM sandbox later).
-- Ensure WebTransport surface on supernodes does not bypass capability gates that apply to native peers.
+- In-app portal games must use the identity channel bridge (`window.conquerd` / `/_conquerd/channel/*`); do not reintroduce external WebTransport.
 - Review release manifest verification and Ed25519 signing.
 - Validate peer-to-peer build attestation challenges and responses.
 - Review installer supply-chain trust (SignPath, Apple notary, Sigstore).
@@ -96,13 +96,14 @@ Working style:
 
 ### 6. DevOps/Infra Agent (Transport + Feature Hosting)
 Responsibilities:
-- Maintain QUIC relay, SFU, and WebTransport + QUIC-stream deployment guidance and scripts.
+- Maintain QUIC relay, SFU, and in-app portal (`web.host.app.v1`) deployment guidance and scripts.
 - Maintain supernode packaging (`scripts/build_supernode.sh` for Linux/macOS `.tar.gz`, `scripts/build_supernode.ps1` for Windows `win64` `.zip`) and release/CI jobs for **linux-x86_64**, **linux-aarch64**, and **win64**.
 - Maintain the supernode feature manifest (`supernode.toml`-style typed capability list replacing ad-hoc env-var toggles).
 - Support hot-reload of feature modules and bespoke `x.<vendor>.*` plug-ins.
 - Keep infra docs aligned with no-backend policy: supernodes assist transport and host feature modules; they are never identity authorities.
 - Ensure endpoint mailbox (`supernode_endpoints.json`, 24h TTL) and ticket renewal (1h TTL, 10-min renewal window) persist across restarts. SFU room state must **not** be persisted — only peer trust (`peers.json`), identity, manifest, and endpoint mailbox belong on disk.
-- Document how to host static + WebTransport-enabled web games under `games/<slug>/`.
+- Document how to host static in-app portal games under `games/<slug>/` (native `conquerd://` only — no public HTTP game ports).
+- Do **not** advertise or allocate WebTransport ports/certs (`web_port`, `web_cert.*`, `web.host.h3.v1`).
 - **Maintain the supernode manager** (`rust/conquerd-supernode-manager/`) as the primary integration-testing and cluster-ops tool: provisioning, `cluster-sync`, `exec`-based remote debugging, and `build-deploy` for live cluster testing against the acdc test cluster (nodes a/b/c). See `rust/conquerd-supernode-manager/agents.md` for the full operator contract.
 
 Working style:
@@ -160,12 +161,12 @@ This section captures implementation locations and invariants that agents must r
   - `src/room_store.rs`: client-owned encrypted room definitions (`my_rooms.dat`), keyed by `(supernode_id, room_id)`; sidebar hide list; replay source for `SfuRoomCreate` on supernode connect. **Never** persist room definitions on the supernode.
   - `src/identity.rs`: Ed25519 + OS keyring integration.
   - `ConnectionManager` (`src/connection_manager/` module — `mod.rs`, `manager.rs`, `internal.rs`, `quic.rs`, `ws.rs`, `events.rs`, `tests.rs`): direct QUIC + relay client paths; outbound `core.chat.v1` / `core.file.v1` must call `gate_through_feature`; audio datagrams must use the quota-checked send helpers.
-- `conquerd-features`: the spine. `FeatureRegistry`, `FeatureModule` trait, `dispatch_message` / `dispatch_invoke_datagram`, inbound/outbound quota enforcement (token-bucket per `(feature, peer)`), auth tiers, channel-tag registry. 114 unit tests. All transports (direct QUIC, relay, WS, WebTransport) must go through the registry for capability-gated paths; hot paths may call `gate_inbound_through_feature` directly but must still respect the same buckets.
+- `conquerd-features`: the spine. `FeatureRegistry`, `FeatureModule` trait, `dispatch_message` / `dispatch_invoke_datagram`, inbound/outbound quota enforcement (token-bucket per `(feature, peer)`), auth tiers, channel-tag registry. 114 unit tests. All transports (direct QUIC, relay, WS) must go through the registry for capability-gated paths; hot paths may call `gate_inbound_through_feature` directly but must still respect the same buckets.
 - `conquerd-opus`: first-party libopus wrapper (DRED + OSCE). Requires DNN data (see Build Notes). Linked only into `conquerd-client`.
-- `conquerd-supernode`: sole supernode implementation (QUIC relay, WS signaling, WebTransport `web.host.h3.v1`, QUIC bidi `web.host.app.v1` portal, SFU, manifest-driven feature hosting).
+- `conquerd-supernode`: sole supernode implementation (QUIC relay, WS signaling, QUIC bidi `web.host.app.v1` portal, SFU, `game.relay.v1` session fan-out, manifest-driven feature hosting).
 - `conquerd-installer`: release download + apply + manifest verification + signing helper.
 
-**Quota symmetry invariant**: inbound (`dispatch_message`, `dispatch_invoke_datagram`, transport hot-path `gate_inbound_through_feature`) and outbound (`gate_through_feature` called from `ConnectionManager::dispatch_outbound`, audio send helpers) must use consistent per-feature/per-peer token buckets. Buckets are cleared on `drop_peer` / `peer_left` / disconnect paths (including WS and WebTransport `release_session`).
+**Quota symmetry invariant**: inbound (`dispatch_message`, `dispatch_invoke_datagram`, transport hot-path `gate_inbound_through_feature`) and outbound (`gate_through_feature` called from `ConnectionManager::dispatch_outbound`, audio send helpers) must use consistent per-feature/per-peer token buckets. Buckets are cleared on `drop_peer` / `peer_left` / disconnect paths (including WS signaling).
 
 **CXX-Qt qproperty rule**: every `#[qproperty(T, name)]` in a `#[cxx_qt::bridge]` block must have a matching field in the Rust state struct (`AppBridgeRust` etc.) and be initialised in `impl Default`. Missing fields are silent in headless mode but fail at runtime/Qt meta-object construction.
 
@@ -205,7 +206,7 @@ Supernodes are **untrusted for content**. They assist NAT traversal, WS/QUIC rel
 | `SfuRoomCreate` room name/type (ephemeral, not persisted) | Decrypted `game.relay.v1` / bespoke datagram payloads |
 
 **Opaque today (correct):**
-- `game.relay.v1` — raw datagram fan-out; supernode never parses inner bytes (`webtransport.rs`, `relay.rs`).
+- `game.relay.v1` — raw datagram fan-out on the QUIC relay (fixed tag `0x05`); supernode never parses inner bytes (`relay.rs` game-session membership).
 - QUIC relay datagram forwarding — inner channel tag + payload forwarded verbatim (`wire.rs`).
 - `EncryptedSignal` — pass-through relay type on the WS path (`MessageType::EncryptedSignal` in `conquerd-supernode/src/main.rs`); the envelope for direct 1:1 E2E ciphertext and the sealed `SfuGroupKey` distribution.
 - `SfuAudio` / `room.audio.sfu` — Opus frames are E2E-sealed as `[epoch:u8][nonce:12][AES-256-GCM(opus)]` (AAD = conv_id ‖ sender ‖ seq) under a per-room sender key; the supernode fans out verbatim and cannot decode. Receivers reject frames without `e2e`. Active-speaker selection uses frame arrival only, never decode (`sfu.rs`).
@@ -266,7 +267,7 @@ if !state.features.bind_module("x.vendor.thing", m.clone()) {
 
 - `register_module` adds descriptor + module in one step (errors on duplicate id).
 - `bind_module(id, m)` attaches a module to a descriptor that the supernode manifest already loaded — preferred for first-party modules so operators retain manifest control.
-- `dispatch_message(id, source, payload)` is the single inbound entry point used by all transports (QUIC peer, QUIC relay, WebTransport). The runtime enforces auth tier + quota before calling the module; returns `false` silently if the quota bucket is exhausted.
+- `dispatch_message(id, source, payload)` is the single inbound entry point used by all transports (QUIC peer, QUIC relay). The runtime enforces auth tier + quota before calling the module; returns `false` silently if the quota bucket is exhausted.
 - `dispatch_invoke_datagram(id, peer, params, tags)` is the invoke entry point (from `CAPABILITY_INVOKE`). Returns `ModuleError::Internal` (e.g. `"datagram quota exceeded"`) if over limit.
 
 ### Supernode capability surface
@@ -287,17 +288,16 @@ The shared tagged-frame contract lives in `rust/conquerd-features/src/channel_fr
 
 The runtime enforces `auth` (`public` | `room-member` | `trusted-peer`) and per-feature byte/datagram quotas before invoking `on_invoke` / `on_message`. Modules MUST NOT re-implement these checks. Non-`core.*` namespaces without explicit `quota_bytes_per_sec` / `quota_datagrams_per_sec` fall back to `DEFAULT_BYTES_PER_SEC` / `DEFAULT_DATAGRAMS_PER_SEC` in `quota.rs` (64 KB/s, 256 datagrams/s) automatically.
 
-Outbound sends are gated symmetrically: `FeatureRegistry::gate_through_feature(feature_id, peer_id, byte_count) → bool` runs the same token-bucket logic against a separate `outbound_quotas` registry. The Rust `ConnectionManager::dispatch_outbound` calls it for `core.chat.v1` and `core.file.v1` before signing and transmitting; `ConnectionManager::send_audio_datagram` / `send_room_audio` gate `core.audio.opus` and `room.audio.sfu` datagrams via dedicated helpers. Transport-layer inbound paths that skip `dispatch_message` (direct QUIC `AUDIO_TAG`, client `SfuAudio`, supernode QUIC relay `handle_datagram`, supernode WS `SfuAudio` fan-out) call `gate_inbound_through_feature` with the same token buckets. Quota buckets (both directions) are cleared on `drop_peer` / `peer_left` / `disconnect` (native WS signaling) and on WebTransport `BrowserBridge::release_session`.
+Outbound sends are gated symmetrically: `FeatureRegistry::gate_through_feature(feature_id, peer_id, byte_count) → bool` runs the same token-bucket logic against a separate `outbound_quotas` registry. The Rust `ConnectionManager::dispatch_outbound` calls it for `core.chat.v1` and `core.file.v1` before signing and transmitting; `ConnectionManager::send_audio_datagram` / `send_room_audio` gate `core.audio.opus` and `room.audio.sfu` datagrams via dedicated helpers. Transport-layer inbound paths that skip `dispatch_message` (direct QUIC `AUDIO_TAG`, client `SfuAudio`, supernode QUIC relay `handle_datagram`, supernode WS `SfuAudio` fan-out) call `gate_inbound_through_feature` with the same token buckets. Quota buckets (both directions) are cleared on `drop_peer` / `peer_left` / `disconnect` (native WS signaling).
 
-### Browser parity
+### In-app portal games
 
-When `web.host.h3.v1` is enabled, ConquerD web clients use `web-sdk/conquerd.mjs` to participate in the exact same channel fabric over WebTransport. The supernode runs the Ed25519 identity handshake and verifies signed envelopes (`verify_browser_envelope`) before fanning payloads out to native peers. Any new `room.*` or `game.*` feature should be tested with both a native and a ConquerD web client.
+Portal pages and games load only inside the native client (`conquerd://` + injected `window.conquerd`). Games use `web-sdk/conquerd.mjs` over portal channel APIs (`/_conquerd/channel/*`) that ride the authenticated QUIC relay — not a public browser transport. Room chat/voice/file stay native (QML + `ConnectionManager`); do not reintroduce page-side SFU clients or WebTransport.
 
 ### Reference modules in-tree
 
 - `core.chat.v1`, `core.audio.opus`, `core.file.v1` — desktop client (`conquerd-client`).
 - `room.audio.sfu`, `room.chat.v1`, `room.file.v1` — supernode room modules and SFU broadcast paths (`rust/conquerd-supernode/src/sfu_module.rs`, `rust/conquerd-supernode/src/main.rs`).
-- `web.host.h3.v1` — supernode WebTransport listener (`webtransport.rs`).
 - `x.conquerd.matchmaker.v1` — **reference bespoke `x.*` example** (`rust/conquerd-features/src/examples.rs`). A complete `FeatureModule` template (Request kind, `TrustedPeer` auth, explicit quota, stateful lobby `on_invoke` with a "lobby ready" hook). Opt-in only via `register_example_modules`; never auto-advertised. Demonstrates how a coordination feature composes with the opaque `game.relay.v1` relay (the ready roster is exactly the set of peers wired together over `game.relay.v1`).
 
 ### Feature trust
@@ -370,8 +370,7 @@ Supernode-hosted modules (multi-party; require a connected supernode):
 | `room.chat.v1` | stream | room-member | Room text chat broadcast via supernode; `body` is E2E-sealed under the per-room sender key (content not persisted server-side). |
 | `room.file.v1` | stream | room-member | Signed room file broadcast via supernode; each chunk's `data` is E2E-sealed under the per-room sender key (AAD = conv_id ‖ sender ‖ transfer_id ‖ chunk_index); recipients verify + decrypt chunks before saving. Offer/complete metadata stays cleartext. |
 | `web.host.app.v1` | stream | public | In-app `conquerd://` portal over QUIC bidi streams in embedded Chromium (4 MB/s). |
-| `web.host.h3.v1` | datagram | public | WebTransport (HTTP/3) bridge so browser clients join the same channel fabric. |
-| `game.relay.v1` | datagram | room-member | Opaque session-scoped datagram relay for in-session games. |
+| `game.relay.v1` | datagram | room-member | Opaque portal game session relay over identity QUIC (fixed tag `0x05`). |
 
 Transport descriptors (handled by the QUIC layer directly; no application module code): `transport.quic.audio.v1`, `transport.quic.relay.v1`, `transport.quic.stream.v1`, `transport.quic.feature_datagram.v1`, `transport.quic.uni_stream.v1`, `transport.quic.stream_priority.v1`, `transport.quic.zero_rtt.v1`, `transport.quic.pmtud.v1`, `transport.quic.migration.v1`, `transport.quic.flow_control.v1`.
 
@@ -382,7 +381,7 @@ The native client browses a supernode's in-app portal without leaving the app: a
 1. Client → supernode: one length-prefixed `WebAppRequest` JSON frame (`{ "path": "/index.html", "method": "GET" }`).
 2. Supernode → client: one `WebAppResponseHeader` JSON frame (`{ "status": 200, "content_type": "text/html", "total_len": N }`) then length-prefixed binary body chunks terminated by a zero-length chunk.
 
-The QUIC connection is the identity gate (the supernode already knows which Ed25519 key opened the stream), so requests are not re-signed. Dynamic routes answered inline: `/health` · `/api/stats` (relay/SFU/peer counts), `/api/peers`, `/api/config`, `/api/metrics`. Static assets are served from `<data_dir>/web/`. The view is restricted to `conquerd://` URLs (external links open in the system browser); a `window.conquerd` JS bridge (`supernodeId`, `ready` → `{ myPeerId, supernodeId, version, fetch() }`) is injected at document creation.
+The QUIC connection is the identity gate (the supernode already knows which Ed25519 key opened the stream), so requests are not re-signed. Dynamic routes answered inline: `/health` · `/api/stats` (relay/SFU/peer counts), `/api/peers`, `/api/config`, `/api/metrics`. Static assets are served from `<data_dir>/web/` and `<data_dir>/games/`. The view is restricted to `conquerd://` URLs (external links open in the system browser); a `window.conquerd` JS bridge (`supernodeId`, `ready` → `{ myPeerId, supernodeId, version, nativeTransport, openChannel/sendDatagramB64/pollDatagrams/closeChannel, fetch() }`) is injected at document creation.
 
 ### Quotas and channel tags
 
@@ -400,11 +399,11 @@ This section is the single source of truth for delivery status (condensed from t
 
 ### Health summary
 
-ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (~660 unit tests listed by `cargo test -- --list`: 117 features + 254 supernode + 208 headless client + 80 installer + 1 opus), plus **LLVM line/region coverage %** on the hot path (`scripts/coverage.ps1` / `coverage.sh` → `coverage/summary.md`; CI job `Rust coverage %`, report-only floors). Architecture is compliant with the capability-gated, client-only, invite-only model, and supply-chain hardening is solid (SHA-pinned actions, version sync, optional signing with graceful fallbacks). Game relay (`game.relay.v1` over WebTransport) is confirmed working end-to-end with native clients. SFU room definitions are client-owned; supernodes host rooms ephemerally only. **Supernode manager** (`rust/conquerd-supernode-manager/`) is production-tested: the acdc three-node cluster (a/b/c) is the live integration-testing target — `build-deploy`, `cluster-sync`, and `exec`-based remote debugging are operational.
+ConquerD is in strong shape for a 1.0 privacy-first modular P2P framework: near-zero authored tech debt, dense unit coverage (~660 unit tests listed by `cargo test -- --list`: 117 features + supernode + headless client + installer + opus), plus **LLVM line/region coverage %** on the hot path (`scripts/coverage.ps1` / `coverage.sh` → `coverage/summary.md`; CI job `Rust coverage %`, report-only floors). Architecture is compliant with the capability-gated, client-only, invite-only model, and supply-chain hardening is solid (SHA-pinned actions, version sync, optional signing with graceful fallbacks). In-app portal games use `game.relay.v1` over the identity QUIC relay (no external WebTransport). SFU room definitions are client-owned; supernodes host rooms ephemerally only. **Supernode manager** (`rust/conquerd-supernode-manager/`) is production-tested: the acdc three-node cluster (a/b/c) is the live integration-testing target — `build-deploy`, `cluster-sync`, and `exec`-based remote debugging are operational.
 
 ### Foundations — stable ✅
 
-P0–P2 delivery is complete and covered by tests: CI hardening, post-handshake replay protection, relay/SFU smoke tests, quota symmetry, cross-platform CI, platform notification/UPnP TODOs, supply-chain scanning, operator runbook, threat model, version automation, metrics export, game relay (`game.relay.v1` over WebTransport), ephemeral SFU rooms, and Space Merkle **Layer 1** (authenticated room tree, including the `"members"` invite-policy widening, its client UI toggle, periodic Space-root re-broadcast, and root-equivocation flagging).
+P0–P2 delivery is complete and covered by tests: CI hardening, post-handshake replay protection, relay/SFU smoke tests, quota symmetry, cross-platform CI, platform notification/UPnP TODOs, supply-chain scanning, operator runbook, threat model, version automation, metrics export, in-app portal game relay (`game.relay.v1` over identity QUIC), ephemeral SFU rooms, and Space Merkle **Layer 1** (authenticated room tree, including the `"members"` invite-policy widening, its client UI toggle, periodic Space-root re-broadcast, and root-equivocation flagging).
 
 The durable invariants for each of these live in **Architecture Notes**, **Using the Modular Framework**, and **Feature Module Reference** above; operator/build/signing detail is in the README and `docs/`. This file tracks invariants and open work — not a changelog, so completed-work detail is not re-logged here.
 

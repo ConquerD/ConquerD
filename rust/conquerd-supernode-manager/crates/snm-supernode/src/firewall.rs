@@ -287,7 +287,7 @@ mod tests {
         NetworkEnv {
             relay_port: 3578,
             ws_port: 35035,
-            web_port: Some(8543),
+            web_port: None, // no public web port (portal is QUIC-only)
             public_host: "155.138.244.189".into(),
             access_mode: "open".into(),
         }
@@ -296,17 +296,21 @@ mod tests {
     #[test]
     fn lists_required_ports() {
         let rules = port_rules(&sample_network());
-        assert_eq!(rules.len(), 4);
+        assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].port, 3578);
         assert_eq!(rules[0].proto, "udp");
+        assert_eq!(rules[1].port, 35035);
+        assert_eq!(rules[1].proto, "tcp");
     }
 
     #[test]
     fn ensure_script_is_idempotent_and_tagged() {
         let script = render_ufw_ensure_script("", "acdc", "a", &sample_network());
+        // Stale instance rules are wiped by comment needle, then re-added.
+        assert!(script.contains("grep -F 'snm:acdc/a'"));
         assert!(script.contains("ufw allow 3578/udp comment 'snm:acdc/a:relay'"));
-        assert!(script.contains("grep -Fq 'snm:acdc/a:relay'"));
-        assert!(script.contains("ufw allow 8543/tcp comment 'snm:acdc/a:web-tcp'"));
+        assert!(!script.contains("web-tcp"));
+        assert!(!script.contains("web-udp"));
     }
 
     #[test]

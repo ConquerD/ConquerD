@@ -1,85 +1,32 @@
 # Cursor Relay — `game.relay.v1` example
 
-A minimal browser game that relays each participant's cursor position to all
-other players in the same session via `game.relay.v1` over WebTransport.
-
-The supernode receives `[tag][payload]` datagrams from each browser peer and
-fans them out verbatim to every other peer in the same session — it never
-parses the game payload.
-
----
+A minimal in-app portal game that relays each participant's cursor position to
+other players in the same session via `game.relay.v1` over the **identity QUIC
+relay** (no external browser / WebTransport).
 
 ## Requirements
 
-- A running `conquerd-supernode` with `game.relay.v1` enabled.
-- The supernode's WebTransport cert fingerprint, supplied automatically in the
-  native portal or via the SDK's `certHash` path for standalone browser access.
+- A running `conquerd-supernode` with `game.relay.v1` and `web.host.app.v1`.
+- A native ConquerD client that has accepted the supernode invite (portal + relay).
 
----
-
-## Enable `game.relay.v1` in supernode.toml
+## Enable features in supernode.toml
 
 ```toml
-schema_version = 1
-
 [[feature]]
 id = "game.relay.v1"
 enabled = true
 
 [[feature]]
-id = "web.host.h3.v1"
+id = "web.host.app.v1"
 enabled = true
 ```
 
----
+## Open the game
 
-## Serve the game files
-
-The supernode's built-in HTTPS portal will serve any directory placed under
-`<data_dir>/games/<slug>/`. Copy the `games/example/` folder there and the
-game will be reachable at:
+From the native client Rooms sidebar, open the supernode portal and navigate to:
 
 ```
-https://<host>:<web_port>/games/example/
+conquerd://<supernode_id>/games/example/?room=lobby1
 ```
 
-Alternatively serve the files from any static HTTPS host and point query
-params at the supernode:
-
-```
-https://your-static-host/game/?host=supernode.example.com&port=8443&room=lobby1
-```
-
----
-
-## URL parameters
-
-| Parameter | Default             | Description                            |
-|-----------|---------------------|----------------------------------------|
-| `host`    | `location.hostname` | Supernode hostname                     |
-| `port`    | `8443`              | Supernode WebTransport port            |
-| `room`    | `default`           | Game session id (shared with players)  |
-
----
-
-## Wire format
-
-The game uses a simple 5-byte header; all payloads are opaque to the relay:
-
-```
-[u8 type][u16 BE x][u16 BE y][utf-8 color hex]
-
-  type 0x01 = CURSOR_UPDATE
-  type 0x02 = CURSOR_LEAVE
-  x, y      = normalised float in [0,1] encoded as uint16 (0..65535)
-  color     = up to 16 bytes of "#rrggbb" (omitted for LEAVE)
-```
-
----
-
-## Extending this example
-
-- Replace cursor positions with player state (position, health, action).
-- Add a coordination feature such as `x.conquerd.matchmaker.v1` for joining/leaving.
-- Use `transport.quic.uni_stream.v1` for ordered reliable events alongside
-  `game.relay.v1` unreliable datagrams for real-time state.
+External HTTPS / browser tabs are not supported.

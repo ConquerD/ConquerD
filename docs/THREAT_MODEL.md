@@ -1,7 +1,7 @@
 # ConquerD Lightweight Threat Model (P3)
 
 **Date:** 2026  
-**Scope:** Invite + handshake, direct/relay sessions, WebTransport/browser clients, capability negotiation, supernode surfaces.  
+**Scope:** Invite + handshake, direct/relay sessions, in-app portal games, capability negotiation, supernode surfaces.  
 **Style:** One-pager, asset-centric, per agents.md "formal lightweight threat model document".
 
 ## Assets
@@ -86,19 +86,18 @@
 
 **Residual:** Traffic analysis by the relay operator (accepted trade-off for NAT traversal help). No content confidentiality from supernode.
 
-### 6. WebTransport / Browser Clients (`web.host.h3.v1`)
+### 6. In-app portal games (`web.host.app.v1` + `game.relay.v1`)
 **Threats:**  
-- Browser-origin attacks (XSS, malicious JS, compromised tab).  
-- Weaker client identity (browser has no OS keyring).  
-- Injection into native peer sessions.
+- Malicious portal page JS (XSS / compromised asset on a supernode).  
+- Injection of game datagrams into other sessions.
 
 **Mitigations (current):**  
-- Ed25519 handshake identical to native (browser SDK performs it over WebTransport).  
-- `verify_browser_envelope` on supernode before dispatching to native peers.  
-- Capability intersection + consent gate still enforced (`FeatureRegistry`).  
-- Browser only ever talks to a user-chosen supernode; no direct P2P from arbitrary origins.
+- Portal pages load only inside the native client (`conquerd://`); no external browser transport.  
+- Pages use the **native peer's** identity — no page-local keypair or TLS cert.  
+- Game fan-out is scoped to `GameRelayJoin` sessions on the QUIC relay; payloads are opaque.  
+- Navigation is locked to `conquerd://` in portal mode; external links open outside the app.
 
-**Residual:** Browser supply-chain / extension attacks. (Same as any web app.)
+**Residual:** A compromised supernode can serve hostile portal HTML (same class as any untrusted web host). Peers should only open portals of supernodes they already trust via invite.
 
 ### 7. Capability Negotiation & Feature Activation
 **Threats:**  
@@ -133,7 +132,7 @@
 - **Social engineering** around invite distribution (out-of-band).  
 - **Supply-chain** attacks on the binary or browser (mitigated by code-signing, Sigstore, pinned actions).  
 - **Long-term session ordering** without full sequence numbers (duplicate envelopes within the freshness window are blocked; strict monotonic ordering remains a possible hardening item).
-- **Browser-origin attacks** on WebTransport clients (same risk surface as any web app).
+- **Hostile portal assets** from an untrusted supernode (mitigated by invite-only supernode trust).
 
 ## Recommendations (aligned with P3)
 - Consider adding monotonic sequence numbers + sliding-window bitmap for all post-handshake signaling if strict ordering becomes necessary.

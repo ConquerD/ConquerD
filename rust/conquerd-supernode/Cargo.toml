@@ -51,7 +51,6 @@ conquerd-features = { path = "../conquerd-features" }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-wtransport = { version = "0.7", default-features = false, features = ["ring", "self-signed"] }
 
 [build-dependencies]
 winresource = "0.1"

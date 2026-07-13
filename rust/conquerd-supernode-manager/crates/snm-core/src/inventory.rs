@@ -318,14 +318,9 @@ impl Inventory {
                     .relay_port
                     .unwrap_or_else(|| default_relay_port(index));
                 let ws_port = instance.ws_port.unwrap_or_else(|| default_ws_port(index));
-                let portal_enabled = instance.features.is_empty()
-                    || instance
-                        .features
-                        .iter()
-                        .any(|f| f.enabled && f.id.starts_with("web.host"));
-                let web_port = instance
-                    .web_port
-                    .or_else(|| portal_enabled.then(|| default_web_port(index)));
+                // web_port is legacy (former WebTransport). Never auto-allocate —
+                // in-app portal uses QUIC only. Operators must set explicitly if needed.
+                let web_port = instance.web_port;
                 let cluster_port = instance
                     .cluster_port
                     .unwrap_or_else(|| default_cluster_port(index));
@@ -374,11 +369,7 @@ impl Inventory {
                 .relay_port
                 .unwrap_or_else(|| default_relay_port(index));
             let ws_port = instance.ws_port.unwrap_or_else(|| default_ws_port(index));
-            let portal_enabled = instance.features.is_empty()
-                || instance.features.iter().any(|f| f.enabled && f.id.starts_with("web.host"));
-            let web_port = instance
-                .web_port
-                .or_else(|| portal_enabled.then(|| default_web_port(index)));
+            let web_port = instance.web_port;
             // Use the cluster's base port if the instance doesn't pin its own.
             let cluster_port = instance.cluster_port.unwrap_or_else(|| {
                 cluster.cluster_port.unwrap_or(4478) + (index as u16) * 100
@@ -411,6 +402,8 @@ pub fn default_ws_port(index: usize) -> u16 {
     34935 + (index as u16) * 100
 }
 
+/// Legacy helper retained for tests/callers that still pass an explicit port.
+/// Prefer leaving `web_port` unset (in-app portal needs no public HTTP port).
 pub fn default_web_port(index: usize) -> u16 {
     8443 + (index as u16) * 100
 }
@@ -697,6 +690,7 @@ ssh = "root@1.2.3.4"
                 relay_port: Some(3578),
                 ws_port: Some(35935),
                 web_port: Some(8543),
+                cluster_port: None,
                 listen_bind: None,
                 access_mode: None,
                 identity_file: None,
@@ -732,6 +726,7 @@ ssh = "root@1.2.3.4"
                 relay_port: Some(3479),
                 ws_port: Some(34936),
                 web_port: Some(8444),
+                cluster_port: None,
                 listen_bind: None,
                 access_mode: None,
                 identity_file: None,
@@ -767,6 +762,7 @@ ssh = "root@1.2.3.4"
                 relay_port: Some(3578),
                 ws_port: Some(35935),
                 web_port: Some(8543),
+                cluster_port: None,
                 listen_bind: None,
                 access_mode: None,
                 identity_file: None,

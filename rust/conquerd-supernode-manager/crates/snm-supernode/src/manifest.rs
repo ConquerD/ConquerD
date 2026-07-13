@@ -196,18 +196,18 @@ mod tests {
     fn serializes_feature_params() {
         let mut config = sample_config();
         config.features = vec![FeatureSpec {
-            id: "web.host.h3.v1".into(),
+            id: "game.relay.v1".into(),
             enabled: true,
             params: Some(toml::Value::Table({
                 let mut t = toml::map::Map::new();
-                t.insert("port".into(), toml::Value::Integer(8443));
+                t.insert("scope".into(), toml::Value::String("session".into()));
                 t
             })),
             cdylib_manifest: None,
         }];
         let raw = render_supernode_toml(&config);
         assert!(raw.contains("params"));
-        assert!(raw.contains("port = 8443"));
+        assert!(raw.contains("scope = \"session\""));
     }
 
     #[test]

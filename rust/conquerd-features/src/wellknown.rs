@@ -275,36 +275,16 @@ pub fn web_host_app_v1() -> CapabilityDescriptor {
         .with_auth(AuthTier::Public)
 }
 
-/// `web.host.h3.v1` — supernode HTTP/3 + WebTransport host. Browsers
-/// connect over WebTransport and bridge their feature datagrams onto the
-/// supernode's channel-tag fabric. TLS cert is loaded from
-/// `<data_dir>/web_cert.pem` / `web_key.pem`; `port` defaults to the
-/// existing `supernode_web_port` env var.
-pub fn web_host_h3_v1() -> CapabilityDescriptor {
-    CapabilityDescriptor::new("web.host.h3.v1", "1.0", ChannelKind::Datagram)
-        .with_params(serde_json::json!({
-            "transport": "webtransport",
-            "alpn": "h3",
-            "datagram_framing": "u8_tag + opaque",
-        }))
-        .with_auth(AuthTier::Public)
-}
-
-/// `game.relay.v1` — opaque datagram relay for game state. The supernode
-/// fans inbound datagrams from each browser (or native) peer to every other
-/// participant in the same game session (identified by the `room` parameter
-/// in the WebTransport request path) without interpreting the payload.
-/// Games control their own serialization; the relay only enforces:
-///
-/// * tag is in the dynamic range `0x10..=0xEF`
-/// * source peer has a verified identity (handshake completed)
-/// * source peer has advertised `game.relay.v1`
-/// * participants share the same session id
+/// `game.relay.v1` — opaque datagram relay for in-app portal games.
+/// The supernode fans inbound QUIC-relay datagrams (fixed channel tag
+/// `GAME_RELAY_TAG`) to peers that joined the same portal game session via
+/// `GameRelayJoin`, without interpreting the payload.
 pub fn game_relay_v1() -> CapabilityDescriptor {
     CapabilityDescriptor::new("game.relay.v1", "1.0", ChannelKind::Datagram)
         .with_params(json!({
             "relay": "opaque",
             "scope": "session",
+            "channel_tag": "fixed",
         }))
         .with_auth(AuthTier::RoomMember)
 }
@@ -332,7 +312,6 @@ pub fn local_capabilities() -> Vec<CapabilityDescriptor> {
         room_chat_v1(),
         room_file_v1(),
         web_host_app_v1(),
-        web_host_h3_v1(),
         game_relay_v1(),
     ]
 }
@@ -377,7 +356,6 @@ mod tests {
             "room.chat.v1",
             "room.file.v1",
             "web.host.app.v1",
-            "web.host.h3.v1",
             "game.relay.v1",
         ];
         assert_eq!(

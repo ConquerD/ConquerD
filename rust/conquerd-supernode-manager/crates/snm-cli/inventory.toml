@@ -29,8 +29,8 @@ features = [
     "room.chat.v1",
     { id = "room.audio.sfu", enabled = true, params = { allow_private_rooms = true, allow_public_rooms = false } },
     "room.file.v1",
-    "web.host.h3.v1",
     "web.host.app.v1",
+    "game.relay.v1",
 ]
 
 [[host]]
@@ -48,6 +48,6 @@ features = [
     "room.chat.v1",
     { id = "room.audio.sfu", enabled = true, params = { allow_private_rooms = true, allow_public_rooms = false } },
     "room.file.v1",
-    "web.host.h3.v1",
     "web.host.app.v1",
+    "game.relay.v1",
 ]

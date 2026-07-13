@@ -1,4 +1,4 @@
-// ConquerD Supernode — main.rs
+// ConquerD Supernode â€” main.rs
 // Standalone Rust supernode binary: QUIC relay + SFU + WebSocket signaling + in-app portal (web.host.app.v1).
 
 mod access;
@@ -13,13 +13,11 @@ mod peer_store;
 mod protocol;
 mod relay;
 mod sfu;
-mod sfu_module;
 mod signaling;
 mod space;
 mod stats;
 mod ticket;
 mod web_app_module;
-mod webtransport;
 mod wire;
 
 use std::collections::{HashMap, HashSet};
@@ -45,8 +43,6 @@ use conquerd_features::wellknown;
 use conquerd_features::FeatureRegistry;
 use conquerd_features::{NativeModuleLoader, TrustedKeyStore};
 
-use crate::webtransport::BrowserBridge;
-
 /// Application version (match client APP_VERSION).
 const APP_VERSION: &str = "1.0.0";
 /// Ticket renewal check interval.
@@ -64,7 +60,7 @@ const ENDPOINT_MAX_AGE_S: f64 = 86400.0;
 /// `cdylib_manifest` path are loaded via [`NativeModuleLoader`]. Signer
 /// keys must be listed in `<data_dir>/trusted_module_keys.txt`; unknown
 /// keys cause the entry to be skipped with a warning (no interactive
-/// prompt on the supernode — add keys to the file to pre-authorise them).
+/// prompt on the supernode â€” add keys to the file to pre-authorise them).
 fn load_manifest(config: &Config) -> manifest::SupernodeManifest {
     match manifest::SupernodeManifest::load_or_default(&config.data_dir) {
         Ok(m) => m,
@@ -98,11 +94,11 @@ fn build_feature_registry(
         }
     }
 
-    // ── Native module loading (Phase 5) ─────────────────────────────────────
+    // â”€â”€ Native module loading (Phase 5) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     //
     // Load cdylib entries from the manifest. Uses the trust store at
     // `<data_dir>/trusted_module_keys.txt`; unknown keys are denied with
-    // a warning (headless supernode — no interactive prompt).
+    // a warning (headless supernode â€” no interactive prompt).
     let native_entries: Vec<_> = manifest.native_module_entries().cloned().collect();
     if !native_entries.is_empty() {
         let keys_path = config.data_dir.join("trusted_module_keys.txt");
@@ -190,31 +186,18 @@ struct SupernodeState {
     signaling: SignalingServer,
     access_controller: Box<dyn access::AccessController>,
     start_time: Instant,
-    /// peer_id → ticket expiry timestamp
+    /// peer_id â†’ ticket expiry timestamp
     ticket_expiry: RwLock<HashMap<String, f64>>,
-    /// peer_id → raw ENDPOINT_UPDATE message
+    /// peer_id â†’ raw ENDPOINT_UPDATE message
     endpoint_mailbox: RwLock<HashMap<String, String>>,
-    /// Pending hole-punch registrations: (peer_a, peer_b) canonical key → PunchRegistration
+    /// Pending hole-punch registrations: (peer_a, peer_b) canonical key â†’ PunchRegistration
     pending_punches: RwLock<HashMap<(String, String), PunchRegistration>>,
     /// Capabilities advertised in `SUPERNODE_INFO`.
     features: Arc<FeatureRegistry>,
-    /// Browser-transport bridge. Always allocated, but only handed to a
-    /// listener task when `web.host.h3.v1` is enabled in the manifest.
-    web_bridge: BrowserBridge,
-    /// SHA-256 fingerprint (hex) of the self-signed WebTransport TLS cert.
-    ///
-    /// Advertised in `SUPERNODE_INFO` so native clients can expose it to
-    /// game pages via `/_conquerd/ctx.json`.  Games pass it to
-    /// `new WebTransport(url, { serverCertificateHashes: [...] })` which
-    /// pins the connection to this specific cert without needing a CA.
-    /// This IS the ConquerD trust model: the supernode's identity was
-    /// already verified via Ed25519 invite/handshake; the cert fingerprint
-    /// is just an additional binding over that trusted channel.
-    web_cert_fingerprint: Option<String>,
     /// Which SFU room types peers may materialize (`room.audio.sfu` params).
     sfu_room_policy: manifest::SfuRoomCreationPolicy,
     /// This node's cluster membership, when an `[cluster]` section is configured.
-    /// `None` ⇒ standalone supernode.
+    /// `None` â‡’ standalone supernode.
     cluster: Option<cluster::ClusterMembership>,
     /// Live intra-cluster transport (set after startup when clustering is on).
     cluster_link: RwLock<Option<Arc<cluster_link::ClusterLink>>>,
@@ -228,16 +211,16 @@ struct SupernodeState {
 }
 
 /// Highest verified [`space::SignedSpaceRoot`] per `space_id`. `space_id` embeds
-/// the owner (`derive_node_id("", owner_pub, …)`), so it is effectively bound to
+/// the owner (`derive_node_id("", owner_pub, â€¦)`), so it is effectively bound to
 /// one signer; we still pin the signer and refuse epoch regression (monotonic
 /// for equivocation containment).
 #[derive(Default)]
 struct SpaceRootStore {
     roots: HashMap<String, space::SignedSpaceRoot>,
-    /// `space_id` → count of detected equivocations (two differently-hashed,
+    /// `space_id` â†’ count of detected equivocations (two differently-hashed,
     /// validly-signed roots seen for the same `(space_id, epoch)`). We chose a
     /// set tree, not an append-only log, so there is no consistency proof
-    /// between epochs — a malicious owner *can* sign two roots for one epoch.
+    /// between epochs â€” a malicious owner *can* sign two roots for one epoch.
     /// Lighter mitigation (flag conflicts; CT-style history tree is deferred in
     /// `backlog.md`): we cannot tell which root is "true", so we keep the
     /// first-seen one (unchanged behavior) but make the conflict observable for
@@ -297,16 +280,16 @@ impl SpaceRootStore {
     }
 }
 
-/// Pure proof-based admission decision (no side effects) — does the presented
+/// Pure proof-based admission decision (no side effects) â€” does the presented
 /// `proof` (+ `grant` for private nodes) admit `sender` to `room_id` against the
 /// current signed `root`? `now` is unix seconds (grant expiry). Extracted so the
 /// security matrix is unit-testable without a full `SupernodeState`.
 ///
 /// - proof must be for exactly `room_id` and verify against `root` (which pins
-///   the epoch → current-epoch-only admission);
+///   the epoch â†’ current-epoch-only admission);
 /// - **public** node: the proof alone admits;
 /// - **private** node: additionally an owner-signed grant bound to this peer,
-///   not expired, whose epoch is already active (`≤ root.epoch`).
+///   not expired, whose epoch is already active (`â‰¤ root.epoch`).
 fn space_admission_ok(
     root: &space::SignedSpaceRoot,
     proof: &space::SpaceInclusionProof,
@@ -319,7 +302,7 @@ fn space_admission_ok(
         return false;
     }
     if proof.node.node_type != "private" {
-        return true; // public node — proof-only admission
+        return true; // public node â€” proof-only admission
     }
     let Some(grant) = grant else {
         return false;
@@ -337,7 +320,7 @@ fn space_admission_ok(
 /// A pending hole-punch registration waiting for both peers.
 struct PunchRegistration {
     registered_at: f64,
-    /// peer_id → endpoint string
+    /// peer_id â†’ endpoint string
     endpoints: HashMap<String, String>,
 }
 
@@ -390,7 +373,7 @@ impl SupernodeState {
 
     /// Deliver a room audio frame replicated from another cluster member to
     /// this node's local voice participants. Prefer QUIC relay datagrams, fall
-    /// back to WebSocket — same transport preference as the local SFU bridge.
+    /// back to WebSocket â€” same transport preference as the local SFU bridge.
     /// Deduped by `message_id`; never re-replicated. Skips the active-speaker
     /// gate (the origin node already applied it; the remote talker is not a
     /// local participant and must not displace local talker scores).
@@ -460,7 +443,7 @@ impl SupernodeState {
     }
 
     /// Local-only room admit: materialize the room if absent and authorize
-    /// `peer` on *this* node. Does **not** cluster-replicate membership —
+    /// `peer` on *this* node. Does **not** cluster-replicate membership â€”
     /// cold members admit via Space proof (or creator / rematerialized token).
     fn local_allow_room_peer(&self, room_id: &str, room_name: &str, room_type: &str, peer: &str) {
         let Some(ref sfu) = self.sfu else {
@@ -471,18 +454,18 @@ impl SupernodeState {
             _ => sfu::RoomType::Private,
         };
         let mut s = sfu.write();
-        // creator "" → no implicit creator privileges; access is via the
+        // creator "" â†’ no implicit creator privileges; access is via the
         // explicit allow below.
         s.create_room(Some(room_id), room_name, rtype, "");
         s.allow_peer(room_id, peer);
     }
 
     /// Materialize a durable room advertised in a peer's `RoomRoster` so this
-    /// member can accept a failed-over join for it. Idempotent — `create_room`
+    /// member can accept a failed-over join for it. Idempotent â€” `create_room`
     /// leaves an existing room untouched. Preserves the advertised `creator_id`
     /// so the room owner retains self-admit/invite authority on any member.
     /// Non-owner private members re-admit via Space proof on join (or local
-    /// invite-token rematerialize) — not via cluster ACL push.
+    /// invite-token rematerialize) â€” not via cluster ACL push.
     fn apply_room_roster(&self, desc: &cluster_link::RoomDescriptor) {
         let Some(ref sfu) = self.sfu else {
             return;
@@ -500,8 +483,8 @@ impl SupernodeState {
         );
     }
 
-    /// Verify + store a signed Space root (highest epoch per space), and — if it
-    /// was newly accepted — cluster-gossip it to peer members. Returns whether it
+    /// Verify + store a signed Space root (highest epoch per space), and â€” if it
+    /// was newly accepted â€” cluster-gossip it to peer members. Returns whether it
     /// was newly stored. Used by the owner announce path and by client-carried
     /// roots on join.
     fn accept_and_gossip_space_root(&self, root: space::SignedSpaceRoot) -> bool {
@@ -518,7 +501,7 @@ impl SupernodeState {
     /// Proof-based Space admission. If `payload` carries space fields that
     /// verify against the current signed root for the space, authorize
     /// `sender`, materialize the room from the proven node, and return `true`.
-    /// Returns `false` to fall through to the local invite-token path —
+    /// Returns `false` to fall through to the local invite-token path â€”
     /// absence or verification failure just means "not admitted by proof", never
     /// an outright denial. Cluster-wide membership is proof-carried; there is no
     /// supernode-to-supernode room ACL push.
@@ -540,10 +523,10 @@ impl SupernodeState {
             return false;
         }
         // A client always carries its current signed root (MTC "fallback
-        // certificate", §5) so admission never blocks on gossip propagation.
+        // certificate", Â§5) so admission never blocks on gossip propagation.
         // Accept it (verify + highest-epoch), then verify the proof against the
-        // CURRENT held root — enforcing current-epoch-only admission (revocation
-        // = exclusion, §8): a stale proof against a superseded root is rejected.
+        // CURRENT held root â€” enforcing current-epoch-only admission (revocation
+        // = exclusion, Â§8): a stale proof against a superseded root is rejected.
         let Some(carried) = payload
             .get("space_root")
             .cloned()
@@ -561,8 +544,8 @@ impl SupernodeState {
         }
 
         // The proof shows the room provably exists in the signed Space, so
-        // **materialize** it from the proven node if absent (§5.1: a proof is an
-        // equally authoritative description) — even when entry is still gated by
+        // **materialize** it from the proven node if absent (Â§5.1: a proof is an
+        // equally authoritative description) â€” even when entry is still gated by
         // a local invite token below. This is the roster-free existence
         // guarantee: any cluster member the joiner reaches can serve the room.
         let rtype = if proof.node.node_type == "private" {
@@ -577,7 +560,7 @@ impl SupernodeState {
                 sfu::RoomType::Public
             };
             // Carry the proven SpaceNode's `invite_policy` onto the
-            // materialized room (§7 "proven SpaceNode" resolution). It is first
+            // materialized room (Â§7 "proven SpaceNode" resolution). It is first
             // created with an empty `creator_id`; the adopt step below binds it
             // to the proven Space owner.
             let mut s = sfu.write();
@@ -592,7 +575,7 @@ impl SupernodeState {
             // inclusion proof (verified against the current signed root above)
             // authenticates `proof.node.owner_pub` as the room's owner, so
             // adopting it as `creator_id` restores owner minting + self-admit
-            // for a room re-materialized after a restart/idle-GC — the durable
+            // for a room re-materialized after a restart/idle-GC â€” the durable
             // replacement for the deferred Layer 2 node-key capability path.
             if s.adopt_creator_if_empty(room_id, &proof.node.owner_pub) {
                 info!(
@@ -603,7 +586,7 @@ impl SupernodeState {
             }
         }
 
-        // Admission decision: public → proof-only; private → owner-signed grant
+        // Admission decision: public â†’ proof-only; private â†’ owner-signed grant
         // bound to this peer. Only on a full pass do we allow locally.
         let grant = payload
             .get("space_grant")
@@ -615,7 +598,7 @@ impl SupernodeState {
             .unwrap_or(0);
         if !space_admission_ok(&root, &proof, grant.as_ref(), sender, room_id, now) {
             // Materialized but not admitted by proof (e.g. private room via a
-            // shareable link carrying no grant) → fall through to the local
+            // shareable link carrying no grant) â†’ fall through to the local
             // token path, which can now validate against the just-materialized room.
             return false;
         }
@@ -706,25 +689,6 @@ impl SupernodeState {
                 json!(format!("conquerd://{}/", self.identity.public_id())),
             );
         }
-        // Advertise WebTransport base URL and cert fingerprint when
-        // web.host.h3.v1 is enabled.  Both are consumed by the native client
-        // and injected into game pages via /_conquerd/ctx.json so that
-        // `new WebTransport(url, { serverCertificateHashes: [{ algorithm:
-        // 'sha-256', value: fingerprint }] })` can connect without any CA
-        // cert.  The fingerprint IS the trust anchor — it was received over
-        // the already Ed25519-verified SUPERNODE_INFO channel.
-        if self.features.get("web.host.h3.v1").is_some() {
-            let port = self.config.web_port.unwrap_or(8443);
-            let host = match self.config.external_host.as_deref() {
-                Some(h) if !h.is_empty() && h != "0.0.0.0" => h.to_owned(),
-                _ => "localhost".to_owned(),
-            };
-            let obj = payload.as_object_mut().unwrap();
-            obj.insert("wt_url".into(), json!(format!("https://{}:{}", host, port)));
-            if let Some(ref fp) = self.web_cert_fingerprint {
-                obj.insert("cert_fingerprint".into(), json!(fp));
-            }
-        }
         // Advertise the signed cluster roster so a client can fail over to any
         // member. Signed by this node's identity, which the client already
         // trusts over the Ed25519-verified SUPERNODE_INFO channel.
@@ -746,7 +710,7 @@ impl SupernodeState {
         let external = self.config.external_host.as_deref().unwrap_or("0.0.0.0");
         if external == "0.0.0.0" {
             warn!(
-                "Relay ticket for {} uses 0.0.0.0 — set supernode_host env var",
+                "Relay ticket for {} uses 0.0.0.0 â€” set supernode_host env var",
                 &peer_pub[..12.min(peer_pub.len())]
             );
         }
@@ -871,7 +835,7 @@ impl SupernodeState {
                 return Some(format!("{}:{}", addr.ip(), addr.port()));
             }
         }
-        // 2. Endpoint mailbox — parse the raw JSON to extract listener
+        // 2. Endpoint mailbox â€” parse the raw JSON to extract listener
         if let Some(raw) = self.endpoint_mailbox.read().get(peer_id) {
             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(raw) {
                 if let Some(listener) = msg
@@ -879,7 +843,7 @@ impl SupernodeState {
                     .and_then(|p| p.get("listener"))
                     .and_then(|v| v.as_str())
                 {
-                    // listener is typically ws://ip:port — extract host:port
+                    // listener is typically ws://ip:port â€” extract host:port
                     if let Some(stripped) = listener.strip_prefix("ws://") {
                         return Some(stripped.to_string());
                     }
@@ -899,7 +863,7 @@ impl SupernodeState {
             Some(ep) => ep,
             None => {
                 debug!(
-                    "[relay-punch] No endpoint for new peer {} — skipping",
+                    "[relay-punch] No endpoint for new peer {} â€” skipping",
                     &new_peer[..12.min(new_peer.len())]
                 );
                 return;
@@ -914,7 +878,7 @@ impl SupernodeState {
                 Some(ep) => ep,
                 None => {
                     debug!(
-                        "[relay-punch] No endpoint for peer {} — skipping pair",
+                        "[relay-punch] No endpoint for peer {} â€” skipping pair",
                         &other_peer[..12.min(other_peer.len())]
                     );
                     continue;
@@ -953,7 +917,7 @@ impl SupernodeState {
             }),
         );
         info!(
-            "[punch] PUNCH_READY sent to {} ↔ {} (punch_at={:.3})",
+            "[punch] PUNCH_READY sent to {} â†” {} (punch_at={:.3})",
             &peer_a[..12.min(peer_a.len())],
             &peer_b[..12.min(peer_b.len())],
             punch_at,
@@ -1005,7 +969,7 @@ impl SupernodeState {
             .insert(sender.to_string(), sender_endpoint.to_string());
 
         info!(
-            "[punch] Registration from {} → {} (endpoint={})",
+            "[punch] Registration from {} â†’ {} (endpoint={})",
             &sender[..12.min(sender.len())],
             &target_peer[..12.min(target_peer.len())],
             sender_endpoint,
@@ -1224,35 +1188,6 @@ impl SupernodeState {
         value
     }
 
-    /// Returns the WebTransport base URL for the `web.host.h3.v1` listener.
-    ///
-    /// Used by the `/api/wt-url` endpoint so game pages loaded inside the
-    /// native portal (where `location.hostname` is the base64url supernode
-    /// ID rather than a resolvable DNS name) can discover the real address
-    /// to pass to `new WebTransport(url)`.
-    ///
-    /// When `external_host` is not configured the URL falls back to
-    /// `https://localhost:<web_port>`, which works for local development.
-    pub(crate) fn wt_url_json(&self) -> serde_json::Value {
-        if self.features.get("web.host.h3.v1").is_none() {
-            return json!({"error": "web.host.h3.v1 not enabled on this supernode"});
-        }
-        let port = self.config.web_port.unwrap_or(8443);
-        let host = match self.config.external_host.as_deref() {
-            Some(h) if !h.is_empty() && h != "0.0.0.0" => h.to_owned(),
-            _ => "localhost".to_owned(),
-        };
-        let url = format!("https://{host}:{port}");
-        // Include the cert fingerprint alongside the URL so the SDK can use
-        // serverCertificateHashes even when it reaches us via the /api/wt-url
-        // fallback (i.e. before SUPERNODE_INFO has been delivered via the
-        // native client trust chain).
-        match &self.web_cert_fingerprint {
-            Some(fp) => json!({"url": url, "certHash": fp}),
-            None => json!({"url": url}),
-        }
-    }
-
     /// Returns the public portal configuration used by browser-side templates.
     /// Safe to expose: no secrets (access_code is omitted).
     pub(crate) fn portal_config(&self) -> serde_json::Value {
@@ -1297,7 +1232,7 @@ impl SupernodeState {
 /// `extract_peer_id`) into the padded form used by the SFU / signaling layer
 /// (`public_id`). Appends `=` until the length is a multiple of 4; a string
 /// that is already padded (or whose length is already aligned) is returned
-/// unchanged. Cheap and infallible — no decode/re-encode round-trip.
+/// unchanged. Cheap and infallible â€” no decode/re-encode round-trip.
 fn pad_base64url(id: &str) -> String {
     match id.len() % 4 {
         0 => id.to_string(),
@@ -1452,7 +1387,7 @@ async fn handle_relay_signaling_stream(
         };
         if msg.sender != peer_id {
             warn!(
-                "Relay signaling sender {} != stream peer {} — dropping {:?}",
+                "Relay signaling sender {} != stream peer {} â€” dropping {:?}",
                 &msg.sender[..12.min(msg.sender.len())],
                 &peer_id[..12.min(peer_id.len())],
                 msg.msg_type,
@@ -1543,7 +1478,7 @@ impl SignalingHandler for SupernodeHandler {
                 self.handle_punch_register(&msg);
             }
             MessageType::ChatMessage => {
-                // Peer-targeted relay only — do not log or inspect payload fields;
+                // Peer-targeted relay only â€” do not log or inspect payload fields;
                 // content may be E2E-encrypted inside `encrypted_signal` envelopes.
             }
             MessageType::TrustRequest | MessageType::TrustAccept => {
@@ -1552,14 +1487,14 @@ impl SignalingHandler for SupernodeHandler {
                 if let Some(target_id) = msg.payload.get("target").and_then(|v| v.as_str()) {
                     self.state.signaling.send_to_peer(target_id, raw);
                     debug!(
-                        "Relayed {:?} from {} → {}",
+                        "Relayed {:?} from {} â†’ {}",
                         msg.msg_type,
                         &msg.sender[..12.min(msg.sender.len())],
                         &target_id[..12.min(target_id.len())],
                     );
                 } else {
                     debug!(
-                        "[trust] {:?} from {} missing payload.target — dropped",
+                        "[trust] {:?} from {} missing payload.target â€” dropped",
                         msg.msg_type,
                         &msg.sender[..12.min(msg.sender.len())],
                     );
@@ -1591,7 +1526,7 @@ impl SignalingHandler for SupernodeHandler {
             | MessageType::AttestationResponse
             | MessageType::CapabilityAnnounce
             | MessageType::Pong => {
-                // Peer-to-peer relay only — forwarding handled by signaling.rs.
+                // Peer-to-peer relay only â€” forwarding handled by signaling.rs.
             }
             MessageType::CapabilityInvoke => {
                 // Route to a targeted peer when the payload carries a `target` field;
@@ -1599,7 +1534,7 @@ impl SignalingHandler for SupernodeHandler {
                 if let Some(target_id) = msg.payload.get("target").and_then(|v| v.as_str()) {
                     self.state.signaling.send_to_peer(target_id, raw);
                     debug!(
-                        "Relayed CAPABILITY_INVOKE from {} → {}",
+                        "Relayed CAPABILITY_INVOKE from {} â†’ {}",
                         &msg.sender[..12.min(msg.sender.len())],
                         &target_id[..12.min(target_id.len())],
                     );
@@ -1607,7 +1542,7 @@ impl SignalingHandler for SupernodeHandler {
                     let feature_id = msg.payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     if feature_id.is_empty() {
                         debug!(
-                            "CAPABILITY_INVOKE from {} missing 'id' — dropped",
+                            "CAPABILITY_INVOKE from {} missing 'id' â€” dropped",
                             &msg.sender[..12.min(msg.sender.len())],
                         );
                     } else {
@@ -1629,7 +1564,7 @@ impl SignalingHandler for SupernodeHandler {
                 let trusted = self.state.peer_store.read().is_trusted(&msg.sender);
                 if trusted && self.state.access_controller.check_access(&msg.sender) {
                     debug!(
-                        "[relay] RelayRequest from {} — re-issuing ticket",
+                        "[relay] RelayRequest from {} â€” re-issuing ticket",
                         &msg.sender[..12.min(msg.sender.len())]
                     );
                     self.state.issue_relay_ticket(&msg.sender);
@@ -1647,7 +1582,7 @@ impl SignalingHandler for SupernodeHandler {
                 self.handle_game_relay_leave(&msg);
             }
             _ => {
-                // Unexpected message type — log for diagnostics.
+                // Unexpected message type â€” log for diagnostics.
                 debug!(
                     "Unhandled message type {:?} from {}",
                     msg.msg_type,
@@ -1661,7 +1596,7 @@ impl SignalingHandler for SupernodeHandler {
         let is_trusted = self.state.peer_store.read().is_trusted(identity_pub);
         if !is_trusted {
             info!(
-                "Peer {} connected but NOT trusted — ignoring (handshake required)",
+                "Peer {} connected but NOT trusted â€” ignoring (handshake required)",
                 &identity_pub[..12.min(identity_pub.len())],
             );
             return;
@@ -1862,7 +1797,7 @@ impl SupernodeHandler {
         }
     }
 
-    /// Portal game session join — relay membership only (no SFU voice room).
+    /// Portal game session join â€” relay membership only (no SFU voice room).
     /// Session id is taken from `payload.room` / `payload.room_id` (game lobby).
     fn handle_game_relay_join(&self, msg: &SignalingMessage) {
         let room = msg
@@ -1880,7 +1815,7 @@ impl SupernodeHandler {
         let trusted = self.state.peer_store.read().is_trusted(&msg.sender);
         if !trusted {
             debug!(
-                "[game.relay] join from untrusted {} — dropped",
+                "[game.relay] join from untrusted {} â€” dropped",
                 &msg.sender[..12.min(msg.sender.len())]
             );
             return;
@@ -1918,7 +1853,7 @@ impl SupernodeHandler {
 
         // Proof-based admission (coexist): if the join carries a valid Space
         // proof (+ grant for private nodes), authorize + materialize the room
-        // before the ACL check below. A no-op when absent → legacy ACL applies.
+        // before the ACL check below. A no-op when absent â†’ legacy ACL applies.
         self.state
             .try_space_admission(&msg.sender, room_id, &msg.payload);
 
@@ -1950,7 +1885,7 @@ impl SupernodeHandler {
                 reason,
                 detail
             );
-            // Tell the client so optimistic voice/UI can roll back — a silent
+            // Tell the client so optimistic voice/UI can roll back â€” a silent
             // deny previously left peers "in room" with no SFU membership.
             self.state.send_signed(
                 &msg.sender,
@@ -2129,7 +2064,7 @@ impl SupernodeHandler {
             }
         }
         // Cross-node room members (attached to a sibling supernode) only hear
-        // this talker if we fan the same opaque frame over the cluster link —
+        // this talker if we fan the same opaque frame over the cluster link â€”
         // parity with room.chat.v1's replicate_room_chat path.
         self.state.replicate_room_audio(room_id, msg, raw);
     }
@@ -2162,7 +2097,7 @@ impl SupernodeHandler {
             .unwrap_or(sfu::DEFAULT_ROOM_ID);
         if !sfu.read().is_chat_sender(room_id, &msg.sender) {
             tracing::debug!(
-                "[room.chat.v1] sender {} is not a member of room {} — dropping chat",
+                "[room.chat.v1] sender {} is not a member of room {} â€” dropping chat",
                 &msg.sender[..12.min(msg.sender.len())],
                 &room_id[..12.min(room_id.len())]
             );
@@ -2327,7 +2262,7 @@ impl SupernodeHandler {
         //     RoomStore entry + token is the membership proof after GC);
         //   * first create without a client token mints a fresh single-use
         //     shareable invite for the creator to distribute.
-        // Room-id alone is NOT enough — non-creators without a token are not
+        // Room-id alone is NOT enough â€” non-creators without a token are not
         // admitted on a bare materialize of an already-existing room.
         let mut invite_token: Option<String> = None;
         if is_private {
@@ -2353,7 +2288,7 @@ impl SupernodeHandler {
 
             if !admitted && (is_creator || created_new) {
                 // Creator (or first materializer creating a brand-new room)
-                // self-admits without a token. Local allow only — cold cluster
+                // self-admits without a token. Local allow only â€” cold cluster
                 // members re-admit via Space proof or rematerialize + token re-seed.
                 let _ = sfu.write().allow_peer(&room_id_out, &msg.sender);
                 if created_new && invite_token.is_none() {
@@ -2399,7 +2334,7 @@ impl SupernodeHandler {
         let room_exists = sfu.read().get_room(room_id).is_some();
         // Re-entry: a peer previously admitted on *this* node is still in its
         // local `allowed` set. The single-use invite token is consumed on first
-        // use, so subsequent re-entry re-sends a spent token — admit already-
+        // use, so subsequent re-entry re-sends a spent token â€” admit already-
         // allowed peers directly (same node only; cold nodes need Space proof
         // or token rematerialize).
         let already_member = sfu
@@ -2485,7 +2420,7 @@ impl SupernodeHandler {
             }
             sfu::InviteMint::NotAuthorized => {
                 warn!(
-                    "[sfu] Invite generate denied for room {} — {} is not the room creator",
+                    "[sfu] Invite generate denied for room {} â€” {} is not the room creator",
                     short(room_id),
                     short(&msg.sender),
                 );
@@ -2497,7 +2432,7 @@ impl SupernodeHandler {
             }
             sfu::InviteMint::RoomNotFound => {
                 warn!(
-                    "[sfu] Invite generate failed for room {} — room not found",
+                    "[sfu] Invite generate failed for room {} â€” room not found",
                     short(room_id),
                 );
                 self.state.send_signed(
@@ -2511,7 +2446,7 @@ impl SupernodeHandler {
 
     /// The owner announces a signed Space root. Verify the owner signature,
     /// store the highest epoch, and cluster-gossip it so any member can later
-    /// admit by proof against it (authenticated room-set sync, §8).
+    /// admit by proof against it (authenticated room-set sync, Â§8).
     fn handle_space_root_announce(&self, msg: &SignalingMessage) {
         let Some(root) = msg
             .payload
@@ -2521,7 +2456,7 @@ impl SupernodeHandler {
         else {
             return;
         };
-        // The announcer must be the root's signer (owner) — a peer can't push
+        // The announcer must be the root's signer (owner) â€” a peer can't push
         // someone else's root here (gossip re-verifies the signature anyway).
         if root.signer.trim_end_matches('=') != msg.sender.trim_end_matches('=') {
             return;
@@ -2599,7 +2534,7 @@ async fn main() -> anyhow::Result<()> {
     let listener_host = config.external_host.as_deref().unwrap_or("0.0.0.0");
     let listener_url = format!("ws://{}:{}", listener_host, config.signaling_port);
     if listener_host == "0.0.0.0" {
-        warn!("Invite listener_url uses 0.0.0.0 — set supernode_host env var for remote clients");
+        warn!("Invite listener_url uses 0.0.0.0 â€” set supernode_host env var for remote clients");
     }
     let mut handshake =
         HandshakeManager::new(identity.clone(), listener_url, config.invite_ttl_seconds);
@@ -2629,7 +2564,7 @@ async fn main() -> anyhow::Result<()> {
 
     // SFU room manager
     let sfu = if config.sfu_enabled {
-        info!("SFU enabled — rooms are ephemeral (peer-owned definitions, idle GC)");
+        info!("SFU enabled â€” rooms are ephemeral (peer-owned definitions, idle GC)");
         Some(RwLock::new(SFURoomManager::new()))
     } else {
         None
@@ -2644,14 +2579,6 @@ async fn main() -> anyhow::Result<()> {
     // Build shared state using Arc::new_cyclic so feature modules can hold a
     // Weak<SupernodeState> without a circular strong-reference cycle.
     //
-    // Generate/reuse the self-signed WebTransport cert before building state
-    // so the fingerprint is available for SUPERNODE_INFO immediately.
-    let web_cert_fingerprint = if config.web_port.is_some() {
-        ensure_web_cert(&config.data_dir)
-    } else {
-        None
-    };
-
     // Cluster membership: validate the operator-declared roster against this
     // node's identity. An invalid roster disables clustering (run standalone)
     // rather than failing startup.
@@ -2690,8 +2617,6 @@ async fn main() -> anyhow::Result<()> {
             endpoint_mailbox: RwLock::new(endpoint_mailbox),
             pending_punches: RwLock::new(HashMap::new()),
             features: Arc::clone(&features),
-            web_bridge: BrowserBridge::new(),
-            web_cert_fingerprint,
             sfu_room_policy: manifest::sfu_room_creation_policy(&features),
             cluster,
             cluster_link: RwLock::new(None),
@@ -2734,7 +2659,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(move |root: space::SignedSpaceRoot| {
                 if let Some(state) = weak.upgrade() {
                     // Gossip is full-mesh: accept (verify + highest-epoch) but do
-                    // not re-forward — the origin already broadcast to all peers.
+                    // not re-forward â€” the origin already broadcast to all peers.
                     state.space_roots.write().accept(root);
                 }
             })
@@ -2864,7 +2789,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Install the room-audio datagram bridge so `room.audio.sfu` frames a peer
-    // sends over its QUIC relay session (unreliable datagrams — no TCP
+    // sends over its QUIC relay session (unreliable datagrams â€” no TCP
     // head-of-line blocking) are fanned out to *every* room member by their
     // best transport: relay datagram for relay-connected members, WebSocket
     // for the rest. The frame stays end-to-end signed, so this never
@@ -2892,8 +2817,8 @@ async fn main() -> anyhow::Result<()> {
                     };
                     let fwd = crate::wire::build_forwarded_datagram(sender_index, &inner);
                     // The relay identifies peers by the *un-padded* base64url id
-                    // (`extract_peer_id`), but the SFU room — populated from the
-                    // WebSocket `SfuJoin` — keys participants by the *padded*
+                    // (`extract_peer_id`), but the SFU room â€” populated from the
+                    // WebSocket `SfuJoin` â€” keys participants by the *padded*
                     // `public_id`. Re-pad `from_peer` into the SFU's id space so
                     // the active-speaker gate recognizes the sender and the
                     // exclusion below actually fires; otherwise the talker is
@@ -2914,7 +2839,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         match relay.send_room_datagram(&member, &fwd) {
                             // Delivered (or dropped on quota/send error) over the
-                            // relay — do not also send over WS for this member.
+                            // relay â€” do not also send over WS for this member.
                             Some(_) => {}
                             // Not relay-connected: deliver over WebSocket,
                             // charging the same `room.audio.sfu` outbound quota.
@@ -2941,58 +2866,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Start WebTransport listener (stub) when the manifest enabled
-    // `web.host.h3.v1`. The bridge is always allocated; the listener
-    // task only spins up when the capability is registered.
-    if state.features.get("web.host.h3.v1").is_some() {
-        let bridge = state.web_bridge.clone();
-        let port = state.config.web_port.unwrap_or(8443);
-        let data_dir = state.config.data_dir.clone();
-
-        // If the SFU is enabled, register `room.audio.sfu` and
-        // `room.chat.v1` as `FeatureModule` instances on the registry,
-        // then install `ModuleNativeDispatcher` so browser-originated
-        // `room.*` payloads land in the registry exactly once per
-        // inbound message. The modules own verify+enumerate+forward.
-        if state.sfu.is_some() {
-            let weak = std::sync::Arc::downgrade(&state);
-            let audio: std::sync::Arc<dyn conquerd_features::FeatureModule> =
-                std::sync::Arc::new(sfu_module::SfuRoomModule::audio(weak.clone()));
-            let chat: std::sync::Arc<dyn conquerd_features::FeatureModule> =
-                std::sync::Arc::new(sfu_module::SfuRoomModule::chat(weak));
-            // Manifest-loaded descriptors usually exist already; bind
-            // first, fall back to register if absent.
-            if !state.features.bind_module("room.audio.sfu", audio.clone()) {
-                let _ = state.features.register_module(audio);
-            }
-            if !state.features.bind_module("room.chat.v1", chat.clone()) {
-                let _ = state.features.register_module(chat);
-            }
-
-            let native_hook: webtransport::NativeMessageHook = {
-                let state_for_hook = std::sync::Arc::downgrade(&state);
-                std::sync::Arc::new(move |source, feature_id, payload| {
-                    if let Some(s) = state_for_hook.upgrade() {
-                        // Inbound quota is enforced in BrowserBridge::on_inbound;
-                        // invoke the bound module directly to avoid double-charging.
-                        if let Some(module) = s.features.module(feature_id) {
-                            module.on_message(source.to_string(), payload);
-                        }
-                    }
-                })
-            };
-            bridge.set_dispatcher(std::sync::Arc::new(
-                webtransport::ModuleNativeDispatcher::new(native_hook),
-            ));
-        }
-
-        bridge.set_features(Arc::clone(&state.features));
-
-        tokio::spawn(async move {
-            webtransport::run_listener(bridge, data_dir, port).await;
-        });
-    }
-
     // Start signaling
     let handler = Arc::new(SupernodeHandler {
         state: state.clone(),
@@ -3010,9 +2883,9 @@ async fn main() -> anyhow::Result<()> {
         }
         let invite = hs.reusable_invite.as_ref().unwrap();
         let uri = invite.to_uri();
-        info!("═══════════════════════════════════════");
+        info!("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
         info!("Invite URL: {}", uri);
-        info!("═══════════════════════════════════════");
+        info!("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
     }
 
     // Ticket renewal timer
@@ -3026,7 +2899,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Idle SFU room GC — peer-materialized rooms are dropped after inactivity.
+    // Idle SFU room GC â€” peer-materialized rooms are dropped after inactivity.
     let state_gc = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -3111,23 +2984,23 @@ fn check_ticket_renewals(state: &SupernodeState) {
 /// ```text
 /// <data_dir>/
 ///   web/
-///     index.html                     ← portal dashboard (uses window.conquerd bridge)
+///     index.html                     â† portal dashboard (uses window.conquerd bridge)
 ///   games/
 ///     example/
-///       index.html                   ← cursor-relay demo UI
-///       game.js                      ← cursor-relay demo logic
+///       index.html                   â† cursor-relay demo UI
+///       game.js                      â† cursor-relay demo logic
 ///     shared-drawing/
-///       index.html                   ← collaborative canvas demo
+///       index.html                   â† collaborative canvas demo
 ///       drawing.js
 ///     brick-breaker/
-///       index.html                   ← multiplayer breakout demo
+///       index.html                   â† multiplayer breakout demo
 ///       brick-breaker.js
 ///   web-sdk/
-///     conquerd.mjs                   ← browser SDK (imported by all game demos)
+///     conquerd.mjs                   â† browser SDK (imported by all game demos)
 /// ```
 ///
-/// The three game demos (`game.relay.v1`) are fully functional browser
-/// experiences that connect via WebTransport when `web.host.h3.v1` is enabled.
+/// The three game demos (`game.relay.v1`) run inside the native in-app portal
+/// over the identity QUIC relay (`window.conquerd` channel APIs).
 fn seed_web_defaults(data_dir: &std::path::Path) {
     // Embedded assets — all paths are relative to this source file and
     // live inside the crate so the build works regardless of whether the
@@ -3159,11 +3032,11 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
 
     // Always-overwrite: all system-owned files must stay current with the
     // binary.  Content is compared first so unchanged files are not touched.
-    // Operators add their own games under a different slug — they never
+    // Operators add their own games under a different slug â€” they never
     // customise these first-party files directly.
     let always_update: &[(&[&str], &str)] = &[
         (&["web", "index.html"], PORTAL_HTML),
-        // Served at /web-sdk/conquerd.mjs — must live under web/ so that
+        // Served at /web-sdk/conquerd.mjs â€” must live under web/ so that
         // the web_app_module route() function finds it via the web_root.
         (&["web", "web-sdk", "conquerd.mjs"], CONQUERD_MJS),
         (&["games", "example", "index.html"], CURSOR_HTML),
@@ -3191,7 +3064,7 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
             let _ = std::fs::create_dir_all(parent);
         }
         match std::fs::read_to_string(&full) {
-            Ok(existing) if existing == *content => {} // unchanged — skip the write
+            Ok(existing) if existing == *content => {} // unchanged â€” skip the write
             _ => {
                 if let Err(e) = std::fs::write(&full, content.as_bytes()) {
                     warn!("[seed] could not write {}: {e}", full.display());
@@ -3200,287 +3073,6 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
                 }
             }
         }
-    }
-}
-
-/// Rotate WebTransport certs after this many seconds of age (cert PEM mtime).
-/// Chromium caps `serverCertificateHashes` at 14 days; we mint 13-day certs and
-/// rotate at 7 days so a restart within the second week always regenerates
-/// before expiry.
-const WEB_CERT_ROTATE_SECS: u64 = 7 * 24 * 3600;
-/// Not-after window for newly minted self-signed WebTransport certs.
-const WEB_CERT_VALIDITY_DAYS: i64 = 13;
-
-/// True when `web_cert.pem` exists and its mtime is younger than the rotate
-/// threshold. Age is always taken from the **cert PEM** (written only when a
-/// cert is minted), never from the fingerprint cache — rewriting the `.hex`
-/// sidecar on reuse used to refresh mtime and permanently skip rotation.
-fn web_cert_still_fresh(cert_path: &std::path::Path) -> bool {
-    std::fs::metadata(cert_path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
-        .map(|age| age.as_secs() < WEB_CERT_ROTATE_SECS)
-        .unwrap_or(false)
-}
-
-/// Sync the fingerprint sidecar only when missing or content differs.
-/// Avoids a no-op rewrite that would bump mtime (historically used as the
-/// freshness clock, and still useful for operator tooling that watches the file).
-fn sync_web_cert_fingerprint_cache(fp_path: &std::path::Path, fingerprint: &str) {
-    let needs_write = match std::fs::read_to_string(fp_path) {
-        Ok(existing) => existing.trim() != fingerprint,
-        Err(_) => true,
-    };
-    if needs_write {
-        if let Err(e) = std::fs::write(fp_path, fingerprint) {
-            // Non-fatal: cert/key are authoritative; the .hex cache is advisory.
-            warn!("[web-cert] write fingerprint cache failed (non-fatal): {e}");
-        }
-    }
-}
-
-/// Ensure a self-signed TLS cert exists for the WebTransport listener.
-///
-/// Returns the SHA-256 fingerprint (lowercase hex) of the cert's DER bytes.
-/// The fingerprint is the trust anchor: it is delivered to native clients via
-/// the already Ed25519-verified `SUPERNODE_INFO` message, so no CA is needed.
-///
-/// Validity is capped at [`WEB_CERT_VALIDITY_DAYS`] (13) to stay within
-/// Chromium's 14-day maximum for `serverCertificateHashes`. The cert is
-/// rotated on startup when `web_cert.pem` is older than
-/// [`WEB_CERT_ROTATE_SECS`] (7 days), measured from the cert file's mtime.
-///
-/// **Always** re-derives the fingerprint from the on-disk cert DER rather
-/// than reading the stored `.hex` file, so the advertised hash is never stale
-/// (e.g. after a crash between the cert write and the fingerprint write, or
-/// after a manual cert replacement).
-fn ensure_web_cert(data_dir: &std::path::Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-
-    let cert_path = data_dir.join("web_cert.pem");
-    let key_path = data_dir.join("web_key.pem");
-    let fp_path = data_dir.join("web_cert_fingerprint.hex");
-
-    // Helper: derive the fingerprint and DER bytes directly from the PEM
-    // on disk so both are always authoritative (not dependent on .hex cache).
-    let derive_fp_and_der_from_disk = || -> Option<(String, Vec<u8>)> {
-        let pem = std::fs::read_to_string(&cert_path).ok()?;
-        // Strip the PEM header/footer and decode the base64 body.
-        let b64: String = pem
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .collect::<Vec<_>>()
-            .join("");
-        use base64::Engine;
-        let der = base64::engine::general_purpose::STANDARD
-            .decode(&b64)
-            .ok()?;
-        let fp = hex::encode(Sha256::digest(&der));
-        Some((fp, der))
-    };
-
-    // Reuse existing cert if it is still fresh (< 7 days by cert PEM mtime)
-    // AND it carries the serverAuth EKU that Chrome WebTransport requires.
-    // Certs generated before the EKU was added are silently rotated.
-    if web_cert_still_fresh(&cert_path) && key_path.exists() {
-        // Re-derive the fingerprint from the actual cert DER so the
-        // advertised hash is always in sync with what wtransport presents.
-        if let Some((fp, der)) = derive_fp_and_der_from_disk() {
-            // Check for serverAuth EKU (OID 1.3.6.1.5.5.7.3.1).
-            // DER encoding of this OID: 06 08 2b 06 01 05 05 07 03 01
-            const SERVER_AUTH_OID: &[u8] =
-                &[0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
-            let has_server_auth = der
-                .windows(SERVER_AUTH_OID.len())
-                .any(|w| w == SERVER_AUTH_OID);
-            if has_server_auth {
-                sync_web_cert_fingerprint_cache(&fp_path, &fp);
-                info!(
-                    "[web-cert] reusing existing cert (fingerprint {}…)",
-                    &fp[..16.min(fp.len())]
-                );
-                return Some(fp);
-            }
-            // Old cert missing serverAuth EKU — Chrome TLS rejects it.
-            // Remove the files so we fall through to regeneration.
-            warn!("[web-cert] existing cert missing serverAuth EKU — regenerating");
-            let _ = std::fs::remove_file(&cert_path);
-            let _ = std::fs::remove_file(&key_path);
-            let _ = std::fs::remove_file(&fp_path);
-        } else {
-            // Cert PEM unreadable — fall through to regeneration.
-            warn!("[web-cert] existing cert unreadable — regenerating");
-        }
-    } else if cert_path.exists() {
-        // Stale, missing key, or unreadable mtime — log so operators see why
-        // a restart regenerates (and so frequent restarts cannot "refresh"
-        // a fingerprint sidecar into permanent reuse of an expired cert).
-        info!(
-            "[web-cert] rotating WebTransport cert (PEM age ≥ {} days or incomplete material)",
-            WEB_CERT_ROTATE_SECS / 86400
-        );
-    }
-
-    // Generate a fresh self-signed ECDSA cert valid for WEB_CERT_VALIDITY_DAYS.
-    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
-
-    let now = time::OffsetDateTime::now_utc();
-    let mut params = CertificateParams::default();
-    params.not_before = now;
-    params.not_after = now + time::Duration::days(WEB_CERT_VALIDITY_DAYS);
-    // Chromium WebTransport with serverCertificateHashes bypasses hostname
-    // verification, but it still requires the certificate to be valid for
-    // TLS server authentication.  Add the serverAuth EKU explicitly so
-    // Chrome's TLS stack accepts the cert at the handshake level.
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-
-    let key = match KeyPair::generate() {
-        Ok(k) => k,
-        Err(e) => {
-            warn!("[web-cert] key generation failed: {e}");
-            return None;
-        }
-    };
-    let cert = match params.self_signed(&key) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("[web-cert] cert generation failed: {e}");
-            return None;
-        }
-    };
-
-    let cert_pem = cert.pem();
-    let key_pem = key.serialize_pem();
-    let fingerprint = hex::encode(Sha256::digest(cert.der().as_ref()));
-
-    if let Err(e) = std::fs::write(&cert_path, &cert_pem) {
-        warn!("[web-cert] write cert failed: {e}");
-        return None;
-    }
-    if let Err(e) = std::fs::write(&key_path, &key_pem) {
-        warn!("[web-cert] write key failed: {e}");
-        return None;
-    }
-    // Fingerprint cache is advisory for operators; age checks use cert PEM mtime.
-    if let Err(e) = std::fs::write(&fp_path, &fingerprint) {
-        warn!("[web-cert] write fingerprint cache failed (non-fatal): {e}");
-    }
-
-    info!(
-        "[web-cert] generated new self-signed cert (fingerprint {}…)",
-        &fingerprint[..16.min(fingerprint.len())]
-    );
-    Some(fingerprint)
-}
-
-#[cfg(test)]
-mod web_cert_tests {
-    use super::*;
-    use std::time::{Duration, SystemTime};
-
-    fn set_mtime(path: &std::path::Path, when: SystemTime) {
-        let f = std::fs::File::options()
-            .write(true)
-            .open(path)
-            .expect("open for mtime");
-        f.set_times(std::fs::FileTimes::new().set_modified(when))
-            .expect("set_modified");
-    }
-
-    #[test]
-    fn ensure_web_cert_generates_and_reuses_when_fresh() {
-        let dir = tempfile::tempdir().unwrap();
-        let fp1 = ensure_web_cert(dir.path()).expect("generate");
-        assert_eq!(fp1.len(), 64, "sha256 hex");
-        assert!(dir.path().join("web_cert.pem").exists());
-        assert!(dir.path().join("web_key.pem").exists());
-        assert!(dir.path().join("web_cert_fingerprint.hex").exists());
-
-        let fp2 = ensure_web_cert(dir.path()).expect("reuse");
-        assert_eq!(fp1, fp2, "fresh cert must be reused across restarts");
-        let pem1 = std::fs::read_to_string(dir.path().join("web_cert.pem")).unwrap();
-        let fp3 = ensure_web_cert(dir.path()).expect("reuse again");
-        assert_eq!(fp1, fp3);
-        let pem2 = std::fs::read_to_string(dir.path().join("web_cert.pem")).unwrap();
-        assert_eq!(pem1, pem2, "reuse must not rewrite cert PEM");
-    }
-
-    #[test]
-    fn ensure_web_cert_rotates_when_pem_older_than_threshold() {
-        let dir = tempfile::tempdir().unwrap();
-        let fp_old = ensure_web_cert(dir.path()).expect("generate");
-        let cert_path = dir.path().join("web_cert.pem");
-        let key_path = dir.path().join("web_key.pem");
-        let fp_path = dir.path().join("web_cert_fingerprint.hex");
-
-        // Backdate the cert PEM past the rotate window. Also backdate the
-        // fingerprint sidecar so a regression that keys off .hex mtime still
-        // fails this test (the PEM is the authoritative clock).
-        let eight_days_ago = SystemTime::now() - Duration::from_secs(WEB_CERT_ROTATE_SECS + 86_400);
-        set_mtime(&cert_path, eight_days_ago);
-        set_mtime(&key_path, eight_days_ago);
-        set_mtime(&fp_path, eight_days_ago);
-        assert!(!web_cert_still_fresh(&cert_path));
-
-        let fp_new = ensure_web_cert(dir.path()).expect("rotate");
-        assert_ne!(fp_old, fp_new, "stale PEM must force a new cert");
-        assert!(web_cert_still_fresh(&cert_path));
-    }
-
-    #[test]
-    fn ensure_web_cert_rotates_even_if_fingerprint_cache_is_fresh() {
-        // Regression: previously age was taken from web_cert_fingerprint.hex,
-        // and every reuse rewrote that file — so frequent restarts kept the
-        // cache "fresh" forever while the PEM aged past notAfter.
-        let dir = tempfile::tempdir().unwrap();
-        let fp_old = ensure_web_cert(dir.path()).expect("generate");
-        let cert_path = dir.path().join("web_cert.pem");
-        let fp_path = dir.path().join("web_cert_fingerprint.hex");
-
-        let fourteen_days_ago = SystemTime::now() - Duration::from_secs(14 * 24 * 3600);
-        set_mtime(&cert_path, fourteen_days_ago);
-        // Leave fingerprint cache at "now" (just written) — the bug path.
-        assert!(
-            std::fs::metadata(&fp_path)
-                .unwrap()
-                .modified()
-                .unwrap()
-                .elapsed()
-                .unwrap()
-                < Duration::from_secs(60)
-        );
-        assert!(!web_cert_still_fresh(&cert_path));
-
-        let fp_new = ensure_web_cert(dir.path()).expect("rotate despite fresh cache");
-        assert_ne!(
-            fp_old, fp_new,
-            "fresh fingerprint sidecar must not block PEM-age rotation"
-        );
-    }
-
-    #[test]
-    fn sync_fingerprint_cache_skips_identical_rewrite() {
-        let dir = tempfile::tempdir().unwrap();
-        let fp_path = dir.path().join("web_cert_fingerprint.hex");
-        std::fs::write(&fp_path, "abc").unwrap();
-        let old_mtime = std::fs::metadata(&fp_path).unwrap().modified().unwrap();
-        // Brief sleep so a spurious rewrite would advance mtime on coarse FS.
-        std::thread::sleep(Duration::from_millis(20));
-        sync_web_cert_fingerprint_cache(&fp_path, "abc");
-        let new_mtime = std::fs::metadata(&fp_path).unwrap().modified().unwrap();
-        assert_eq!(
-            old_mtime, new_mtime,
-            "identical fingerprint must not rewrite (mtime preserved)"
-        );
-        sync_web_cert_fingerprint_cache(&fp_path, "def");
-        assert_eq!(std::fs::read_to_string(&fp_path).unwrap().trim(), "def");
-    }
-
-    #[test]
-    fn web_cert_still_fresh_false_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!web_cert_still_fresh(&dir.path().join("nope.pem")));
     }
 }
 
@@ -3499,7 +3091,7 @@ mod identity_normalization_tests {
         let no_pad = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let padded = base64::engine::general_purpose::URL_SAFE;
         // Sweep several distinct 32-byte keys; Ed25519 keys are always 32 bytes
-        // → 43 unpadded chars → 44 padded (one trailing '=').
+        // â†’ 43 unpadded chars â†’ 44 padded (one trailing '=').
         for seed in [0u8, 1, 7, 42, 255] {
             let key = [seed; 32];
             let relay_id = no_pad.encode(key); // what the relay sees
@@ -3620,7 +3212,8 @@ mod build_feature_registry_tests {
         assert!(ids.iter().any(|i| i == "core.file.v1"));
         assert!(ids.iter().any(|i| i == "room.audio.sfu"));
         assert!(ids.iter().any(|i| i == "web.host.app.v1"));
-        assert!(ids.iter().any(|i| i == "web.host.h3.v1"));
+        assert!(ids.iter().any(|i| i == "game.relay.v1"));
+        assert!(ids.iter().all(|i| i != "web.host.h3.v1"));
     }
 
     #[test]
@@ -3744,7 +3337,7 @@ mod space_admission_tests {
 
     #[test]
     fn space_root_store_flags_same_epoch_content_conflict_as_equivocation() {
-        // Same owner key, same space_id, same epoch — but two different node
+        // Same owner key, same space_id, same epoch â€” but two different node
         // sets produce two different `root_hash`es. A malicious (or buggy)
         // owner signing both is exactly the equivocation a set tree cannot
         // prevent structurally; we can only detect and flag it (lighter
@@ -3763,7 +3356,7 @@ mod space_admission_tests {
             key_commit: String::new(),
         });
         // Same epoch (forced, simulating an attacker/bug re-using an epoch
-        // number) as `root_a`, different node set → different root_hash.
+        // number) as `root_a`, different node set â†’ different root_hash.
         sp_fork.epoch = sp.epoch;
         let root_b = sp_fork.signed_root(1000, |b| ed25519_sign(&key.to_bytes(), b).unwrap());
         assert_eq!(root_a.epoch, root_b.epoch);
@@ -3800,10 +3393,10 @@ mod space_admission_tests {
         let proof = sp.prove(&rid).unwrap();
         let peer = "peer-b-pub";
 
-        // No grant → refused.
+        // No grant â†’ refused.
         assert!(!space_admission_ok(&root, &proof, None, peer, &rid, 0));
 
-        // Valid grant for this peer → admitted.
+        // Valid grant for this peer â†’ admitted.
         let grant = sp.grant(&rid, peer, 0, |b| ed25519_sign(&key.to_bytes(), b).unwrap());
         assert!(space_admission_ok(
             &root,
@@ -3814,7 +3407,7 @@ mod space_admission_tests {
             0
         ));
 
-        // Grant for a *different* peer → refused (replay by a third party).
+        // Grant for a *different* peer â†’ refused (replay by a third party).
         assert!(!space_admission_ok(
             &root,
             &proof,
@@ -3824,7 +3417,7 @@ mod space_admission_tests {
             0
         ));
 
-        // Grant signed by a non-owner → refused.
+        // Grant signed by a non-owner â†’ refused.
         let attacker = SigningKey::generate(&mut OsRng);
         let forged = sp.grant(&rid, peer, 0, |b| {
             ed25519_sign(&attacker.to_bytes(), b).unwrap()
@@ -3838,7 +3431,7 @@ mod space_admission_tests {
             0
         ));
 
-        // Expired grant → refused.
+        // Expired grant â†’ refused.
         let expiring = sp.grant(&rid, peer, 500, |b| {
             ed25519_sign(&key.to_bytes(), b).unwrap()
         });
@@ -3859,7 +3452,7 @@ mod space_admission_tests {
             501
         ));
 
-        // Grant for a different node id → refused.
+        // Grant for a different node id â†’ refused.
         let other = sp.grant("other-room", peer, 0, |b| {
             ed25519_sign(&key.to_bytes(), b).unwrap()
         });
@@ -3891,7 +3484,7 @@ mod space_admission_tests {
         ));
 
         // After the Space changes (new epoch), the OLD proof no longer verifies
-        // against the NEW root → current-epoch-only admission.
+        // against the NEW root â†’ current-epoch-only admission.
         sp.upsert_node(space::SpaceNode {
             node_id: space::derive_node_id(&sp.space_id, &sp.owner_pub, "Extra"),
             parent_id: sp.space_id.clone(),

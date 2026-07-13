@@ -290,9 +290,7 @@ async fn fetch_invite_one(
                 .map(|invite| {
                     let mut text =
                         format!("source: {}\n\n{}", invite.source_path, invite.invite_url);
-                    if let Some(fp) = invite.web_cert_fingerprint {
-                        text.push_str(&format!("\n\nweb_cert_fingerprint: {fp}"));
-                    }
+
                     text
                 })
                 .map_err(|e| e.to_string())

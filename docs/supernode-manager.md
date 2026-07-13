@@ -45,15 +45,14 @@ Resolved from `CONQUERD_HOME` (manager sets this per instance). Default layout: 
 | `sfu_rooms.json` | Room persistence (when SFU not ephemeral) | Persistent; restart behavior depends on supernode build |
 | `supernode_endpoints.json` | Endpoint mailbox | Persistent |
 | `reusable_invite.json` | Invite payload | Read by `invite` command |
-| `web_cert.pem` / `web_key.pem` / `web_cert_fingerprint.hex` | WebTransport cert | Persistent; fingerprint surfaced in `invite` |
-| `web/`, `games/<slug>/` | Static assets | Not synced by manager yet |
+| `web/`, `games/<slug>/` | In-app portal assets | Seeded by supernode binary |
 | `trusted_module_keys.txt` | Plugin signer keys | Not pushed by manager yet |
 
 ### Configuration surface
 
 - **Preferred:** `<data_dir>/supernode.toml` — manager generates per instance via `snm-supernode::manifest::render_supernode_toml`.
 - **SFU room policy:** `[defaults.supernode]` / per-instance overrides for `allow_public_rooms` / `allow_private_rooms` are emitted as **inline** `params = { … }` on the `room.audio.sfu` feature row (not a separate `[feature.params]` table).
-- **Legacy env vars** (still written in systemd drop-ins): `supernode_host`, `supernode_port`, `supernode_signaling_port`, `supernode_web_port`. Manifest fields (`listen_addr`, `ws_listen_addr`, `web_port`) are authoritative in `supernode.toml`.
+- **Legacy env vars** (still written in systemd drop-ins): `supernode_host`, `supernode_port`, `supernode_signaling_port`. Manifest fields (`listen_addr`, `ws_listen_addr`) are authoritative. Do not set public `web_port` — portal is QUIC-only.
 - **Clustering:** an optional `[cluster]` section (with `[[cluster.member]]` rows) links several supernodes into one logical node. Additive to `schema_version = 1` — the manager renders and pushes the shared roster to every member. Full contract, provisioning flow, and firewalling in §8.
 - `CONQUERD_BUILD_ID` is compiled into the binary; status probes it via `strings` when present.
 
@@ -63,10 +62,11 @@ Each instance binds at minimum:
 
 - QUIC relay (UDP): default `3478 + 100×index`
 - WS signaling (TCP): default `34935 + 100×index`
-- Web / WebTransport: default `8443 + 100×index` when a `web.host.*` feature is enabled
-- **Cluster QUIC link (UDP): only when the instance is part of a cluster** — a dedicated port distinct from the relay port, set via `cluster_addr`. Suggested default `4478 + 100×index` (relay + 1000). Reachable **between cluster members only**, not the public. See §8.
+- **Cluster QUIC link (UDP): only when the instance is part of a cluster** — dedicated port via `cluster_addr` (suggested `4478 + 100×index`). Member-to-member only.
 
-Omitted ports in inventory are auto-allocated at resolve time (`snm-core::inventory::default_*_port`). They are **not** written back into `inventory.toml` automatically — pin ports explicitly for stability.
+No public web/game port. In-app portal uses `web.host.app.v1` over QUIC.
+
+Omitted relay/ws/cluster ports are auto-allocated at resolve time. `web_port` is never auto-allocated.
 
 `public_host` on each instance must be the address remote clients use for relay tickets.
 
@@ -78,7 +78,7 @@ Omitted ports in inventory are auto-allocated at resolve time (`snm-core::invent
 
 ### Health / observability
 
-Status today comes from `systemctl is-active`, binary identity probe (SHA-256 + mtime + optional embedded build id), and `journalctl`. HTTP `/health` scraping is not implemented (WebTransport portal is not plain HTTPS).
+Status today comes from `systemctl is-active`, binary identity probe (SHA-256 + mtime + optional embedded build id), and `journalctl`.
 
 ---
 
@@ -165,8 +165,7 @@ ssh = "root@155.138.244.189"
   public_host = "155.138.244.189"
   relay_port = 3478
   ws_port = 34935
-  web_port = 8433
-  features = ["core.chat.v1", "room.audio.sfu", "web.host.app.v1", ...]
+  features = ["core.chat.v1", "room.audio.sfu", "web.host.app.v1", "game.relay.v1", ...]
 ```
 
 Rules:

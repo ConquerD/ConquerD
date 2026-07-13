@@ -58,17 +58,6 @@ static PORTAL_PEER_ID: OnceLock<String> = OnceLock::new();
 /// the lower-cased authority Chromium hands the scheme handler.
 static PORTAL_ID_MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-/// Per-supernode WebTransport base URL (e.g. `https://relay.example:8443`).
-/// Set when a `SUPERNODE_INFO` message with `wt_url` is received.
-/// Served via `/_conquerd/ctx.json` so game pages loaded inside
-/// `conquerd://` know the real address for `new WebTransport(url)`.
-static SUPERNODE_WT_URLS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-
-/// Per-supernode SHA-256 fingerprint of the self-signed WebTransport cert.
-/// Delivered via the already-verified SUPERNODE_INFO channel so game pages
-/// can use `serverCertificateHashes` without any CA.
-static SUPERNODE_CERT_FPS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-
 fn portal_map() -> &'static Mutex<HashMap<String, String>> {
     PORTAL_ID_MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -81,45 +70,6 @@ pub fn register_portal_peer_id(peer_id: &str) {
     if let Ok(mut map) = portal_map().lock() {
         map.entry(lowered).or_insert_with(|| peer_id.to_owned());
     }
-}
-
-/// Cache the WebTransport base URL for *supernode_id*.
-/// Called from `bridge.rs` when a `SUPERNODE_INFO` message arrives.
-pub fn set_supernode_wt_url(supernode_id: &str, wt_url: &str) {
-    if let Ok(mut map) = SUPERNODE_WT_URLS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-    {
-        map.insert(supernode_id.to_owned(), wt_url.to_owned());
-    }
-}
-
-fn get_supernode_wt_url(supernode_id: &str) -> Option<String> {
-    SUPERNODE_WT_URLS
-        .get()?
-        .lock()
-        .ok()?
-        .get(supernode_id)
-        .cloned()
-}
-
-/// Cache the WebTransport cert fingerprint for *supernode_id*.
-pub fn set_supernode_cert_fingerprint(supernode_id: &str, fingerprint: &str) {
-    if let Ok(mut map) = SUPERNODE_CERT_FPS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-    {
-        map.insert(supernode_id.to_owned(), fingerprint.to_owned());
-    }
-}
-
-fn get_supernode_cert_fingerprint(supernode_id: &str) -> Option<String> {
-    SUPERNODE_CERT_FPS
-        .get()?
-        .lock()
-        .ok()?
-        .get(supernode_id)
-        .cloned()
 }
 
 /// Inbound portal game datagrams keyed by supernode id (base64url payloads).
@@ -232,28 +182,13 @@ pub unsafe extern "C" fn conquerd_fetch_sync(
     // conquerd://<any_supernode>/_conquerd/ctx.json
     //   Returns the client's own peer ID and version so portal JS can
     //   populate `window.conquerd` without an extra network hop.
-    //   `nativeTransport: true` tells the SDK to use identity-path game
-    //   relay APIs instead of WebTransport + self-signed certs.
+    //   `nativeTransport: true` — games use identity-path channel APIs only.
     if path == "/_conquerd/ctx.json" {
         let peer_id = PORTAL_PEER_ID.get().map(String::as_str).unwrap_or("");
-        let wt_base = get_supernode_wt_url(&supernode_id).unwrap_or_default();
-        let cert_fp = get_supernode_cert_fingerprint(&supernode_id).unwrap_or_default();
-        let wt_field = if wt_base.is_empty() {
-            String::new()
-        } else {
-            format!(",\"wtBaseUrl\":\"{}\"", wt_base.replace('"', "\\\""))
-        };
-        let fp_field = if cert_fp.is_empty() {
-            String::new()
-        } else {
-            format!(",\"wtCertHash\":\"{}\"", cert_fp.replace('"', "\\\""))
-        };
         let json = format!(
-            "{{\"myPeerId\":\"{}\",\"version\":\"{}\",\"nativeTransport\":true{}{}}}",
+            "{{\"myPeerId\":\"{}\",\"version\":\"{}\",\"nativeTransport\":true}}",
             peer_id.replace('"', "\\\""),
             env!("CARGO_PKG_VERSION"),
-            wt_field,
-            fp_field,
         );
         let ct = b"application/json; charset=utf-8";
         unsafe {

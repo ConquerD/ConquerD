@@ -29,8 +29,8 @@ use crate::web_app_client::{self, WebAppResponse};
 
 use super::events::{ConnectionCommand, ConnectionEvent};
 use super::internal::{
-    rewrite_loopback_wt_url, InternalEvent, PeerConnection, PeerConnectionState,
-    PeerTransportStats, PendingInvite, SupernodePingTracker, SupernodeSession, INVITE_TTL,
+    InternalEvent, PeerConnection, PeerConnectionState, PeerTransportStats, PendingInvite,
+    SupernodePingTracker, SupernodeSession, INVITE_TTL,
 };
 use super::quic::run_quic_peer_session;
 use super::ws::supernode_ws_task;
@@ -4437,63 +4437,12 @@ impl ConnectionManager {
                     .and_then(|p| p.get("allow_public_rooms"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let mut wt_url = msg
-                    .payload
-                    .get("wt_url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                // Self-heal: a supernode that was started without
-                // `supernode_host` advertises its WebTransport URL with a
-                // loopback/wildcard host (`localhost`, `127.0.0.1`,
-                // `0.0.0.0`).  That host is meaningless to a remote client —
-                // its embedded browser would dial its OWN machine and fail
-                // ("Opening handshake failed").  We already reached this
-                // supernode at a real address (its signaling `ws_url`), so
-                // substitute that host while preserving the advertised port.
-                if !wt_url.is_empty() {
-                    if let Some(sn) = self.supernodes.get(&msg.sender) {
-                        if let Some(fixed) = rewrite_loopback_wt_url(&wt_url, &sn.ws_url) {
-                            debug!(
-                                "Rewrote supernode wt_url {} -> {} using signaling host",
-                                wt_url, fixed
-                            );
-                            wt_url = fixed;
-                        }
-                    }
-                }
-                let cert_fingerprint = msg
-                    .payload
-                    .get("cert_fingerprint")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                // Belt-and-suspenders: populate the scheme-layer caches here
-                // on the tokio thread, *before* the QUIC relay is established.
-                // This ensures /_conquerd/ctx.json always serves a populated
-                // wtBaseUrl/wtCertHash by the time any FetchWebApp can succeed.
-                // The bridge.rs call on the Qt main thread is kept as well;
-                // both writes are idempotent (Mutex-guarded HashMap inserts).
-                #[cfg(feature = "webengine")]
-                {
-                    if !wt_url.is_empty() {
-                        crate::ui::scheme::set_supernode_wt_url(&msg.sender, &wt_url);
-                    }
-                    if !cert_fingerprint.is_empty() {
-                        crate::ui::scheme::set_supernode_cert_fingerprint(
-                            &msg.sender,
-                            &cert_fingerprint,
-                        );
-                    }
-                }
                 let _ = self
                     .event_tx
                     .try_send(ConnectionEvent::SupernodeInfoReceived {
                         supernode_id: msg.sender.clone(),
                         homepage_url,
                         title,
-                        wt_url,
-                        cert_fingerprint,
                         sfu_enabled,
                         public_rooms_enabled,
                     });

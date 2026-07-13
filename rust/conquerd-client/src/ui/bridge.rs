@@ -5356,29 +5356,9 @@ fn dispatch_event(
             supernode_id,
             homepage_url,
             title,
-            wt_url,
-            cert_fingerprint,
             sfu_enabled,
             public_rooms_enabled,
         } => {
-            // Cache the WebTransport base URL and cert fingerprint so
-            // /_conquerd/ctx.json can expose them to game pages loaded via
-            // conquerd://.  The fingerprint lets games use
-            // `serverCertificateHashes` — no CA cert needed.
-            #[cfg(feature = "webengine")]
-            {
-                if !wt_url.is_empty() {
-                    crate::ui::scheme::set_supernode_wt_url(&supernode_id, &wt_url);
-                }
-                if !cert_fingerprint.is_empty() {
-                    crate::ui::scheme::set_supernode_cert_fingerprint(
-                        &supernode_id,
-                        &cert_fingerprint,
-                    );
-                }
-            }
-            #[cfg(not(feature = "webengine"))]
-            let _ = (&wt_url, &cert_fingerprint);
             let url_q = homepage_url.clone();
             let title_q = title.clone();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {

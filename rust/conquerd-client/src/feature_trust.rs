@@ -120,7 +120,7 @@ mod tests {
         assert!(is_first_party("core.chat.v1"));
         assert!(is_first_party("transport.quic.audio.v1"));
         assert!(is_first_party("room.audio.sfu"));
-        assert!(is_first_party("web.host.h3.v1"));
+        assert!(is_first_party("web.host.app.v1"));
         assert!(is_first_party("game.demo.v1"));
         assert!(!is_first_party("x.vendor.thing"));
         assert!(!is_first_party("custom.thing"));

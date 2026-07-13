@@ -10,7 +10,6 @@ pub struct InviteInfo {
     pub label: String,
     pub invite_url: String,
     pub source_path: String,
-    pub web_cert_fingerprint: Option<String>,
 }
 
 pub fn reusable_invite_path(data_dir: &str) -> String {
@@ -75,34 +74,15 @@ pub async fn fetch_invite(
         );
     }
 
-    let fingerprint_cmd = format!(
-        "cat {} 2>/dev/null || true",
-        shell_escape(&format!("{}/web_cert_fingerprint.hex", layout.data_dir))
-    );
-    let fingerprint_out = transport.run(&fingerprint_cmd).await.ok();
-    let file_fingerprint = fingerprint_out.and_then(|o| {
-        if o.exit_code == 0 {
-            let fp = o.stdout.trim();
-            if fp.is_empty() {
-                None
-            } else {
-                Some(fp.to_string())
-            }
-        } else {
-            None
-        }
-    });
-
-    let (invite_url, web_cert_fingerprint) = parse_reusable_invite(&output.stdout)?;
+    let invite_url = parse_reusable_invite(&output.stdout)?;
     Ok(InviteInfo {
         label: label.to_string(),
         invite_url,
         source_path,
-        web_cert_fingerprint: file_fingerprint.or(web_cert_fingerprint),
     })
 }
 
-fn parse_reusable_invite(raw: &str) -> Result<(String, Option<String>)> {
+fn parse_reusable_invite(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         bail!("reusable_invite.json is empty");
@@ -110,19 +90,18 @@ fn parse_reusable_invite(raw: &str) -> Result<(String, Option<String>)> {
 
     if trimmed.starts_with("conquerd://") {
         let url = extract_conquerd_url(trimmed).context("parse invite URL")?;
-        return Ok((url, None));
+        return Ok(url);
     }
 
     let value: serde_json::Value =
         serde_json::from_str(trimmed).context("parse reusable_invite.json as JSON")?;
 
     if let Some(url) = find_conquerd_url_in_value(&value) {
-        return Ok((url, find_fingerprint_in_value(&value)));
+        return Ok(url);
     }
 
     if value.get("invite").is_some() {
-        let url = build_conquerd_invite_url(&value)?;
-        return Ok((url, find_fingerprint_in_value(&value)));
+        return build_conquerd_invite_url(&value);
     }
 
     bail!("no invite payload found in reusable_invite.json")
@@ -154,30 +133,7 @@ fn build_conquerd_invite_url(root: &serde_json::Value) -> Result<String> {
     Ok(format!("conquerd://{encoded}"))
 }
 
-fn find_fingerprint_in_value(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(s) if looks_like_fingerprint(s) => Some(s.clone()),
-        serde_json::Value::Array(items) => items.iter().find_map(find_fingerprint_in_value),
-        serde_json::Value::Object(map) => {
-            for key in [
-                "web_cert_fingerprint",
-                "web_cert_fingerprint_hex",
-                "fingerprint",
-                "fingerprint_hex",
-            ] {
-                if let Some(serde_json::Value::String(s)) = map.get(key) {
-                    return Some(s.clone());
-                }
-            }
-            map.values().find_map(find_fingerprint_in_value)
-        }
-        _ => None,
-    }
-}
 
-fn looks_like_fingerprint(s: &str) -> bool {
-    s.len() >= 16 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
 
 fn extract_conquerd_url(text: &str) -> Option<String> {
     let start = text.find("conquerd://")?;
@@ -221,7 +177,7 @@ mod tests {
 
     #[test]
     fn builds_conquerd_url_from_reusable_invite_json() {
-        let (url, _) = parse_reusable_invite(SAMPLE_REUSABLE).unwrap();
+        let url = parse_reusable_invite(SAMPLE_REUSABLE).unwrap();
         assert!(url.starts_with("conquerd://"));
         assert!(url.contains("eyJ"));
         assert_eq!(
@@ -232,14 +188,14 @@ mod tests {
 
     #[test]
     fn parses_raw_url_file() {
-        let (url, _) = parse_reusable_invite("conquerd://payload\n").unwrap();
+        let url = parse_reusable_invite("conquerd://payload\n").unwrap();
         assert_eq!(url, "conquerd://payload");
     }
 
     #[test]
     fn finds_nested_url() {
         let raw = r#"{"data":{"link":"conquerd://nested"}}"#;
-        let (url, _) = parse_reusable_invite(raw).unwrap();
+        let url = parse_reusable_invite(raw).unwrap();
         assert_eq!(url, "conquerd://nested");
     }
 }

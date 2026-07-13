@@ -47,10 +47,9 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - On a clustered deployment (multiple supernodes hosting the same room), voice now carries across every node in the cluster, matching how room chat already worked.
 
 ### In-App Supernode Portal & Browser Games
-- Supernodes with `web_port` configured serve an in-app portal over a QUIC bidi-stream channel (`web.host.app.v1`). The native client browses `conquerd://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no CA needed.
-- A WebTransport listener (`web.host.h3.v1`) on the same port lets browser-side game clients join the exact same channel fabric as native peers using the `web-sdk/conquerd.mjs` JavaScript SDK. Ed25519 identity handshake is performed; the supernode verifies signed envelopes before any fan-out.
-- **`game.relay.v1`** — opaque datagram relay: the supernode fans raw datagrams to all WebTransport peers in the same room without reading or modifying the payload. Three demo games are bundled: **cursor relay** (multi-cursor canvas), **brick breaker** (multiplayer paddle game), **shared drawing** (collaborative canvas).
-- Game pages are served from `<data_dir>/games/<slug>/` and reachable at `conquerd://<supernode_id>/games/<slug>/`. The `window.conquerd` JS bridge is injected automatically; games call `window.conquerd.ready` to obtain the WebTransport URL and cert fingerprint via the ConquerD trust chain — no HTTPS CA required.
+- Supernodes with `web.host.app.v1` serve an in-app portal over a QUIC bidi-stream channel. The native client browses `conquerd://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no public game ports, no TLS certs.
+- **`game.relay.v1`** — opaque datagram relay for in-app portal games: the supernode fans raw QUIC-relay datagrams among peers that joined the same game session (identity path; no external browser / WebTransport). Three demo games are bundled: **cursor relay**, **brick breaker**, **shared drawing**.
+- Game pages are served from `<data_dir>/games/<slug>/` and reachable only via the native portal at `conquerd://<supernode_id>/games/<slug>/`. The `window.conquerd` JS bridge exposes channel APIs over the authenticated QUIC session.
 - Self-signed TLS cert (13-day validity, ECDSA P-256, `serverAuth` EKU) is generated automatically on first start and rotated after 7 days. The SHA-256 fingerprint is delivered to native clients in `SUPERNODE_INFO` and forwarded to game pages via `/_conquerd/ctx.json`.
 
 ### Security & Identity
@@ -318,8 +317,8 @@ For the precise runtime contract (auth tier enforcement order, quota symmetry ac
 | `room.chat.v1` | stream | room-member | supernode `SfuRoomModule` |
 | `room.file.v1` | stream | room-member | supernode SFU file broadcast |
 | `web.host.app.v1` | stream | public | supernode QUIC bidi-stream portal (`conquerd://` pages for native client) |
-| `web.host.h3.v1` | datagram | public | supernode WebTransport (HTTP/3) listener — browser game clients |
-| `game.relay.v1` | datagram | room-member | supernode opaque datagram relay for browser game sessions |
+
+| `game.relay.v1` | datagram | room-member | opaque in-app portal game session relay over identity QUIC |
 
 ### Enabling Features on a Supernode
 
@@ -346,8 +345,6 @@ id = "room.file.v1"
 enabled = true
 
 [[feature]]
-id = "web.host.h3.v1"
-enabled = true                          # exposes /wt/<feature_id> over WebTransport
 
 [[feature]]
 id = "x.acme.matchmaker"                # bespoke third-party module
@@ -392,16 +389,15 @@ if !state.features.bind_module("x.acme.matchmaker", module.clone()) {
 
 `bind_module` attaches a module to a descriptor that's already loaded from the manifest; `register_module` adds both the descriptor and its module in one step. Inbound messages are delivered through `FeatureRegistry::dispatch_message(id, source, payload)`.
 
-### Browser Participation (WebTransport / Game Relay)
+### In-app portal games (`game.relay.v1`)
 
-When `web.host.h3.v1` is enabled on a supernode, browser-side game clients connect over WebTransport using `web-sdk/conquerd.mjs`. The same SDK is served from the portal at `/web-sdk/conquerd.mjs`. Games import it with a relative path:
+Games run only inside the native client portal. The SDK is served at `/web-sdk/conquerd.mjs` and imported with a relative path:
 
 ```js
 import { ConquerdClient } from "../../web-sdk/conquerd.mjs";
 
+// Games run only inside the native portal (window.conquerd).
 const client = new ConquerdClient({
-  host: resolvedHost,  // from window.conquerd.ready or query param
-  port: 8443,
   features: ["game.relay.v1"],
   room: "my-lobby",
 });
@@ -411,17 +407,11 @@ client.on("datagram",     (featureId, data) => { /* handle inbound relay datagra
 client.on("disconnected", ()       => { /* ... */ });
 client.on("error",        (e)      => { /* ... */ });
 
-await client.connect();   // performs Ed25519 identity handshake
+await client.connect();   // opens portal channel over identity QUIC relay
 client.sendDatagram("game.relay.v1", myPayload);
 ```
 
-When opened inside the native client portal (`conquerd://` scheme), `window.conquerd.ready` resolves with the WebTransport URL and cert fingerprint from the ConquerD trust chain — no HTTPS CA required, no `host`/`port` query params needed:
-
-```js
-const ctx = await window.conquerd.ready;
-// ctx.wtBaseUrl and ctx.wtCertHash are pre-populated from SUPERNODE_INFO
-// ConquerdClient.connect() picks them up automatically.
-```
+`window.conquerd.ready` exposes portal channel APIs (`openChannel`, `sendDatagramB64`, `pollDatagrams`, `closeChannel`) and `myPeerId` from the native trust chain — no host/port/cert parameters.
 
 Three bundled game demos are deployed to `<data_dir>/games/` on first supernode start:
 
@@ -431,7 +421,7 @@ Three bundled game demos are deployed to `<data_dir>/games/` on first supernode 
 | `/games/brick-breaker/` | Brick breaker — multiplayer paddle game |
 | `/games/shared-drawing/` | Shared drawing — collaborative canvas with stroke broadcast |
 
-All three use the same `game.relay.v1` opaque datagram relay and can be opened via `conquerd://<supernode_id>/games/<slug>/` from the in-app portal (supernode avatar in the Rooms sidebar) or directly at `https://<host>:<web_port>/games/<slug>/` from a browser (with `?host=<host>&port=<port>` query params when not in portal context).
+All three use `game.relay.v1` and open only via `conquerd://<supernode_id>/games/<slug>/` from the in-app portal (Rooms sidebar). External browsers are not supported.
 
 The SDK also exports `ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, and `featureForFixedTag` for games that interoperate with first-party `core.*` channels.
 
@@ -638,7 +628,7 @@ Runtime ports and access settings are read from environment variables; hosted fe
 | `supernode_port` | `3478` | UDP port for QUIC relay traffic |
 | `supernode_signaling_port` | `34935` | TCP port for WebSocket signaling. **Always set a fixed value** — changing it breaks firewall rules and stored peer endpoints |
 | `supernode_invite_ttl` | `-1` | Invite expiry in minutes. `-1` = never expires |
-| `supernode_host` | *(unset)* | Public DNS name or IP used in invite URLs, relay tickets, and WebTransport URLs for remote clients |
+| `supernode_host` | *(unset)* | Public DNS name or IP used in invite URLs and relay tickets for remote clients |
 | `CONQUERD_HOME` | `~/.conquerd` | Data directory for identity, settings, files |
 
 #### Feature / process toggles
@@ -655,11 +645,11 @@ Prefer `supernode.toml` for capability advertisement (see [Enabling Features on 
 
 #### Portal / Access Control Settings
 
+The in-app portal is served over QUIC (`web.host.app.v1`) — there is **no** public HTTPS/WebTransport port and **no** TLS game certs.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `supernode_web_port` | *(unset)* | HTTPS port for portal/homepage. Set to enable (e.g. `8443`). Also enables the WebTransport listener and `game.relay.v1` on the same port |
-| `supernode_web_localhost_only` | `0` | Bind the portal/WebTransport surface to localhost only |
-| `supernode_web_title` | `Relay Node` | Human-readable name shown on the homepage |
+| `supernode_web_title` | `Relay Node` | Human-readable name shown on the in-app portal |
 | `supernode_access_mode` | `open` | Access mode: `open`, `tos`, `ad`, `code` |
 | `supernode_access_code` | `conquerd` | Access code (only used when mode is `code`) |
 | `supernode_ad_duration` | `30` | Countdown seconds (only used when mode is `ad`) |
@@ -733,11 +723,10 @@ Environment=supernode_invite_ttl=-1
 Environment=supernode_port=3478
 Environment=supernode_signaling_port=34935
 
-# Portal + game relay (uncomment to enable)
-#Environment=supernode_web_port=8443
+# In-app portal title / access (portal is QUIC — no public web_port)
 #Environment=supernode_web_title=My Relay Node
 #Environment=supernode_access_mode=open
-# Required for remote clients to reach the WebTransport game relay:
+# Required so remote peers get routable invite/relay tickets:
 #Environment=supernode_host=relay.example.com
 
 ExecStart=/usr/local/bin/conquerd-supernode
@@ -896,7 +885,7 @@ SFU **room state is not persisted** on the supernode — rooms exist in memory w
 - **Peers can't connect**: Verify both `supernode_port` (UDP) and `supernode_signaling_port` (TCP) are forwarded and open. Set `supernode_host` to the public DNS name or IP when remote peers need to connect.
 - **Port changes on restart**: Always set `supernode_signaling_port` to a fixed value (e.g. `34935`). Changing it breaks firewall rules and stored peer endpoints.
 - **Service fails with exit code 226/NAMESPACE**: LXC, OpenVZ, or some VPS hosts don't support mount namespaces. Comment out the hardening block in the systemd unit file and restart.
-- **Peers get relay access without the portal**: Ensure `supernode_access_mode` is set to `tos`, `ad`, or `code` (not `open`) and `supernode_web_port` is set.
+- **Peers get relay access without the portal**: Ensure `supernode_access_mode` is set to `tos`, `ad`, or `code` (not `open`) so operators can gate grants without a public web surface.
 
 ---
 
@@ -907,7 +896,7 @@ SFU **room state is not persisted** on the supernode — rooms exist in memory w
 | File | Purpose |
 |---|---|
 | `rust/conquerd-client/src/main.rs` | Desktop client entry. Initialises identity (keyring + passphrase), Qt `QGuiApplication`, the `AppBridge` QObject, and the QML engine. Handles `conquerd://` URIs on argv and single-instance forwarding. |
-| `rust/conquerd-supernode/src/main.rs` | Headless relay binary. Reads env / `supernode.toml`, starts QUIC relay + WebSocket signaling + optional HTTPS portal + HTTP/3/WebTransport listener. |
+| `rust/conquerd-supernode/src/main.rs` | Headless relay binary. Reads env / `supernode.toml`, starts QUIC relay + WebSocket signaling + in-app portal (`web.host.app.v1`) + game session fan-out. |
 | `rust/conquerd-installer/src/main.rs` | Standalone updater. Downloads and applies signed releases from GitHub. |
 
 ### Building from Source
@@ -1084,10 +1073,10 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 │   │       ├── ringtone.rs / taskbar_badge.rs / upnp.rs / uri_scheme.rs / web_app_client.rs
 │   │       └── ui/                # AppBridge QObject + QML models (Peer/Chat/Call/Room/Settings/FileTransfer)
 │   ├── conquerd-features/         # rlib: capability registry, FeatureModule trait, quota enforcement (114 unit tests)
-│   ├── conquerd-supernode/        # Standalone binary: QUIC relay, ephemeral SFU, WS signaling, WebTransport + QUIC-stream portal (212 unit tests)
-│   └── conquerd-installer/        # Standalone binary: signed-release download + apply (74 unit tests)
-├── web-sdk/conquerd.mjs           # Browser SDK (WebTransport client matching the native channel fabric)
-├── games/                         # Example browser games served over `web.host.h3.v1`
+│   ├── conquerd-supernode/        # Standalone binary: QUIC relay, ephemeral SFU, WS signaling, in-app portal
+│   └── conquerd-installer/        # Standalone binary: signed-release download + apply
+├── web-sdk/conquerd.mjs           # In-app portal game SDK (identity QUIC channel; no WebTransport)
+├── games/                         # Example portal games (conquerd:// only)
 ├── packaging/                     # Linux .desktop file, macOS Info.plist template, AppRun
 ├── scripts/check_version_sync.ps1 # Verify Cargo.toml versions stay aligned (PowerShell)
 ├── scripts/build_supernode.sh     # Package conquerd-supernode (.tar.gz; Linux/macOS hosts)
@@ -1141,7 +1130,6 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 | Cryptography | `ed25519-dalek`, `x25519-dalek`, `aes-gcm`, `argon2`, `hkdf` |
 | Signaling serialisation | JSON over WebSocket (`tokio-tungstenite`) and QUIC bidirectional streams |
 | Local storage | SQLite (`rusqlite`) for chat history; JSON for settings/peers/rooms |
-| SDP/WebTransport (browser) | WebTransport + HTTP/3 (`h3`, `quinn`) on the supernode |
 | Testing | `cargo test` |
 | Packaging | `cargo`, `windeployqt6`, 7-Zip (Windows); AppImage (Linux); `.dmg` (macOS) |
 
@@ -1220,7 +1208,7 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 - **Chat-first UX** — text is the primary interaction after connecting; voice is opt-in per conversation. Per-conversation scroll persistence, typing indicators, unread badges on taskbar + tray.
 - **Voice calls** — low-latency Opus over QUIC, push-to-talk and voice activation, spectral-gate noise suppression, jitter buffer with de-click.
 - **Rooms (multi-peer voice)** — client-owned room definitions (`my_rooms.dat`); supernodes host SFU sessions ephemerally over QUIC relay with chat/voice/file parity, idle GC, and reconnect materialization.
-- **Game relay & in-app portal**: `game.relay.v1` opaque datagram relay over WebTransport; three bundled browser game demos (cursor relay, brick breaker, shared drawing) served from `<data_dir>/games/` and accessible from the in-app portal at `conquerd://<supernode_id>/games/<slug>/`. Self-signed TLS cert with `serverAuth` EKU auto-generated and rotated every 7 days; fingerprint delivered via `SUPERNODE_INFO` trust chain.
+- **Game relay & in-app portal**: `game.relay.v1` opaque datagrams over the identity QUIC relay; three bundled demos (cursor relay, brick breaker, shared drawing) under `<data_dir>/games/`, opened only from the native portal at `conquerd://<supernode_id>/games/<slug>/`. No public WebTransport port or TLS game certs.
 - **Supernode release binaries**: pre-built packages for Linux x86_64, Linux ARM64, and Windows x86_64 on GitHub Releases and nightlies (`scripts/build_supernode.sh` / `scripts/build_supernode.ps1`).
 - **NAT traversal** — UPnP port mapping, QUIC/WebSocket direct connect, supernode relay fallback, relay-coordinated hole punching.
 - **Security** — signed, transcript-bound signaling with timestamp freshness checks and per-sender replay deduplication; peer revocation with propagation; release-signed P2P updates with Ed25519 + threshold validation; crash/installer logging.

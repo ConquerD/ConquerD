@@ -396,9 +396,7 @@ async fn cmd_invite(path: &PathBuf, args: TargetArgs, backend: SshBackend) -> Re
         println!("{}", invite.label);
         println!("  source: {}", invite.source_path);
         println!("  invite: {}", invite.invite_url);
-        if let Some(fp) = invite.web_cert_fingerprint {
-            println!("  web_cert_fingerprint: {fp}");
-        }
+
     }
     Ok(())
 }

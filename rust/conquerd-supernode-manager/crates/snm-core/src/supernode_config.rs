@@ -15,8 +15,8 @@ pub const KNOWN_FEATURES: &[&str] = &[
     "room.audio.sfu",
     "room.file.v1",
     "core.file.v1",
-    "web.host.h3.v1",
     "web.host.app.v1",
+    "game.relay.v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,12 +188,8 @@ pub fn enrich_feature_params(
     sn_defaults: &SupernodeDefaults,
     instance: &crate::Instance,
 ) -> Vec<FeatureSpec> {
+    let _ = web_port; // legacy field; WebTransport removed — port no longer attached to features
     for feature in &mut features {
-        if feature.id == "web.host.h3.v1" && feature.enabled {
-            if let Some(web_port) = web_port {
-                merge_feature_param(feature, "port", Value::Integer(i64::from(web_port)));
-            }
-        }
         if feature.id == "room.audio.sfu" && feature.enabled {
             apply_sfu_room_policy(feature, sn_defaults, instance);
         }
@@ -287,8 +283,8 @@ pub fn default_instance_features() -> Vec<FeatureSpec> {
         FeatureSpec::enabled("room.chat.v1"),
         default_sfu_feature(),
         FeatureSpec::enabled("room.file.v1"),
-        FeatureSpec::enabled("web.host.h3.v1"),
         FeatureSpec::enabled("web.host.app.v1"),
+        FeatureSpec::enabled("game.relay.v1"),
     ]
 }
 
@@ -354,18 +350,18 @@ ssh = "root@1.2.3.4"
     id = "a"
     public_host = "h.example.net"
     features = [
-      { id = "web.host.h3.v1", enabled = true, params = { port = 8443 } },
+      { id = "web.host.app.v1", enabled = true },
+      { id = "game.relay.v1", enabled = true },
     ]
 "#;
         let inv: Inventory = toml::from_str(raw).unwrap();
         let f = &inv.host[0].instances[0].features[0];
-        assert_eq!(f.id, "web.host.h3.v1");
-        assert!(f.params.is_some());
+        assert_eq!(f.id, "web.host.app.v1");
     }
 
     #[test]
-    fn enriches_web_host_params() {
-        let features = vec![FeatureSpec::enabled("web.host.h3.v1")];
+    fn enrich_feature_params_ignores_legacy_web_port() {
+        let features = vec![FeatureSpec::enabled("web.host.app.v1")];
         let sn_defaults = SupernodeDefaults::default();
         let instance = Instance {
             id: "a".into(),
@@ -373,6 +369,7 @@ ssh = "root@1.2.3.4"
             relay_port: None,
             ws_port: None,
             web_port: None,
+            cluster_port: None,
             listen_bind: None,
             access_mode: None,
             identity_file: None,
@@ -381,8 +378,7 @@ ssh = "root@1.2.3.4"
             features: vec![],
         };
         let out = enrich_feature_params(features, Some(8543), &sn_defaults, &instance);
-        let params = out[0].params.as_ref().unwrap();
-        assert_eq!(params.get("port").and_then(|v| v.as_integer()), Some(8543));
+        assert!(out[0].params.is_none());
     }
 
     #[test]
@@ -390,7 +386,8 @@ ssh = "root@1.2.3.4"
         let features = default_instance_features();
         assert!(features.iter().any(|f| f.id == "room.chat.v1"));
         assert!(features.iter().any(|f| f.id == "web.host.app.v1"));
-        assert!(features.iter().any(|f| f.id == "web.host.h3.v1"));
+        assert!(features.iter().any(|f| f.id == "game.relay.v1"));
+        assert!(features.iter().all(|f| f.id != "web.host.h3.v1"));
         let sfu = features.iter().find(|f| f.id == "room.audio.sfu").unwrap();
         let params = sfu.params.as_ref().unwrap();
         assert_eq!(
@@ -413,6 +410,7 @@ ssh = "root@1.2.3.4"
             relay_port: None,
             ws_port: None,
             web_port: None,
+            cluster_port: None,
             listen_bind: None,
             access_mode: None,
             identity_file: None,
@@ -439,6 +437,7 @@ ssh = "root@1.2.3.4"
             relay_port: Some(3478),
             ws_port: Some(34935),
             web_port: Some(8443),
+            cluster_port: None,
             listen_bind: Some("127.0.0.1".into()),
             access_mode: Some("access_code".into()),
             identity_file: None,

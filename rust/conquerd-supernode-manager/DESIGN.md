@@ -111,7 +111,6 @@ id = "a"
 public_host = "203.0.113.10"
 relay_port = 3478
 ws_port = 34935
-web_port = 8443
 features = ["core.chat.v1", "room.audio.sfu", "web.host.app.v1"]
 ```
 
@@ -223,9 +222,8 @@ The manager assumes each instance has an isolated data directory:
   sfu_rooms.json
   supernode_endpoints.json
   reusable_invite.json
-  web_cert.pem
-  web_key.pem
-  web_cert_fingerprint.hex
+  web/                  # in-app portal assets (seeded by binary)
+  games/                # portal game demos (seeded by binary)
 ```
 
 Manager-owned files:
@@ -241,7 +239,6 @@ Persistent files that install and config-push must not clobber:
 - `identity.json`
 - peer and room state
 - endpoint mailbox
-- WebTransport certificate and key
 - reusable invite data
 
 ## Install Flow
@@ -347,10 +344,10 @@ The CLI status path also prints build id, mtime, and binary path when available.
 Logs use `journalctl -u conquerd-supernode@{id}.service`. The TUI fetches a
 snapshot; the CLI supports `--follow`.
 
-Invite reads `reusable_invite.json` from the instance data directory and also
-surfaces the WebTransport certificate fingerprint when present.
+Invite reads `reusable_invite.json` from the instance data directory and prints
+the `conquerd://` invite URL only (no cert fingerprints — portal is QUIC-only).
 
-HTTP health, stats, metrics, peers, and config endpoints are not scraped yet.
+HTTP health scraping is not used; the portal is not a public HTTP surface.
 
 ## Firewall Behavior
 
@@ -403,4 +400,4 @@ Recommended next steps:
 4. Persist auto-allocated ports into inventory or a lock file.
 5. Implement rootless systemd.
 6. Add a local audit log for operations.
-7. Add optional HTTP/WebTransport-aware health probing where feasible.
+7. Optional deeper journal/status probes for portal health (no public HTTP port).
