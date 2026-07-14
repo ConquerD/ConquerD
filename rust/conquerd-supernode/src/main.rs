@@ -2934,7 +2934,11 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
 
-    // Cleanup
+    // Cleanup. Send every signaling client a proper WS Close frame first so
+    // they take the clean-close reconnect path (not a TCP reset), and give
+    // the writer tasks a moment to flush it before the process exits.
+    state.signaling.close_all();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     if let Some(ref relay) = state.relay {
         relay.shutdown();
     }

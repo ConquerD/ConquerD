@@ -61,15 +61,28 @@ pub struct SignalingServer {
     /// re-delivery of an already-seen signed message within the freshness
     /// window, complementing the per-message `is_fresh` timestamp check.
     replay_guard: Arc<ReplayGuard>,
+    /// Broadcast fired on graceful shutdown: every connection's writer task
+    /// sends a proper WS Close frame (code 1001 "going away") so clients take
+    /// their clean-close reconnect path instead of seeing a TCP reset.
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl SignalingServer {
     pub fn new(our_id: String) -> Self {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             state: Arc::new(RwLock::new(SignalingState::new())),
             our_id,
             replay_guard: Arc::new(ReplayGuard::new(300.0)),
+            shutdown_tx,
         }
+    }
+
+    /// Graceful shutdown: ask every connected signaling client's writer task
+    /// to send a WS Close frame. Call before process exit and give the writer
+    /// tasks a brief moment to flush.
+    pub fn close_all(&self) {
+        let _ = self.shutdown_tx.send(());
     }
 
     pub(crate) fn state(&self) -> Arc<RwLock<SignalingState>> {
@@ -186,6 +199,7 @@ impl SignalingServer {
         let state = self.state.clone();
         let our_id = self.our_id.clone();
         let replay_guard = self.replay_guard.clone();
+        let shutdown_tx = self.shutdown_tx.clone();
 
         tokio::spawn(async move {
             loop {
@@ -195,6 +209,7 @@ impl SignalingServer {
                         let handler = handler.clone();
                         let our_id = our_id.clone();
                         let replay_guard = replay_guard.clone();
+                        let shutdown_rx = shutdown_tx.subscribe();
                         tokio::spawn(async move {
                             if let Err(e) = handle_ws_connection(
                                 stream,
@@ -203,6 +218,7 @@ impl SignalingServer {
                                 handler,
                                 &our_id,
                                 replay_guard,
+                                shutdown_rx,
                             )
                             .await
                             {
@@ -229,17 +245,38 @@ async fn handle_ws_connection(
     handler: Arc<dyn SignalingHandler>,
     our_id: &str,
     replay_guard: Arc<ReplayGuard>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
     let ws = accept_async(stream).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    // Writer task: forward queued messages to WebSocket
+    // Writer task: forward queued messages to WebSocket. On graceful shutdown
+    // send a proper Close frame (1001 "going away") so the client takes its
+    // clean-close reconnect path instead of seeing a TCP reset.
     let write_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_tx.send(Message::Text(msg)).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(msg) => {
+                        if ws_tx.send(Message::Text(msg)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                _ = shutdown_rx.recv() => {
+                    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+                    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+                    let _ = ws_tx
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Away,
+                            reason: "shutdown".into(),
+                        })))
+                        .await;
+                    break;
+                }
             }
         }
     });
