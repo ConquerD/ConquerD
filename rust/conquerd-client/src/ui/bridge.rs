@@ -1018,6 +1018,12 @@ pub struct AppBridgeRust {
     /// Used to detect missed calls (CallEnded while flag is still set).
     has_incoming_call: bool,
 
+    /// Direct-call fallback room carried by the last incoming `CallRequest`:
+    /// `(peer_id, supernode_id, room_id, invite_token)`. When set, `accept_call`
+    /// joins this temporary private SFU room instead of dialing direct QUIC.
+    /// Cleared on accept or call end.
+    incoming_call_fallback: Option<(String, String, String, String)>,
+
     /// User's own avatar config as JSON (saved in settings, broadcast to peers).
     avatar_config_json: String,
 
@@ -1185,6 +1191,7 @@ impl Default for AppBridgeRust {
             call_duration_secs: 0,
             missed_calls: 0,
             has_incoming_call: false,
+            incoming_call_fallback: None,
             conn_cmd_tx: None,
             call_cmd_tx: None,
             sfu_cmd_tx: None,
@@ -2477,7 +2484,42 @@ impl ffi::AppBridge {
             msg.target = Some(pid.clone());
             let _ = tx.try_send(ConnectionCommand::SendMessage(msg));
         }
-        if let Some(ref tx) = self.rust().call_cmd_tx {
+        // Direct-call fallback: the caller could not open direct QUIC and sent
+        // temp private-room coordinates — join that room instead of dialing.
+        let fallback = {
+            let mut r = self.as_mut().rust_mut();
+            match r.incoming_call_fallback.take() {
+                Some(f) if f.0 == pid => Some(f),
+                other => {
+                    r.incoming_call_fallback = other;
+                    None
+                }
+            }
+        };
+        if let Some((_, supernode_id, room_id, invite_token)) = fallback {
+            if let Some(ref tx) = self.rust().conn_cmd_tx {
+                let _ = tx.try_send(ConnectionCommand::JoinRoomWithInvite {
+                    supernode_id: supernode_id.clone(),
+                    room_id: room_id.clone(),
+                    invite_token,
+                });
+            }
+            {
+                let mut r = self.as_mut().rust_mut();
+                r.voice_supernode_id = supernode_id.clone();
+                r.voice_room_id = room_id.clone();
+            }
+            if let Some(ref tx) = self.rust().call_cmd_tx {
+                let _ = tx.try_send(CallCommand::SetRoomMode {
+                    supernode_id,
+                    room_id,
+                });
+                let va = read_voice_activation_setting();
+                let _ = tx.try_send(CallCommand::StartAudio {
+                    voice_activation: va,
+                });
+            }
+        } else if let Some(ref tx) = self.rust().call_cmd_tx {
             let va = read_voice_activation_setting();
             let _ = tx.try_send(CallCommand::StartAudio {
                 voice_activation: va,
@@ -5123,10 +5165,45 @@ fn dispatch_event(
                 );
             });
         }
-        ConnectionEvent::CallRequest { peer_id } => {
-            crate::platform::play_ringtone();
-            crate::platform::show_notification("Incoming call", &peer_id);
+        ConnectionEvent::CallRequest {
+            peer_id,
+            fallback_supernode_id,
+            fallback_room_id,
+            fallback_invite_token,
+        } => {
+            let fallback = (!fallback_supernode_id.is_empty() && !fallback_room_id.is_empty())
+                .then(|| {
+                    (
+                        peer_id.clone(),
+                        fallback_supernode_id,
+                        fallback_room_id,
+                        fallback_invite_token,
+                    )
+                });
+            let ring = fallback.is_none();
+            if ring {
+                crate::platform::play_ringtone();
+                crate::platform::show_notification("Incoming call", &peer_id);
+            }
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                let has_fallback = fallback.is_some();
+                bridge.as_mut().rust_mut().incoming_call_fallback = fallback;
+                // A fallback re-invite for the call we already accepted (the
+                // caller's direct dial failed): join the temp room silently
+                // instead of ringing a second time.
+                if has_fallback
+                    && bridge.rust().active_direct_call_peer_id == peer_id
+                    && bridge.rust().call_state.to_string() != "idle"
+                {
+                    bridge
+                        .as_mut()
+                        .accept_call(&QString::from(peer_id.as_str()));
+                    return;
+                }
+                if has_fallback {
+                    crate::platform::play_ringtone();
+                    crate::platform::show_notification("Incoming call", &peer_id);
+                }
                 bridge.as_mut().rust_mut().has_incoming_call = true;
                 bridge
                     .as_mut()
@@ -5172,9 +5249,40 @@ fn dispatch_event(
                 emit_peers_updated(bridge.as_mut());
             });
         }
+        ConnectionEvent::CallFallbackRoomReady {
+            peer_id,
+            supernode_id,
+            room_id,
+        } => {
+            // Caller side: our direct dial never completed and the CM created a
+            // temp private room + invited the peer. Switch local audio to room
+            // mode; the call proper starts when the peer joins the room.
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                {
+                    let mut r = bridge.as_mut().rust_mut();
+                    r.voice_supernode_id = supernode_id.clone();
+                    r.voice_room_id = room_id.clone();
+                }
+                if let Some(ref tx) = bridge.rust().call_cmd_tx {
+                    let _ = tx.try_send(CallCommand::SetRoomMode {
+                        supernode_id,
+                        room_id,
+                    });
+                    let va = read_voice_activation_setting();
+                    let _ = tx.try_send(CallCommand::StartAudio {
+                        voice_activation: va,
+                    });
+                }
+                let banner = format!("Calling via room \u{00b7} {peer_id}");
+                bridge
+                    .as_mut()
+                    .set_session_banner(QString::from(banner.as_str()));
+            });
+        }
         ConnectionEvent::CallEnded { .. } => {
             call_timer_stop.take(); // stop the duration timer
             let _ = qt_thread.queue(|mut bridge: Pin<&mut ffi::AppBridge>| {
+                bridge.as_mut().rust_mut().incoming_call_fallback = None;
                 if bridge.rust().has_incoming_call {
                     bridge.as_mut().rust_mut().has_incoming_call = false;
                     let mc = bridge.rust().missed_calls + 1;

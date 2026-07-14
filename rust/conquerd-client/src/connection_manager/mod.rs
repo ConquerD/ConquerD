@@ -5,6 +5,10 @@
 //! - An async `tokio::task` drives the WebSocket signaling loop.
 //! - A `quinn::Endpoint` handles peer-to-peer QUIC connections.
 //! - `mpsc` channels carry inbound events to the application layer.
+//!
+//! The manager itself is split under [`manager`]: routing, inbound dispatch,
+//! room/group-key sessions, direct peer QUIC, and invite handshake — still one
+//! type and one `run_inner` loop.
 
 mod events;
 mod internal;

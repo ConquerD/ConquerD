@@ -1,6 +1,6 @@
 //! Connection fallback logic — pure-data, no I/O.
 //!
-//! ## Candidate ordering (`build_ws_candidates`)
+//! ## Candidate ordering ([`build_ws_candidates`])
 //!
 //! Returns an ordered, de-duplicated list of WebSocket connect candidates:
 //! 1. Connected / known supernode relay endpoints (fastest when both peers
@@ -9,16 +9,13 @@
 //! 3. LAN hint advertised by the peer.
 //! 4. Any further relay hints from the peer record.
 //!
-//! ## Direct-call fallback (`DirectFallbackCoordinator`)
+//! ## Direct-call fallback ([`DirectFallbackCoordinator`])
 //!
-//! When a direct QUIC call to a peer fails the client falls back to a
-//! temporary private SFU room:
-//! 1. Pick a trusted supernode (prefer already-connected).
-//! 2. Build a deterministic `direct-…` room id.
-//! 3. On `SFU_ROOM_CREATED` ack, send a peer-room invite and join.
-//!
-//! This module owns only the state machine and pure helpers.  All I/O lives
-//! in the calling layer.
+//! When a direct QUIC call cannot be established the client falls back to a
+//! temporary private SFU room on a trusted supernode. The connection manager
+//! owns the I/O; this module holds the pure state machine and helpers.
+
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // Candidate ordering
@@ -31,11 +28,11 @@ pub const TEMP_ROOM_PREFIX: &str = "direct-";
 ///
 /// # Arguments
 ///
-/// * `endpoint_url`                – peer's primary direct endpoint.
-/// * `lan_hint`                    – best-effort LAN address from the peer.
-/// * `supernode_relay_hints`       – caller-supplied relay hints.
+/// * `endpoint_url`                  – peer's primary direct endpoint.
+/// * `lan_hint`                      – best-effort LAN address from the peer.
+/// * `supernode_relay_hints`         – caller-supplied relay hints.
 /// * `connected_supernode_endpoints` – WS URLs of currently-connected trusted supernodes.
-/// * `peer_relay_hints` – further `relay_hints` from the peer record.
+/// * `peer_relay_hints`              – further `relay_hints` from the peer record.
 pub fn build_ws_candidates<'a>(
     endpoint_url: Option<&'a str>,
     lan_hint: Option<&'a str>,
@@ -43,46 +40,47 @@ pub fn build_ws_candidates<'a>(
     connected_supernode_endpoints: impl IntoIterator<Item = &'a str>,
     peer_relay_hints: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
     let mut candidates: Vec<String> = Vec::new();
-    let mut supernode_candidates: Vec<String> = Vec::new();
 
-    let extend = |items: &mut Vec<String>, src: &mut dyn Iterator<Item = &str>| {
-        for hint in src {
-            if !hint.is_empty() && !items.contains(&hint.to_owned()) {
-                items.push(hint.to_owned());
-            }
+    let mut push = |url: &str| {
+        if !url.is_empty() && seen.insert(url.to_owned()) {
+            candidates.push(url.to_owned());
         }
     };
 
-    extend(
-        &mut supernode_candidates,
-        &mut connected_supernode_endpoints.into_iter(),
-    );
-    extend(
-        &mut supernode_candidates,
-        &mut supernode_relay_hints.into_iter(),
-    );
-
-    // Supernode candidates go first
-    for sc in &supernode_candidates {
-        if !candidates.contains(sc) {
-            candidates.push(sc.clone());
-        }
+    for h in connected_supernode_endpoints {
+        push(h);
     }
-
+    for h in supernode_relay_hints {
+        push(h);
+    }
     if let Some(ep) = endpoint_url {
-        if !ep.is_empty() && !candidates.contains(&ep.to_owned()) {
-            candidates.push(ep.to_owned());
-        }
+        push(ep);
     }
     if let Some(lh) = lan_hint {
-        if !lh.is_empty() && !candidates.contains(&lh.to_owned()) {
-            candidates.push(lh.to_owned());
-        }
+        push(lh);
     }
-    extend(&mut candidates, &mut peer_relay_hints.into_iter());
+    for h in peer_relay_hints {
+        push(h);
+    }
 
     candidates
+}
+
+/// Convenience: ordered, de-duplicated list from a peer/supernode's stored
+/// `relay_hints` (and optional primary endpoint).
+pub fn build_ws_candidates_from_hints(
+    endpoint_url: Option<&str>,
+    relay_hints: &[String],
+) -> Vec<String> {
+    build_ws_candidates(
+        endpoint_url,
+        None,
+        std::iter::empty(),
+        std::iter::empty(),
+        relay_hints.iter().map(String::as_str),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +104,9 @@ pub struct PendingFallback {
 #[derive(Debug, Default)]
 pub struct DirectFallbackCoordinator {
     pending: Option<PendingFallback>,
+    /// Monotonic counter embedded in room ids so concurrent profiles don't
+    /// collide when identity prefixes match.
+    counter: u32,
 }
 
 impl DirectFallbackCoordinator {
@@ -116,6 +117,12 @@ impl DirectFallbackCoordinator {
     /// The currently pending fallback, if any.
     pub fn pending(&self) -> Option<&PendingFallback> {
         self.pending.as_ref()
+    }
+
+    /// Take the next room-id counter value.
+    pub fn next_counter(&mut self) -> u32 {
+        self.counter = self.counter.wrapping_add(1);
+        self.counter
     }
 
     /// Schedule a fallback for the given peer.
@@ -136,7 +143,12 @@ impl DirectFallbackCoordinator {
             .unwrap_or(false)
     }
 
-    // -- Pure helpers -------------------------------------------------------
+    /// Returns `true` if the given room id is the currently pending fallback room.
+    pub fn is_pending_room(&self, supernode_id: &str, room_id: &str) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| p.supernode_id == supernode_id && p.room_id == room_id)
+    }
 
     /// Return `true` for room IDs minted by the fallback path.
     pub fn is_temp_direct_room(room_id: &str) -> bool {
@@ -156,16 +168,12 @@ impl DirectFallbackCoordinator {
     /// Pick a trusted supernode id for fallback.
     ///
     /// Preference order:
-    /// 1. A trusted (not blocked, not revoked) supernode that is currently
-    ///    connected via WebSocket.
+    /// 1. A trusted supernode that is currently connected via WebSocket.
     /// 2. Any trusted supernode in the provided list.
     /// 3. Empty string when none qualify.
-    ///
-    /// `supernode_ids` is the full list of trusted supernode peer-ids.
-    /// `connected_ids` is the subset that currently has an active WS session.
     pub fn pick_supernode<'a>(
         supernode_ids: impl IntoIterator<Item = &'a str>,
-        connected_ids: &std::collections::HashSet<String>,
+        connected_ids: &HashSet<String>,
     ) -> String {
         let mut fallback: Option<String> = None;
         for id in supernode_ids {
@@ -194,7 +202,7 @@ mod tests {
             Some("ws://direct:8080"),
             Some("ws://192.168.1.2:8080"),
             std::iter::empty(),
-            ["ws://supernode:443"].into_iter(),
+            ["ws://supernode:443"],
             std::iter::empty(),
         );
         assert_eq!(candidates[0], "ws://supernode:443");
@@ -203,15 +211,61 @@ mod tests {
     }
 
     #[test]
+    fn candidate_order_all_tiers() {
+        let candidates = build_ws_candidates(
+            Some("ws://direct:4000"),
+            Some("ws://lan:4000"),
+            ["ws://relay-hint:4001"],
+            ["ws://supernode:4002"],
+            ["ws://peer-relay:4003"],
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                "ws://supernode:4002".to_owned(),  // connected supernodes first
+                "ws://relay-hint:4001".to_owned(), // then supernode relay hints
+                "ws://direct:4000".to_owned(),     // then direct endpoint
+                "ws://lan:4000".to_owned(),        // then LAN hint
+                "ws://peer-relay:4003".to_owned(), // peer relay hints last
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_skip_empty() {
+        let candidates =
+            build_ws_candidates(Some(""), None, std::iter::empty(), [""], std::iter::empty());
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
     fn candidate_dedup() {
         let candidates = build_ws_candidates(
             Some("ws://node:9000"),
             None,
-            ["ws://node:9000"].into_iter(),
-            ["ws://node:9000"].into_iter(),
+            ["ws://node:9000"],
+            ["ws://node:9000"],
             std::iter::empty(),
         );
         assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn from_hints_preserves_order_and_dedups() {
+        let hints = vec![
+            "ws://a:1".to_owned(),
+            "ws://b:2".to_owned(),
+            "ws://a:1".to_owned(),
+        ];
+        let c = build_ws_candidates_from_hints(Some("ws://primary:9"), &hints);
+        assert_eq!(
+            c,
+            vec![
+                "ws://primary:9".to_owned(),
+                "ws://a:1".to_owned(),
+                "ws://b:2".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -219,25 +273,35 @@ mod tests {
         let id =
             DirectFallbackCoordinator::build_room_id("aabbccddeeff0011", "112233445566ffee", 7);
         assert!(id.starts_with("direct-"));
-        assert!(id.contains('-'));
+        assert!(DirectFallbackCoordinator::is_temp_direct_room(&id));
     }
 
     #[test]
     fn pick_supernode_prefers_connected() {
-        let mut connected = std::collections::HashSet::new();
+        let mut connected = HashSet::new();
         connected.insert("sn2".to_owned());
-        let picked = DirectFallbackCoordinator::pick_supernode(
-            ["sn1", "sn2", "sn3"].into_iter(),
-            &connected,
-        );
+        let picked = DirectFallbackCoordinator::pick_supernode(["sn1", "sn2", "sn3"], &connected);
         assert_eq!(picked, "sn2");
     }
 
     #[test]
     fn pick_supernode_falls_back_to_first() {
-        let connected = std::collections::HashSet::new();
-        let picked =
-            DirectFallbackCoordinator::pick_supernode(["sn1", "sn2"].into_iter(), &connected);
+        let connected = HashSet::new();
+        let picked = DirectFallbackCoordinator::pick_supernode(["sn1", "sn2"], &connected);
         assert_eq!(picked, "sn1");
+    }
+
+    #[test]
+    fn pending_room_match() {
+        let mut c = DirectFallbackCoordinator::new();
+        c.set_pending(PendingFallback {
+            peer_id: "p".into(),
+            room_id: "direct-x".into(),
+            supernode_id: "sn".into(),
+        });
+        assert!(c.is_pending_room("sn", "direct-x"));
+        assert!(!c.is_pending_room("sn", "other"));
+        c.cancel();
+        assert!(c.pending().is_none());
     }
 }

@@ -32,7 +32,25 @@ pub enum ConnectionEvent {
         reason: String,
     },
     /// Call request from a remote peer.
-    CallRequest { peer_id: String },
+    ///
+    /// When the caller could not open direct QUIC they may include a temporary
+    /// private SFU room (`fallback_*`); the callee should join that room on
+    /// accept instead of waiting for a P2P path.
+    CallRequest {
+        peer_id: String,
+        fallback_supernode_id: String,
+        fallback_room_id: String,
+        fallback_invite_token: String,
+    },
+    /// Caller side of the direct-call fallback: the temporary private SFU room
+    /// was created + joined and the invite was sent to `peer_id`. The local
+    /// audio pipeline should switch to room mode on `supernode_id`/`room_id`
+    /// instead of waiting for a direct QUIC path.
+    CallFallbackRoomReady {
+        peer_id: String,
+        supernode_id: String,
+        room_id: String,
+    },
     /// Remote peer accepted our call request.
     CallAccepted { peer_id: String },
     /// Remote peer rejected or ended the call.
@@ -244,6 +262,12 @@ pub enum ConnectionCommand {
         peer_id: String,
         host: String,
         port: u16,
+    },
+    /// Direct QUIC is unavailable — create a temporary private SFU room on a
+    /// trusted supernode, join it, and invite `peer_id` via `CallRequest`
+    /// carrying the room coordinates.
+    StartDirectCallFallback {
+        peer_id: String,
     },
     /// Request a relay slot from a connected supernode.
     RequestRelay {

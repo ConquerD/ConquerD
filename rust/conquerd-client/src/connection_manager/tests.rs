@@ -2,12 +2,14 @@ use super::internal::{host_from_url, is_loopback_or_wildcard};
 use super::manager::{
     accept_group_key_epoch, build_room_invite_url, is_elected_keyer, may_send_room_e2e_content,
     normalize_room_type, parse_quic_lan_hint, parse_room_invite, peer_quic_endpoint,
-    plan_cluster_failover, room_scope_key, should_auto_join_on_room_created,
-    should_mint_first_room_key, should_track_pending_materialize, should_use_private_room_invite,
-    union_members_for_room, FailoverPlan, RoomInvitePayload, ROOM_INVITE_SCHEMA,
+    peer_reconnect_backoff, plan_cluster_failover, room_scope_key,
+    should_auto_join_on_room_created, should_fanout_peer_relay, should_mint_first_room_key,
+    should_track_pending_materialize, should_use_private_room_invite, union_members_for_room,
+    FailoverPlan, RoomInvitePayload, ROOM_INVITE_SCHEMA,
 };
 use super::ConnectionManager;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 #[test]
 fn parses_saved_quic_endpoints() {
@@ -907,4 +909,311 @@ fn failover_preserves_roster_order_within_live_and_cold() {
             cold: vec![("C".to_owned(), "ws://C.example:34935".to_owned())],
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sprint A: peer-relay fan-out + direct-QUIC reconnect backoff
+// ---------------------------------------------------------------------------
+
+#[test]
+fn peer_relay_fanout_for_ordinary_peers_not_supernodes() {
+    // Peer-targeted traffic that missed direct QUIC must fan out so multi-homed
+    // recipients are not stranded on a wrong cluster member.
+    assert!(should_fanout_peer_relay(true, false));
+    // Supernode-targeted messages stay single-homed (room create/list/join).
+    assert!(!should_fanout_peer_relay(true, true));
+    // Untargeted broadcasts use first-successful delivery, not full fan-out.
+    assert!(!should_fanout_peer_relay(false, false));
+    assert!(!should_fanout_peer_relay(false, true));
+}
+
+#[test]
+fn peer_reconnect_backoff_doubles_then_caps() {
+    assert_eq!(peer_reconnect_backoff(0), Duration::from_secs(1));
+    assert_eq!(peer_reconnect_backoff(1), Duration::from_secs(2));
+    assert_eq!(peer_reconnect_backoff(2), Duration::from_secs(4));
+    assert_eq!(peer_reconnect_backoff(3), Duration::from_secs(8));
+    assert_eq!(peer_reconnect_backoff(5), Duration::from_secs(32));
+    assert_eq!(peer_reconnect_backoff(6), Duration::from_secs(60));
+    assert_eq!(peer_reconnect_backoff(10), Duration::from_secs(60));
+    assert_eq!(peer_reconnect_backoff(100), Duration::from_secs(60));
+}
+
+// ---------------------------------------------------------------------------
+// Sprint C: in-process integration harness — outbound routing matrix and the
+// direct-call → private-room fallback flow, driven against a real
+// ConnectionManager with fake supernode WS sessions (no network).
+// ---------------------------------------------------------------------------
+
+mod harness {
+    use super::super::events::ConnectionEvent;
+    use super::super::ConnectionManager;
+    use crate::identity::Identity;
+    use crate::peer_store::PeerStore;
+    use crate::protocol::SignalingMessage;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    pub(super) struct TestCm {
+        pub cm: ConnectionManager,
+        pub events: mpsc::Receiver<ConnectionEvent>,
+        pub identity: Arc<Identity>,
+        pub store: Arc<RwLock<PeerStore>>,
+        // Keeps the peer-store file alive for the duration of the test.
+        _dir: tempfile::TempDir,
+    }
+
+    pub(super) fn test_cm() -> TestCm {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Arc::new(Identity::generate());
+        let store = PeerStore::open(&identity, Some(&dir.path().join("peers.dat"))).unwrap();
+        let store = Arc::new(RwLock::new(store));
+        let (cm, events) =
+            ConnectionManager::new_for_test(Arc::clone(&identity), Arc::clone(&store));
+        TestCm {
+            cm,
+            events,
+            identity,
+            store,
+            _dir: dir,
+        }
+    }
+
+    /// Ed25519-sign `msg` in place the same way peers/supernodes do on the wire.
+    pub(super) fn sign(identity: &Identity, msg: &mut SignalingMessage) {
+        use base64::Engine;
+        let canonical = msg.canonical_bytes().unwrap();
+        let sig = identity.sign(&canonical);
+        msg.signature = Some(base64::engine::general_purpose::URL_SAFE.encode(sig));
+    }
+
+    /// Drain everything currently queued on a fake supernode WS session and
+    /// parse the Text frames back into `SignalingMessage`s.
+    pub(super) fn drain_ws(rx: &mut mpsc::Receiver<WsMessage>) -> Vec<SignalingMessage> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            if let WsMessage::Text(text) = frame {
+                if let Ok(msg) = SignalingMessage::from_json(&text) {
+                    out.push(msg);
+                }
+            }
+        }
+        out
+    }
+}
+
+#[tokio::test]
+async fn routing_fans_out_peer_traffic_and_single_homes_supernode_traffic() {
+    use crate::protocol::{MessageType, SignalingMessage};
+    use serde_json::Value;
+
+    let mut t = harness::test_cm();
+    let mut sn_a = t.cm.test_add_supernode_session("SN-AAAA");
+    let mut sn_b = t.cm.test_add_supernode_session("SN-BBBB");
+
+    // Peer-targeted chat with no direct QUIC session must fan out to every
+    // connected supernode — a multi-homed recipient may be live on only one.
+    let mut chat = SignalingMessage::new(MessageType::ChatMessage, t.identity.public_id());
+    chat.target = Some("some-remote-peer".to_owned());
+    chat.payload
+        .insert("message_id".to_owned(), Value::String("m1".to_owned()));
+    chat.payload
+        .insert("body".to_owned(), Value::String("hello".to_owned()));
+    t.cm.dispatch_outbound(chat).await;
+
+    let got_a = harness::drain_ws(&mut sn_a);
+    let got_b = harness::drain_ws(&mut sn_b);
+    assert_eq!(got_a.len(), 1, "fan-out must reach supernode A");
+    assert_eq!(got_b.len(), 1, "fan-out must reach supernode B");
+
+    // Supernode-targeted signaling stays single-homed on that session.
+    let mut list = SignalingMessage::new(MessageType::SfuRoomList, t.identity.public_id());
+    list.target = Some("SN-AAAA".to_owned());
+    t.cm.dispatch_outbound(list).await;
+
+    let got_a = harness::drain_ws(&mut sn_a);
+    let got_b = harness::drain_ws(&mut sn_b);
+    assert_eq!(
+        got_a.len(),
+        1,
+        "supernode-targeted message must reach its target"
+    );
+    assert_eq!(got_a[0].msg_type, MessageType::SfuRoomList);
+    assert!(
+        got_b.is_empty(),
+        "supernode-targeted message must not fan out"
+    );
+}
+
+#[tokio::test]
+async fn chat_without_any_route_fails_fast_with_event() {
+    use super::events::ConnectionEvent;
+    use crate::protocol::{MessageType, SignalingMessage};
+    use serde_json::Value;
+
+    let mut t = harness::test_cm();
+    // No supernode sessions, no direct QUIC: the send must fail immediately
+    // with ChatSendFailed rather than vanishing.
+    let mut chat = SignalingMessage::new(MessageType::ChatMessage, t.identity.public_id());
+    chat.target = Some("unreachable-peer".to_owned());
+    chat.payload
+        .insert("message_id".to_owned(), Value::String("m2".to_owned()));
+    t.cm.dispatch_outbound(chat).await;
+
+    match t.events.try_recv() {
+        Ok(ConnectionEvent::ChatSendFailed {
+            peer_id,
+            message_id,
+            reason,
+        }) => {
+            assert_eq!(peer_id, "unreachable-peer");
+            assert_eq!(message_id, "m2");
+            assert_eq!(reason, "peer is offline");
+        }
+        other => panic!("expected ChatSendFailed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn direct_call_fallback_creates_private_room_then_invites_peer() {
+    use super::events::ConnectionEvent;
+    use crate::identity::Identity;
+    use crate::peer_store::PeerRecord;
+    use crate::protocol::{MessageType, SignalingMessage};
+    use serde_json::Value;
+
+    let mut t = harness::test_cm();
+
+    // A trusted supernode with a live (fake) session.
+    let sn_identity = Identity::generate();
+    let sn_id = sn_identity.public_id();
+    {
+        let mut store = t.store.write();
+        store.upsert(PeerRecord {
+            peer_id: sn_identity.peer_id(),
+            identity_pub: sn_id.clone(),
+            is_supernode: true,
+            ..Default::default()
+        });
+    }
+    let mut sn_rx = t.cm.test_add_supernode_session(&sn_id);
+
+    // 1) Kick off the fallback: a private `direct-…` room create must go to
+    //    the trusted supernode.
+    t.cm.start_direct_call_fallback("remote-callee").await;
+    let sent = harness::drain_ws(&mut sn_rx);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].msg_type, MessageType::SfuRoomCreate);
+    let room_id = sent[0].payload["room_id"].as_str().unwrap().to_owned();
+    assert!(room_id.starts_with("direct-"), "temp room id: {room_id}");
+    assert_eq!(sent[0].payload["room_type"], "private");
+
+    // Re-entrancy guard: a second start for the same peer is a no-op.
+    t.cm.start_direct_call_fallback("remote-callee").await;
+    assert!(harness::drain_ws(&mut sn_rx).is_empty());
+
+    // 2) The supernode acks the create. The manager must auto-join and send
+    //    the callee a CallRequest carrying the room coordinates + token.
+    let mut ack = SignalingMessage::new(MessageType::SfuRoomCreated, sn_id.clone());
+    for (k, v) in [
+        ("room_id", room_id.as_str()),
+        ("room_name", "Direct call"),
+        ("room_type", "private"),
+        ("invite_token", "tok-123"),
+    ] {
+        ack.payload
+            .insert(k.to_owned(), Value::String(v.to_owned()));
+    }
+    harness::sign(&sn_identity, &mut ack);
+    t.cm.handle_inbound_from_supernode(sn_id.clone(), ack).await;
+
+    let sent = harness::drain_ws(&mut sn_rx);
+    let kinds: Vec<_> = sent.iter().map(|m| m.msg_type.clone()).collect();
+    assert!(
+        kinds.contains(&MessageType::SfuJoin),
+        "must join the temp room, got {kinds:?}"
+    );
+    let call_req = sent
+        .iter()
+        .find(|m| m.msg_type == MessageType::CallRequest)
+        .expect("CallRequest with fallback coordinates must be relayed");
+    assert_eq!(call_req.target.as_deref(), Some("remote-callee"));
+    assert_eq!(call_req.payload["fallback_supernode_id"], sn_id.as_str());
+    assert_eq!(call_req.payload["fallback_room_id"], room_id.as_str());
+    assert_eq!(call_req.payload["fallback_invite_token"], "tok-123");
+
+    // 3) The caller UI is told to switch to room audio; the temp room must NOT
+    //    surface as a normal RoomCreated (no sidebar / room-store entry).
+    let mut saw_fallback_ready = false;
+    while let Ok(ev) = t.events.try_recv() {
+        match ev {
+            ConnectionEvent::CallFallbackRoomReady {
+                peer_id,
+                supernode_id,
+                room_id: rid,
+            } => {
+                assert_eq!(peer_id, "remote-callee");
+                assert_eq!(supernode_id, sn_id);
+                assert_eq!(rid, room_id);
+                saw_fallback_ready = true;
+            }
+            ConnectionEvent::RoomCreated { .. } => {
+                panic!("temp direct-call room must not emit RoomCreated")
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_fallback_ready, "CallFallbackRoomReady must be emitted");
+}
+
+#[tokio::test]
+async fn inbound_call_request_surfaces_fallback_room_coordinates() {
+    use super::events::ConnectionEvent;
+    use crate::identity::Identity;
+    use crate::peer_store::PeerRecord;
+    use crate::protocol::{MessageType, SignalingMessage};
+    use serde_json::Value;
+
+    let mut t = harness::test_cm();
+
+    // Callee side: the caller must be a trusted peer (Call* trust gate).
+    let caller = Identity::generate();
+    {
+        let mut store = t.store.write();
+        store.upsert(PeerRecord {
+            peer_id: caller.peer_id(),
+            identity_pub: caller.public_id(),
+            ..Default::default()
+        });
+    }
+
+    let mut req = SignalingMessage::new(MessageType::CallRequest, caller.public_id());
+    req.target = Some(t.identity.public_id());
+    for (k, v) in [
+        ("fallback_supernode_id", "SN-XYZ"),
+        ("fallback_room_id", "direct-abc-def-1"),
+        ("fallback_invite_token", "tok-9"),
+    ] {
+        req.payload
+            .insert(k.to_owned(), Value::String(v.to_owned()));
+    }
+    harness::sign(&caller, &mut req);
+    t.cm.handle_inbound(req).await;
+
+    match t.events.try_recv() {
+        Ok(ConnectionEvent::CallRequest {
+            peer_id,
+            fallback_supernode_id,
+            fallback_room_id,
+            fallback_invite_token,
+        }) => {
+            assert_eq!(peer_id, caller.peer_id());
+            assert_eq!(fallback_supernode_id, "SN-XYZ");
+            assert_eq!(fallback_room_id, "direct-abc-def-1");
+            assert_eq!(fallback_invite_token, "tok-9");
+        }
+        other => panic!("expected CallRequest event, got {other:?}"),
+    }
 }

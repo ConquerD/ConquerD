@@ -46,7 +46,6 @@ mod plugin_runtime;
 mod protocol;
 mod quic_relay_client;
 mod quic_tls;
-mod relay;
 mod ringtone;
 mod room_manager;
 mod room_store;
@@ -525,9 +524,11 @@ async fn handle_event(
                 error!("Failed to update failed message status: {}", e);
             }
         }
-        ConnectionEvent::CallRequest { peer_id } => {
+        ConnectionEvent::CallRequest { peer_id, .. } => {
             info!("Incoming call from {}", peer_id);
-            // Ring and ensure session exists.
+            // Ring and ensure session exists. (The headless client ignores the
+            // fallback_* room coordinates — room-mode call answering is a Qt
+            // bridge flow.)
             platform::play_ringtone();
             let _ = call_cmd_tx.try_send(call_controller::CallCommand::InitiatePeer {
                 peer_id,
@@ -563,6 +564,20 @@ async fn handle_event(
             platform::stop_ringtone();
             let _ = call_cmd_tx.try_send(call_controller::CallCommand::StopAudio);
             let _ = call_cmd_tx.try_send(call_controller::CallCommand::RemovePeer { peer_id });
+        }
+        ConnectionEvent::CallFallbackRoomReady {
+            peer_id,
+            supernode_id,
+            room_id,
+        } => {
+            info!(
+                "Direct call to {} falling back to room {} on {}",
+                peer_id, room_id, supernode_id
+            );
+            let _ = call_cmd_tx.try_send(call_controller::CallCommand::SetRoomMode {
+                supernode_id,
+                room_id,
+            });
         }
         ConnectionEvent::RelayGranted {
             supernode_id,

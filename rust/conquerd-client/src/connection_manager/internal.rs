@@ -20,11 +20,23 @@ pub(super) enum PeerConnectionState {
     Connected,
 }
 
+/// Outbound frame from the connection manager to a live QUIC peer session.
+#[derive(Debug)]
+pub(super) enum PeerOutbound {
+    /// Tagged frame on the long-lived reliable signaling stream
+    /// (length-prefixed by the session write task).
+    Reliable(Vec<u8>),
+    /// Unreliable QUIC datagram (direct audio). Payload is the full wire
+    /// frame including the channel tag.
+    Datagram(Vec<u8>),
+}
+
 #[derive(Debug)]
 pub(super) struct PeerConnection {
     pub(super) peer_id: String,
     pub(super) state: PeerConnectionState,
-    pub(super) quic_sig_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Outbound path into `run_quic_peer_session` (reliable + datagram).
+    pub(super) quic_out_tx: Option<mpsc::Sender<PeerOutbound>>,
     pub(super) connected_at: Option<Instant>,
 }
 
@@ -33,7 +45,7 @@ impl PeerConnection {
         Self {
             peer_id: peer_id.into(),
             state: PeerConnectionState::Disconnected,
-            quic_sig_tx: None,
+            quic_out_tx: None,
             connected_at: None,
         }
     }
@@ -47,7 +59,7 @@ impl PeerConnection {
 pub(super) enum InternalEvent {
     QuicConnected {
         peer_id: String,
-        sig_tx: mpsc::Sender<Vec<u8>>,
+        out_tx: mpsc::Sender<PeerOutbound>,
     },
     QuicDisconnected {
         peer_id: String,
@@ -79,6 +91,32 @@ pub(super) enum InternalEvent {
         supernode_id: String,
         client: Option<Arc<QuicRelayClient>>,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Channel-drop metrics
+// ---------------------------------------------------------------------------
+
+/// Process-wide counters for messages dropped because a bounded channel was
+/// full (`try_send` on hot paths). Purely diagnostic: senders stay non-blocking
+/// (the manager must never await into its own worker tasks — see the WS task's
+/// awaited sends in the other direction), but drops become countable and are
+/// warn!-logged at power-of-two totals instead of vanishing silently.
+pub(super) mod drop_metrics {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// ConnectionManager → app-layer [`super::super::events::ConnectionEvent`] channel.
+    pub(in crate::connection_manager) static APP_EVENTS: AtomicU64 = AtomicU64::new(0);
+    /// ConnectionManager → supernode WebSocket outbound channel.
+    pub(in crate::connection_manager) static WS_OUTBOUND: AtomicU64 = AtomicU64::new(0);
+    /// ConnectionManager → direct QUIC peer-session outbound channel.
+    pub(in crate::connection_manager) static PEER_OUTBOUND: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one drop; returns the running total so callers can rate-limit
+    /// their logging (`total.is_power_of_two()`).
+    pub(in crate::connection_manager) fn note(counter: &AtomicU64) -> u64 {
+        counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 // ---------------------------------------------------------------------------

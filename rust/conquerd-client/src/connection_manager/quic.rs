@@ -1,34 +1,48 @@
 //! QUIC peer session task.
+//!
+//! Transport contract for a direct peer session:
+//! - **Reliable signaling** rides one long-lived unidirectional stream per
+//!   direction, with 4-byte big-endian length-prefixed tagged frames
+//!   (control / chat / file).
+//! - **Direct audio** (`core.audio.opus`) rides QUIC **datagrams** (same
+//!   `[AUDIO_TAG][id_len][peer_id][opus]` layout as before) so frames are not
+//!   head-of-line blocked and do not open a stream per 20 ms packet.
+//!
+//! Inbound still accepts additional uni/bi streams (interop / older peers that
+//! open one stream per message) and datagrams.
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use super::internal::InternalEvent;
+use super::internal::{InternalEvent, PeerOutbound};
+
 // ---------------------------------------------------------------------------
 // QUIC peer session task
 // ---------------------------------------------------------------------------
 
 /// Manages a single QUIC peer connection.
 ///
-/// - Opens a bidirectional signaling stream (stream 0).
-/// - Forwards outbound bytes from `sig_tx` into the send side.
-/// - Reads inbound bytes from the recv side, sending `InternalEvent::QuicSignalingData`.
-/// - Sends `InternalEvent::QuicConnected` once the stream is open.
-/// - Sends `InternalEvent::QuicDisconnected` when the session ends.
+/// - Opens a long-lived outbound uni stream for reliable signaling.
+/// - Forwards [`PeerOutbound::Reliable`] frames with length-prefix framing.
+/// - Sends [`PeerOutbound::Datagram`] via `Connection::send_datagram`.
+/// - Reads inbound streams + datagrams into `InternalEvent::QuicSignalingData`.
+/// - Emits `QuicConnected` once outbound channels are ready; `QuicDisconnected`
+///   when the session ends.
 pub(super) async fn run_quic_peer_session(
     connection: quinn::Connection,
     peer_id: String,
     internal_tx: mpsc::Sender<InternalEvent>,
 ) {
-    let (sig_tx, mut sig_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (out_tx, mut out_rx) = mpsc::channel::<PeerOutbound>(128);
 
     let _ = internal_tx
         .send(InternalEvent::QuicConnected {
             peer_id: peer_id.clone(),
-            sig_tx,
+            out_tx,
         })
         .await;
 
@@ -73,35 +87,76 @@ pub(super) async fn run_quic_peer_session(
         }
     });
 
-    // Outbound write buffer
     let peer_id_w = peer_id.clone();
     let peer_id_r = peer_id.clone();
 
-    // Spawn a task to write outbound messages
+    // Outbound: one long-lived uni for reliable frames; datagrams for audio.
     let write_conn = connection.clone();
     let write_task = tokio::spawn(async move {
-        while let Some(bytes) = sig_rx.recv().await {
-            let mut send_stream = match write_conn.open_uni().await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    warn!(
-                        "Failed to open QUIC signaling stream to {}: {e}",
-                        &peer_id_w[..8.min(peer_id_w.len())]
-                    );
-                    break;
+        let mut send_stream: Option<quinn::SendStream> = None;
+        while let Some(msg) = out_rx.recv().await {
+            match msg {
+                PeerOutbound::Datagram(bytes) => {
+                    if let Err(e) = write_conn.send_datagram(Bytes::from(bytes)) {
+                        debug!(
+                            "QUIC datagram send failed for {}: {e}",
+                            &peer_id_w[..8.min(peer_id_w.len())]
+                        );
+                        // Datagram failure is best-effort; keep the session.
+                    }
                 }
-            };
-            // Length-prefix framing: 4-byte big-endian length + payload
-            let len = (bytes.len() as u32).to_be_bytes();
-            if send_stream.write_all(&len).await.is_err() {
-                break;
+                PeerOutbound::Reliable(bytes) => {
+                    if send_stream.is_none() {
+                        match write_conn.open_uni().await {
+                            Ok(stream) => send_stream = Some(stream),
+                            Err(e) => {
+                                warn!(
+                                    "Failed to open QUIC signaling stream to {}: {e}",
+                                    &peer_id_w[..8.min(peer_id_w.len())]
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    let Some(stream) = send_stream.as_mut() else {
+                        break;
+                    };
+                    let len = (bytes.len() as u32).to_be_bytes();
+                    if stream.write_all(&len).await.is_err()
+                        || stream.write_all(&bytes).await.is_err()
+                    {
+                        // Stream died — try to reopen on the next reliable frame.
+                        let _ = stream.finish();
+                        send_stream = None;
+                        // Retry once immediately on a fresh stream.
+                        match write_conn.open_uni().await {
+                            Ok(mut new_stream) => {
+                                if new_stream.write_all(&len).await.is_ok()
+                                    && new_stream.write_all(&bytes).await.is_ok()
+                                {
+                                    send_stream = Some(new_stream);
+                                } else {
+                                    warn!(
+                                        "QUIC signaling stream write failed for {}",
+                                        &peer_id_w[..8.min(peer_id_w.len())]
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to reopen QUIC signaling stream to {}: {e}",
+                                    &peer_id_w[..8.min(peer_id_w.len())]
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
             }
-            if send_stream.write_all(&bytes).await.is_err() {
-                break;
-            }
-            if send_stream.finish().is_err() {
-                break;
-            }
+        }
+        if let Some(mut stream) = send_stream.take() {
+            let _ = stream.finish();
         }
         debug!(
             "QUIC write task ended for {}",
@@ -109,19 +164,18 @@ pub(super) async fn run_quic_peer_session(
         );
     });
 
-    // Read loop: length-prefixed frames
+    // Accept loop: spawn a reader per inbound stream so long-lived signaling
+    // streams do not head-of-line-block datagram reception (direct audio).
     loop {
         tokio::select! {
             stream = connection.accept_uni() => {
                 match stream {
                     Ok(recv_stream) => {
-                        if !read_quic_signaling_stream(
-                            recv_stream,
-                            &peer_id_r,
-                            &internal_tx,
-                        ).await {
-                            break;
-                        }
+                        let peer = peer_id_r.clone();
+                        let tx = internal_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = read_quic_signaling_stream(recv_stream, &peer, &tx).await;
+                        });
                     }
                     Err(_) => break,
                 }
@@ -129,13 +183,24 @@ pub(super) async fn run_quic_peer_session(
             stream = connection.accept_bi() => {
                 match stream {
                     Ok((_send_stream, recv_stream)) => {
-                        if !read_quic_signaling_stream(
-                            recv_stream,
-                            &peer_id_r,
-                            &internal_tx,
-                        ).await {
-                            break;
-                        }
+                        let peer = peer_id_r.clone();
+                        let tx = internal_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = read_quic_signaling_stream(recv_stream, &peer, &tx).await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+            dgram = connection.read_datagram() => {
+                match dgram {
+                    Ok(bytes) => {
+                        let _ = internal_tx
+                            .send(InternalEvent::QuicSignalingData {
+                                peer_id: peer_id_r.clone(),
+                                data: bytes.to_vec(),
+                            })
+                            .await;
                     }
                     Err(_) => break,
                 }
@@ -150,6 +215,11 @@ pub(super) async fn run_quic_peer_session(
         .await;
 }
 
+/// Read length-prefixed frames until the stream ends.
+///
+/// Returns `false` only on a protocol hard-fail (frame too large) so the
+/// session should tear down; stream EOF returns `true` (session may continue
+/// on other streams / datagrams).
 async fn read_quic_signaling_stream(
     mut recv_stream: quinn::RecvStream,
     peer_id: &str,
