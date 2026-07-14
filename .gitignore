@@ -87,4 +87,6 @@ ruff_audit.json
 /rust/conquerd-client/target
 /terminals
 /agent-tools
+# Grok / agent MCP tool schema cache (not project source)
+/mcps
 /.claude/skills
