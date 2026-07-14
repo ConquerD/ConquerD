@@ -278,6 +278,15 @@ async fn headless_main() {
         ConnectionManager::split(Arc::clone(&identity), Arc::clone(&peer_store));
     tokio::spawn(cm_fut);
 
+    // Scripted/CI hook (mirrors CONQUERD_PASSPHRASE): accept an invite URL on
+    // startup so a headless client can join a supernode without a UI.
+    if let Ok(invite_url) = std::env::var("CONQUERD_ACCEPT_INVITE") {
+        if !invite_url.is_empty() {
+            info!("Accepting invite from CONQUERD_ACCEPT_INVITE");
+            let _ = cmd_tx.try_send(ConnectionCommand::AcceptInvite { invite_url });
+        }
+    }
+
     // ------------------------------------------------------------------
     // GitHub updater
     // ------------------------------------------------------------------
