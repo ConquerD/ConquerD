@@ -100,7 +100,9 @@ run_cargo "$CLIENT_DIR" clippy -p conquerd-client --no-default-features -- -D wa
 if [[ "$SKIP_AUDIT" -eq 0 ]]; then
     if ! command -v cargo-audit >/dev/null 2>&1; then
         step "Installing cargo-audit (not on PATH)"
-        cargo install cargo-audit --locked
+        # Keep in sync with CARGO_AUDIT_VERSION in .github/workflows/ci.yml —
+        # latest cargo-audit can require a newer rustc than RUST_TOOLCHAIN.
+        cargo install cargo-audit --version 0.22.1 --locked
     fi
 
     step "cargo audit (rust/ workspace)"

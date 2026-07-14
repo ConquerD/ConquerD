@@ -137,7 +137,9 @@ Invoke-Step 'cargo clippy (client workspace, headless, -D warnings)' {
 if (-not $SkipAudit) {
     if (-not (Get-Command cargo-audit -ErrorAction SilentlyContinue)) {
         Write-Step 'Installing cargo-audit (not on PATH)'
-        cargo install cargo-audit --locked
+        # Keep in sync with CARGO_AUDIT_VERSION in .github/workflows/ci.yml —
+        # latest cargo-audit can require a newer rustc than $RustToolchain.
+        cargo install cargo-audit --version 0.22.1 --locked
     }
 
     Invoke-Step 'cargo audit (rust/ workspace)' {

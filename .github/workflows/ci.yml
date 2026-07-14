@@ -9,6 +9,9 @@ on:
 
 env:
   RUST_TOOLCHAIN: "1.89.0"
+  # Pinned so CI never builds "latest" cargo-audit, whose MSRV can outrun the
+  # pinned toolchain (rustsec/audit-check did exactly that). Known-good on 1.89.
+  CARGO_AUDIT_VERSION: "0.22.1"
 
 jobs:
   test:
@@ -16,8 +19,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # rustsec/audit-check posts a GitHub Check run for advisory results.
-      checks: write
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -110,19 +111,29 @@ jobs:
 
       # --- Security ---------------------------------------------------------
       # Lockfiles live under rust/ (two separate Cargo workspaces, not repo root).
-      - name: Security audit (rust workspace)
-        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2 (pinned)
+      # The RUSTSEC-2024-0436 ignore (macOS-only wgpu-hal→metal `paste`) lives
+      # in rust/.cargo/audit.toml and is picked up automatically.
+      - name: Cache cargo-audit binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: rust
-          # Transitive macOS wgpu-hal→metal; installer uses glow. See rust/.cargo/audit.toml.
-          ignore: RUSTSEC-2024-0436
+          path: ~/.cargo/bin/cargo-audit
+          key: linux-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}
+
+      - name: Install cargo-audit
+        # Skip the build when the cached binary already reports the pinned
+        # version (cargo install would rebuild — ~/.cargo/.crates.toml is not
+        # part of the cache).
+        run: |
+          cargo-audit --version 2>/dev/null | grep -qF "$CARGO_AUDIT_VERSION" \
+            || cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+
+      - name: Security audit (rust workspace)
+        run: cargo audit --file Cargo.lock
+        working-directory: rust
 
       - name: Security audit (client workspace)
-        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2 (pinned)
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: rust/conquerd-client
+        run: cargo audit --file Cargo.lock
+        working-directory: rust/conquerd-client
 
   # Line/region coverage % via cargo-llvm-cov (report-only; raise floors later).
   # High-ROI packages: features + supernode + headless client. See scripts/coverage.sh.
