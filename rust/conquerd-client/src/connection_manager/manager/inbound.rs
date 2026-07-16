@@ -345,12 +345,21 @@ impl ConnectionManager {
                     .to_owned();
                 let sender_peer_id = self.canonical_peer_id_for_sender(&msg.sender);
                 if !handle.is_empty() {
-                    // Persist updated handle in peer store
+                    // Persist updated handle in peer store (peer_id or identity_pub key).
                     let mut store = self.peer_store.write();
-                    if let Some(rec) = store.get_mut(&sender_peer_id) {
-                        rec.handle = handle.clone();
+                    let key = if store.get(&sender_peer_id).is_some() {
+                        Some(sender_peer_id.clone())
+                    } else {
+                        store
+                            .get_by_identity(&msg.sender)
+                            .map(|r| r.peer_id.clone())
+                    };
+                    if let Some(pid) = key {
+                        if let Some(rec) = store.get_mut(&pid) {
+                            rec.handle = handle.clone();
+                        }
+                        let _ = store.save();
                     }
-                    let _ = store.save();
                     drop(store);
                 }
                 self.emit_event(ConnectionEvent::HandleUpdated {
@@ -493,6 +502,21 @@ impl ConnectionManager {
                             .collect()
                     })
                     .unwrap_or_default();
+                // `chat_members` (participants + text-chat subscribers) is the key
+                // group: it drives group-key election/sealing so text-only
+                // subscribers get keyed and can send/read room chat without a
+                // voice join. Falls back to `members` for older supernodes that
+                // don't send it (legacy behavior: subscribers stay unkeyed).
+                let chat_members: Vec<String> = msg
+                    .payload
+                    .get("chat_members")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| members.clone());
                 // If a cluster failover fan-out is awaiting confirmation for this
                 // room, the sibling that answered is the one that still holds it
                 // — promote it to the current supernode (correcting the
@@ -522,15 +546,17 @@ impl ConnectionManager {
                         room_id: room_id.clone(),
                     });
                 }
-                // Reconcile the room group key against this authoritative member
-                // set (first keying / rotate-on-leave / seal-to-newcomer) if we're
-                // the elected keyer for this snapshot.
-                self.sync_room_membership(&msg.sender, &room_id, &members)
+                // Reconcile the room group key against the authoritative key
+                // group (participants + subscribers) so text-only members are
+                // keyed too. Voice rail uses `members`; text members panel uses
+                // `chat_members`.
+                self.sync_room_membership(&msg.sender, &room_id, &chat_members)
                     .await;
                 self.emit_event(ConnectionEvent::RoomMembersChanged {
                     supernode_id: msg.sender.clone(),
                     room_id,
                     members,
+                    chat_members,
                 });
             }
             MessageType::SfuPeerJoined => {
@@ -1026,6 +1052,13 @@ impl ConnectionManager {
                 if !should_auto_join_on_room_created(denied, room_id.is_empty(), materialize_only) {
                     // Materialize-only replay: refresh sidebar counts, do not join.
                     self.send_room_list_request(&supernode_id).await;
+                    // Private rooms stay text-active while connected: subscribe
+                    // *after* the room exists on the supernode so SfuChat is
+                    // delivered even when the user is in another voice room.
+                    if room_type == "private" {
+                        self.chat_active_rooms.insert(materialize_key);
+                        self.send_room_subscribe(&supernode_id, &room_id).await;
+                    }
                 } else {
                     self.current_supernode_id = supernode_id.clone();
                     self.current_room_id = room_id.clone();
@@ -1233,6 +1266,11 @@ impl ConnectionManager {
                     if let Some(record) = store.get_mut(&joiner_peer_id) {
                         record.last_seen_at = unix_now_f64();
                         record.auto_connect = true;
+                        // Refresh display name when the joiner announces one
+                        // (earlier empty-handle trust rows stay blank otherwise).
+                        if !joiner_handle.is_empty() {
+                            record.handle = joiner_handle.clone();
+                        }
                         if joiner_quic_port != 0 {
                             record.quic_port = joiner_quic_port;
                         }
@@ -1264,6 +1302,7 @@ impl ConnectionManager {
                 // Send INVITE_HANDSHAKE_ACCEPT back
                 let sender = self.identity.public_id();
                 let peer_id_str = self.identity.peer_id();
+                let inviter_handle = super::peer_session::read_local_display_handle();
                 let mut reply =
                     SignalingMessage::new(MessageType::InviteHandshakeAccept, sender.clone());
                 let direct_joiner_connected = self
@@ -1285,7 +1324,15 @@ impl ConnectionManager {
                 reply
                     .payload
                     .insert("inviter_identity_pub".into(), Value::String(sender));
+                if !inviter_handle.is_empty() {
+                    reply
+                        .payload
+                        .insert("inviter_handle".into(), Value::String(inviter_handle));
+                }
                 self.dispatch_outbound(reply).await;
+                // Redundant with inviter_handle on ACCEPT, but also covers reconnect
+                // paths that only re-run INIT/ACCEPT without a fresh invite URL.
+                self.send_handle_update(&joiner_peer_id).await;
 
                 self.emit_event(ConnectionEvent::PeerConnected(joiner_peer_id.clone()));
                 self.emit_event(ConnectionEvent::InviteAccepted {
@@ -1350,10 +1397,22 @@ impl ConnectionManager {
                         } else {
                             vec![pending.relay_hint.clone()]
                         };
+                        // Prefer ACCEPT handle; fall back to any previously
+                        // known handle so a blank ACCEPT never blanks a name.
+                        let prior_handle = store
+                            .get(&inviter_peer_id)
+                            .or_else(|| store.get_by_identity(&inviter_identity_pub))
+                            .map(|r| r.handle.clone())
+                            .unwrap_or_default();
+                        let handle = if !inviter_handle.is_empty() {
+                            inviter_handle.clone()
+                        } else {
+                            prior_handle
+                        };
                         store.upsert_from_invite(crate::peer_store::PeerRecord {
                             peer_id: inviter_peer_id.clone(),
                             identity_pub: inviter_identity_pub.clone(),
-                            handle: inviter_handle.clone(),
+                            handle,
                             relay_hints,
                             auto_connect: !pending.is_supernode,
                             quic_port: parse_quic_lan_hint(&pending.lan_hint)
@@ -1367,6 +1426,9 @@ impl ConnectionManager {
                         });
                         let _ = store.save();
                     }
+                    // Tell the inviter our display name (INIT may have been empty
+                    // if settings loaded after handshake started).
+                    self.send_handle_update(&inviter_peer_id).await;
                     self.emit_event(ConnectionEvent::PeerConnected(inviter_peer_id.clone()));
                     self.emit_event(ConnectionEvent::InviteAccepted {
                         peer_id: inviter_peer_id,

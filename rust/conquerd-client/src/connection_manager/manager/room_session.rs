@@ -784,6 +784,15 @@ impl ConnectionManager {
         self.dispatch_outbound(msg).await;
     }
 
+    pub(super) async fn send_room_unsubscribe(&mut self, supernode_id: &str, room_id: &str) {
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::SfuUnsubscribe, sender);
+        msg.target = Some(supernode_id.to_owned());
+        msg.payload
+            .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
+        self.dispatch_outbound(msg).await;
+    }
+
     pub(super) async fn send_room_invite(
         &mut self,
         supernode_id: &str,

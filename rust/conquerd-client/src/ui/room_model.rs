@@ -14,6 +14,7 @@ mod room_roles {
     pub const MUTED: i32 = 259;
     pub const AUDIO_LEVEL: i32 = 260;
     pub const IS_SELF: i32 = 261;
+    pub const ONLINE: i32 = 262;
 }
 
 #[cxx_qt::bridge]
@@ -100,7 +101,13 @@ pub mod ffi {
 
 pub use ffi::RoomModel;
 
-#[derive(Default, Clone)]
+/// serde default for the `online` field: entries in a room roster are
+/// live-present members unless a producer explicitly says otherwise.
+fn default_online() -> bool {
+    true
+}
+
+#[derive(Clone)]
 pub struct RoomParticipant {
     pub peer_id: String,
     pub handle: String,
@@ -108,6 +115,24 @@ pub struct RoomParticipant {
     pub muted: bool,
     pub audio_level: f32,
     pub is_self: bool,
+    /// Presence in the room. Room roster entries are live-present members, so
+    /// this is normally `true`; it exists so the members list can render an
+    /// online/offline indicator without inventing UI-only state.
+    pub online: bool,
+}
+
+impl Default for RoomParticipant {
+    fn default() -> Self {
+        Self {
+            peer_id: String::new(),
+            handle: String::new(),
+            speaking: false,
+            muted: false,
+            audio_level: 0.0,
+            is_self: false,
+            online: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -134,6 +159,7 @@ impl ffi::RoomModel {
             r if r == room_roles::MUTED => QVariant::from(&p.muted),
             r if r == room_roles::AUDIO_LEVEL => (&p.audio_level).into(),
             r if r == room_roles::IS_SELF => QVariant::from(&p.is_self),
+            r if r == room_roles::ONLINE => QVariant::from(&p.online),
             _ => QVariant::default(),
         }
     }
@@ -146,6 +172,7 @@ impl ffi::RoomModel {
         h.insert(room_roles::MUTED, QByteArray::from("muted"));
         h.insert(room_roles::AUDIO_LEVEL, QByteArray::from("audioLevel"));
         h.insert(room_roles::IS_SELF, QByteArray::from("isSelf"));
+        h.insert(room_roles::ONLINE, QByteArray::from("online"));
         h
     }
 
@@ -163,6 +190,8 @@ impl ffi::RoomModel {
             audio_level: f32,
             #[serde(default)]
             is_self: bool,
+            #[serde(default = "default_online")]
+            online: bool,
         }
         if let Ok(rows) = serde_json::from_str::<Vec<Row>>(&json.to_string()) {
             self.as_mut().begin_reset_model();
@@ -175,6 +204,7 @@ impl ffi::RoomModel {
                     muted: r.muted,
                     audio_level: r.audio_level,
                     is_self: r.is_self,
+                    online: r.online,
                 })
                 .collect();
             self.as_mut().end_reset_model();

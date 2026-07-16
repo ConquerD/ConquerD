@@ -744,12 +744,13 @@ ApplicationWindow {
     // Settings section index (0=Audio … 7=Diagnostics). Drives SettingsPage.currentTab.
     property int settingsTab: 0
 
-    // Auto-switch to room tab when joinRoom succeeds
+    // Auto-switch to room tab when voice join succeeds. Leaving voice must not
+    // kick the user off the room text panel when a text room is still selected.
     Connections {
         target: backend
         function onIn_roomChanged() {
             if (backend.in_room) navIndex = 1
-            else if (navIndex === 1) navIndex = 0
+            else if (navIndex === 1 && !roomPanel.roomId) navIndex = 0
         }
     }
 
@@ -781,7 +782,10 @@ ApplicationWindow {
     // Live-data models
     PeerListModel     { id: peerModel }
     ChatModel         { id: chatModel }
+    // Voice-rail participants (active voice room only).
     RoomModel         { id: roomModel }
+    // Text-room members panel (selected room's chat recipients).
+    RoomModel         { id: textRoomModel }
     FileTransferModel { id: fileTransferModel }
 
     // Sidebar: supernodes with grouped SFU rooms (nodesUpdated + sfuRoomsUpdated)
@@ -833,6 +837,7 @@ ApplicationWindow {
         backend.chatHistoryPrepended.connect(chatPanel.onHistoryPrepended)
         backend.messageStatusChanged.connect(chatModel.updateMessageStatus)
         backend.participantsUpdated.connect(roomModel.setParticipants)
+        backend.textMembersUpdated.connect(textRoomModel.setParticipants)
         backend.localSpeakingChanged.connect(function(speaking) {
             roomModel.updateParticipant(backend.public_id, speaking, false)
         })
@@ -998,6 +1003,8 @@ ApplicationWindow {
             chatPanel.peerIsTyping = isTyping
         }
         function onRoomChatReceived(msgJson) {
+            // Bridge already filters to the selected text room; RoomPanel also
+            // checks room_id so history loads / edge races cannot cross-paint.
             roomPanel.appendRoomChat(msgJson)
         }
         // Show a tray balloon when a message arrives while the window is not active.
@@ -2073,7 +2080,9 @@ ApplicationWindow {
                 id: roomPanel
                 anchors.fill: parent
                 visible: navIndex === 1
-                roomModel: roomModel
+                // Text members only — never the active voice roster (voice rail
+                // owns roomModel). Peers who share this room's chat space.
+                roomModel: textRoomModel
                 fileTransferModel: fileTransferModel
                 settingsModel: settingsModel
                 youtubePreviewEnabled: settingsModel ? settingsModel.youtube_preview_enabled : true
@@ -2193,23 +2202,28 @@ ApplicationWindow {
                 NumberAnimation { duration: Theme.animFast; easing.type: Easing.InOutQuad }
             }
 
-            participantModel: backend.in_room ? roomModel : directCallModel
-            contextName: backend.in_room
+            // Always the active voice session only (never the selected text room).
+            participantModel: backend.voice_active && backend.in_room
+                ? roomModel
+                : directCallModel
+            contextName: backend.voice_active && backend.in_room
                 ? root.voiceRoomName
                 : (root.activeCallPeerHandle() || chatPanel.selectedPeerName || chatPanel.selectedPeerId || "Call")
-            supernodeId: backend.in_room ? root.voiceSupernodeId : ""
-            supernodeHandle: backend.in_room
+            supernodeId: backend.voice_active && backend.in_room ? root.voiceSupernodeId : ""
+            supernodeHandle: backend.voice_active && backend.in_room
                 ? root.supernodeHandleFor(root.voiceSupernodeId)
                 : ""
             callState: backend.call_state
-            inRoom: backend.in_room
+            inRoom: backend.voice_active && backend.in_room
             connectionMode: backend.connection_mode
             durationSecs: backend.call_duration_secs
 
             onEndCallRequested: {
-                if (backend.in_room) {
+                if (backend.voice_active && backend.in_room) {
                     backend.leaveRoom()
-                    navIndex = 0
+                    // Stay on the room text panel when a text room is still selected.
+                    if (!roomPanel.roomId)
+                        navIndex = 0
                 } else {
                     backend.endCall()
                 }

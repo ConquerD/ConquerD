@@ -146,6 +146,24 @@ pub(super) fn load_direct_p2p_settings() -> (bool, u16) {
     (enabled, port)
 }
 
+/// Display name from this profile's `settings.json` (`local_handle`).
+/// Used in invite URLs, handshake INIT/ACCEPT, and `HandleUpdate` broadcasts.
+pub(super) fn read_local_display_handle() -> String {
+    let path = Identity::default_key_dir().join("settings.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return String::new();
+    };
+    value
+        .get("local_handle")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_owned()
+}
+
 pub fn peer_quic_endpoint(record: &crate::peer_store::PeerRecord) -> Option<(String, u16)> {
     record
         .relay_hints

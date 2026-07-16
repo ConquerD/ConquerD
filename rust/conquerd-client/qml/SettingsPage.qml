@@ -479,7 +479,14 @@ Item {
                                 color: Theme.text
                                 placeholderTextColor: Theme.muted
                                 background: Rectangle { color: Theme.bg3; radius: Theme.radiusMd; border.color: activeFocus ? Theme.accent : Theme.bg3; border.width: 1 }
-                                onEditingFinished: if (root.settings) root.settings.local_handle = text
+                                onEditingFinished: {
+                                    if (!root.settings) return
+                                    root.settings.local_handle = text
+                                    root.settings.save()
+                                    // Push the new name to already-connected peers.
+                                    if (backend)
+                                        backend.broadcastHandleToAll(text.trim())
+                                }
                             }
                         }
                     }

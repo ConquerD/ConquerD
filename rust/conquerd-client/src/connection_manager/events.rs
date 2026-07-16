@@ -89,10 +89,15 @@ pub enum ConnectionEvent {
     /// Typing indicator from a peer.
     TypingIndicator { peer_id: String, is_typing: bool },
     /// Room member list changed (full snapshot from `SfuMembers`).
+    ///
+    /// `members` is the **voice** participant roster (drives the voice rail).
+    /// `chat_members` is participants + text-chat subscribers (drives the
+    /// text-room members panel and group-key election on the client).
     RoomMembersChanged {
         supernode_id: String,
         room_id: String,
         members: Vec<String>,
+        chat_members: Vec<String>,
     },
     /// Supernode rejected our `SfuJoin` (`SfuJoinResult` accepted=false).
     /// UI must roll back optimistic voice / current-room state.
@@ -305,6 +310,13 @@ pub enum ConnectionCommand {
         supernode_id: String,
         room_id: String,
     },
+    /// Stop receiving text chat for a room (sends `SfuUnsubscribe`). Does not
+    /// leave voice if still joined; drops local group-key material only when
+    /// we are not voicing this room.
+    UnsubscribeRoomChat {
+        supernode_id: String,
+        room_id: String,
+    },
     /// Send an Opus audio frame to a specific peer over QUIC datagrams.
     SendAudioFrame {
         peer_id: String,
@@ -485,6 +497,15 @@ pub enum ConnectionCommand {
     /// Broadcast our avatar config to every currently-connected peer.
     BroadcastAvatarConfigToAll {
         config_json: String,
+    },
+    /// Send our display handle to a specific peer (`HandleUpdate`).
+    BroadcastHandleUpdate {
+        peer_id: String,
+        handle: String,
+    },
+    /// Send our display handle to every currently-connected peer.
+    BroadcastHandleUpdateToAll {
+        handle: String,
     },
     /// Graceful shutdown.
     Shutdown,

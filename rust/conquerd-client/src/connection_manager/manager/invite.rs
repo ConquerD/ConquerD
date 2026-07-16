@@ -218,6 +218,7 @@ impl ConnectionManager {
             .map(|d| d.as_secs())
             .unwrap_or(0)
             + 900;
+        let inviter_handle = super::peer_session::read_local_display_handle();
         let payload = serde_json::json!({
             "inviter_peer_id": self.identity.peer_id(),
             "inviter_identity_pub": self.identity.public_id(),
@@ -225,6 +226,8 @@ impl ConnectionManager {
             "expires_at": expires_at,
             "lan_hint": self.local_quic_hint()
                 .unwrap_or_else(|| format!("quic://127.0.0.1:{port}")),
+            // Peers list label on the joiner before/without a HandleUpdate.
+            "inviter_handle": inviter_handle,
         });
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
         Some(format!("conquerd://invite#{encoded}"))
@@ -302,6 +305,7 @@ impl ConnectionManager {
             .map(|addr| addr.port())
             .unwrap_or(0);
 
+        let joiner_handle = super::peer_session::read_local_display_handle();
         let mut msg = SignalingMessage::new(MessageType::InviteHandshakeInit, sender.clone());
         msg.target = Some(target);
         msg.payload
@@ -318,6 +322,10 @@ impl ConnectionManager {
             "joiner_quic_port".into(),
             Value::Number(joiner_quic_port.into()),
         );
+        if !joiner_handle.is_empty() {
+            msg.payload
+                .insert("joiner_handle".into(), Value::String(joiner_handle));
+        }
         if let Some(hint) = self.local_quic_hint() {
             msg.payload
                 .insert("joiner_lan_hint".into(), Value::String(hint));
@@ -694,6 +702,7 @@ impl ConnectionManager {
             .and_then(|ep| ep.local_addr().ok())
             .map(|addr| addr.port())
             .unwrap_or(0);
+        let joiner_handle = super::peer_session::read_local_display_handle();
         let mut msg = SignalingMessage::new(MessageType::InviteHandshakeInit, sender.clone());
         msg.target = Some(inviter_identity_pub.clone());
         msg.payload
@@ -710,6 +719,10 @@ impl ConnectionManager {
             "joiner_quic_port".into(),
             Value::Number(joiner_quic_port.into()),
         );
+        if !joiner_handle.is_empty() {
+            msg.payload
+                .insert("joiner_handle".into(), Value::String(joiner_handle));
+        }
         if let Some(hint) = self.local_quic_hint() {
             msg.payload
                 .insert("joiner_lan_hint".into(), Value::String(hint));

@@ -666,6 +666,38 @@ impl SupernodeState {
         self.signaling.send_to_peer(target, &msg.to_json());
     }
 
+    /// Broadcast a room's authoritative rosters to every chat recipient (voice
+    /// participants **and** text-chat subscribers).
+    ///
+    /// `members` is the voice roster — it drives the voice rail, the UI member
+    /// list and P2P audio init on the client (unchanged semantics). `chat_members`
+    /// is the full key-group roster (participants + subscribers) that drives E2E
+    /// group-key distribution: the client feeds it into keyer election / sealing,
+    /// so a text-only subscriber is sealed the room key and can send *and* read
+    /// room chat without ever joining voice. Sent to every chat recipient so all
+    /// of them compute the same keyer over the same set.
+    fn broadcast_sfu_members(&self, room_id: &str) {
+        let Some(ref sfu) = self.sfu else {
+            return;
+        };
+        let (members, chat_members) = {
+            let s = sfu.read();
+            let members = s
+                .get_room(room_id)
+                .map(|r| r.participant_ids())
+                .unwrap_or_default();
+            (members, s.get_chat_recipients(room_id))
+        };
+        let payload = json!({
+            "room_id": room_id,
+            "members": members,
+            "chat_members": chat_members,
+        });
+        for peer in &chat_members {
+            self.send_signed(peer, MessageType::SfuMembers, payload.clone());
+        }
+    }
+
     /// Build the JSON payload for `SUPERNODE_INFO`. Always includes the
     /// advertised capability list. When `web.host.app.v1` is enabled we
     /// also advertise the canonical `conquerd://` URL pointing at this
@@ -1649,6 +1681,9 @@ impl SignalingHandler for SupernodeHandler {
                             json!({"peer_id": identity_pub, "room_id": room_id}),
                         );
                     }
+                    // Reannounce the key roster so text-only subscribers also
+                    // drop the departed peer and the keyer rotates.
+                    self.state.broadcast_sfu_members(room_id);
                 }
                 // Broadcast updated room list (participant counts changed)
                 self.state.broadcast_room_list();
@@ -1903,11 +1938,15 @@ impl SupernodeHandler {
             relay.join_room(&msg.sender, room_id);
         }
 
-        // Send member list to joiner
+        // Send member list to joiner. Include `chat_members` (participants +
+        // text subscribers) so the joiner's key-group view matches everyone
+        // else's from the first snapshot — otherwise a members-only frame could
+        // race the broadcast below and transiently drop subscribers from keying.
+        let chat_members = sfu.read().get_chat_recipients(room_id);
         self.state.send_signed(
             &msg.sender,
             MessageType::SfuMembers,
-            json!({"room_id": room_id, "members": members}),
+            json!({"room_id": room_id, "members": members, "chat_members": chat_members}),
         );
 
         // Notify existing members
@@ -1920,6 +1959,11 @@ impl SupernodeHandler {
                 );
             }
         }
+
+        // Reannounce the full key roster to every chat recipient so text-only
+        // subscribers (who don't receive SfuPeerJoined) learn about the new
+        // participant and agree on the keyer election.
+        self.state.broadcast_sfu_members(room_id);
 
         info!(
             "Peer {} joined room {}",
@@ -1958,6 +2002,11 @@ impl SupernodeHandler {
                 json!({"peer_id": msg.sender, "room_id": room_id}),
             );
         }
+
+        // Reannounce the key roster to text-only subscribers too (they don't
+        // receive SfuPeerLeft) so they drop the departed member from keyer
+        // election and the keyer rotates for forward secrecy.
+        self.state.broadcast_sfu_members(room_id);
 
         // Participant IDs/counts changed; refresh room sidebar stats.
         self.state.broadcast_room_list();
@@ -2141,6 +2190,10 @@ impl SupernodeHandler {
                 &msg.sender[..12.min(msg.sender.len())],
                 &room_id[..12.min(room_id.len())]
             );
+            // Announce the widened key-group roster so the elected keyer seals
+            // the current epoch to the new subscriber (and the subscriber learns
+            // the set) — this is what lets text chat work without a voice join.
+            self.state.broadcast_sfu_members(room_id);
         }
     }
 
@@ -2162,6 +2215,9 @@ impl SupernodeHandler {
             &msg.sender[..12.min(msg.sender.len())],
             &room_id[..12.min(room_id.len())]
         );
+        // Roster shrank — reannounce so the keyer rotates the epoch (forward
+        // secrecy) and reseals to whoever remains.
+        self.state.broadcast_sfu_members(room_id);
     }
 
     fn handle_sfu_room_create(&self, msg: &SignalingMessage) {

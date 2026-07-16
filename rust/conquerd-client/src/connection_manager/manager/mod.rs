@@ -142,10 +142,15 @@ pub struct ConnectionManager {
     room_members: HashSet<String>,
     /// Per-(feature, peer) consent decisions for non-first-party invokes.
     feature_trust: FeatureTrustStore,
-    /// Current SFU room identifier (empty when not in a room).
+    /// Current SFU **voice** room identifier (empty when not in a voice room).
+    /// Used for outbound room audio routing; independent of multi-room text chat.
     current_room_id: String,
-    /// Supernode we joined the current room on (empty when not in a room).
+    /// Supernode we joined the current voice room on (empty when not in a room).
     current_supernode_id: String,
+    /// Rooms we want to keep receiving text chat for (`supernode_id:room_id`).
+    /// Survives voice leave so private rooms (and any room we subscribed to)
+    /// keep getting `SfuChat` while we voice elsewhere.
+    chat_active_rooms: HashSet<String>,
     /// Live QUIC relay connections keyed by supernode identity pubkey.
     /// Populated lazily once a `RelayGranted` event arrives and the
     /// background connect succeeds. Used by [`ConnectionCommand::FetchWebApp`]
@@ -316,6 +321,7 @@ impl ConnectionManager {
             feature_trust: FeatureTrustStore::new(),
             current_room_id: String::new(),
             current_supernode_id: String::new(),
+            chat_active_rooms: HashSet::new(),
             quic_relays: HashMap::new(),
             replay_guard: ReplayGuard::new(Self::MAX_MESSAGE_AGE_SECS),
             transport_stats: HashMap::new(),
@@ -494,6 +500,9 @@ impl ConnectionManager {
                         ConnectionCommand::JoinRoom { supernode_id, room_id } => {
                             self.current_supernode_id = supernode_id.clone();
                             self.current_room_id = room_id.clone();
+                            // Voice join also receives room chat while present.
+                            self.chat_active_rooms
+                                .insert(room_scope_key(&supernode_id, &room_id));
                             self.send_room_join(&supernode_id, &room_id).await;
                             // Establish a QUIC relay session for low-latency room
                             // audio (datagrams instead of WS). Harmless if it
@@ -504,6 +513,7 @@ impl ConnectionManager {
                             self.current_supernode_id = supernode_id.clone();
                             self.current_room_id = room_id.clone();
                             let key = format!("{supernode_id}:{room_id}");
+                            self.chat_active_rooms.insert(key.clone());
                             self.pending_private_room_joins.insert(key);
                             self.send_room_invite(&supernode_id, &room_id, &invite_token).await;
                             self.ensure_room_relay(&supernode_id).await;
@@ -512,21 +522,55 @@ impl ConnectionManager {
                             supernode_id,
                             room_id,
                         } => {
-                            self.current_room_id.clear();
-                            self.current_supernode_id.clear();
-                            // Drop local key material + pending seals for this room.
-                            self.group_keys.forget(&room_id);
-                            self.pending_group_key_acks
-                                .retain(|(r, _), _| r != &room_id);
-                            let room_key = format!("{supernode_id}:{room_id}");
-                            self.room_group_members.remove(&room_key);
+                            // Voice leave only — do not tear down multi-room text
+                            // chat. Clear voice routing scope only when it matches
+                            // the room being left.
+                            if self.current_room_id == room_id
+                                && self.current_supernode_id == supernode_id
+                            {
+                                self.current_room_id.clear();
+                                self.current_supernode_id.clear();
+                            }
+                            let room_key = room_scope_key(&supernode_id, &room_id);
+                            let keep_chat = self.chat_active_rooms.contains(&room_key);
+                            if !keep_chat {
+                                // Fully leaving this room's content surface.
+                                self.group_keys.forget(&room_id);
+                                self.pending_group_key_acks
+                                    .retain(|(r, _), _| r != &room_id);
+                                self.room_group_members.remove(&room_key);
+                            }
                             self.send_room_leave(&supernode_id, &room_id).await;
+                            // SfuLeave drops voice participation only; text chat
+                            // requires an explicit subscriber entry once we are
+                            // no longer a participant. Re-subscribe so private
+                            // (and any chat-active) rooms keep receiving messages
+                            // while we voice elsewhere.
+                            if keep_chat {
+                                self.send_room_subscribe(&supernode_id, &room_id).await;
+                            }
                         }
                         ConnectionCommand::RemoveSupernode { supernode_id } => {
                             self.remove_supernode(&supernode_id).await;
                         }
                         ConnectionCommand::SubscribeRoomChat { supernode_id, room_id } => {
+                            self.chat_active_rooms
+                                .insert(room_scope_key(&supernode_id, &room_id));
                             self.send_room_subscribe(&supernode_id, &room_id).await;
+                        }
+                        ConnectionCommand::UnsubscribeRoomChat { supernode_id, room_id } => {
+                            let room_key = room_scope_key(&supernode_id, &room_id);
+                            self.chat_active_rooms.remove(&room_key);
+                            // Drop keys only when we are not still voicing this room.
+                            let still_voice = self.current_room_id == room_id
+                                && self.current_supernode_id == supernode_id;
+                            if !still_voice {
+                                self.group_keys.forget(&room_id);
+                                self.pending_group_key_acks
+                                    .retain(|(r, _), _| r != &room_id);
+                                self.room_group_members.remove(&room_key);
+                            }
+                            self.send_room_unsubscribe(&supernode_id, &room_id).await;
                         }
                         ConnectionCommand::SendAudioFrame { peer_id, opus_data } => {
                             self.send_audio_datagram(&peer_id, opus_data).await;
@@ -708,6 +752,20 @@ impl ConnectionManager {
                                 .collect();
                             for peer_id in connected {
                                 self.send_avatar_config(&peer_id, &config_json).await;
+                            }
+                        }
+                        ConnectionCommand::BroadcastHandleUpdate { peer_id, handle } => {
+                            self.send_handle_update_with(&peer_id, &handle).await;
+                        }
+                        ConnectionCommand::BroadcastHandleUpdateToAll { handle } => {
+                            let connected: Vec<String> = self
+                                .peers
+                                .iter()
+                                .filter(|(_, p)| p.state == PeerConnectionState::Connected)
+                                .map(|(id, _)| id.clone())
+                                .collect();
+                            for peer_id in connected {
+                                self.send_handle_update_with(&peer_id, &handle).await;
                             }
                         }
                         ConnectionCommand::CreateRoom {
@@ -910,6 +968,8 @@ impl ConnectionManager {
                 self.send_room_leave(supernode_id, &room_id).await;
             }
         }
+        let prefix = format!("{supernode_id}:");
+        self.chat_active_rooms.retain(|k| !k.starts_with(&prefix));
         if let Some(sn) = self.supernodes.remove(supernode_id) {
             sn.ws_task.abort();
             let _ = sn.send_tx.try_send(WsMessage::Close(None));
@@ -941,6 +1001,9 @@ impl ConnectionManager {
                 self.send_capability_announce(&peer_id).await;
                 // Also send build attestation so the peer knows our reproducible build ID.
                 self.send_build_attestation(&peer_id).await;
+                // Advertise our display handle so the peer list shows names even
+                // when the original invite handshake stored an empty handle.
+                self.send_handle_update(&peer_id).await;
                 // Direct path recovered — a pending private-room call fallback
                 // (or an armed grace-period check) for this peer is moot.
                 if self.direct_fallback.is_pending_for(&peer_id) {
@@ -1441,6 +1504,24 @@ impl ConnectionManager {
             "BUILD_ATTESTATION sent to {}",
             &peer_id[..8.min(peer_id.len())]
         );
+    }
+
+    /// Send our local display handle to a peer (`HandleUpdate`).
+    pub(super) async fn send_handle_update(&mut self, peer_id: &str) {
+        let handle = peer_session::read_local_display_handle();
+        self.send_handle_update_with(peer_id, &handle).await;
+    }
+
+    pub(super) async fn send_handle_update_with(&mut self, peer_id: &str, handle: &str) {
+        if handle.is_empty() {
+            return;
+        }
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::HandleUpdate, sender);
+        msg.target = Some(peer_id.to_owned());
+        msg.payload
+            .insert("handle".to_owned(), Value::String(handle.to_owned()));
+        self.dispatch_outbound(msg).await;
     }
 
     /// Broadcast our avatar config to a single trusted peer.
