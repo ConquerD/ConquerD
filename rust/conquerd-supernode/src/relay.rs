@@ -41,8 +41,13 @@ struct RelayPeer {
 
 /// Shared relay state.
 pub struct RelayState {
-    /// Authorized peer IDs.
+    /// Authorized peer IDs (full relay access: rooms, datagrams, signaling).
     allowed: HashSet<String>,
+    /// Portal-only guests: trusted peers that have not yet passed the access
+    /// gate. Their QUIC relay connection is admitted, but restricted to the
+    /// `web.host.app.v1` portal stream — no room join, no datagram forwarding,
+    /// no reliable signaling. Promoted into `allowed` once the gate is passed.
+    portal_allowed: HashSet<String>,
     /// Connected peers: identity_pub → RelayPeer.
     peers: HashMap<String, RelayPeer>,
     /// Reverse map: peer_index → identity_pub.
@@ -65,6 +70,7 @@ impl RelayState {
     fn new() -> Self {
         Self {
             allowed: HashSet::new(),
+            portal_allowed: HashSet::new(),
             peers: HashMap::new(),
             index_to_peer: HashMap::new(),
             rooms: HashMap::new(),
@@ -263,11 +269,23 @@ impl QUICRelayServer {
             .insert(peer_id.trim_end_matches('=').to_string());
     }
 
-    /// Re-authorize (update ticket without disconnecting).
+    /// Re-authorize (update ticket without disconnecting). Full grant also
+    /// clears any portal-only guest entry so the peer's live connection is
+    /// upgraded to full access without needing to reconnect.
     pub fn allow_peer_update(&self, peer_id: &str) {
+        let normalized = peer_id.trim_end_matches('=').to_string();
+        let mut state = self.state.write();
+        state.portal_allowed.remove(&normalized);
+        state.allowed.insert(normalized);
+    }
+
+    /// Admit a peer as a **portal-only guest**: its relay connection is
+    /// accepted but restricted to the `web.host.app.v1` portal stream until it
+    /// passes the access gate and is promoted via [`allow_peer_update`].
+    pub fn allow_portal_peer(&self, peer_id: &str) {
         self.state
             .write()
-            .allowed
+            .portal_allowed
             .insert(peer_id.trim_end_matches('=').to_string());
     }
 
@@ -509,9 +527,17 @@ async fn handle_connection(
         &peer_id[..12.min(peer_id.len())]
     );
 
-    // Check authorization
-    let allowed = state.read().allowed.contains(&peer_id);
-    if !allowed {
+    // Check authorization. A peer with full access joins the relay normally;
+    // a portal-only guest (trusted but not yet access-granted) is admitted with
+    // a restricted lane: it may open the `web.host.app.v1` portal stream to
+    // pass the access gate, but gets no room join, no datagram forwarding, and
+    // no reliable signaling until promoted into `allowed`.
+    let (allowed, portal_only) = {
+        let st = state.read();
+        let full = st.allowed.contains(&peer_id);
+        (full, !full && st.portal_allowed.contains(&peer_id))
+    };
+    if !allowed && !portal_only {
         warn!(
             "Unauthorized relay peer: {}",
             &peer_id[..12.min(peer_id.len())]
@@ -520,6 +546,12 @@ async fn handle_connection(
         let _ = send_cmd(&connection, &cmd).await;
         connection.close(0u32.into(), b"not_allowed");
         return Ok(());
+    }
+    if portal_only {
+        debug!(
+            "Portal-only guest relay connection: {}",
+            &peer_id[..12.min(peer_id.len())]
+        );
     }
 
     // Allocate peer index
@@ -569,8 +601,11 @@ async fn handle_connection(
     let welcome = serde_json::json!({"relay_cmd": "welcome", "index": peer_index});
     send_cmd(&connection, &welcome).await?;
 
-    // Notify room members if peer is already in a room
-    notify_room_peer_joined(&state, &peer_id, peer_index);
+    // Notify room members if peer is already in a room. Portal-only guests are
+    // never room members, so skip.
+    if !portal_only {
+        notify_room_peer_joined(&state, &peer_id, peer_index);
+    }
 
     info!(
         "Relay peer connected: {} index={} from {}",
@@ -591,11 +626,15 @@ async fn handle_connection(
         let peer_id_streams = peer_id.clone();
         let hook_lock = bidi_hook.clone();
         let signal_lock = signal_hook.clone();
+        let state_streams = state.clone();
         tokio::spawn(async move {
             while let Ok((send, mut recv)) = conn_streams.accept_bi().await {
                 let peer = peer_id_streams.clone();
                 let hook = hook_lock.read().clone();
                 let signal = signal_lock.read().clone();
+                // Full access is re-read per stream so a mid-connection grant
+                // (portal guest → promoted) takes effect without reconnect.
+                let full_access = state_streams.read().allowed.contains(&peer);
                 // Read the discriminating prefix on its own task so a slow
                 // client can't stall the accept loop for other streams.
                 tokio::spawn(async move {
@@ -605,10 +644,16 @@ async fn handle_connection(
                     }
                     let first = u32::from_be_bytes(len_buf);
                     if first == conquerd_features::channel_frame::RELAY_SIGNAL_STREAM_MAGIC {
-                        if let Some(signal) = signal {
-                            (signal)(peer, send, recv);
+                        // Reliable signaling (room chat/file) is full-access only.
+                        // Portal-only guests get their signaling stream dropped.
+                        if full_access {
+                            if let Some(signal) = signal {
+                                (signal)(peer, send, recv);
+                            }
                         }
                     } else if let Some(hook) = hook {
+                        // The portal (`web.host.app.v1`) is reachable by guests —
+                        // it is how they pass the access gate.
                         (hook)(peer, send, recv, first);
                     }
                     // No matching hook → streams drop (remote gets a reset).
@@ -629,13 +674,19 @@ async fn handle_connection(
             dgram = connection.read_datagram() => {
                 match dgram {
                     Ok(data) => {
-                        handle_datagram(
-                            &state_clone,
-                            &features_clone,
-                            &room_audio_bridge_clone,
-                            &peer_id_clone,
-                            &data,
-                        );
+                        // Datagram forwarding (room audio, peer relay) is
+                        // full-access only; a portal-only guest's datagrams are
+                        // dropped. Re-read per datagram so a mid-connection
+                        // grant takes effect immediately.
+                        if state_clone.read().allowed.contains(&peer_id_clone) {
+                            handle_datagram(
+                                &state_clone,
+                                &features_clone,
+                                &room_audio_bridge_clone,
+                                &peer_id_clone,
+                                &data,
+                            );
+                        }
                     }
                     Err(_) => break, // Connection closed
                 }

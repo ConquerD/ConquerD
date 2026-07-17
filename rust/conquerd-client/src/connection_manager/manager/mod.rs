@@ -1004,6 +1004,9 @@ impl ConnectionManager {
                 // Advertise our display handle so the peer list shows names even
                 // when the original invite handshake stored an empty handle.
                 self.send_handle_update(&peer_id).await;
+                // Advertise our avatar config too, so the peer renders the
+                // identicon we configured rather than the default fallback.
+                self.send_local_avatar_config(&peer_id).await;
                 // Direct path recovered — a pending private-room call fallback
                 // (or an armed grace-period check) for this peer is moot.
                 if self.direct_fallback.is_pending_for(&peer_id) {
@@ -1380,6 +1383,27 @@ impl ConnectionManager {
         query: Option<String>,
         reply_tx: tokio::sync::oneshot::Sender<std::result::Result<WebAppResponse, String>>,
     ) {
+        // `open_node_portal` navigates immediately while RequestRelay is still
+        // in flight. Wait briefly (same budget as portal game open) so the
+        // first page load does not fail with "Portal unavailable" before the
+        // QUIC relay is ready.
+        if !self
+            .quic_relays
+            .get(&supernode_id)
+            .is_some_and(|r| r.is_alive())
+        {
+            self.request_relay(&supernode_id).await;
+            for _ in 0..40 {
+                if self
+                    .quic_relays
+                    .get(&supernode_id)
+                    .is_some_and(|r| r.is_alive())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
         let Some(relay) = self.quic_relays.get(&supernode_id).cloned() else {
             let _ = reply_tx.send(Err(format!(
                 "no QUIC relay connection for supernode {}",
@@ -1510,6 +1534,21 @@ impl ConnectionManager {
     pub(super) async fn send_handle_update(&mut self, peer_id: &str) {
         let handle = peer_session::read_local_display_handle();
         self.send_handle_update_with(peer_id, &handle).await;
+    }
+
+    /// Send our locally-configured avatar to a peer (`AvatarConfig`), reading
+    /// the persisted `avatar_config_json`. Called on connect alongside
+    /// `send_handle_update` so a peer that connects *after* we last edited our
+    /// avatar still renders the identicon we configured — otherwise their
+    /// record keeps `avatar_config = None` and falls back to the default.
+    /// No-op when the user has not customised it (receiver defaults to the
+    /// identical `AvatarConfig::default()`).
+    pub(super) async fn send_local_avatar_config(&mut self, peer_id: &str) {
+        let config_json = peer_session::read_local_avatar_config();
+        if config_json.is_empty() {
+            return;
+        }
+        self.send_avatar_config(peer_id, &config_json).await;
     }
 
     pub(super) async fn send_handle_update_with(&mut self, peer_id: &str, handle: &str) {

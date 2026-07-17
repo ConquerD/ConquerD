@@ -3870,14 +3870,23 @@ fn resolve_avatar_config(
     });
 
     let config = if !cfg_str.is_empty() {
-        // Caller provided an explicit config (own-avatar preview).
+        // Caller provided an explicit config (own-avatar preview / any site
+        // that binds `configJson` directly, e.g. Settings and the top-right).
         serde_json::from_str(&cfg_str).unwrap_or_default()
     } else if seed_id == bridge.my_public_id {
-        // Empty configJson means "factory defaults" for the local user.
-        // Do not fall back to AppBridgeRust::avatar_config_json here —
-        // that field can lag behind SettingsModel during reset and would
-        // keep rendering the previous custom avatar until the next edit.
-        AvatarConfig::default()
+        // Local user's own avatar with no explicit config. Use the applied
+        // custom config so *every* self-avatar site (voice rail, own room
+        // messages, onboarding, …) renders identically to the Settings
+        // preview and the top-right avatar — not the factory default.
+        //
+        // `avatar_config_json` is kept in lockstep with SettingsModel: it is
+        // pushed on load, on every avatar edit, and on reset (which sets it to
+        // ""), so an empty value here genuinely means "factory defaults".
+        if bridge.avatar_config_json.is_empty() {
+            AvatarConfig::default()
+        } else {
+            serde_json::from_str(&bridge.avatar_config_json).unwrap_or_default()
+        }
     } else if let Some(ref ps) = bridge.peer_store {
         let store = ps.read();
         let rec = store
@@ -5746,16 +5755,49 @@ fn dispatch_event(
             });
         }
         ConnectionEvent::RelayGranted {
+            supernode_id,
             relay_host,
             relay_port,
+            portal_only,
             ..
         } => {
-            let banner = format!("Relay \u{00b7} {relay_host}:{relay_port}");
+            let banner = if portal_only {
+                "Portal \u{00b7} access required".to_owned()
+            } else {
+                format!("Relay \u{00b7} {relay_host}:{relay_port}")
+            };
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 bridge
                     .as_mut()
                     .set_session_banner(QString::from(banner.as_str()));
-                bridge.as_mut().set_connection_mode(QString::from("relay"));
+                bridge
+                    .as_mut()
+                    .set_connection_mode(QString::from(if portal_only {
+                        "portal"
+                    } else {
+                        "relay"
+                    }));
+                // Portal-only guest grant: route straight to the access gate.
+                // Inline the navigation (don't call open_node_portal, which
+                // would re-issue RequestRelay and loop against this grant).
+                if portal_only {
+                    let canon = bridge
+                        .rust()
+                        .resolve_supernode_node_id_str(&supernode_id)
+                        .unwrap_or_else(|| supernode_id.clone());
+                    let sn_id = bridge
+                        .rust()
+                        .pick_live_cluster_member(&canon)
+                        .unwrap_or(canon);
+                    #[cfg(feature = "webengine")]
+                    crate::ui::scheme::register_portal_peer_id(&sn_id);
+                    // Access portal is a separate page from the full dashboard.
+                    let url = format!("conquerd://{}/access.html", sn_id);
+                    bridge.as_mut().navigate_node_portal(
+                        QString::from(sn_id.as_str()),
+                        QString::from(url.as_str()),
+                    );
+                }
             });
         }
         ConnectionEvent::TypingIndicator { peer_id, is_typing } => {

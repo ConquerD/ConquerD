@@ -612,22 +612,44 @@ impl SupernodeState {
         let Some(link) = self.cluster_link.read().clone() else {
             return;
         };
-        let handle = self
+        let (handle, direct_invite) = self
             .peer_store
             .read()
             .get_peer(identity_pub)
-            .map(|p| p.handle.clone())
+            .map(|p| {
+                (
+                    p.handle.clone(),
+                    is_direct_invite_transcript(&p.transcript_hash),
+                )
+            })
             .unwrap_or_default();
-        link.replicate_peer_auth(identity_pub, &handle);
+        link.replicate_peer_auth(identity_pub, &handle, direct_invite);
     }
 
     /// Apply a client-authorization grant replicated from another member: trust
     /// the peer (peer store + relay allow-list + access grant) so this node
     /// accepts the client if it fails over here. Idempotent.
-    fn apply_peer_auth(&self, identity_pub: &str, handle: &str) {
+    fn apply_peer_auth(&self, identity_pub: &str, handle: &str, direct_invite: bool) {
         {
             let mut store = self.peer_store.write();
-            if !store.is_trusted(identity_pub) {
+            let transcript = if direct_invite {
+                REPLICATED_DIRECT_INVITE_MARKER.to_owned()
+            } else {
+                ROOM_GUEST_TRANSCRIPT_MARKER.to_owned()
+            };
+            if let Some(existing) = store.get_peer(identity_pub).cloned() {
+                // Upgrade room-guest → direct-invite marker when a sibling
+                // reports a real handshake; never downgrade.
+                let mut updated = existing;
+                if !handle.is_empty() {
+                    updated.handle = handle.to_string();
+                }
+                if direct_invite && !is_direct_invite_transcript(&updated.transcript_hash) {
+                    updated.transcript_hash = transcript;
+                }
+                store.add_peer(updated);
+                let _ = store.save();
+            } else {
                 let peer_id = crate::crypto::b64url_decode(identity_pub)
                     .map(|b| crate::crypto::derive_peer_id(&b))
                     .unwrap_or_default();
@@ -644,7 +666,7 @@ impl SupernodeState {
                     revoked: false,
                     auto_connect: false,
                     is_supernode: false,
-                    transcript_hash: String::new(),
+                    transcript_hash: transcript,
                     created_at: now,
                     last_seen_at: now,
                     quic_port: 0,
@@ -652,10 +674,92 @@ impl SupernodeState {
                 let _ = store.save();
             }
         }
+        // Respect the access gate on replicated trust: a peer trusted on
+        // another cluster member is admitted here, but only with full relay
+        // access if this node already grants them (direct-invite under open,
+        // or prior TOS accept). Otherwise portal-only so they can pass the
+        // access portal on this node.
         if let Some(ref relay) = self.relay {
-            relay.allow_peer(identity_pub);
+            if self.check_peer_access(identity_pub) {
+                relay.allow_peer(identity_pub);
+            } else {
+                relay.allow_portal_peer(identity_pub);
+            }
         }
-        self.access_controller.on_peer_granted(identity_pub);
+    }
+
+    /// True when `peer_id` completed a **direct supernode invite** (handshake
+    /// transcript present, or a cluster-replicated direct-invite marker).
+    /// Room-invite guests use [`ROOM_GUEST_TRANSCRIPT_MARKER`] and return false.
+    fn is_direct_invite_peer(&self, peer_id: &str) -> bool {
+        self.peer_store.read().get_peer(peer_id).is_some_and(|p| {
+            !p.revoked && !p.blocked && is_direct_invite_transcript(&p.transcript_hash)
+        })
+    }
+
+    /// Unified access check for ticket issuance and portal status.
+    ///
+    /// * **Open mode + direct invite** → granted (no TOS).
+    /// * **Open mode + room guest** → requires guest TOS accept on the controller.
+    /// * **tos / ad / code** → always consult the controller (including direct invite).
+    fn check_peer_access(&self, peer_id: &str) -> bool {
+        let mode = self.access_controller.mode_name();
+        if mode == "open" && self.is_direct_invite_peer(peer_id) {
+            return true;
+        }
+        self.access_controller.check_access(peer_id)
+    }
+
+    /// Promote a portal-only guest to full relay access after it passes the
+    /// access gate in the in-app portal. `relay_peer_id` is the un-padded id
+    /// from the portal QUIC stream; it is re-padded to the canonical
+    /// `public_id` so the peer store and access controller are keyed
+    /// consistently with the signaling/trust path. Records the grant and issues
+    /// a full relay ticket (which upgrades the guest's live relay connection in
+    /// place). Returns `false` when the caller is not a currently-trusted peer
+    /// (guards against un-handshaken callers reaching the grant endpoint).
+    pub(crate) fn grant_portal_access(&self, relay_peer_id: &str) -> bool {
+        let identity_pub = pad_base64url(relay_peer_id);
+        if !self.peer_store.read().is_trusted(&identity_pub) {
+            warn!(
+                "Portal access grant refused for untrusted peer {}",
+                &identity_pub[..12.min(identity_pub.len())]
+            );
+            return false;
+        }
+        self.access_controller.on_peer_granted(&identity_pub);
+        self.issue_relay_ticket(&identity_pub);
+        info!(
+            "Portal access granted to {} ({} gate passed)",
+            &identity_pub[..12.min(identity_pub.len())],
+            self.access_controller.mode_name()
+        );
+        true
+    }
+
+    /// Access-gate status for the calling portal peer. `relay_peer_id` is the
+    /// un-padded portal-stream id; it is re-padded to match the access
+    /// controller's key space. Drives the gate page: when `granted` is false
+    /// the page renders the gate for `access_mode`, otherwise it proceeds to
+    /// the dashboard.
+    pub(crate) fn portal_access_status(&self, relay_peer_id: &str) -> serde_json::Value {
+        let identity_pub = pad_base64url(relay_peer_id);
+        let direct_invite = self.is_direct_invite_peer(&identity_pub);
+        let granted = self.check_peer_access(&identity_pub);
+        let mode = self.access_controller.mode_name();
+        // Open-mode room guests use the TOS access portal; direct-invite peers
+        // skip it. Explicit tos/ad/code modes always expose their gate kind.
+        let requires_gate = !granted;
+        json!({
+            "granted": granted,
+            "access_mode": mode,
+            "direct_invite": direct_invite,
+            "requires_gate": requires_gate,
+            "access_portal": self.access_controller.portal_entry_path(),
+            "tos_text": self.config.tos_text,
+            "ad_duration": self.config.ad_duration,
+            "ad_content": self.config.ad_content,
+        })
     }
 
     /// Send a signed message to a peer via signaling.
@@ -735,8 +839,92 @@ impl SupernodeState {
         payload
     }
 
-    /// Issue a relay ticket to a peer.
+    /// Issue a **full-access** relay ticket to a peer (rooms, audio, signaling).
     fn issue_relay_ticket(&self, peer_pub: &str) {
+        self.issue_ticket(peer_pub, false);
+    }
+
+    /// Issue a **portal-only** ticket to a trusted-but-not-yet-access-granted
+    /// guest. The client can establish the relay connection and open the
+    /// `web.host.app.v1` portal to pass the access gate, but the relay withholds
+    /// rooms, datagram forwarding, and reliable signaling until the guest is
+    /// promoted via [`issue_relay_ticket`].
+    fn issue_portal_ticket(&self, peer_pub: &str) {
+        self.issue_ticket(peer_pub, true);
+    }
+
+    /// Issue the correct ticket shape for a peer that is already authorized
+    /// (trusted and/or room-admitted): full relay when the access gate grants
+    /// them, portal-only otherwise so they can still load the access portal.
+    fn issue_ticket_for_access_state(&self, peer_pub: &str) {
+        if self.check_peer_access(peer_pub) {
+            self.issue_relay_ticket(peer_pub);
+        } else {
+            self.issue_portal_ticket(peer_pub);
+        }
+    }
+
+    /// Ensure a room-admitted peer can open the portal / room-audio QUIC path
+    /// even when they never completed a full supernode invite handshake.
+    ///
+    /// Room invites (`conquerd://room#…`) deliberately skip the handshake, so
+    /// the peer is WS-connected and in the SFU ACL but not in `peers.json`.
+    /// Without a relay ticket the client shows "Portal unavailable" because
+    /// `web.host.app.v1` rides the identity QUIC relay only. Trusting the
+    /// room-authorized peer here (same shape as cluster `PeerAuth`) and
+    /// issuing a ticket closes that gap; the access gate still decides
+    /// portal-only vs full relay.
+    fn ensure_relay_for_room_guest(&self, peer_pub: &str) {
+        let already_trusted = self.peer_store.read().is_trusted(peer_pub);
+        if !already_trusted {
+            {
+                let mut store = self.peer_store.write();
+                if !store.is_trusted(peer_pub) {
+                    let peer_id = crate::crypto::b64url_decode(peer_pub)
+                        .map(|b| crate::crypto::derive_peer_id(&b))
+                        .unwrap_or_default();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64();
+                    store.add_peer(peer_store::PeerRecord {
+                        peer_id,
+                        identity_pub: peer_pub.to_string(),
+                        relay_hints: vec![],
+                        handle: String::new(),
+                        blocked: false,
+                        revoked: false,
+                        auto_connect: false,
+                        is_supernode: false,
+                        // Room-invite path — not a direct supernode handshake.
+                        // Marker keeps open-mode guest TOS required.
+                        transcript_hash: ROOM_GUEST_TRANSCRIPT_MARKER.to_owned(),
+                        created_at: now,
+                        last_seen_at: now,
+                        quic_port: 0,
+                    });
+                    let _ = store.save();
+                    info!(
+                        "Trusted room-invite guest {} for portal/relay access",
+                        &peer_pub[..12.min(peer_pub.len())]
+                    );
+                }
+            }
+            // First admission: full on_peer_trusted path (capability announce,
+            // cluster PeerAuth so other members accept failover, ticket).
+            self.on_peer_trusted(peer_pub);
+            return;
+        }
+        // Already trusted (handshake or prior room admit): refresh the ticket
+        // so a later RequestRelay after idle still lands. Matches the
+        // access-gate branch of on_peer_trusted without re-announcing caps.
+        self.issue_ticket_for_access_state(peer_pub);
+    }
+
+    /// Shared ticket issuance. `portal_only` decides whether the relay admits
+    /// the peer with full access or the restricted portal lane, and is echoed
+    /// in `RelayGranted` so the client knows to route straight to the gate.
+    fn issue_ticket(&self, peer_pub: &str, portal_only: bool) {
         let Some(ref relay) = self.relay else { return };
 
         let external = self.config.external_host.as_deref().unwrap_or("0.0.0.0");
@@ -753,7 +941,11 @@ impl SupernodeState {
             &self.identity.signing_key,
         );
 
-        relay.allow_peer_update(peer_pub);
+        if portal_only {
+            relay.allow_portal_peer(peer_pub);
+        } else {
+            relay.allow_peer_update(peer_pub);
+        }
 
         self.ticket_expiry
             .write()
@@ -766,6 +958,10 @@ impl SupernodeState {
                 "ticket": ticket.to_value(),
                 "relay_host": ticket.relay_host,
                 "relay_port": ticket.relay_port,
+                // Backward-compatible: older clients ignore this and treat the
+                // grant as full. New clients route portal-only grants to the gate.
+                "portal_only": portal_only,
+                "access_mode": self.access_controller.mode_name(),
             }),
         );
 
@@ -778,7 +974,8 @@ impl SupernodeState {
         );
 
         info!(
-            "Issued relay ticket to {}",
+            "Issued {} ticket to {}",
+            if portal_only { "portal-only" } else { "relay" },
             &peer_pub[..12.min(peer_pub.len())]
         );
     }
@@ -810,16 +1007,20 @@ impl SupernodeState {
         // any member. Idempotent on the receiving side; no-op when standalone.
         self.replicate_peer_auth(identity_pub);
 
-        if self.access_controller.check_access(identity_pub) {
+        if self.check_peer_access(identity_pub) {
             self.issue_relay_ticket(identity_pub);
         } else {
-            // Trusted but not yet access-granted. The legacy HTTPS portal
-            // redirect (`RelayPaymentRequired`) has been removed; out-of-band
-            // grant flow (operator CLI / `access_controller`) is the path now.
+            // Trusted but not yet access-granted. Admit as a portal-only guest
+            // so the client can open `/access.html` and pass the access gate
+            // (open-mode guest TOS / tos / ad / code). Passing it calls
+            // `grant_portal_access` which promotes the guest to a full ticket.
             info!(
-                "Peer {} is trusted but lacks relay access; awaiting operator grant",
-                &identity_pub[..12.min(identity_pub.len())]
+                "Peer {} is trusted but not access-granted; issuing portal-only ticket ({} gate, direct_invite={})",
+                &identity_pub[..12.min(identity_pub.len())],
+                self.access_controller.mode_name(),
+                self.is_direct_invite_peer(identity_pub)
             );
+            self.issue_portal_ticket(identity_pub);
         }
 
         // Replay stored endpoint updates
@@ -1243,7 +1444,7 @@ impl SupernodeState {
             .iter()
             .filter_map(|id| {
                 let rec = store.get_peer(id)?;
-                let has_relay = self.access_controller.check_access(id);
+                let has_relay = self.check_peer_access(id);
                 let online = connected_set.contains(id.as_str());
                 Some(json!({
                     "handle": if rec.handle.is_empty() { &rec.peer_id[..12.min(rec.peer_id.len())] } else { &rec.handle },
@@ -1257,6 +1458,19 @@ impl SupernodeState {
 
         json!(peers)
     }
+}
+
+/// Peer-store `transcript_hash` for room-invite guests (no supernode handshake).
+/// Open mode requires TOS accept for these peers before full relay access.
+const ROOM_GUEST_TRANSCRIPT_MARKER: &str = "room-guest";
+
+/// Cluster-replicated marker for peers who completed a direct supernode invite
+/// on another member (real handshake transcript is not gossiped).
+const REPLICATED_DIRECT_INVITE_MARKER: &str = "replicated-direct-invite";
+
+/// True when the peer-store transcript marks a **direct supernode invite**.
+fn is_direct_invite_transcript(transcript_hash: &str) -> bool {
+    !transcript_hash.is_empty() && transcript_hash != ROOM_GUEST_TRANSCRIPT_MARKER
 }
 
 /// Re-pad an un-padded base64url identifier (as produced by the relay's
@@ -1591,17 +1805,35 @@ impl SignalingHandler for SupernodeHandler {
             }
             MessageType::RelayRequest => {
                 // Client explicitly requests (or refreshes) a relay ticket.
-                // Re-issue if the peer is trusted and has relay access.
+                // Authorize when:
+                //   * peer is trusted (handshake / prior room admit), or
+                //   * peer has real SFU room membership (room-invite guest).
+                // Access gate then picks full vs portal-only. Previously we
+                // required both trust *and* check_access, which (1) dropped
+                // trusted peers who still needed the portal gate and (2)
+                // permanently stranded room-invite-only peers with
+                // "Portal unavailable".
                 let trusted = self.state.peer_store.read().is_trusted(&msg.sender);
-                if trusted && self.state.access_controller.check_access(&msg.sender) {
+                let room_authorized = self
+                    .state
+                    .sfu
+                    .as_ref()
+                    .is_some_and(|sfu| sfu.read().is_room_authorized_peer(&msg.sender));
+                if trusted || room_authorized {
                     debug!(
-                        "[relay] RelayRequest from {} â€” re-issuing ticket",
-                        &msg.sender[..12.min(msg.sender.len())]
+                        "[relay] RelayRequest from {} — issuing ticket (trusted={} room={})",
+                        &msg.sender[..12.min(msg.sender.len())],
+                        trusted,
+                        room_authorized
                     );
-                    self.state.issue_relay_ticket(&msg.sender);
+                    if room_authorized && !trusted {
+                        self.state.ensure_relay_for_room_guest(&msg.sender);
+                    } else {
+                        self.state.issue_ticket_for_access_state(&msg.sender);
+                    }
                 } else {
                     debug!(
-                        "[relay] RelayRequest from {} ignored (not trusted / no access)",
+                        "[relay] RelayRequest from {} ignored (not trusted / no room membership)",
                         &msg.sender[..12.min(msg.sender.len())]
                     );
                 }
@@ -1970,6 +2202,12 @@ impl SupernodeHandler {
             &msg.sender[..12.min(msg.sender.len())],
             room_id
         );
+
+        // Room membership authorizes portal + room-audio QUIC even without a
+        // full supernode handshake (room-invite path). Issue / refresh ticket
+        // proactively so the client's ensure_room_relay / open portal don't
+        // race an empty RelayRequest denial.
+        self.state.ensure_relay_for_room_guest(&msg.sender);
 
         // Participant IDs/counts changed; refresh every connected peer's
         // room sidebar so voice stats stay scoped to the actual room.
@@ -2435,6 +2673,14 @@ impl SupernodeHandler {
                 }),
             );
 
+            // A validated room invite is enough authorization for portal /
+            // room-audio relay tickets (the peer is on the room ACL even before
+            // the follow-up SfuJoin). Without this, room-invite-only guests
+            // open the portal and get "Portal unavailable".
+            if valid {
+                self.state.ensure_relay_for_room_guest(&msg.sender);
+            }
+
             // Room visibility + counts arrive via the client's pending SfuJoin
             // (SfuMembers sidebar patch + post-join broadcast_room_list). A
             // pre-join SfuRoomList here races that path and resets private-room
@@ -2705,7 +2951,7 @@ async fn main() -> anyhow::Result<()> {
             let weak = weak.clone();
             Arc::new(move |g: cluster_link::PeerAuthGrant| {
                 if let Some(state) = weak.upgrade() {
-                    state.apply_peer_auth(&g.identity_pub, &g.handle);
+                    state.apply_peer_auth(&g.identity_pub, &g.handle, g.direct_invite);
                 }
             })
         };
@@ -3029,7 +3275,9 @@ fn check_ticket_renewals(state: &SupernodeState) {
             "Renewing relay ticket for {}",
             &peer_id[..12.min(peer_id.len())]
         );
-        state.issue_relay_ticket(&peer_id);
+        // Respect the access gate on renewal — do not promote a portal-only
+        // guest to full relay just because their ticket is about to expire.
+        state.issue_ticket_for_access_state(&peer_id);
     }
 }
 
@@ -3065,6 +3313,7 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
     // live inside the crate so the build works regardless of whether the
     // wider project root (games/, web-sdk/) is present (e.g. on Linux CI).
     const PORTAL_HTML: &str = include_str!("../templates/web_index.html");
+    const ACCESS_HTML: &str = include_str!("../templates/web_access.html");
 
     // Cursor relay (original example)
     const CURSOR_HTML: &str = include_str!("../templates/games_example_index.html");
@@ -3095,6 +3344,8 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
     // customise these first-party files directly.
     let always_update: &[(&[&str], &str)] = &[
         (&["web", "index.html"], PORTAL_HTML),
+        // Standalone access portal (TOS / gate) — separate from the full portal.
+        (&["web", "access.html"], ACCESS_HTML),
         // Served at /web-sdk/conquerd.mjs â€” must live under web/ so that
         // the web_app_module route() function finds it via the web_root.
         (&["web", "web-sdk", "conquerd.mjs"], CONQUERD_MJS),
@@ -3132,6 +3383,19 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod access_invite_tests {
+    use super::*;
+
+    #[test]
+    fn direct_invite_transcript_detects_handshake_and_markers() {
+        assert!(is_direct_invite_transcript("abc123deadbeef"));
+        assert!(is_direct_invite_transcript(REPLICATED_DIRECT_INVITE_MARKER));
+        assert!(!is_direct_invite_transcript(""));
+        assert!(!is_direct_invite_transcript(ROOM_GUEST_TRANSCRIPT_MARKER));
     }
 }
 

@@ -832,11 +832,19 @@ impl ConnectionManager {
                     .get("relay_port")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as u16;
+                // Portal-only grant: we're a guest that must pass the access
+                // gate before full relay access. Absent on older supernodes.
+                let portal_only = msg
+                    .payload
+                    .get("portal_only")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 self.emit_event(ConnectionEvent::RelayGranted {
                     supernode_id: msg.sender.clone(),
                     ticket,
                     relay_host: host.clone(),
                     relay_port: port,
+                    portal_only,
                 });
                 // Open the QUIC relay connection so subsequent
                 // `web.host.app.v1` fetches (and future native SFU paths)
@@ -1333,6 +1341,7 @@ impl ConnectionManager {
                 // Redundant with inviter_handle on ACCEPT, but also covers reconnect
                 // paths that only re-run INIT/ACCEPT without a fresh invite URL.
                 self.send_handle_update(&joiner_peer_id).await;
+                self.send_local_avatar_config(&joiner_peer_id).await;
 
                 self.emit_event(ConnectionEvent::PeerConnected(joiner_peer_id.clone()));
                 self.emit_event(ConnectionEvent::InviteAccepted {
@@ -1429,6 +1438,7 @@ impl ConnectionManager {
                     // Tell the inviter our display name (INIT may have been empty
                     // if settings loaded after handshake started).
                     self.send_handle_update(&inviter_peer_id).await;
+                    self.send_local_avatar_config(&inviter_peer_id).await;
                     self.emit_event(ConnectionEvent::PeerConnected(inviter_peer_id.clone()));
                     self.emit_event(ConnectionEvent::InviteAccepted {
                         peer_id: inviter_peer_id,

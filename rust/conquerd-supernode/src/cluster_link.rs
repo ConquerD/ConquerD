@@ -79,6 +79,11 @@ pub enum ClusterMsgKind {
     PeerAuth {
         identity_pub: String,
         handle: String,
+        /// True when the origin node admitted this peer via a **direct supernode
+        /// invite handshake** (non-empty transcript). Room-invite guests leave
+        /// this false so open-mode TOS still applies after failover.
+        #[serde(default)]
+        direct_invite: bool,
     },
     /// Sent once after `Hello` to advertise this node's software version.
     VersionInfo {
@@ -199,6 +204,8 @@ pub struct ReplicatedMsg {
 pub struct PeerAuthGrant {
     pub identity_pub: String,
     pub handle: String,
+    /// Origin admitted via direct supernode invite (handshake transcript).
+    pub direct_invite: bool,
 }
 
 /// Fetches the `room_id`s this node currently has local subscribers for.
@@ -337,11 +344,12 @@ impl ClusterLink {
 
     /// Broadcast a client-authorization grant to all peer members so any member
     /// accepts this client's signaling/relay after it fails over.
-    pub fn replicate_peer_auth(&self, identity_pub: &str, handle: &str) {
+    pub fn replicate_peer_auth(&self, identity_pub: &str, handle: &str, direct_invite: bool) {
         let msg = ClusterMsg::signed(
             ClusterMsgKind::PeerAuth {
                 identity_pub: identity_pub.to_string(),
                 handle: handle.to_string(),
+                direct_invite,
             },
             &self.identity,
         );
@@ -733,10 +741,12 @@ impl ClusterLink {
             ClusterMsgKind::PeerAuth {
                 identity_pub,
                 handle,
+                direct_invite,
             } => {
                 (self.on_peer_auth)(PeerAuthGrant {
                     identity_pub,
                     handle,
+                    direct_invite,
                 });
             }
             ClusterMsgKind::VersionInfo {
@@ -1243,7 +1253,7 @@ mod tests {
 
         let mut delivered = false;
         for _ in 0..100 {
-            link_a.replicate_peer_auth("client-XYZ", "Alice");
+            link_a.replicate_peer_auth("client-XYZ", "Alice", true);
             if !auths.lock().is_empty() {
                 delivered = true;
                 break;
@@ -1255,6 +1265,7 @@ mod tests {
             let got = auths.lock();
             assert_eq!(got[0].identity_pub, "client-XYZ");
             assert_eq!(got[0].handle, "Alice");
+            assert!(got[0].direct_invite);
         }
         link_a.shutdown();
         link_b.shutdown();

@@ -650,6 +650,17 @@ impl SFURoomManager {
         })
     }
 
+    /// True when `peer_id` has real membership in any room (creator, ACL,
+    /// voice participant, or text subscriber). Used to authorize portal/relay
+    /// tickets for room-invite guests who never completed a full supernode
+    /// handshake. Deliberately does **not** count public-room visibility —
+    /// merely being able to *see* the default lobby must not grant relay.
+    pub fn is_room_authorized_peer(&self, peer_id: &str) -> bool {
+        self.rooms
+            .values()
+            .any(|r| r.is_invite_eligible_member(peer_id))
+    }
+
     /// Subscribe a peer to a room's text chat without voice join.
     pub fn subscribe(&mut self, peer_id: &str, room_id: &str) -> bool {
         if let Some(room) = self.rooms.get_mut(room_id) {
@@ -862,6 +873,29 @@ mod tests {
         assert!(!mgr.is_chat_sender("r1", "outsider"));
         assert!(mgr.subscribe("listener", "r1"));
         assert!(mgr.is_chat_sender("r1", "listener"));
+    }
+
+    #[test]
+    fn room_authorized_peer_requires_real_membership_not_public_visibility() {
+        let mut mgr = SFURoomManager::new();
+        // Built-in default is public — mere visibility must not grant relay.
+        assert!(
+            !mgr.is_room_authorized_peer("stranger"),
+            "public lobby visibility is not room authorization"
+        );
+
+        mgr.create_room(Some("priv"), "Private", RoomType::Private, "owner")
+            .expect("room");
+        // ACL allow (room-invite path) counts.
+        mgr.allow_peer("priv", "invited");
+        assert!(mgr.is_room_authorized_peer("invited"));
+        assert!(!mgr.is_room_authorized_peer("outsider"));
+
+        // Voice join on a public room also counts (actual membership).
+        mgr.create_room(Some("pub"), "Public", RoomType::Public, "owner2")
+            .expect("room");
+        mgr.join_room("joiner", "pub");
+        assert!(mgr.is_room_authorized_peer("joiner"));
     }
 
     #[test]

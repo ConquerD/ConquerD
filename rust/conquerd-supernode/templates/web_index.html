@@ -144,7 +144,6 @@
   <div id="error-banner"></div>
 
   <main id="main">
-    <!-- Stat cards -->
     <div class="grid" id="stat-cards">
       <div class="card">
         <div class="card-label">Uptime</div>
@@ -164,7 +163,6 @@
       </div>
     </div>
 
-    <!-- Cluster members (hidden when standalone) -->
     <section id="cluster-section">
       <h2>Cluster — <span id="cluster-id-display" style="color:var(--text);text-transform:none;letter-spacing:normal"></span></h2>
       <table>
@@ -177,7 +175,6 @@
       </table>
     </section>
 
-    <!-- Games -->
     <section>
       <h2>Games (game.relay.v1)</h2>
       <div class="games-grid" id="games-grid">
@@ -206,7 +203,6 @@
   </footer>
 
   <script>
-    // ── Helpers ────────────────────────────────────────────────────────────
     function el(id) { return document.getElementById(id); }
 
     function fmtUptime(secs) {
@@ -226,14 +222,16 @@
       return `<span class="badge ${cls || ''}">${text}</span>`;
     }
 
-    // ── Portal bootstrap ───────────────────────────────────────────────────
     let myPeerId = "";
     let supernodeId = "";
     let conquerdFetch = null;
 
+    function accessPortalUrl() {
+      return "conquerd://" + supernodeId + "/access.html";
+    }
+
     async function bootstrap() {
       try {
-        // window.conquerd is injected by the native client's scheme handler.
         if (typeof window.conquerd === "undefined") {
           showError("window.conquerd bridge not available. Open this page through the Conquerd client.");
           return;
@@ -243,30 +241,46 @@
         supernodeId = ctx.supernodeId || window.location.hostname;
         conquerdFetch = ctx.fetch.bind(ctx);
 
-        // Update header
         el("node-id-display").textContent = `supernode: ${supernodeId}`;
         el("stat-my-id").textContent = myPeerId || "—";
 
-        // Fix all game links to use the correct supernode id
         const gameExample = el("game-example");
         if (gameExample) gameExample.href = `conquerd://${supernodeId}/games/example/`;
-
         const gameDrawing = el("game-drawing");
         if (gameDrawing) gameDrawing.href = `conquerd://${supernodeId}/games/shared-drawing/`;
-
         const gameBrick = el("game-brick");
         if (gameBrick) gameBrick.href = `conquerd://${supernodeId}/games/brick-breaker/`;
 
-        // Hide spinner, show content
-        el("connecting").style.display = "none";
-        el("main").classList.add("visible");
+        // Full portal is for authorized peers only. Guests (and gated modes)
+        // are sent to the separate access portal first.
+        const status = await fetchAccessStatus();
+        if (!status || status.granted !== true) {
+          window.location.replace(accessPortalUrl());
+          return;
+        }
 
-        // Initial load + start polling
-        await refresh();
-        setInterval(refresh, 10000);
+        el("connecting").style.display = "none";
+        enterDashboard();
       } catch (e) {
         showError(`Bridge error: ${e.message || e}`);
       }
+    }
+
+    async function fetchAccessStatus() {
+      try {
+        const r = await conquerdFetch("/api/access/status");
+        return await r.json();
+      } catch (e) {
+        console.warn("[portal] access status unavailable:", e);
+        // Fail closed for the full portal — send to access page.
+        return { granted: false };
+      }
+    }
+
+    function enterDashboard() {
+      el("main").classList.add("visible");
+      refresh();
+      setInterval(refresh, 10000);
     }
 
     async function refresh() {
@@ -330,7 +344,6 @@
       banner.textContent = msg;
     }
 
-    // ── Boot ───────────────────────────────────────────────────────────────
     bootstrap().catch(e => showError(String(e)));
   </script>
 </body>

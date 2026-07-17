@@ -769,6 +769,13 @@ ApplicationWindow {
         function onThemeChanged() {
             applyThemePreference(settingsModel.theme)
         }
+        // Keep the bridge's applied avatar config in lockstep with settings so
+        // every self-avatar site (voice rail, own room messages, …) resolves to
+        // the same config as the Settings preview — including after a profile
+        // reload or reset, not just after an in-page avatar edit.
+        function onAvatar_config_jsonChanged() {
+            backend.setAvatarConfigJson(settingsModel.avatar_config_json)
+        }
     }
 
     Connections {

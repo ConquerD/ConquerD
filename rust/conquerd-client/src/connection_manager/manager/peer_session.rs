@@ -164,6 +164,27 @@ pub(super) fn read_local_display_handle() -> String {
         .to_owned()
 }
 
+/// Own avatar configuration JSON from this profile's `settings.json`
+/// (`avatar_config_json`). An empty string means "use defaults" — there is
+/// nothing to send because the receiver already falls back to the identical
+/// `AvatarConfig::default()`. Mirrors [`read_local_display_handle`] so the
+/// avatar propagates on connect the same way the handle does.
+pub(super) fn read_local_avatar_config() -> String {
+    let path = Identity::default_key_dir().join("settings.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return String::new();
+    };
+    value
+        .get("avatar_config_json")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_owned()
+}
+
 pub fn peer_quic_endpoint(record: &crate::peer_store::PeerRecord) -> Option<(String, u16)> {
     record
         .relay_hints

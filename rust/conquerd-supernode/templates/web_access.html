@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conquerd — Access</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --border:   #30363d;
+      --text:     #e6edf3;
+      --muted:    #8b949e;
+      --accent:   #58a6ff;
+      --green:    #3fb950;
+      --red:      #f85149;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, "Cascadia Code", "Fira Code", "Menlo", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+    }
+    header h1 { font-size: 15px; color: var(--accent); letter-spacing: 0.03em; }
+    header .node-id {
+      font-size: 11px;
+      color: var(--muted);
+      word-break: break-all;
+      margin-top: 2px;
+    }
+    #connecting {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 50vh;
+      color: var(--muted);
+      gap: 8px;
+    }
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #error-banner {
+      display: none;
+      background: #2d1a1a;
+      border: 1px solid var(--red);
+      color: var(--red);
+      padding: 10px 16px;
+      margin: 16px 24px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    #gate { display: none; padding: 32px 24px; max-width: 720px; margin: 0 auto; }
+    #gate.visible { display: block; }
+    #gate h2 { font-size: 16px; color: var(--accent); margin-bottom: 6px; letter-spacing: 0.02em; }
+    #gate .gate-sub { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+    .gate-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px 22px;
+    }
+    #gate-tos-text {
+      white-space: pre-wrap;
+      max-height: 46vh;
+      overflow-y: auto;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-size: 12px;
+      line-height: 1.7;
+      color: var(--text);
+      margin-bottom: 18px;
+    }
+    .gate-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    .btn {
+      background: var(--accent);
+      color: #0d1117;
+      border: none;
+      border-radius: 7px;
+      padding: 10px 20px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.9; }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+    .gate-note { color: var(--muted); font-size: 11px; }
+    .gate-note.err { color: var(--red); }
+    .gate-note.ok  { color: var(--green); }
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 14px 24px;
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: auto;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Conquerd — Access</h1>
+      <div class="node-id" id="node-id-display">Connecting…</div>
+    </div>
+  </header>
+
+  <div id="connecting"><div class="spinner"></div> Establishing secure session…</div>
+  <div id="error-banner"></div>
+
+  <div id="gate">
+    <h2 id="gate-title">Access required</h2>
+    <div class="gate-sub" id="gate-subtitle">This supernode requires you to continue.</div>
+    <div class="gate-panel">
+      <div id="gate-tos-text">Loading…</div>
+      <div class="gate-actions">
+        <button class="btn" id="gate-accept">I Accept</button>
+        <span class="gate-note" id="gate-note"></span>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <span>Agree to continue to the full supernode portal</span>
+  </footer>
+
+  <script>
+    function el(id) { return document.getElementById(id); }
+
+    const DEFAULT_TOS =
+      "By continuing you agree to use this supernode responsibly.\n\n" +
+      "You were admitted via a room invite, not a direct supernode invite. " +
+      "Accepting grants relay and portal access for this session on this node.";
+
+    let conquerdFetch = null;
+    let supernodeId = "";
+
+    function portalHomeUrl() {
+      // Prefer same-origin root so the full portal (index.html) loads.
+      return "conquerd://" + supernodeId + "/";
+    }
+
+    async function bootstrap() {
+      try {
+        if (typeof window.conquerd === "undefined") {
+          showError("window.conquerd bridge not available. Open this page through the Conquerd client.");
+          return;
+        }
+        const ctx = await window.conquerd.ready;
+        supernodeId = ctx.supernodeId || window.location.hostname;
+        conquerdFetch = ctx.fetch.bind(ctx);
+        el("node-id-display").textContent = "supernode: " + supernodeId;
+        el("connecting").style.display = "none";
+
+        const status = await fetchAccessStatus();
+        if (status && status.granted === true) {
+          // Already authorized — continue to the full portal.
+          window.location.replace(portalHomeUrl());
+          return;
+        }
+        showGate(status || { access_mode: "open", tos_text: "" });
+      } catch (e) {
+        showError("Bridge error: " + (e.message || e));
+      }
+    }
+
+    async function fetchAccessStatus() {
+      try {
+        const r = await conquerdFetch("/api/access/status");
+        return await r.json();
+      } catch (e) {
+        console.warn("[access] status unavailable:", e);
+        return null;
+      }
+    }
+
+    function showGate(status) {
+      const mode = status.access_mode || "open";
+      const note = el("gate-note");
+      note.className = "gate-note";
+      note.textContent = "";
+      const acceptBtn = el("gate-accept");
+
+      if (mode === "tos" || mode === "open") {
+        el("gate-title").textContent =
+          mode === "open" ? "Terms of Service" : "Terms of Service";
+        el("gate-subtitle").textContent =
+          mode === "open"
+            ? "You joined via a room invite. Please review and accept to use this supernode's portal and relay."
+            : "Please review and accept to use this supernode.";
+        const text = (status.tos_text && String(status.tos_text).trim())
+          ? status.tos_text
+          : DEFAULT_TOS;
+        el("gate-tos-text").textContent = text;
+        acceptBtn.textContent = "I Accept";
+      } else if (mode === "ad") {
+        el("gate-title").textContent = "Access required";
+        el("gate-subtitle").textContent = "This supernode uses ad-gated access.";
+        el("gate-tos-text").textContent =
+          (status.ad_content && String(status.ad_content).trim())
+            ? status.ad_content
+            : "Continue after the access delay to use this supernode.";
+        acceptBtn.textContent = "Continue";
+      } else if (mode === "code") {
+        el("gate-title").textContent = "Access required";
+        el("gate-subtitle").textContent = "This supernode requires an access code.";
+        el("gate-tos-text").textContent =
+          "Continue to request access. (Code entry UI uses the accept action on this build.)";
+        acceptBtn.textContent = "Continue";
+      } else {
+        el("gate-title").textContent = "Access required";
+        el("gate-subtitle").textContent =
+          'This supernode uses "' + mode + '" access control.';
+        el("gate-tos-text").textContent = "Continue to request access to this supernode.";
+        acceptBtn.textContent = "Continue";
+      }
+
+      acceptBtn.onclick = async () => {
+        acceptBtn.disabled = true;
+        note.className = "gate-note";
+        note.textContent = "Submitting…";
+        try {
+          const r = await conquerdFetch("/api/access/accept");
+          const body = await r.json().catch(() => ({}));
+          if (r.status === 200 && body.granted) {
+            note.className = "gate-note ok";
+            note.textContent = "Access granted. Opening portal…";
+            setTimeout(() => {
+              window.location.replace(portalHomeUrl());
+            }, 500);
+          } else {
+            acceptBtn.disabled = false;
+            note.className = "gate-note err";
+            note.textContent = "Access was not granted. Please try again.";
+          }
+        } catch (e) {
+          acceptBtn.disabled = false;
+          note.className = "gate-note err";
+          note.textContent = "Error: " + (e.message || e);
+        }
+      };
+
+      el("gate").classList.add("visible");
+    }
+
+    function showError(msg) {
+      el("connecting").style.display = "none";
+      const banner = el("error-banner");
+      banner.style.display = "block";
+      banner.textContent = msg;
+    }
+
+    bootstrap().catch(e => showError(String(e)));
+  </script>
+</body>
+</html>

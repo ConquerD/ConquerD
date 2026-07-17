@@ -209,11 +209,18 @@ pub fn core_audio_opus() -> CapabilityDescriptor {
 }
 
 /// `room.audio.sfu` — SFU room voice via QUIC relay.
+///
+/// Byte quota is sized for the **signed JSON wire frame**, not raw Opus:
+/// each 20 ms frame is E2E-sealed, base64'd, and wrapped in an Ed25519-signed
+/// `SfuAudio` envelope (`[ROOM_AUDIO_TAG][json]`). At the default 128 kbps
+/// ceiling that is ~40 KiB/s continuous; 128 KiB/s leaves ~3× headroom for
+/// ABR overshoot and bursty speech without the supernode dropping frames
+/// (which clients report as 6–30% "packet loss" even when ICMP is clean).
 pub fn room_audio_sfu() -> CapabilityDescriptor {
     CapabilityDescriptor::new("room.audio.sfu", "1.0", ChannelKind::Datagram)
         .with_params(json!({
             "codec": "opus",
-            "quota_bytes_per_sec": 32 * 1024,
+            "quota_bytes_per_sec": 128 * 1024,
             "quota_datagrams_per_sec": 200,
             "allow_public_rooms": false,
             "allow_private_rooms": true,

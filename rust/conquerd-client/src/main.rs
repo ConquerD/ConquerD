@@ -593,6 +593,7 @@ async fn handle_event(
             ticket: _,
             relay_host,
             relay_port,
+            portal_only: _,
         } => {
             info!(
                 "Relay granted by {} at {}:{}",

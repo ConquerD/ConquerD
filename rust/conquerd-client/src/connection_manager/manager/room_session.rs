@@ -903,16 +903,14 @@ impl ConnectionManager {
     ///
     /// Outbound quota uses `room.audio.sfu` (gated against the supernode peer id).
     /// See `send_audio_datagram` for the direct P2P `core.audio.opus` path.
+    ///
+    /// Quota is charged on the **signed wire size** (`1 + json.len()` for the
+    /// relay tag + envelope), matching the supernode inbound gate — not raw
+    /// Opus length (which under-counted by ~3–5× and let the client flood past
+    /// the supernode's 32 KiB/s cap before that was raised).
     pub(super) async fn send_room_audio(&mut self, opus_data: Vec<u8>) {
         if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
             return; // Not in a room
-        }
-        if !self.check_room_audio_outbound_quota(&self.current_supernode_id, opus_data.len()) {
-            debug!(
-                "[room.audio.sfu] outbound quota exceeded for {}; dropping frame",
-                &self.current_supernode_id[..8.min(self.current_supernode_id.len())]
-            );
-            return;
         }
         let sender = self.identity.public_id();
         let room_id = self.current_room_id.clone();
@@ -950,9 +948,25 @@ impl ConnectionManager {
         msg.payload
             .insert("seq".to_owned(), Value::Number(seq.into()));
 
+        // Sign once so both the relay path and the WS fallback share the same
+        // wire bytes — and so outbound quota can charge the real envelope size
+        // (ROOM_AUDIO_TAG + signed JSON), matching supernode inbound accounting.
+        let Some(json) = self.sign_message_json(&mut msg) else {
+            return;
+        };
+        // +1 for ROOM_AUDIO_TAG on the relay datagram path (WS is comparable).
+        let wire_bytes = json.len().saturating_add(1);
+        if !self.check_room_audio_outbound_quota(&supernode_id, wire_bytes) {
+            debug!(
+                "[room.audio.sfu] outbound quota exceeded for {}; dropping frame",
+                &supernode_id[..8.min(supernode_id.len())]
+            );
+            return;
+        }
+
         // Fast path: relay datagram (no TCP head-of-line blocking), unless we're
         // in a WS cooldown after repeated relay failures (anti-thrash). The Arc
-        // clone drops the `self.quic_relays` borrow before we sign / fall back.
+        // clone drops the `self.quic_relays` borrow before we send / fall back.
         let try_relay = self.room_relay_cooldown_frames == 0;
         if self.room_relay_cooldown_frames > 0 {
             self.room_relay_cooldown_frames -= 1;
@@ -966,11 +980,9 @@ impl ConnectionManager {
             None
         };
         if let Some(relay) = relay {
-            if let Some(json) = self.sign_message_json(&mut msg) {
-                if relay.send_room_audio(json.as_bytes()) {
-                    self.room_relay_fail_streak = 0;
-                    return;
-                }
+            if relay.send_room_audio(json.as_bytes()) {
+                self.room_relay_fail_streak = 0;
+                return;
             }
             // Relay path is unhealthy; after a short streak, prefer WS for a
             // ~3 s cooldown (≈150 frames at 50 fps) rather than retrying — and
@@ -982,8 +994,7 @@ impl ConnectionManager {
                 debug!("[room.audio.sfu] relay datagram unhealthy; using WS for ~3 s");
             }
         }
-        // Fallback: WebSocket SFU relay (re-signs; deterministic Ed25519 yields
-        // the identical signature, so this is safe even after the attempt above).
+        // Fallback: WebSocket SFU relay. Message is already signed.
         self.dispatch_outbound(msg).await;
     }
 

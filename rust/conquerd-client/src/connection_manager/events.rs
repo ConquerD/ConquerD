@@ -61,6 +61,13 @@ pub enum ConnectionEvent {
         ticket: String,
         relay_host: String,
         relay_port: u16,
+        /// True when this is a **portal-only** grant: the supernode admitted us
+        /// as a guest that must pass the access gate (TOS / ad / code / payment)
+        /// in the in-app portal before full relay access is issued. The client
+        /// opens the relay connection (needed to reach the portal) and routes
+        /// straight to the gate. Older supernodes omit the flag → treated as a
+        /// normal full grant.
+        portal_only: bool,
     },
     /// Connection to a supernode WebSocket established.
     SupernodeConnected(String),

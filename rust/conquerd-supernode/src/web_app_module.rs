@@ -177,6 +177,29 @@ impl WebAppHostModule {
                     }
                     return self.send_json(send, peer_id, 200, &json).await;
                 }
+                "/api/access/status" => {
+                    // Access-gate status for the calling (identity-verified)
+                    // peer. Drives whether the portal shows the gate or the
+                    // dashboard.
+                    let json = state.portal_access_status(peer_id);
+                    return self.send_json(send, peer_id, 200, &json).await;
+                }
+                "/api/access/accept" => {
+                    // Pass the access gate. The caller is cryptographically
+                    // identified by the QUIC relay stream (peer_id), so no body
+                    // is needed — hitting this endpoint *is* the authenticated
+                    // acceptance. Promotes the guest to a full relay ticket.
+                    let granted = state.grant_portal_access(peer_id);
+                    let status = if granted { 200 } else { 403 };
+                    return self
+                        .send_json(
+                            send,
+                            peer_id,
+                            status,
+                            &serde_json::json!({ "granted": granted }),
+                        )
+                        .await;
+                }
                 _ => {}
             }
         }
