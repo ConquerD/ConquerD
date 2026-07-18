@@ -90,3 +90,7 @@ ruff_audit.json
 # Grok / agent MCP tool schema cache (not project source)
 /mcps
 /.claude/skills
+# Headless client cargo targets (build_headless.bat)
+/rust/target-headless
+/rust/target-headless2
+/rust/target-headless-check

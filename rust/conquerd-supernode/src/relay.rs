@@ -561,26 +561,36 @@ async fn handle_connection(
             connection.close(0u32.into(), b"full");
             return Ok(());
         }
-        // Remove old connection if peer reconnects: close the stale
-        // connection (its exit path is skipped via the stable_id guard
-        // in the disconnect cleanup) and reset quota buckets so the new
-        // session starts fresh rather than inheriting consumed tokens.
-        if let Some(old) = st.peers.get(&peer_id) {
+        // Soft-replace on reconnect: close the stale connection (its exit
+        // path is skipped via the stable_id guard) and reset quota buckets,
+        // but **preserve room membership**. The old `remove_peer` path wiped
+        // `rooms` + `peer.room_id`, so post-reconnect `room.audio.sfu`
+        // datagrams were dropped while the client still treated the relay
+        // send as success (no WS fallback) — one-way silence until re-join.
+        let prior_room = st.peers.get(&peer_id).and_then(|p| p.room_id.clone());
+        if let Some(old) = st.peers.remove(&peer_id) {
             old.connection.close(0u32.into(), b"reconnected");
-            st.remove_peer(&peer_id);
+            st.index_to_peer.remove(&old.peer_index);
+            if let Some(ref room) = prior_room {
+                st.rooms
+                    .entry(room.clone())
+                    .or_default()
+                    .insert(peer_id.clone());
+            }
             features.clear_peer_quotas(&peer_id);
             features.clear_peer_outbound_quotas(&peer_id);
         }
         let idx = st
             .allocate_index()
             .ok_or_else(|| anyhow::anyhow!("no peer indices"))?;
-        // Check if this peer is already assigned to a room (SFU join may
-        // arrive via WebSocket before the QUIC relay connection is up).
-        let existing_room = st
-            .rooms
-            .iter()
-            .find(|(_, members)| members.contains(&peer_id))
-            .map(|(room_id, _)| room_id.clone());
+        // Prefer the room we just preserved; also cover SFU join that arrived
+        // via WebSocket before this QUIC relay connection was up.
+        let existing_room = prior_room.or_else(|| {
+            st.rooms
+                .iter()
+                .find(|(_, members)| members.contains(&peer_id))
+                .map(|(room_id, _)| room_id.clone())
+        });
         st.index_to_peer.insert(idx, peer_id.clone());
         st.peers.insert(
             peer_id.clone(),
@@ -738,6 +748,24 @@ fn relay_datagram_feature(payload: &[u8]) -> (&'static str, usize) {
     ("game.relay.v1", payload.len())
 }
 
+/// Extract `room_id` from a `room.audio.sfu` inner payload
+/// (`[ROOM_AUDIO_TAG][signed SfuAudio JSON]`). Returns `None` when the frame is
+/// too short, not JSON, or missing the field — the caller may still fall back
+/// to the relay peer's join-time room assignment.
+fn room_id_from_room_audio_payload(payload: &[u8]) -> Option<String> {
+    if payload.len() < 2 {
+        return None;
+    }
+    // Skip the fixed channel tag; body is the signed JSON envelope.
+    let json = std::str::from_utf8(&payload[1..]).ok()?;
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("payload")
+        .and_then(|p| p.get("room_id"))
+        .and_then(|r| r.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+}
+
 /// Try to forward `fwd` to `recipient` if outbound `room.*` / core / game quota
 /// allows it. Returns true when the datagram was sent.
 fn try_forward_datagram(
@@ -793,11 +821,41 @@ fn handle_datagram(
     if target_idx == wire::BROADCAST_INDEX && feature_id == "room.audio.sfu" {
         let bridge = room_audio_bridge.read().clone();
         if let Some(bridge) = bridge {
-            let room_id = from.room_id.clone();
+            // Prefer room_id from the signed SfuAudio payload (always present
+            // on a well-formed frame). Fall back to the relay peer's last
+            // join_room assignment — which can be missing after a reconnect
+            // race or if SfuJoin beat the QUIC session by a few ms.
+            let payload_room = room_id_from_room_audio_payload(payload);
+            let room_id = payload_room.clone().or_else(|| from.room_id.clone());
+            // Heal a missing peer.room_id so subsequent frames and bookkeeping
+            // stay consistent without waiting for another SfuJoin.
+            if from.room_id.is_none() {
+                if let Some(ref rid) = payload_room {
+                    drop(st);
+                    {
+                        let mut stw = state.write();
+                        if let Some(peer) = stw.peers.get_mut(from_peer) {
+                            peer.room_id = Some(rid.clone());
+                        }
+                        stw.rooms
+                            .entry(rid.clone())
+                            .or_default()
+                            .insert(from_peer.to_string());
+                    }
+                } else {
+                    drop(st);
+                }
+            } else {
+                drop(st);
+            }
             let inner = payload.to_vec();
-            drop(st);
             if let Some(room_id) = room_id {
                 (bridge)(from_peer.to_string(), sender_index, room_id, inner);
+            } else {
+                debug!(
+                    "[relay] room.audio.sfu from {} has no room_id (peer state or payload); dropping",
+                    &from_peer[..12.min(from_peer.len())]
+                );
             }
             return;
         }
@@ -1336,6 +1394,22 @@ mod tests {
             srv.send_room_datagram("ghost-peer", &[0x01, 0x04, 0x7b]),
             None
         );
+    }
+
+    #[test]
+    fn room_id_from_room_audio_payload_reads_envelope() {
+        use conquerd_features::channel_frame::ROOM_AUDIO_TAG;
+        let signed_json =
+            br#"{"type":"sfu_audio","sender":"abc","payload":{"room_id":"default","seq":1}}"#;
+        let mut payload = vec![ROOM_AUDIO_TAG];
+        payload.extend_from_slice(signed_json);
+        assert_eq!(
+            room_id_from_room_audio_payload(&payload).as_deref(),
+            Some("default")
+        );
+        // Missing field / not JSON → None (caller falls back to peer.room_id).
+        assert!(room_id_from_room_audio_payload(&[ROOM_AUDIO_TAG, b'{']).is_none());
+        assert!(room_id_from_room_audio_payload(&[]).is_none());
     }
 
     #[test]

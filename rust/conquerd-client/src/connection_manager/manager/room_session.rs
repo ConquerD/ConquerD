@@ -118,15 +118,20 @@ pub fn should_auto_join_on_room_created(
 /// Whether `join_room` should take the private invite round-trip
 /// (`JoinRoomWithInvite`) instead of a plain `SfuJoin`.
 ///
-/// Creators and already-admitted peers skip the single-use token path.
+/// Creators self-admit via `creator_id` on any cluster member (RoomRoster).
+/// Non-creators must present their RoomStore invite token so cold members can
+/// rematerialize membership — even if this session already admitted them on
+/// *another* cluster node (`already_admitted` is not host-scoped). Skipping the
+/// token after admit-on-A breaks join-on-B/C.
+///
 /// Shared with the Qt bridge so UI and CM cannot diverge on this policy.
 pub fn should_use_private_room_invite(
-    already_admitted: bool,
+    _already_admitted: bool,
     is_private: bool,
     is_creator: bool,
     has_invite_token: bool,
 ) -> bool {
-    !already_admitted && is_private && !is_creator && has_invite_token
+    is_private && !is_creator && has_invite_token
 }
 
 /// Cluster-wide union of a room's members across every supernode snapshot.
@@ -694,14 +699,13 @@ impl ConnectionManager {
     /// flow (`RelayGranted` → background connect) is best-effort; room audio
     /// transparently falls back to the WebSocket SFU path if it never lands.
     pub(super) async fn ensure_room_relay(&mut self, supernode_id: &str) {
-        if self
-            .quic_relays
-            .get(supernode_id)
-            .is_some_and(|r| r.is_alive())
-        {
+        let route = self
+            .resolve_supernode_ws_target(supernode_id)
+            .unwrap_or_else(|| supernode_id.to_owned());
+        if self.quic_relays.get(&route).is_some_and(|r| r.is_alive()) {
             return;
         }
-        self.request_relay(supernode_id).await;
+        self.request_relay(&route).await;
     }
 
     pub(super) async fn request_relay(&mut self, supernode_id: &str) {
@@ -713,10 +717,24 @@ impl ConnectionManager {
         self.dispatch_outbound(msg).await;
     }
 
+    /// Prefer a live cluster session when `supernode_id` is offline so room
+    /// control traffic is not dropped after the invite host dies.
+    pub(super) fn live_room_route(&self, supernode_id: &str) -> String {
+        self.resolve_supernode_ws_target(supernode_id)
+            .unwrap_or_else(|| supernode_id.to_owned())
+    }
+
     pub(super) async fn send_room_join(&mut self, supernode_id: &str, room_id: &str) {
+        let route = self.live_room_route(supernode_id);
+        // Keep the manager's voice/room host aligned with the node that will
+        // process the join (sidebar still keys rooms under the cluster rep).
+        if self.current_room_id == room_id || self.current_room_id.is_empty() {
+            self.current_supernode_id = route.clone();
+            self.current_room_id = room_id.to_owned();
+        }
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuJoin, sender.clone());
-        msg.target = Some(supernode_id.to_owned());
+        msg.target = Some(route);
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
         msg.payload
@@ -755,9 +773,10 @@ impl ConnectionManager {
     }
 
     pub(super) async fn send_room_leave(&mut self, supernode_id: &str, room_id: &str) {
+        let route = self.live_room_route(supernode_id);
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuLeave, sender.clone());
-        msg.target = Some(supernode_id.to_owned());
+        msg.target = Some(route);
         msg.payload
             .insert("peer_id".to_owned(), Value::String(sender));
         let rid = if room_id.is_empty() {
@@ -775,19 +794,21 @@ impl ConnectionManager {
         // even for chat-only rooms with no active voice. No-op if a live relay
         // already exists; room messaging still works over WS if the grant
         // never lands.
-        self.ensure_room_relay(supernode_id).await;
+        let route = self.live_room_route(supernode_id);
+        self.ensure_room_relay(&route).await;
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuSubscribe, sender.clone());
-        msg.target = Some(supernode_id.to_owned());
+        msg.target = Some(route);
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
         self.dispatch_outbound(msg).await;
     }
 
     pub(super) async fn send_room_unsubscribe(&mut self, supernode_id: &str, room_id: &str) {
+        let route = self.live_room_route(supernode_id);
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuUnsubscribe, sender);
-        msg.target = Some(supernode_id.to_owned());
+        msg.target = Some(route);
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
         self.dispatch_outbound(msg).await;
@@ -799,9 +820,14 @@ impl ConnectionManager {
         room_id: &str,
         invite_token: &str,
     ) {
+        let route = self.live_room_route(supernode_id);
+        if self.current_room_id == room_id || self.current_room_id.is_empty() {
+            self.current_supernode_id = route.clone();
+            self.current_room_id = room_id.to_owned();
+        }
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuRoomInvite, sender.clone());
-        msg.target = Some(supernode_id.to_owned());
+        msg.target = Some(route);
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
         msg.payload.insert(
@@ -841,20 +867,23 @@ impl ConnectionManager {
             invite_token,
         } = req;
         let normalized = normalize_room_type(room_type);
-        if should_track_pending_materialize(materialize_only, room_id) {
-            if let Some(rid) = room_id.filter(|s| !s.is_empty()) {
-                self.pending_materialize
-                    .insert(room_scope_key(supernode_id, rid));
+        // Prefer a live cluster session when the invite host is offline so
+        // rematerialize of private rooms still lands on B/C.
+        let route = self.live_room_route(supernode_id);
+        let rid_opt = room_id.filter(|s| !s.is_empty());
+        if should_track_pending_materialize(materialize_only, rid_opt) {
+            if let Some(rid) = rid_opt {
+                self.pending_materialize.insert(room_scope_key(&route, rid));
             }
         }
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuRoomCreate, sender.clone());
-        msg.target = Some(supernode_id.to_owned());
+        msg.target = Some(route.clone());
         msg.payload
             .insert("room_name".to_owned(), Value::String(room_name.to_owned()));
         msg.payload
             .insert("room_type".to_owned(), Value::String(normalized.to_owned()));
-        if let Some(rid) = room_id.filter(|s| !s.is_empty()) {
+        if let Some(rid) = rid_opt {
             msg.payload
                 .insert("room_id".to_owned(), Value::String(rid.to_owned()));
         }
@@ -879,7 +908,7 @@ impl ConnectionManager {
         }
         info!(
             "[cm] SfuRoomCreate: supernode={} name={room_name} type={normalized} materialize_only={materialize_only} has_token={}",
-            &supernode_id[..8.min(supernode_id.len())],
+            &route[..8.min(route.len())],
             !invite_token.is_empty()
         );
         self.dispatch_outbound(msg).await;
@@ -914,7 +943,8 @@ impl ConnectionManager {
         }
         let sender = self.identity.public_id();
         let room_id = self.current_room_id.clone();
-        let supernode_id = self.current_supernode_id.clone();
+        // Prefer a live cluster sibling when the original room host is offline.
+        let supernode_id = self.live_room_route(&self.current_supernode_id.clone());
         use base64::Engine;
 
         // E2E-seal under real group-key material only. The deterministic
@@ -1006,9 +1036,14 @@ impl ConnectionManager {
         sender_handle: &str,
         message_id: &str,
     ) {
+        // Prefer a live cluster session when the inbound host is down — same
+        // rewrite join/subscribe already use. Without this, multi-home room
+        // chat can target the node that *delivered* an inbound frame even after
+        // that WS session died mid Ollama reply, and the message is dropped.
+        let route = self.live_room_route(supernode_id);
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuChat, sender.clone());
-        msg.target = Some(supernode_id.to_owned());
+        msg.target = Some(route.clone());
         msg.payload
             .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
         // E2E-seal the body under the room group key (`AAD = room_id ‖ sender ‖
@@ -1017,7 +1052,11 @@ impl ConnectionManager {
         // supernode (it knows `room_id`), and cleartext is worse. Keying is
         // near-instant at join with ACK/reseal.
         if !may_send_room_e2e_content(self.group_keys.has_real_key(room_id)) {
-            warn!("[room.chat] no real group key for room yet; dropping outbound message");
+            warn!(
+                "[room.chat] no real group key for room {} yet; dropping outbound message (route={})",
+                &room_id[..12.min(room_id.len())],
+                &route[..12.min(route.len())]
+            );
             return;
         }
         let Some((epoch, sealed)) = crate::group_key::seal_chat_body(
@@ -1027,7 +1066,10 @@ impl ConnectionManager {
             message_id,
             body.as_bytes(),
         ) else {
-            warn!("[room.chat] seal failed; dropping outbound message");
+            warn!(
+                "[room.chat] seal failed for room {}; dropping outbound message",
+                &room_id[..12.min(room_id.len())]
+            );
             return;
         };
         msg.payload.insert(
@@ -1047,6 +1089,12 @@ impl ConnectionManager {
                 Value::String(message_id.to_owned()),
             );
         }
+        info!(
+            "[room.chat] sending SfuChat room={} via {}… mid={}",
+            &room_id[..12.min(room_id.len())],
+            &route[..12.min(route.len())],
+            &message_id[..8.min(message_id.len())]
+        );
         self.dispatch_outbound(msg).await;
     }
 
@@ -1191,9 +1239,10 @@ impl ConnectionManager {
     }
 
     pub(super) async fn send_room_list_request(&mut self, supernode_id: &str) {
+        let route = self.live_room_route(supernode_id);
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuRoomList, sender);
-        msg.target = Some(supernode_id.to_owned());
+        msg.target = Some(route);
         self.dispatch_outbound(msg).await;
     }
 

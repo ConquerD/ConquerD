@@ -161,6 +161,7 @@ pub(super) fn is_loopback_or_wildcard(host: &str) -> bool {
 // PendingInvite
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub(super) struct PendingInvite {
     pub(super) inviter_peer_id: String,
     pub(super) inviter_identity_pub: String,

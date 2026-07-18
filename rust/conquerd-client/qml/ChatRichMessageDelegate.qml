@@ -34,12 +34,94 @@ Item {
         || root.kind === "file"
         || root.attachmentPath !== ""
 
+    /// Session-local state for invite embeds in this message (not persisted).
+    property bool inviteIgnored: false
+    property bool inviteAccepted: false
+
+    readonly property string inviteUrl: root.conquerdInviteUrl(root.body)
+    readonly property bool hasInvite: root.inviteUrl !== ""
+    readonly property string inviteKind: root.conquerdInviteKind(root.inviteUrl)
+    readonly property string bodyWithoutInvite: root.stripInviteUrl(root.body, root.inviteUrl)
+    readonly property bool showInviteEmbed: root.hasInvite && !root.inviteIgnored
+
+    // ListView reuses delegates — clear per-message invite UI state on rebind.
+    onMsgIdChanged: {
+        inviteIgnored = false
+        inviteAccepted = false
+    }
+    onBodyChanged: {
+        inviteIgnored = false
+        inviteAccepted = false
+    }
+
     function fileUrlFromPath(p) {
         if (!p || p === "") return ""
         if (p.indexOf("file:") === 0) return p
         var n = p.replace(/\\/g, "/")
         if (n.charAt(0) !== "/") n = "/" + n
         return "file://" + n
+    }
+
+    /// First `conquerd://…` token in a chat body (peer, room, or legacy bare).
+    function conquerdInviteUrl(value) {
+        var m = (value || "").match(/conquerd:\/\/[^\s<>"']+/i)
+        return m ? m[0] : ""
+    }
+
+    function conquerdInviteKind(url) {
+        var u = (url || "").toLowerCase()
+        if (u === "")
+            return ""
+        if (u.indexOf("conquerd://room#") === 0 || u.indexOf("://room#") >= 0)
+            return "room"
+        if (u.indexOf("conquerd://invite#") === 0 || u.indexOf("://invite#") >= 0)
+            return "peer"
+        return "invite"
+    }
+
+    function stripInviteUrl(value, url) {
+        if (!url || url === "")
+            return value || ""
+        return (value || "").split(url).join("").replace(/\s+/g, " ").trim()
+    }
+
+    function inviteTitle() {
+        if (root.inviteKind === "room")
+            return root.mine ? "Room invite shared" : "Room invite"
+        if (root.inviteKind === "peer")
+            return root.mine ? "Peer invite shared" : "Peer invite"
+        return root.mine ? "Invite shared" : "ConquerD invite"
+    }
+
+    function inviteSubtitle() {
+        if (root.inviteAccepted)
+            return "Accepting…"
+        if (root.mine)
+            return "They can Accept from their chat to connect."
+        if (root.inviteKind === "room")
+            return "Join this room on a trusted supernode."
+        if (root.inviteKind === "peer")
+            return "Add this peer to your trusted list."
+        return "Open this invite to connect."
+    }
+
+    function inviteUrlShort() {
+        var u = root.inviteUrl
+        if (u.length <= 42)
+            return u
+        return u.substring(0, 28) + "…" + u.substring(u.length - 10)
+    }
+
+    function acceptInvite() {
+        if (!root.hasInvite || root.inviteAccepted)
+            return
+        root.inviteAccepted = true
+        if (typeof backend !== "undefined" && backend && backend.pasteInvite)
+            backend.pasteInvite(root.inviteUrl)
+    }
+
+    function ignoreInvite() {
+        root.inviteIgnored = true
     }
 
     readonly property string avatarPeerId: root.mine
@@ -84,6 +166,10 @@ Item {
         text = text.replace(/~~([^~\n]+)~~/g, "<s>$1</s>")
         text = text.replace(/\n/g, "<br>")
         text = text.replace(/(https?:\/\/[^\s<>"]+)/g,
+            '<a href="$1" style="color:' + Theme.toHex(root.mine ? Theme.linkMine : Theme.linkPeer) + '">$1</a>')
+        // Linkify conquerd:// invites so a leftover URL still routes in-app
+        // (Accept embed is preferred when the full message is an invite).
+        text = text.replace(/(conquerd:\/\/[^\s<>"]+)/gi,
             '<a href="$1" style="color:' + Theme.toHex(root.mine ? Theme.linkMine : Theme.linkPeer) + '">$1</a>')
         return text
     }
@@ -158,6 +244,21 @@ Item {
     function timestampText() {
         if (root.timestamp <= 0) return ""
         return Qt.formatDateTime(new Date(root.timestamp * 1000), "MMM d, yyyy hh:mm")
+    }
+
+    /// Plain text suitable for clipboard (full message, not rich HTML).
+    function copyableText() {
+        if (root.body && root.body !== "")
+            return root.body
+        if (root.attachmentName && root.attachmentName !== "")
+            return root.attachmentName
+        return ""
+    }
+
+    function copyEntireMessage() {
+        var t = root.copyableText()
+        if (t !== "")
+            root.copyRequested(t)
     }
 
     property string dateSeparator: ""
@@ -378,25 +479,187 @@ Item {
                     }
                 }
 
-                Text {
-                    id: bodyText
-                    // Hide the text label when a media/file embed is showing;
-                    // keep it for plain text and for attachments missing a path.
-                    visible: root.attachmentPath === "" ||
-                             (root.kind !== "image" && root.kind !== "video" && root.kind !== "file")
+                // ConquerD invite embed — Accept / Ignore for inbound links.
+                Rectangle {
+                    id: inviteEmbed
+                    visible: root.showInviteEmbed
                     width: parent.width
-                    text: root.richText(root.body)
-                    textFormat: Text.RichText
+                    height: visible ? inviteEmbedCol.implicitHeight + 16 : 0
+                    radius: Theme.radiusSm
+                    color: root.mine ? Qt.rgba(0, 0, 0, 0.14) : Theme.bg1
+                    border.color: root.mine ? Qt.rgba(255, 255, 255, 0.12) : Theme.bg3
+                    border.width: 1
+                    clip: true
+
+                    ColumnLayout {
+                        id: inviteEmbedCol
+                        anchors {
+                            left: parent.left
+                            right: parent.right
+                            top: parent.top
+                            margins: 10
+                        }
+                        spacing: 8
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+
+                            Rectangle {
+                                Layout.preferredWidth: 36
+                                Layout.preferredHeight: 36
+                                radius: Theme.radiusSm
+                                color: root.mine ? Qt.rgba(255, 255, 255, 0.12) : Theme.bg2
+                                border.color: root.mine ? Qt.rgba(255, 255, 255, 0.08) : Theme.bg3
+                                border.width: 1
+
+                                Image {
+                                    anchors.centerIn: parent
+                                    source: root.inviteKind === "room"
+                                        ? "qrc:/qt/qml/ConquerD/Client/icons/handshake.svg"
+                                        : "qrc:/qt/qml/ConquerD/Client/icons/invite.svg"
+                                    sourceSize.width: 18
+                                    sourceSize.height: 18
+                                    width: 18
+                                    height: 18
+                                    fillMode: Image.PreserveAspectFit
+                                    opacity: 0.95
+                                }
+                            }
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 2
+
+                                Text {
+                                    text: root.inviteTitle()
+                                    color: root.mine ? Theme.textInv : Theme.text
+                                    font.pixelSize: Theme.fontSizeBody
+                                    font.bold: true
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                                Text {
+                                    text: root.inviteSubtitle()
+                                    color: root.mine ? Theme.textInv : Theme.muted
+                                    opacity: root.mine ? 0.8 : 1.0
+                                    font.pixelSize: Theme.fontSizeCaption
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
+                                }
+                                Text {
+                                    text: root.inviteUrlShort()
+                                    color: root.mine ? Theme.textInv : Theme.muted
+                                    opacity: 0.65
+                                    font.pixelSize: Theme.fontSizeMicro
+                                    font.family: "Consolas, monospace"
+                                    elide: Text.ElideMiddle
+                                    Layout.fillWidth: true
+                                }
+                            }
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            // Inbound: Accept / Ignore. Outbound: Copy only.
+                            StyledButton {
+                                visible: !root.mine
+                                enabled: !root.inviteAccepted
+                                text: root.inviteAccepted ? "Accepted" : "Accept"
+                                primary: true
+                                compact: true
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/check.svg"
+                                onClicked: root.acceptInvite()
+                            }
+                            StyledButton {
+                                visible: !root.mine && !root.inviteAccepted
+                                text: "Ignore"
+                                compact: true
+                                flat: true
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
+                                onClicked: root.ignoreInvite()
+                            }
+                            StyledButton {
+                                visible: root.mine || root.inviteAccepted
+                                text: "Copy link"
+                                compact: true
+                                flat: true
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/clipboard.svg"
+                                onClicked: root.copyRequested(root.inviteUrl)
+                            }
+                            Item { Layout.fillWidth: true }
+                        }
+                    }
+                }
+
+                // After Ignore: quiet status line (session-only).
+                Text {
+                    visible: root.hasInvite && root.inviteIgnored && !root.mine
+                    width: parent.width
+                    text: "Invite ignored"
+                    color: Theme.muted
+                    font.pixelSize: Theme.fontSizeCaption
+                    font.italic: true
+                }
+
+                // Read-only selectable body so users can drag-select and Ctrl+C.
+                TextEdit {
+                    id: bodyText
+                    // Hide when media/file embeds take over, or when the body is
+                    // only a conquerd:// invite (the invite card / ignored line
+                    // replaces the raw URL).
+                    visible: {
+                        if (root.kind === "image" || root.kind === "video" || root.kind === "file")
+                            return root.attachmentPath === ""
+                        if (root.hasInvite && root.bodyWithoutInvite === "")
+                            return false
+                        return true
+                    }
+                    width: parent.width
+                    height: visible ? contentHeight : 0
+                    readOnly: true
+                    selectByMouse: true
+                    selectByKeyboard: true
+                    activeFocusOnPress: true
+                    cursorVisible: false
+                    text: root.richText(
+                        root.hasInvite && root.bodyWithoutInvite !== ""
+                            ? root.bodyWithoutInvite
+                            : root.body
+                    )
+                    textFormat: TextEdit.RichText
                     color: root.mine ? Theme.textInv : Theme.text
+                    selectedTextColor: root.mine ? Theme.accent : Theme.textInv
+                    selectionColor: root.mine ? Qt.rgba(255, 255, 255, 0.35) : Theme.accent
                     font.pixelSize: Theme.fontSizeBody
-                    wrapMode: Text.Wrap
-                    onLinkActivated: (link) => Qt.openUrlExternally(link)
+                    wrapMode: TextEdit.Wrap
+                    onLinkActivated: (link) => {
+                        // Route conquerd:// through the invite path instead of
+                        // the system browser (which cannot open the scheme).
+                        if ((link || "").toLowerCase().indexOf("conquerd://") === 0) {
+                            if (typeof backend !== "undefined" && backend && backend.pasteInvite)
+                                backend.pasteInvite(link)
+                            return
+                        }
+                        Qt.openUrlExternally(link)
+                    }
+
+                    // Right-click opens our message menu without blocking
+                    // left-drag selection (TapHandler composes with TextEdit).
+                    TapHandler {
+                        acceptedButtons: Qt.RightButton
+                        onTapped: menu.popup()
+                    }
                 }
             }
 
             MouseArea {
                 anchors.fill: parent
                 acceptedButtons: Qt.RightButton
+                // Sit behind bodyText / controls so selection and buttons win;
+                // still catch right-click on empty bubble chrome (attachments, padding).
                 z: -1
                 onClicked: function(mouse) {
                     if (mouse.button === Qt.RightButton) {
@@ -520,6 +783,7 @@ Item {
                 text: root.timestampText()
                 color: Theme.muted
                 font.pixelSize: Theme.fontSizeCaption
+                anchors.verticalCenter: parent.verticalCenter
             }
 
             Text {
@@ -527,6 +791,21 @@ Item {
                 text: root.statusText()
                 color: root.status === "failed" ? Theme.danger : Theme.muted
                 font.pixelSize: Theme.fontSizeCaption
+                anchors.verticalCenter: parent.verticalCenter
+            }
+
+            ToolButton {
+                visible: root.copyableText() !== ""
+                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/clipboard.svg"
+                icon.width: 14
+                icon.height: 14
+                icon.color: Theme.muted
+                implicitWidth: 22
+                implicitHeight: 22
+                padding: 4
+                ToolTip.text: "Copy message"
+                ToolTip.visible: hovered
+                onClicked: root.copyEntireMessage()
             }
 
             ToolButton {
@@ -593,8 +872,14 @@ Item {
     Menu {
         id: menu
         MenuItem {
-            text: "Copy Text"
-            onTriggered: root.copyRequested(root.body)
+            text: "Copy Selection"
+            enabled: bodyText.visible && bodyText.selectedText !== ""
+            onTriggered: root.copyRequested(bodyText.selectedText)
+        }
+        MenuItem {
+            text: "Copy Message"
+            enabled: root.copyableText() !== ""
+            onTriggered: root.copyEntireMessage()
         }
         MenuItem {
             text: "Open Attachment"

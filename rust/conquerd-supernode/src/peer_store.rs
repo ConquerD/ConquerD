@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::crypto::normalize_public_id;
+
 /// A single peer record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRecord {
@@ -71,6 +73,9 @@ impl PeerStore {
             return;
         };
         for peer in file.peers {
+            let mut peer = peer;
+            // Collapse pad variants so load-time keys match live lookups.
+            peer.identity_pub = normalize_public_id(&peer.identity_pub);
             self.peers.insert(peer.identity_pub.clone(), peer);
         }
     }
@@ -93,35 +98,62 @@ impl PeerStore {
         std::fs::write(&self.path, json)
     }
 
+    /// Resolve a map key for `identity_pub`, trying the canonical padded form
+    /// and common pad variants so WS / relay / cluster encodings all hit.
+    fn resolve_key(&self, identity_pub: &str) -> Option<String> {
+        let canon = normalize_public_id(identity_pub);
+        if self.peers.contains_key(&canon) {
+            return Some(canon);
+        }
+        if self.peers.contains_key(identity_pub) {
+            return Some(identity_pub.to_string());
+        }
+        let bare = identity_pub.trim_end_matches('=');
+        if bare != identity_pub && self.peers.contains_key(bare) {
+            return Some(bare.to_string());
+        }
+        None
+    }
+
     /// Add or update a trusted peer.
-    pub fn add_peer(&mut self, record: PeerRecord) {
+    pub fn add_peer(&mut self, mut record: PeerRecord) {
+        record.identity_pub = normalize_public_id(&record.identity_pub);
+        // Drop any legacy pad-variant key so we never hold two entries for one peer.
+        let bare = record.identity_pub.trim_end_matches('=').to_string();
+        if bare != record.identity_pub {
+            self.peers.remove(&bare);
+        }
         self.peers.insert(record.identity_pub.clone(), record);
     }
 
     /// Get peer by identity_pub.
     pub fn get_peer(&self, identity_pub: &str) -> Option<&PeerRecord> {
-        self.peers.get(identity_pub)
+        self.resolve_key(identity_pub)
+            .and_then(|k| self.peers.get(&k))
     }
 
     /// Check if a peer is trusted (exists and not revoked/blocked).
     pub fn is_trusted(&self, identity_pub: &str) -> bool {
-        self.peers
-            .get(identity_pub)
+        self.get_peer(identity_pub)
             .is_some_and(|p| !p.revoked && !p.blocked)
     }
 
     /// Revoke a peer.
     #[allow(dead_code)]
     pub fn revoke_peer(&mut self, identity_pub: &str) {
-        if let Some(peer) = self.peers.get_mut(identity_pub) {
-            peer.revoked = true;
+        if let Some(key) = self.resolve_key(identity_pub) {
+            if let Some(peer) = self.peers.get_mut(&key) {
+                peer.revoked = true;
+            }
         }
     }
 
     /// Remove a peer entirely.
     #[allow(dead_code)]
     pub fn remove_peer(&mut self, identity_pub: &str) {
-        self.peers.remove(identity_pub);
+        if let Some(key) = self.resolve_key(identity_pub) {
+            self.peers.remove(&key);
+        }
     }
 
     /// Get all trusted peer identity_pubs.
@@ -135,11 +167,13 @@ impl PeerStore {
 
     /// Update last_seen_at for a peer.
     pub fn touch_peer(&mut self, identity_pub: &str) {
-        if let Some(peer) = self.peers.get_mut(identity_pub) {
-            peer.last_seen_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64();
+        if let Some(key) = self.resolve_key(identity_pub) {
+            if let Some(peer) = self.peers.get_mut(&key) {
+                peer.last_seen_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64();
+            }
         }
     }
 
@@ -389,6 +423,40 @@ mod tests {
         store.save().unwrap();
         let store2 = PeerStore::new(&nested_path);
         assert!(store2.is_trusted("deep"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pad_variants_resolve_to_same_trusted_peer() {
+        let dir = std::env::temp_dir().join("conquerd_test_pad_peers");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 43-char unpadded URL-safe base64 of a 32-byte key.
+        let bare: String = std::iter::repeat_n('A', 43).collect();
+        assert_eq!(bare.len(), 43);
+        let padded = format!("{bare}=");
+        let mut store = PeerStore::new(&dir.join("peers.json"));
+        store.add_peer(PeerRecord {
+            peer_id: "pid".into(),
+            identity_pub: bare.clone(),
+            relay_hints: vec![],
+            handle: "Pad".into(),
+            blocked: false,
+            revoked: false,
+            auto_connect: false,
+            is_supernode: false,
+            transcript_hash: "abc".into(),
+            created_at: 0.0,
+            last_seen_at: 0.0,
+            quic_port: 0,
+        });
+        assert!(store.is_trusted(&bare));
+        assert!(store.is_trusted(&padded));
+        assert_eq!(
+            store.get_peer(&bare).unwrap().identity_pub,
+            normalize_public_id(&bare)
+        );
+        assert_eq!(store.total_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

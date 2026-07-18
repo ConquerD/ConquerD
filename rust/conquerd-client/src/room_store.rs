@@ -537,6 +537,40 @@ impl RoomStore {
         v
     }
 
+    /// All saved rooms whose `supernode_id` matches any member of a cluster
+    /// (pad-tolerant + peer-store aliases). Used to rematerialize client-owned
+    /// definitions onto a live multi-home sibling after the invite host is down.
+    pub fn list_for_cluster_members(
+        &self,
+        peer_store: &crate::peer_store::PeerStore,
+        member_ids: &[String],
+    ) -> Vec<RoomEntry> {
+        let mut bare: HashSet<String> = HashSet::new();
+        for m in member_ids {
+            bare.insert(m.trim_end_matches('=').to_owned());
+            if let Some(c) = peer_store.resolve_supernode_identity_pub(m) {
+                bare.insert(c.trim_end_matches('=').to_owned());
+            }
+        }
+        if bare.is_empty() {
+            return Vec::new();
+        }
+        let mut seen_rooms: HashSet<String> = HashSet::new();
+        let mut v: Vec<RoomEntry> = Vec::new();
+        for e in self.rooms.values() {
+            let resolved = peer_store
+                .resolve_supernode_identity_pub(&e.supernode_id)
+                .unwrap_or_else(|| e.supernode_id.clone());
+            let hit = bare.contains(resolved.trim_end_matches('='))
+                || bare.contains(e.supernode_id.trim_end_matches('='));
+            if hit && seen_rooms.insert(e.room_id.clone()) {
+                v.push(e.clone());
+            }
+        }
+        v.sort_by(|a, b| a.room_name.cmp(&b.room_name));
+        v
+    }
+
     /// Rewrite room rows keyed by hex `peer_id` to canonical `identity_pub`.
     pub fn normalize_supernode_ids(
         &mut self,
@@ -645,6 +679,36 @@ mod tests {
         let entry = store2.get("sn-abc", "room-123").unwrap();
         assert_eq!(entry.room_name, "Test Room");
         assert!(entry.is_creator);
+    }
+
+    #[test]
+    fn list_for_cluster_members_finds_rooms_under_any_member() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+        store
+            .add(
+                RoomEntry::new("r1", "Greens")
+                    .with_type("private")
+                    .with_supernode("node-A-pub")
+                    .with_invite_token("tok"),
+            )
+            .unwrap();
+        store
+            .add(
+                RoomEntry::new("r2", "Other")
+                    .with_type("private")
+                    .with_supernode("node-X-unrelated"),
+            )
+            .unwrap();
+        let ps = crate::peer_store::PeerStore::open(&id, None).unwrap();
+        // Empty peer store — match by bare supernode_id only.
+        let members = vec!["node-A-pub".into(), "node-B-pub".into()];
+        let got = store.list_for_cluster_members(&ps, &members);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].room_id, "r1");
+        assert_eq!(got[0].invite_token, "tok");
     }
 
     #[test]

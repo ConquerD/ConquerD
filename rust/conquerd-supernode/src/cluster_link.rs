@@ -85,6 +85,11 @@ pub enum ClusterMsgKind {
         #[serde(default)]
         direct_invite: bool,
     },
+    /// Full set of client-authorization grants this member currently holds.
+    /// Sent on link-up and periodically so cold / restarted members converge
+    /// on the same trusted-client set without re-inviting each peer. Receivers
+    /// apply each entry via the same path as a single [`ClusterMsgKind::PeerAuth`].
+    PeerAuthRoster { peers: Vec<PeerAuthDescriptor> },
     /// Sent once after `Hello` to advertise this node's software version.
     VersionInfo {
         version: String,
@@ -95,6 +100,17 @@ pub enum ClusterMsgKind {
     /// Sent on change; receivers keep the highest epoch per `(space_id, signer)`
     /// after re-verifying the owner signature.
     SpaceRoot { root: SignedSpaceRoot },
+}
+
+/// One client-authorization entry as advertised in a [`ClusterMsgKind::PeerAuthRoster`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerAuthDescriptor {
+    pub identity_pub: String,
+    #[serde(default)]
+    pub handle: String,
+    /// Origin admitted via direct supernode invite (handshake transcript).
+    #[serde(default)]
+    pub direct_invite: bool,
 }
 
 /// One durable room as advertised in a [`ClusterMsgKind::RoomRoster`]. Carries
@@ -222,6 +238,8 @@ pub type LocalRoomRosterFn = Arc<dyn Fn() -> Vec<RoomDescriptor> + Send + Sync>;
 pub type OnRoomRosterFn = Arc<dyn Fn(RoomDescriptor) + Send + Sync>;
 /// Applies a replicated client-authorization grant (trust the peer).
 pub type OnPeerAuthFn = Arc<dyn Fn(PeerAuthGrant) + Send + Sync>;
+/// Fetches this node's trusted-client descriptors to advertise to peers.
+pub type LocalPeerAuthRosterFn = Arc<dyn Fn() -> Vec<PeerAuthDescriptor> + Send + Sync>;
 /// Accepts a gossiped signed Space root (store highest epoch per space).
 pub type OnSpaceRootFn = Arc<dyn Fn(SignedSpaceRoot) + Send + Sync>;
 
@@ -274,6 +292,9 @@ pub struct ClusterLink {
     /// Set in [`ClusterLink::start`]; source of durable room descriptors for the
     /// periodic roster gossip and the initial advertise on a new link.
     local_room_roster: RwLock<Option<LocalRoomRosterFn>>,
+    /// Set in [`ClusterLink::start`]; source of trusted-client grants for the
+    /// periodic PeerAuth roster gossip and the initial advertise on a new link.
+    local_peer_auth_roster: RwLock<Option<LocalPeerAuthRosterFn>>,
     /// Set in [`ClusterLink::start`]; source of truth for the periodic Space-root
     /// re-gossip (and the initial advertise on a freshly-established link).
     local_space_roots: RwLock<Option<LocalSpaceRootsFn>>,
@@ -302,6 +323,7 @@ impl ClusterLink {
             on_space_root,
             local_rooms: RwLock::new(None),
             local_room_roster: RwLock::new(None),
+            local_peer_auth_roster: RwLock::new(None),
             local_space_roots: RwLock::new(None),
             shutdown: Arc::new(Notify::new()),
             server_endpoint: RwLock::new(None),
@@ -403,6 +425,7 @@ impl ClusterLink {
         local_rooms: LocalRoomsFn,
         local_room_roster: LocalRoomRosterFn,
         local_space_roots: LocalSpaceRootsFn,
+        local_peer_auth_roster: LocalPeerAuthRosterFn,
     ) -> anyhow::Result<u16> {
         *self.local_space_roots.write() = Some(Arc::clone(&local_space_roots));
         let bind: SocketAddr = self
@@ -411,6 +434,7 @@ impl ClusterLink {
 
         *self.local_rooms.write() = Some(Arc::clone(&local_rooms));
         *self.local_room_roster.write() = Some(Arc::clone(&local_room_roster));
+        *self.local_peer_auth_roster.write() = Some(Arc::clone(&local_peer_auth_roster));
 
         let (server_config, _cert) = build_quinn_server_config(&self.identity.public_id())?;
         let endpoint = Endpoint::server(server_config, bind)?;
@@ -459,10 +483,10 @@ impl ClusterLink {
             });
         }
 
-        // Periodic subscription + Space-root re-advertisement. Roots are
-        // otherwise only gossiped on-change (`replicate_space_root`), so a
-        // member that missed that gossip (or joined the cluster later) would
-        // never converge without this.
+        // Periodic subscription + room / peer-auth roster + Space-root
+        // re-advertisement. PeerAuth is otherwise only fire-and-forget on new
+        // trust, so a member that missed that gossip (or joined later) would
+        // never learn historical clients without this bulk roster.
         {
             let this = Arc::clone(self);
             let shutdown = Arc::clone(&self.shutdown);
@@ -473,6 +497,7 @@ impl ClusterLink {
                         _ = interval.tick() => {
                             this.broadcast_subscriptions(&local_rooms());
                             this.broadcast_room_roster(&local_room_roster());
+                            this.broadcast_peer_auth_roster(&local_peer_auth_roster());
                             for root in local_space_roots() {
                                 this.replicate_space_root(&root);
                             }
@@ -513,6 +538,21 @@ impl ClusterLink {
         let msg = ClusterMsg::signed(
             ClusterMsgKind::RoomRoster {
                 rooms: rooms.to_vec(),
+            },
+            &self.identity,
+        );
+        self.send_to_all_peers(&msg.encode_frame());
+    }
+
+    /// Advertise this node's trusted-client set so cold members accept
+    /// multi-homed / failed-over clients without a re-invite. No-op when empty.
+    fn broadcast_peer_auth_roster(&self, peers: &[PeerAuthDescriptor]) {
+        if peers.is_empty() {
+            return;
+        }
+        let msg = ClusterMsg::signed(
+            ClusterMsgKind::PeerAuthRoster {
+                peers: peers.to_vec(),
             },
             &self.identity,
         );
@@ -649,6 +689,19 @@ impl ClusterLink {
             }
         }
 
+        // Advertise trusted clients immediately so a cold member accepts
+        // multi-homed clients without waiting for the next periodic tick (or a
+        // re-invite). Mirrors RoomRoster self-heal for the peer trust set.
+        let local_peer_auth_roster = self.local_peer_auth_roster.read().clone();
+        if let Some(local_peer_auth_roster) = local_peer_auth_roster {
+            let peers = local_peer_auth_roster();
+            if !peers.is_empty() {
+                let roster =
+                    ClusterMsg::signed(ClusterMsgKind::PeerAuthRoster { peers }, &self.identity);
+                let _ = send.write_all(&roster.encode_frame()).await;
+            }
+        }
+
         // Writer task: drain the outbound channel onto the stream.
         let writer = tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
@@ -748,6 +801,15 @@ impl ClusterLink {
                     handle,
                     direct_invite,
                 });
+            }
+            ClusterMsgKind::PeerAuthRoster { peers } => {
+                for p in peers {
+                    (self.on_peer_auth)(PeerAuthGrant {
+                        identity_pub: p.identity_pub,
+                        handle: p.handle,
+                        direct_invite: p.direct_invite,
+                    });
+                }
             }
             ClusterMsgKind::VersionInfo {
                 version,
@@ -895,17 +957,53 @@ mod tests {
         Arc::new(Vec::new)
     }
 
+    /// Empty peer-auth roster source, for tests that don't exercise trust sync.
+    fn no_peer_auth_roster() -> LocalPeerAuthRosterFn {
+        Arc::new(Vec::new)
+    }
+
     async fn start_two_node_link(
         a_pub: &str,
         b_pub: &str,
-        mut new_link_a: impl FnMut(ClusterMembership) -> Arc<ClusterLink>,
-        mut new_link_b: impl FnMut(ClusterMembership) -> Arc<ClusterLink>,
+        new_link_a: impl Fn(ClusterMembership) -> Arc<ClusterLink>,
+        new_link_b: impl Fn(ClusterMembership) -> Arc<ClusterLink>,
         rooms_a: LocalRoomsFn,
         roster_a: LocalRoomRosterFn,
         roots_a: LocalSpaceRootsFn,
         rooms_b: LocalRoomsFn,
         roster_b: LocalRoomRosterFn,
         roots_b: LocalSpaceRootsFn,
+    ) -> (Arc<ClusterLink>, Arc<ClusterLink>) {
+        start_two_node_link_with_auth(
+            a_pub,
+            b_pub,
+            new_link_a,
+            new_link_b,
+            rooms_a,
+            roster_a,
+            roots_a,
+            no_peer_auth_roster(),
+            rooms_b,
+            roster_b,
+            roots_b,
+            no_peer_auth_roster(),
+        )
+        .await
+    }
+
+    async fn start_two_node_link_with_auth(
+        a_pub: &str,
+        b_pub: &str,
+        new_link_a: impl Fn(ClusterMembership) -> Arc<ClusterLink>,
+        new_link_b: impl Fn(ClusterMembership) -> Arc<ClusterLink>,
+        rooms_a: LocalRoomsFn,
+        roster_a: LocalRoomRosterFn,
+        roots_a: LocalSpaceRootsFn,
+        peer_auth_a: LocalPeerAuthRosterFn,
+        rooms_b: LocalRoomsFn,
+        roster_b: LocalRoomRosterFn,
+        roots_b: LocalSpaceRootsFn,
+        peer_auth_b: LocalPeerAuthRosterFn,
     ) -> (Arc<ClusterLink>, Arc<ClusterLink>) {
         const ATTEMPTS: u32 = 5;
         for attempt in 1..=ATTEMPTS {
@@ -914,11 +1012,21 @@ mod tests {
             let link_a = new_link_a(mem_a);
             let link_b = new_link_b(mem_b);
             let res_a = link_a
-                .start(rooms_a.clone(), roster_a.clone(), roots_a.clone())
+                .start(
+                    rooms_a.clone(),
+                    roster_a.clone(),
+                    roots_a.clone(),
+                    peer_auth_a.clone(),
+                )
                 .await;
             let res_b = if res_a.is_ok() {
                 link_b
-                    .start(rooms_b.clone(), roster_b.clone(), roots_b.clone())
+                    .start(
+                        rooms_b.clone(),
+                        roster_b.clone(),
+                        roots_b.clone(),
+                        peer_auth_b.clone(),
+                    )
                     .await
             } else {
                 Err(anyhow::anyhow!("link A start failed"))
@@ -1267,6 +1375,93 @@ mod tests {
             assert_eq!(got[0].handle, "Alice");
             assert!(got[0].direct_invite);
         }
+        link_a.shutdown();
+        link_b.shutdown();
+    }
+
+    /// A freshly-established cluster link advertises the sender's trusted-client
+    /// roster immediately, so a cold member that missed fire-and-forget
+    /// `PeerAuth` still converges without re-inviting every client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_node_cluster_advertises_peer_auth_roster_on_link_establish() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+        let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
+
+        let a_auth: LocalPeerAuthRosterFn = Arc::new(|| {
+            vec![PeerAuthDescriptor {
+                identity_pub: "client-HISTORIC".into(),
+                handle: "Bob".into(),
+                direct_invite: true,
+            }]
+        });
+
+        let auths = Arc::new(parking_lot::Mutex::new(Vec::<PeerAuthGrant>::new()));
+        let on_auth_b: OnPeerAuthFn = {
+            let a = auths.clone();
+            Arc::new(move |grant| a.lock().push(grant))
+        };
+        let no_repl: OnReplicateFn = Arc::new(|_| {});
+        let no_roster_rx: OnRoomRosterFn = Arc::new(|_| {});
+        let no_auth: OnPeerAuthFn = Arc::new(|_| {});
+        let no_root: OnSpaceRootFn = Arc::new(|_| {});
+
+        let rooms: LocalRoomsFn = Arc::new(Vec::new);
+        let (link_a, link_b) = start_two_node_link_with_auth(
+            &a_pub,
+            &b_pub,
+            |mem_a| {
+                ClusterLink::new(
+                    id_a.clone(),
+                    mem_a,
+                    no_repl.clone(),
+                    no_roster_rx.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            |mem_b| {
+                ClusterLink::new(
+                    id_b.clone(),
+                    mem_b,
+                    no_repl.clone(),
+                    no_roster_rx.clone(),
+                    on_auth_b.clone(),
+                    no_root.clone(),
+                )
+            },
+            rooms.clone(),
+            no_roster(),
+            Arc::new(Vec::new),
+            a_auth,
+            rooms,
+            no_roster(),
+            Arc::new(Vec::new),
+            no_peer_auth_roster(),
+        )
+        .await;
+
+        let mut delivered = false;
+        for _ in 0..100 {
+            if !auths.lock().is_empty() {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            delivered,
+            "B never received A's PeerAuth roster on link establish"
+        );
+        {
+            let got = auths.lock();
+            assert_eq!(got[0].identity_pub, "client-HISTORIC");
+            assert_eq!(got[0].handle, "Bob");
+            assert!(got[0].direct_invite);
+        }
+
         link_a.shutdown();
         link_b.shutdown();
     }

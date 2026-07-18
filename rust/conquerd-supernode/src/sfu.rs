@@ -123,15 +123,7 @@ struct InviteToken {
 /// → 44 padded). Short test identifiers and other non-key strings are left
 /// untouched so callers and unit tests that use plain labels keep working.
 pub(crate) fn normalize_peer_id(peer_id: &str) -> String {
-    let bare = peer_id.trim_end_matches('=');
-    // URL_SAFE base64 of 32 bytes is always 43 unpadded chars (43 % 4 == 3).
-    if bare.len() != 43 {
-        return peer_id.to_string();
-    }
-    let mut s = String::with_capacity(44);
-    s.push_str(bare);
-    s.push('=');
-    s
+    crate::crypto::normalize_public_id(peer_id)
 }
 
 impl SFURoom {
@@ -644,9 +636,15 @@ impl SFURoomManager {
 
     /// True when `peer_id` is a voice participant or text-only subscriber in
     /// `room_id` — the minimum bar for accepting an outbound `SfuChat`.
+    ///
+    /// Normalizes Ed25519 `public_id` padding so relay-sourced (often unpadded)
+    /// and WS-sourced (padded) ids resolve to the same membership entry — same
+    /// contract as join/subscribe/ACL. Without this, cluster multi-path senders
+    /// can pass membership on one path and be dropped as non-members on another.
     pub fn is_chat_sender(&self, room_id: &str, peer_id: &str) -> bool {
+        let peer_id = normalize_peer_id(peer_id);
         self.rooms.get(room_id).is_some_and(|r| {
-            r.participants.contains_key(peer_id) || r.subscribers.contains(peer_id)
+            r.participants.contains_key(&peer_id) || r.subscribers.contains(&peer_id)
         })
     }
 
@@ -873,6 +871,25 @@ mod tests {
         assert!(!mgr.is_chat_sender("r1", "outsider"));
         assert!(mgr.subscribe("listener", "r1"));
         assert!(mgr.is_chat_sender("r1", "listener"));
+    }
+
+    #[test]
+    fn is_chat_sender_normalizes_public_id_padding() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("r1"), "Room", RoomType::Public, "creator")
+            .expect("room");
+        // 43-char unpadded base64url of 32 bytes — join stores the padded form.
+        let unpadded: String = std::iter::repeat('B').take(43).collect();
+        let padded = normalize_peer_id(&unpadded);
+        assert!(mgr.subscribe(&unpadded, "r1"));
+        assert!(
+            mgr.is_chat_sender("r1", &padded),
+            "padded lookup must match unpadded subscribe"
+        );
+        assert!(
+            mgr.is_chat_sender("r1", &unpadded),
+            "unpadded wire sender must match stored membership"
+        );
     }
 
     #[test]
@@ -1142,6 +1159,24 @@ mod tests {
         mgr.create_room(Some("priv"), "Private", RoomType::Private, "creator");
         assert!(!mgr.reregister_invite_token("priv", "", "creator"));
         assert!(!mgr.reregister_invite_token("missing", "tok", "creator"));
+    }
+
+    /// Cold cluster member: room exists via roster (creator only, no ACL / no
+    /// token map). Presenting a client-held RoomStore token re-seeds + admits —
+    /// same path `handle_sfu_room_invite` uses after RoomRoster materialize.
+    #[test]
+    fn cold_node_roster_room_admits_via_reregistered_token() {
+        let mut mgr = SFURoomManager::new();
+        // RoomRoster shape: existence + creator, empty allowed/token map.
+        mgr.create_room(Some("greens"), "Greens Place", RoomType::Private, "owner");
+        assert!(!mgr.join_room("member", "greens").0);
+        let token = "client-held-roomstore-token";
+        assert!(mgr.reregister_invite_token("greens", token, "owner"));
+        assert!(mgr.validate_room_invite("greens", token, "member"));
+        assert!(mgr.join_room("member", "greens").0);
+        // Durable multi-use: second presentation still works.
+        assert!(mgr.validate_room_invite("greens", token, "member2"));
+        assert!(mgr.join_room("member2", "greens").0);
     }
 
     /// Private room: creator is admitted via creator_id without a prior

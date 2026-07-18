@@ -58,6 +58,12 @@ pub mod ffi {
         #[qproperty(i32, missed_calls)]
         /// True when the x.ollama.v1 plugin is enabled and its task is running.
         #[qproperty(bool, ollama_available)]
+        /// Latest Ollama model-list JSON array (e.g. `["llama3.2:latest"]`).
+        /// Updated by `fetchOllamaModels`; QML should watch this property (more
+        /// reliable than the signal alone with cxx-qt Connections).
+        #[qproperty(QString, ollama_models_json)]
+        /// Last model-list error (empty on success). Pair with `ollama_models_json`.
+        #[qproperty(QString, ollama_models_error)]
         /// Normalized audio input level (0.0–1.0), updated each Opus frame.
         /// Non-zero only while a call or mic test is active.
         #[qproperty(f32, mic_level)]
@@ -935,6 +941,11 @@ pub struct AppBridgeRust {
     /// Keep the background OS thread (and the tokio Runtime inside it) alive.
     rt_thread: Option<std::thread::JoinHandle<()>>,
 
+    /// Clone of the background tokio runtime handle. Used by Qt-thread invokables
+    /// (e.g. `fetchOllamaModels`) that must spawn work without being *inside*
+    /// the runtime — `Handle::try_current()` is always `None` on the GUI thread.
+    rt_handle: Option<tokio::runtime::Handle>,
+
     /// Unread inbound chat message count (cleared by clearUnread()).
     unread_chat: u32,
 
@@ -984,6 +995,18 @@ pub struct AppBridgeRust {
     /// True when the Ollama plugin is running. Mirrors the `ollama_available` qproperty.
     ollama_available: bool,
 
+    /// Latest model-list JSON. Mirrors the `ollama_models_json` qproperty.
+    ollama_models_json: QString,
+
+    /// Latest model-list error. Mirrors the `ollama_models_error` qproperty.
+    ollama_models_error: QString,
+
+    /// In-flight auto-reply streams: request_id → reply target.
+    auto_reply_pending: std::collections::HashMap<String, AutoReplyTarget>,
+
+    /// Accumulated auto-reply text per request_id (streamed chunks).
+    auto_reply_buf: std::collections::HashMap<String, String>,
+
     /// Normalized audio input level (0.0–1.0). Updated each Opus frame while
     /// a call or mic test is active. Mirrors the `mic_level` qproperty.
     mic_level: f32,
@@ -1005,6 +1028,12 @@ pub struct AppBridgeRust {
     /// Populated from `chat_members` (participants + subscribers) for
     /// `current_supernode_id` / `current_room_id`.
     text_member_ids: Vec<String>,
+
+    /// Display handles learned from room chat (and similar) for room UI labels.
+    /// Keyed by SFU member id (`public_id`). Not a trust store — room membership
+    /// alone must not promote someone into the Peers rail; this only names the
+    /// members panel when PeerStore has no handle yet.
+    room_display_handles: std::collections::HashMap<String, String>,
 
     /// Authoritative SfuMembers snapshots that arrived before the voice rail
     /// scope was stamped (e.g. the connection manager's eager join on create).
@@ -1065,6 +1094,11 @@ pub struct AppBridgeRust {
     /// (the smallest member id), so per-member connect/disconnect patches are
     /// folded here rather than pushed to the sidebar individually.
     supernode_connected: std::collections::HashMap<String, bool>,
+
+    /// Hosts (pad-normalized) already rematerialized this session. Cleared on
+    /// disconnect so a later reconnect still replays rooms. Stops
+    /// ClusterMembersUpdated from re-firing CreateRoom → tray spam.
+    rematerialized_hosts: HashSet<String>,
 }
 
 fn request_invite_url(rust: &AppBridgeRust) -> Option<String> {
@@ -1225,6 +1259,7 @@ impl Default for AppBridgeRust {
             identity: None,
             pending_release: None,
             rt_thread: None,
+            rt_handle: None,
             unread_chat: 0,
             peer_store: None,
             chat_store: None,
@@ -1240,11 +1275,16 @@ impl Default for AppBridgeRust {
             ptt_thread: None,
             ollama_cmd_tx: None,
             ollama_available: false,
+            ollama_models_json: QString::from("[]"),
+            ollama_models_error: QString::from(""),
+            auto_reply_pending: std::collections::HashMap::new(),
+            auto_reply_buf: std::collections::HashMap::new(),
             mic_level: 0.0,
             mic_test_active: false,
             room_chat_history: std::collections::HashMap::new(),
             room_participant_ids: Vec::new(),
             text_member_ids: Vec::new(),
+            room_display_handles: std::collections::HashMap::new(),
             pending_room_rosters: std::collections::HashMap::new(),
             pending_chat_rosters: std::collections::HashMap::new(),
             online_peer_ids: HashSet::new(),
@@ -1257,6 +1297,7 @@ impl Default for AppBridgeRust {
             avatar_config_json: String::new(),
             cluster_siblings: std::collections::HashMap::new(),
             supernode_connected: std::collections::HashMap::new(),
+            rematerialized_hosts: HashSet::new(),
         }
     }
 }
@@ -1718,6 +1759,10 @@ impl ffi::AppBridge {
 
         let qt_thread = self.qt_thread();
 
+        // Hand the runtime Handle back to the Qt thread so invokables can
+        // spawn work (model list, etc.) without relying on try_current().
+        let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel::<tokio::runtime::Handle>(1);
+
         let rt_thread = match std::thread::Builder::new()
             .name("conquerd-tokio".into())
             .spawn(move || {
@@ -1731,6 +1776,8 @@ impl ffi::AppBridge {
                         return;
                     }
                 };
+
+                let _ = handle_tx.send(rt.handle().clone());
 
                 // Register the scheme handler callback so conquerd:// URL
                 // fetches can be routed through the ConnectionManager.
@@ -1752,6 +1799,7 @@ impl ffi::AppBridge {
                     // Spawn Ollama task if the plugin is enabled.
                     if let Some(task) = ollama_task {
                         tokio::spawn(task);
+                        info!("[plugins] x.ollama.v1 task spawned");
                     }
 
                     crate::platform::register_uri_scheme();
@@ -1798,7 +1846,22 @@ impl ffi::AppBridge {
             }
         };
 
+        match handle_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(handle) => {
+                self.as_mut().rust_mut().rt_handle = Some(handle);
+            }
+            Err(e) => {
+                warn!("failed to capture tokio runtime handle: {e}");
+            }
+        }
+
         self.as_mut().rust_mut().rt_thread = Some(rt_thread);
+
+        if ollama_is_available {
+            info!("[plugins] x.ollama.v1 available (enabled in settings)");
+        } else {
+            info!("[plugins] x.ollama.v1 not started (disabled in settings — model list still works via direct HTTP)");
+        }
     }
 
     fn end_call(mut self: Pin<&mut Self>) {
@@ -2049,11 +2112,17 @@ impl ffi::AppBridge {
             + 900;
 
         let inviter_handle = read_local_handle();
+        // Keep the offline/fallback path wire-compatible with ConnectionManager::
+        // generate_invite_url (AcceptInvite rejects invites without this field).
+        let inviter_eph = crate::crypto::generate_ephemeral_keypair();
+        let inviter_ephemeral_pub =
+            crate::crypto::b64url_encode_nopad(inviter_eph.public.as_bytes());
         let payload = serde_json::json!({
             "inviter_peer_id": peer_id,
             "inviter_identity_pub": pub_key,
             "invite_id": invite_id,
             "expires_at": expires_at,
+            "inviter_ephemeral_pub": inviter_ephemeral_pub,
             "inviter_handle": inviter_handle,
         });
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
@@ -2327,12 +2396,19 @@ impl ffi::AppBridge {
             let store = ps.read();
             room_participant_label(
                 Some(&store),
+                Some(&r.room_display_handles),
                 &peer_id.to_string(),
                 &r.my_peer_id,
                 &r.my_public_id,
             )
         } else {
-            room_participant_label(None, &peer_id.to_string(), &r.my_peer_id, &r.my_public_id)
+            room_participant_label(
+                None,
+                Some(&r.room_display_handles),
+                &peer_id.to_string(),
+                &r.my_peer_id,
+                &r.my_public_id,
+            )
         };
         QString::from(label.as_str())
     }
@@ -3781,6 +3857,10 @@ impl ffi::AppBridge {
         let pr = prompt.to_string();
         let sys = system_prompt.to_string();
         if let Some(ref tx) = self.rust().ollama_cmd_tx {
+            // Always push the latest settings (model / base URL) before query —
+            // the plugin task otherwise keeps the startup snapshot forever.
+            let cfg = crate::ollama_module::read_assistant_settings().to_config();
+            let _ = tx.try_send(crate::ollama_module::OllamaCommand::SetConfig(cfg));
             let _ = tx.try_send(crate::ollama_module::OllamaCommand::Query {
                 request_id: rid,
                 prompt: pr,
@@ -3808,38 +3888,363 @@ impl ffi::AppBridge {
             }
         };
 
-        // If the plugin task is running, route through its command channel so the
-        // result arrives via the existing OllamaEvent dispatch path.
-        if let Some(ref tx) = self.rust().ollama_cmd_tx {
-            let _ = tx.try_send(crate::ollama_module::OllamaCommand::ListModels { base_url: url });
+        // Always fetch over direct HTTP on the background runtime handle.
+        // Model-list is a local settings UX path — it must not depend on the
+        // plugin task / event loop (which previously made mid-session enable
+        // and Connections-only delivery flaky). Must NOT use
+        // `Handle::try_current()`: this invokable runs on the Qt GUI thread.
+        let Some(handle) = self.rust().rt_handle.clone() else {
+            warn!("[ollama] fetch_ollama_models: runtime handle not ready yet");
+            publish_ollama_models(
+                self,
+                "[]",
+                "Backend still starting — click refresh in a moment, or re-open the AI settings tab.",
+            );
             return;
-        }
+        };
 
-        // Plugin disabled — do a standalone fetch and queue back via CxxQtThread.
-        // Guard: QML child Component.onCompleted fires before MainWindow.onCompleted
-        // calls initializeBackend(), so this can be reached before the Tokio runtime
-        // exists.  Silently no-op; the settings page shows "Click ↻ to load models".
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
+        info!("[ollama] ListModels fetching {url}/api/tags");
         let qt_thread = self.qt_thread();
-        let client = reqwest::Client::new();
-        tokio::spawn(async move {
+        // Disable system proxy: localhost Ollama must not go through HTTP_PROXY.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        handle.spawn(async move {
             let (models_json, error) =
                 match crate::ollama_module::fetch_model_list(&client, &url).await {
-                    Ok(names) => (
-                        serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_owned()),
-                        String::new(),
-                    ),
-                    Err(e) => ("[]".to_owned(), e),
+                    Ok(names) => {
+                        info!("[ollama] ListModels ok: {} model(s)", names.len());
+                        (
+                            serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_owned()),
+                            String::new(),
+                        )
+                    }
+                    Err(e) => {
+                        warn!("[ollama] ListModels failed for {url}: {e}");
+                        ("[]".to_owned(), e)
+                    }
                 };
-            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                bridge.as_mut().ollama_models_ready(
-                    QString::from(models_json.as_str()),
-                    QString::from(error.as_str()),
-                );
+            let _ = qt_thread.queue(move |bridge: Pin<&mut ffi::AppBridge>| {
+                publish_ollama_models(bridge, &models_json, &error);
             });
         });
+    }
+}
+
+/// Publish a model-list result to QML via qproperties (primary) + signal (compat).
+fn publish_ollama_models(mut bridge: Pin<&mut ffi::AppBridge>, models_json: &str, error: &str) {
+    let models_q = QString::from(models_json);
+    let error_q = QString::from(error);
+    bridge.as_mut().set_ollama_models_json(models_q.clone());
+    bridge.as_mut().set_ollama_models_error(error_q.clone());
+    bridge.as_mut().ollama_models_ready(models_q, error_q);
+}
+
+/// Where an auto-reply should be sent once the Ollama stream finishes.
+#[derive(Debug, Clone)]
+enum AutoReplyTarget {
+    Direct {
+        peer_id: String,
+    },
+    Room {
+        supernode_id: String,
+        room_id: String,
+    },
+}
+
+/// Kick off an Ollama query that will be posted back as chat when complete.
+///
+/// No-op when the plugin is disabled, the matching auto-respond flag is off,
+/// the inbound body is empty, or the Ollama command channel is unavailable.
+fn maybe_start_auto_reply(
+    mut bridge: Pin<&mut ffi::AppBridge>,
+    target: AutoReplyTarget,
+    inbound_body: &str,
+    inbound_message_id: &str,
+) {
+    let body = inbound_body.trim();
+    if body.is_empty() {
+        return;
+    }
+    let settings = crate::ollama_module::read_assistant_settings();
+    if !settings.enabled {
+        return;
+    }
+    let want = match &target {
+        AutoReplyTarget::Direct { .. } => settings.auto_respond_direct,
+        AutoReplyTarget::Room { .. } => settings.auto_respond_room,
+    };
+    if !want {
+        return;
+    }
+    let Some(tx) = bridge.rust().ollama_cmd_tx.clone() else {
+        warn!("[ollama] auto-reply skipped: plugin not running (enable AI assistant and restart)");
+        return;
+    };
+
+    let request_id = match &target {
+        AutoReplyTarget::Direct { peer_id } => {
+            format!("auto-direct-{}-{}", peer_id, inbound_message_id)
+        }
+        AutoReplyTarget::Room {
+            supernode_id,
+            room_id,
+        } => format!("auto-room-{supernode_id}-{room_id}-{inbound_message_id}"),
+    };
+
+    // Cancel any prior in-flight auto-reply to the same target so we don't
+    // flood the peer when messages arrive faster than generation.
+    let stale: Vec<String> = bridge
+        .rust()
+        .auto_reply_pending
+        .iter()
+        .filter(|(_, t)| match (t, &target) {
+            (AutoReplyTarget::Direct { peer_id: a }, AutoReplyTarget::Direct { peer_id: b }) => {
+                a == b
+            }
+            // room_id only — multi-home cluster deliveries share one cancel scope.
+            (
+                AutoReplyTarget::Room { room_id: ra, .. },
+                AutoReplyTarget::Room { room_id: rb, .. },
+            ) => ra == rb,
+            _ => false,
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for old_id in stale {
+        let _ = tx.try_send(crate::ollama_module::OllamaCommand::Cancel {
+            request_id: old_id.clone(),
+        });
+        bridge
+            .as_mut()
+            .rust_mut()
+            .auto_reply_pending
+            .remove(&old_id);
+        bridge.as_mut().rust_mut().auto_reply_buf.remove(&old_id);
+    }
+
+    let sys = if settings.system_prompt.trim().is_empty() {
+        "You are a helpful assistant in a private peer-to-peer chat. \
+         Remember earlier turns in this conversation and reply with continuity. \
+         Keep replies concise."
+            .to_owned()
+    } else {
+        // Multi-turn hint layered on the user's system prompt.
+        format!(
+            "{}\n\n(You are in a multi-turn chat; use prior messages in this conversation for context.)",
+            settings.system_prompt.trim()
+        )
+    };
+
+    let conversation_id = match &target {
+        AutoReplyTarget::Direct { peer_id } => {
+            crate::ollama_module::conversation_id_direct(peer_id)
+        }
+        AutoReplyTarget::Room { room_id, .. } => {
+            crate::ollama_module::conversation_id_room(room_id)
+        }
+    };
+
+    info!(
+        "[ollama] auto-reply start rid={request_id} model={} conv={conversation_id} target={target:?}",
+        settings.model
+    );
+    let _ = tx.try_send(crate::ollama_module::OllamaCommand::SetConfig(
+        settings.to_config(),
+    ));
+    if tx
+        .try_send(crate::ollama_module::OllamaCommand::Chat {
+            request_id: request_id.clone(),
+            conversation_id,
+            user_message: body.to_owned(),
+            system_prompt: sys,
+        })
+        .is_err()
+    {
+        warn!("[ollama] auto-reply Chat try_send failed");
+        return;
+    }
+    bridge
+        .as_mut()
+        .rust_mut()
+        .auto_reply_pending
+        .insert(request_id.clone(), target);
+    bridge
+        .as_mut()
+        .rust_mut()
+        .auto_reply_buf
+        .insert(request_id, String::new());
+}
+
+/// Append a streamed token for an auto-reply request (if tracked).
+fn auto_reply_on_chunk(mut bridge: Pin<&mut ffi::AppBridge>, request_id: &str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(buf) = bridge
+        .as_mut()
+        .rust_mut()
+        .auto_reply_buf
+        .get_mut(request_id)
+    {
+        buf.push_str(text);
+    }
+}
+
+/// Finish an auto-reply: send the accumulated text as chat (direct or room).
+fn auto_reply_on_done(mut bridge: Pin<&mut ffi::AppBridge>, request_id: &str) {
+    let target = bridge
+        .as_mut()
+        .rust_mut()
+        .auto_reply_pending
+        .remove(request_id);
+    let body = bridge
+        .as_mut()
+        .rust_mut()
+        .auto_reply_buf
+        .remove(request_id)
+        .unwrap_or_default();
+    let Some(target) = target else {
+        return;
+    };
+    let reply = body.trim();
+    if reply.is_empty() {
+        warn!("[ollama] auto-reply {request_id} finished with empty body");
+        return;
+    }
+    info!(
+        "[ollama] auto-reply done rid={request_id} chars={} target={target:?}",
+        reply.chars().count()
+    );
+    match target {
+        AutoReplyTarget::Direct { peer_id } => {
+            bridge
+                .as_mut()
+                .send_chat(&QString::from(peer_id.as_str()), &QString::from(reply));
+        }
+        AutoReplyTarget::Room {
+            supernode_id,
+            room_id,
+        } => {
+            send_room_chat_to(bridge, &supernode_id, &room_id, reply);
+        }
+    }
+}
+
+fn auto_reply_on_error(mut bridge: Pin<&mut ffi::AppBridge>, request_id: &str, message: &str) {
+    let had = bridge
+        .as_mut()
+        .rust_mut()
+        .auto_reply_pending
+        .remove(request_id)
+        .is_some();
+    bridge.as_mut().rust_mut().auto_reply_buf.remove(request_id);
+    if had {
+        warn!("[ollama] auto-reply {request_id} failed: {message}");
+    }
+}
+
+/// Send SFU room chat to an explicit room (does not depend on the UI selection).
+fn send_room_chat_to(
+    mut bridge: Pin<&mut ffi::AppBridge>,
+    supernode_id: &str,
+    room_id: &str,
+    body: &str,
+) {
+    if supernode_id.is_empty() || room_id.is_empty() || body.is_empty() {
+        return;
+    }
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let (handle, sender_id, chat_store_opt) = {
+        let r = bridge.rust();
+        let handle = r
+            .peer_store
+            .as_ref()
+            .and_then(|ps| {
+                let store = ps.read();
+                store.get(&r.my_peer_id).map(|rec| rec.display_name())
+            })
+            .unwrap_or_default();
+        let sender_id = r.my_public_id.clone();
+        let cs = r.chat_store.clone();
+        (handle, sender_id, cs)
+    };
+    let sn = supernode_id.to_owned();
+    let rid = room_id.to_owned();
+    let body_str = body.to_owned();
+    let sent = match bridge.rust().conn_cmd_tx {
+        Some(ref tx) => tx
+            .try_send(ConnectionCommand::SendSfuChat {
+                supernode_id: sn.clone(),
+                room_id: rid.clone(),
+                body: body_str.clone(),
+                sender_handle: handle.clone(),
+                message_id: message_id.clone(),
+            })
+            .is_ok(),
+        None => false,
+    };
+    let status = if sent { "sent" } else { "failed" };
+    let message_status = if sent {
+        crate::chat_store::MessageStatus::Sent
+    } else {
+        crate::chat_store::MessageStatus::Failed
+    };
+    let json = serde_json::json!({
+        "msg_id": message_id.clone(),
+        "sender": handle.clone(),
+        "sender_id": sender_id.clone(),
+        "body": body_str.clone(),
+        "timestamp": now_ts,
+        "kind": "text",
+        "mine": true,
+        "is_room": true,
+        "status": status,
+        "supernode_id": sn.clone(),
+        "room_id": rid.clone(),
+    })
+    .to_string();
+    if let Some(ref cs) = chat_store_opt {
+        let store_key = room_chat_store_peer_id(&sn, &rid);
+        let chat_msg = crate::chat_store::ChatMessage {
+            id: message_id,
+            peer_id: store_key,
+            sender: sender_id,
+            recipient: rid.clone(),
+            body: body_str,
+            timestamp: now_ts,
+            is_self: true,
+            status: message_status,
+            kind: crate::chat_store::MessageKind::Text,
+            attachment_name: String::new(),
+            attachment_path: String::new(),
+            size_str: String::new(),
+            status_note: String::new(),
+            sender_handle: handle,
+        };
+        if let Err(e) = cs.insert(&chat_msg) {
+            warn!("chat_store insert (auto room reply) error: {e}");
+        }
+    }
+    let key = room_chat_history_key(&sn, &rid);
+    bridge
+        .as_mut()
+        .rust_mut()
+        .room_chat_history
+        .entry(key)
+        .or_default()
+        .push(json.clone());
+    let show = bridge.rust().current_supernode_id == sn && bridge.rust().current_room_id == rid;
+    if show {
+        bridge
+            .as_mut()
+            .room_chat_received(QString::from(json.as_str()));
     }
 }
 
@@ -4169,12 +4574,36 @@ fn room_chat_display_sender(
         let store = ps.read();
         return room_participant_label(
             Some(&store),
+            Some(&bridge.room_display_handles),
             sender_id,
             &bridge.my_peer_id,
             &bridge.my_public_id,
         );
     }
-    room_participant_label(None, sender_id, &bridge.my_peer_id, &bridge.my_public_id)
+    room_participant_label(
+        None,
+        Some(&bridge.room_display_handles),
+        sender_id,
+        &bridge.my_peer_id,
+        &bridge.my_public_id,
+    )
+}
+
+/// Remember a room member's display handle for the members panel (not trust).
+/// Returns true when the cached label changed.
+fn remember_room_display_handle(rust: &mut AppBridgeRust, sender_id: &str, handle: &str) -> bool {
+    let handle = handle.trim();
+    if sender_id.is_empty() || handle.is_empty() {
+        return false;
+    }
+    match rust.room_display_handles.get(sender_id) {
+        Some(existing) if existing == handle => false,
+        _ => {
+            rust.room_display_handles
+                .insert(sender_id.to_owned(), handle.to_owned());
+            true
+        }
+    }
 }
 
 fn peer_row_json_with_presence(
@@ -4445,13 +4874,46 @@ fn active_voice_room_scope(bridge: &AppBridgeRust) -> (String, String) {
 
 fn is_active_voice_room(bridge: &AppBridgeRust, supernode_id: &str, room_id: &str) -> bool {
     let (sn, rid) = active_voice_room_scope(bridge);
-    !rid.is_empty() && sn == supernode_id && rid == room_id
+    !rid.is_empty() && rid == room_id && same_cluster_scope(bridge, &sn, supernode_id)
 }
 
 fn is_selected_text_room(bridge: &AppBridgeRust, supernode_id: &str, room_id: &str) -> bool {
     !bridge.current_room_id.is_empty()
-        && bridge.current_supernode_id == supernode_id
         && bridge.current_room_id == room_id
+        && same_cluster_scope(bridge, &bridge.current_supernode_id, supernode_id)
+}
+
+/// Pad-tolerant equality for Ed25519 `public_id` strings.
+fn pub_id_eq(a: &str, b: &str) -> bool {
+    a == b || a.trim_end_matches('=') == b.trim_end_matches('=')
+}
+
+/// True when `a` and `b` name the same logical supernode: exact match, or
+/// verified cluster siblings of each other. Room joins often keep the invite
+/// member id in UI scope while multi-home/failover delivers `SfuMembers` from
+/// a live sibling — without this, voice rail + sidebar counts freeze after
+/// the invite host dies.
+fn same_cluster_scope(bridge: &AppBridgeRust, a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if pub_id_eq(a, b) {
+        return true;
+    }
+    bridge.cluster_full_set(a).iter().any(|m| pub_id_eq(m, b))
+        || bridge.cluster_full_set(b).iter().any(|m| pub_id_eq(m, a))
+}
+
+/// Sidebar / room-store key for events from any cluster member: prefer the
+/// known-supernode identity (invite host), else the cluster representative.
+fn sidebar_supernode_id(bridge: &AppBridgeRust, event_supernode_id: &str) -> Option<String> {
+    if let Some(canon) = bridge.resolve_supernode_node_id_str(event_supernode_id) {
+        return Some(bridge.cluster_representative(&canon));
+    }
+    let key = bridge.cluster_member_key(event_supernode_id)?;
+    let rep = bridge.cluster_representative(&key);
+    // Prefer a known-supernode form of the representative when present.
+    Some(bridge.resolve_supernode_node_id_str(&rep).unwrap_or(rep))
 }
 
 fn room_roster_key(supernode_id: &str, room_id: &str) -> String {
@@ -4481,10 +4943,23 @@ fn emit_member_list_json(
 ) {
     let my_public_id = bridge.rust().my_public_id.clone();
     let my_peer_id = bridge.rust().my_peer_id.clone();
+    let display_handles = bridge.rust().room_display_handles.clone();
     let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-        room_participants_json(Some(&ps.read()), members, &my_peer_id, &my_public_id)
+        room_participants_json(
+            Some(&ps.read()),
+            Some(&display_handles),
+            members,
+            &my_peer_id,
+            &my_public_id,
+        )
     } else {
-        room_participants_json(None, members, &my_peer_id, &my_public_id)
+        room_participants_json(
+            None,
+            Some(&display_handles),
+            members,
+            &my_peer_id,
+            &my_public_id,
+        )
     };
     if as_voice {
         bridge
@@ -4695,82 +5170,147 @@ fn emit_cluster_node_connected(
         .nodes_updated(QString::from(node_json.as_str()));
 }
 
+/// Rematerialize every client-owned room for a cluster onto a **live** host.
+///
+/// `target_host` is the WS session that will receive `SfuRoomCreate` (may be a
+/// multi-home sibling that is *not* in the peer store). `source_member_ids` is
+/// the full cluster set so rooms saved under the invite host (A) are found even
+/// when replaying onto B/C after A is down — without this, private joins hit
+/// `room_absent` on cold members.
 fn replay_saved_rooms_on_supernode_connect(
     room_store: &crate::room_store::RoomStore,
     peer_store: &crate::peer_store::PeerStore,
     conn_cmd_tx: &mpsc::Sender<ConnectionCommand>,
-    supernode_id: &str,
-    sibling_ids: &[String],
+    target_host: &str,
+    source_member_ids: &[String],
+    hide_keys: &[String],
     my_public_id: &str,
     identity: Option<&crate::identity::Identity>,
 ) {
-    // Rooms saved under `supernode_id` itself take priority; verified cluster
-    // siblings only fill in rooms we don't already have a direct entry for,
-    // so a member we're already connected to also gets client-owned rooms we
-    // only ever created/joined via one of its siblings — a cluster presents
-    // as one logical supernode to peers (see agents.md "Crypto — group key
-    // reliability" neighbourhood / cluster failover notes in backlog.md).
-    let mut seen_room_ids: HashSet<String> = HashSet::new();
-    let source_ids: Vec<&str> = std::iter::once(supernode_id)
-        .chain(sibling_ids.iter().map(String::as_str))
-        .collect();
-    for source_id in source_ids {
-        for entry in room_store.list_for_supernode_resolved(peer_store, source_id) {
-            if entry.room_id == "default" {
-                continue;
-            }
-            if !seen_room_ids.insert(entry.room_id.clone()) {
-                continue;
-            }
-            // Hide status is a sidebar preference for the connection we're
-            // materializing *onto* (`supernode_id`), not the source the saved
-            // entry happened to come from.
-            if room_store.is_hidden_from_sidebar(supernode_id, &entry.room_id) {
-                continue;
-            }
-            let creator_id = if entry.creator_id.is_empty() {
-                my_public_id.to_owned()
-            } else {
-                entry.creator_id.clone()
-            };
-            let _ = conn_cmd_tx.try_send(ConnectionCommand::CreateRoom {
-                supernode_id: supernode_id.to_owned(),
-                room_name: entry.room_name.clone(),
-                room_type: entry.room_type.clone(),
-                room_id: Some(entry.room_id.clone()),
-                creator_id: Some(creator_id),
-                materialize_only: true,
-                invite_policy: entry.invite_policy.clone(),
-                // Re-seed after idle GC so private-room invite rejoin works.
-                invite_token: entry.invite_token.clone(),
-            });
-            // Private-room chat subscribe is deferred until `SfuRoomCreated`
-            // materialize ack (CM inserts chat_active + SfuSubscribe) so the
-            // room exists before we try to join its subscriber set.
+    let entries = if source_member_ids.is_empty() {
+        room_store.list_for_supernode_resolved(peer_store, target_host)
+    } else {
+        room_store.list_for_cluster_members(peer_store, source_member_ids)
+    };
+    for entry in entries {
+        if entry.room_id == "default" {
+            continue;
         }
+        // Hide is keyed under the invite host / entry supernode — check all
+        // cluster aliases so a room hidden under A stays hidden on B/C.
+        let hidden = hide_keys
+            .iter()
+            .any(|k| room_store.is_hidden_from_sidebar(k, &entry.room_id))
+            || room_store.is_hidden_from_sidebar(&entry.supernode_id, &entry.room_id)
+            || room_store.is_hidden_from_sidebar(target_host, &entry.room_id);
+        if hidden {
+            continue;
+        }
+        let creator_id = if entry.creator_id.is_empty() {
+            my_public_id.to_owned()
+        } else {
+            entry.creator_id.clone()
+        };
+        let _ = conn_cmd_tx.try_send(ConnectionCommand::CreateRoom {
+            supernode_id: target_host.to_owned(),
+            room_name: entry.room_name.clone(),
+            room_type: entry.room_type.clone(),
+            room_id: Some(entry.room_id.clone()),
+            creator_id: Some(creator_id),
+            materialize_only: true,
+            invite_policy: entry.invite_policy.clone(),
+            // Re-seed after idle GC / cold-node start so private rejoin works.
+            invite_token: entry.invite_token.clone(),
+        });
     }
-    // Periodic Space-root re-broadcast on reconnect: the one guaranteed
-    // convergence point (the supernode may have restarted and lost its
-    // in-memory `SpaceRootStore`), so re-announce our owned Space root here
-    // rather than only on room create/adopt. Best-effort — no identity, no
-    // Space owned for this supernode, or a signing hiccup must not block the
-    // reconnect flow.
+    // Space-root re-broadcast: prefer invite-host space id when present.
     if let Some(identity) = identity {
-        let space_id = crate::room_store::RoomStore::space_id_for(my_public_id, supernode_id);
-        if let Some(space) = room_store.get_space(&space_id) {
-            let issued_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let root = space.signed_root(issued_at, |b| identity.sign(b));
-            if let Ok(root_json) = serde_json::to_string(&root) {
-                let _ = conn_cmd_tx.try_send(ConnectionCommand::AnnounceSpaceRoot {
-                    supernode_id: supernode_id.to_owned(),
-                    root_json,
-                });
+        let space_hosts: Vec<&str> = std::iter::once(target_host)
+            .chain(source_member_ids.iter().map(String::as_str))
+            .collect();
+        for host in space_hosts {
+            let space_id = crate::room_store::RoomStore::space_id_for(my_public_id, host);
+            if let Some(space) = room_store.get_space(&space_id) {
+                let issued_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let root = space.signed_root(issued_at, |b| identity.sign(b));
+                if let Ok(root_json) = serde_json::to_string(&root) {
+                    let _ = conn_cmd_tx.try_send(ConnectionCommand::AnnounceSpaceRoot {
+                        supernode_id: target_host.to_owned(),
+                        root_json,
+                    });
+                }
+                break;
             }
         }
     }
+}
+
+/// Collect cluster member ids (pad-normalized) for room-store lookup, plus a
+/// stable hide-key list (invite rep first when known).
+fn cluster_materialize_context(
+    bridge: &AppBridgeRust,
+    live_member: &str,
+) -> (
+    String,      /*target*/
+    Vec<String>, /*sources*/
+    Vec<String>, /*hide_keys*/
+) {
+    let target = live_member.to_owned();
+    let sources = bridge.cluster_full_set(live_member);
+    let mut hide_keys = sources.clone();
+    let rep = bridge.cluster_representative(live_member);
+    if !hide_keys.iter().any(|k| pub_id_eq(k, &rep)) {
+        hide_keys.push(rep);
+    }
+    if let Some(canon) = bridge.resolve_supernode_node_id_str(live_member) {
+        if !hide_keys.iter().any(|k| pub_id_eq(k, &canon)) {
+            hide_keys.push(canon);
+        }
+    }
+    // Always include live member itself for standalone / first-connect.
+    let mut source_ids = sources;
+    if source_ids.is_empty() {
+        source_ids.push(target.clone());
+    } else if !source_ids.iter().any(|k| pub_id_eq(k, &target)) {
+        source_ids.push(target.clone());
+    }
+    (target, source_ids, hide_keys)
+}
+
+fn rematerialize_rooms_on_live_host(bridge: &mut AppBridgeRust, live_member: &str) {
+    let host_key = live_member.trim_end_matches('=').to_owned();
+    if bridge.rematerialized_hosts.contains(&host_key) {
+        return;
+    }
+    let Some(rs) = bridge.room_store.as_ref() else {
+        return;
+    };
+    let Some(ps) = bridge.peer_store.as_ref() else {
+        return;
+    };
+    let Some(tx) = bridge.conn_cmd_tx.as_ref() else {
+        return;
+    };
+    let (target, sources, hide_keys) = cluster_materialize_context(bridge, live_member);
+    info!(
+        "[bridge] rematerializing {} cluster room source(s) onto live host {}",
+        sources.len(),
+        &target[..12.min(target.len())]
+    );
+    replay_saved_rooms_on_supernode_connect(
+        &rs.read(),
+        &ps.read(),
+        tx,
+        &target,
+        &sources,
+        &hide_keys,
+        bridge.my_public_id.as_str(),
+        bridge.identity.as_deref(),
+    );
+    bridge.rematerialized_hosts.insert(host_key);
 }
 
 fn filter_sfu_rooms_for_sidebar(
@@ -4886,6 +5426,11 @@ fn room_voice_sidebar_patch(
         return None;
     }
 
+    // Fold multi-home sibling ids onto the single logical sidebar row (invite
+    // host / cluster representative).
+    let sidebar_sn =
+        sidebar_supernode_id(bridge, supernode_id).unwrap_or_else(|| supernode_id.to_owned());
+
     let mut room = serde_json::json!({
         "room_id": room_id,
         "participant_ids": member_ids,
@@ -4895,7 +5440,10 @@ fn room_voice_sidebar_patch(
     if let (Some(rs), Some(ps)) = (bridge.room_store.as_ref(), bridge.peer_store.as_ref()) {
         let store = rs.read();
         let peer_store = ps.read();
-        if let Some(entry) = store.get(supernode_id, room_id) {
+        if let Some(entry) = store
+            .get(&sidebar_sn, room_id)
+            .or_else(|| store.get(supernode_id, room_id))
+        {
             room["room_name"] = serde_json::Value::String(entry.room_name.clone());
             room["room_type"] = serde_json::Value::String(entry.room_type.clone());
             room["creator_id"] = serde_json::Value::String(entry.creator_id.clone());
@@ -4908,7 +5456,7 @@ fn room_voice_sidebar_patch(
         );
         return Some(
             serde_json::json!({
-                "supernode_id": supernode_id,
+                "supernode_id": sidebar_sn,
                 "rooms": rooms,
                 "replace": false,
             })
@@ -4923,7 +5471,7 @@ fn room_voice_sidebar_patch(
     );
     Some(
         serde_json::json!({
-            "supernode_id": supernode_id,
+            "supernode_id": sidebar_sn,
             "rooms": rooms,
             "replace": false,
         })
@@ -4933,6 +5481,7 @@ fn room_voice_sidebar_patch(
 
 fn room_participant_label(
     peer_store: Option<&crate::peer_store::PeerStore>,
+    display_handles: Option<&std::collections::HashMap<String, String>>,
     peer_id: &str,
     my_peer_id: &str,
     my_public_id: &str,
@@ -4944,9 +5493,8 @@ fn room_participant_label(
         }
         if let Some(store) = peer_store {
             if let Some(rec) = store.get(my_peer_id) {
-                let name = rec.display_name();
-                if !name.is_empty() {
-                    return name;
+                if !rec.handle.is_empty() {
+                    return rec.handle.clone();
                 }
             }
         }
@@ -4955,7 +5503,14 @@ fn room_participant_label(
             .get(peer_id)
             .or_else(|| store.get_by_identity(peer_id))
         {
-            return rec.display_name();
+            if !rec.handle.is_empty() {
+                return rec.handle.clone();
+            }
+        }
+    }
+    if let Some(cache) = display_handles {
+        if let Some(h) = cache.get(peer_id).filter(|s| !s.is_empty()) {
+            return h.clone();
         }
     }
     if peer_id.len() > 12 {
@@ -4967,6 +5522,7 @@ fn room_participant_label(
 
 fn room_participants_json(
     peer_store: Option<&crate::peer_store::PeerStore>,
+    display_handles: Option<&std::collections::HashMap<String, String>>,
     ids: &[String],
     my_peer_id: &str,
     my_public_id: &str,
@@ -4976,7 +5532,13 @@ fn room_participants_json(
             .map(|id| {
                 serde_json::json!({
                     "peer_id": id,
-                    "handle": room_participant_label(peer_store, id, my_peer_id, my_public_id),
+                    "handle": room_participant_label(
+                        peer_store,
+                        display_handles,
+                        id,
+                        my_peer_id,
+                        my_public_id
+                    ),
                     "speaking": false,
                     "muted": false,
                     "is_self": id == my_public_id || id == my_peer_id,
@@ -5219,6 +5781,16 @@ fn dispatch_event(
                     QString::from(peer_id_clone.as_str()),
                     QString::from(preview_text.as_str()),
                 );
+
+                // Optional Ollama auto-reply for direct messages.
+                maybe_start_auto_reply(
+                    bridge.as_mut(),
+                    AutoReplyTarget::Direct {
+                        peer_id: peer_id_clone,
+                    },
+                    &body_clone,
+                    &message_id_clone,
+                );
             });
         }
         ConnectionEvent::ChatAck {
@@ -5426,37 +5998,21 @@ fn dispatch_event(
                 if let Some(key) = bridge.rust().cluster_member_key(&id) {
                     emit_cluster_node_connected(bridge.as_mut(), &key, true);
                 }
-                // Known-supernode work (room replay, banners) needs the canonical
-                // id; a not-yet-trusted sibling only contributes to the rollup.
-                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&id) else {
-                    return;
-                };
-                let my_public_id = bridge.rust().my_public_id.clone();
-                if let (Some(rs), Some(ps), Some(tx)) = (
-                    bridge.rust().room_store.as_ref(),
-                    bridge.rust().peer_store.as_ref(),
-                    bridge.rust().conn_cmd_tx.as_ref(),
-                ) {
-                    let siblings = bridge
-                        .rust()
-                        .cluster_siblings
-                        .get(&canon)
-                        .cloned()
-                        .unwrap_or_default();
-                    replay_saved_rooms_on_supernode_connect(
-                        &rs.read(),
-                        &ps.read(),
-                        tx,
-                        &canon,
-                        &siblings,
-                        &my_public_id,
-                        bridge.rust().identity.as_deref(),
-                    );
-                }
+                // Rematerialize client-owned rooms onto *this* live host — invite
+                // supernode (A) or multi-home sibling (B/C). Previously we only
+                // replayed for peer-store supernodes, so B/C never got private
+                // rooms when A was down (joins → room_absent).
+                rematerialize_rooms_on_live_host(&mut bridge.as_mut().rust_mut(), &id);
             });
         }
         ConnectionEvent::SupernodeDisconnected(id) => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                // Allow rematerialize again if this host reconnects later.
+                bridge
+                    .as_mut()
+                    .rust_mut()
+                    .rematerialized_hosts
+                    .remove(id.trim_end_matches('='));
                 let Some(key) = bridge.rust().cluster_member_key(&id) else {
                     return;
                 };
@@ -5494,14 +6050,37 @@ fn dispatch_event(
             members,
         } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
-                    return;
-                };
+                // Accept rosters from multi-home siblings (not only invite host).
+                let key = bridge
+                    .rust()
+                    .resolve_supernode_node_id_str(&supernode_id)
+                    .unwrap_or_else(|| supernode_id.trim_end_matches('=').to_owned());
                 bridge
                     .as_mut()
                     .rust_mut()
                     .cluster_siblings
-                    .insert(canon, members);
+                    .insert(key.clone(), members);
+                // Roster often arrives *after* SupernodeConnected for a cold
+                // sibling. Rematerialize only hosts not yet done this session
+                // (see rematerialized_hosts) so we don't re-CreateRoom forever.
+                let live: Vec<String> = bridge
+                    .rust()
+                    .supernode_connected
+                    .iter()
+                    .filter(|(_, up)| **up)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for host in live {
+                    if bridge
+                        .rust()
+                        .cluster_full_set(&key)
+                        .iter()
+                        .any(|m| pub_id_eq(m, &host))
+                        || pub_id_eq(&host, &key)
+                    {
+                        rematerialize_rooms_on_live_host(&mut bridge.as_mut().rust_mut(), &host);
+                    }
+                }
             });
         }
         ConnectionEvent::RoomFailedOver {
@@ -5596,8 +6175,38 @@ fn dispatch_event(
             let banner = format!("Room \u{00b7} {room_name}");
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
+                    // Multi-home sibling ack for a rematerialize — not a user create.
                     return;
                 };
+                // Rematerialize / cluster replay must never surface as tray
+                // "Private room created". If RoomStore already has this room_id
+                // anywhere in the cluster, stay silent.
+                let already_known = {
+                    let members = bridge.rust().cluster_full_set(&canon);
+                    match (
+                        bridge.rust().room_store.as_ref(),
+                        bridge.rust().peer_store.as_ref(),
+                    ) {
+                        (Some(rs), Some(ps)) => {
+                            let store = rs.read();
+                            let ps = ps.read();
+                            store.get(&canon, &room_id).is_some()
+                                || store
+                                    .list_for_cluster_members(&ps, &members)
+                                    .iter()
+                                    .any(|e| e.room_id == room_id)
+                        }
+                        (Some(rs), None) => rs.read().get(&canon, &room_id).is_some(),
+                        _ => false,
+                    }
+                };
+                if already_known {
+                    debug!(
+                        "[bridge] ignoring RoomCreated for already-known room {} (rematerialize)",
+                        &room_id[..8.min(room_id.len())]
+                    );
+                    return;
+                }
                 let my_public_id = bridge.rust().my_public_id.clone();
                 let invite_policy = {
                     let mut r = bridge.as_mut().rust_mut();
@@ -5807,7 +6416,7 @@ fn dispatch_event(
                     .typing_changed(QString::from(peer_id.as_str()), is_typing);
             });
         }
-        ConnectionEvent::HandleUpdated { peer_id, handle: _ } => {
+        ConnectionEvent::HandleUpdated { peer_id, handle } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 let is_supernode = bridge
                     .rust()
@@ -5818,18 +6427,19 @@ fn dispatch_event(
                 if !is_supernode {
                     emit_peers_updated(bridge.as_mut());
                 }
-                if bridge.rust().in_room && !bridge.rust().room_participant_ids.is_empty() {
-                    let my_public_id = bridge.rust().my_public_id.clone();
-                    let my_peer_id = bridge.rust().my_peer_id.clone();
+                // Also seed the room label cache so members panels pick up renames
+                // even when the peer is not in PeerStore yet.
+                if remember_room_display_handle(&mut bridge.as_mut().rust_mut(), &peer_id, &handle)
+                {
+                    // no-op beyond cache; re-emit rosters below
+                }
+                if !bridge.rust().room_participant_ids.is_empty() {
                     let ids = bridge.rust().room_participant_ids.clone();
-                    let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
-                        room_participants_json(Some(&ps.read()), &ids, &my_peer_id, &my_public_id)
-                    } else {
-                        room_participants_json(None, &ids, &my_peer_id, &my_public_id)
-                    };
-                    bridge
-                        .as_mut()
-                        .participants_updated(QString::from(json.as_str()));
+                    emit_member_list_json(&mut bridge, &ids, true);
+                }
+                if !bridge.rust().text_member_ids.is_empty() {
+                    let ids = bridge.rust().text_member_ids.clone();
+                    emit_member_list_json(&mut bridge, &ids, false);
                 }
             });
         }
@@ -6068,6 +6678,13 @@ fn dispatch_event(
                 let Some(sn) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
                     return;
                 };
+                // Learn the sender's display name for the room members panel
+                // without promoting them into the trusted Peers list.
+                let handle_changed = remember_room_display_handle(
+                    &mut bridge.as_mut().rust_mut(),
+                    &sender_id,
+                    &sender_handle,
+                );
                 let display_sender =
                     room_chat_display_sender(bridge.rust(), &sender_handle, &sender_id);
                 let json = serde_json::json!({
@@ -6106,6 +6723,10 @@ fn dispatch_event(
                         warn!("chat_store insert (room inbound) error: {e}");
                     }
                 }
+                if handle_changed && !bridge.rust().text_member_ids.is_empty() {
+                    let ids = bridge.rust().text_member_ids.clone();
+                    emit_member_list_json(&mut bridge, &ids, false);
+                }
                 let key = room_chat_history_key(&sn, &room_id);
                 // Persist in session-scoped history so switchToRoom can replay.
                 bridge
@@ -6123,6 +6744,23 @@ fn dispatch_event(
                     bridge
                         .as_mut()
                         .room_chat_received(QString::from(json.as_str()));
+                }
+
+                // Don't auto-reply to our own room messages (shouldn't appear
+                // here, but sender_id check is the hard gate).
+                let mine = !bridge.rust().my_public_id.is_empty()
+                    && (sender_id == bridge.rust().my_public_id
+                        || sender_id == bridge.rust().my_peer_id);
+                if !mine {
+                    maybe_start_auto_reply(
+                        bridge.as_mut(),
+                        AutoReplyTarget::Room {
+                            supernode_id: sn,
+                            room_id,
+                        },
+                        &body,
+                        &message_id,
+                    );
                 }
             });
         }
@@ -6158,7 +6796,9 @@ fn dispatch_event(
             rooms_json,
         } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                let Some(canon) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
+                // Accept lists from multi-home cluster siblings (not in peer
+                // store) by folding onto the invite representative row.
+                let Some(canon) = sidebar_supernode_id(bridge.rust(), &supernode_id) else {
                     return;
                 };
                 let remote = serde_json::from_str::<serde_json::Value>(&rooms_json)
@@ -6534,7 +7174,15 @@ fn dispatch_ollama_event(
             let rid = chunk.request_id.clone();
             let text = chunk.text.clone();
             let done = chunk.done;
+            let is_auto = rid.starts_with("auto-");
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                if is_auto {
+                    auto_reply_on_chunk(bridge.as_mut(), &rid, &text);
+                    if done {
+                        auto_reply_on_done(bridge.as_mut(), &rid);
+                    }
+                    return;
+                }
                 if !text.is_empty() {
                     bridge
                         .as_mut()
@@ -6550,7 +7198,12 @@ fn dispatch_ollama_event(
             message,
         } => {
             warn!("[ollama] error for {request_id}: {message}");
+            let is_auto = request_id.starts_with("auto-");
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                if is_auto {
+                    auto_reply_on_error(bridge.as_mut(), &request_id, &message);
+                    return;
+                }
                 bridge.as_mut().ollama_error(
                     QString::from(request_id.as_str()),
                     QString::from(message.as_str()),
@@ -6559,11 +7212,8 @@ fn dispatch_ollama_event(
         }
         OllamaEvent::Models { models, error } => {
             let models_json = serde_json::to_string(&models).unwrap_or_else(|_| "[]".to_owned());
-            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                bridge.as_mut().ollama_models_ready(
-                    QString::from(models_json.as_str()),
-                    QString::from(error.as_str()),
-                );
+            let _ = qt_thread.queue(move |bridge: Pin<&mut ffi::AppBridge>| {
+                publish_ollama_models(bridge, &models_json, &error);
             });
         }
     }
@@ -6689,5 +7339,16 @@ mod cluster_grouping_tests {
         // All down → none.
         let c = connected(&[("A", false), ("B", false), ("C", false)]);
         assert_eq!(pick_live_cluster_member(&s, &c, "A"), None);
+    }
+
+    #[test]
+    fn same_cluster_scope_matches_siblings_and_pad_variants() {
+        // Minimal AppBridgeRust-shaped check via free helpers used by roster apply.
+        assert!(pub_id_eq("abc=", "abc"));
+        assert!(!pub_id_eq("abc", "xyz"));
+        // cluster_full_set is the basis of same_cluster_scope; siblings share a set.
+        let s = abc_cluster();
+        assert!(cluster_full_set(&s, "A").iter().any(|m| pub_id_eq(m, "C")));
+        assert!(cluster_full_set(&s, "C").iter().any(|m| pub_id_eq(m, "A")));
     }
 }

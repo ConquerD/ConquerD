@@ -298,12 +298,27 @@ impl ConnectionManager {
                         if relay.send_signaling(json.as_bytes()) {
                             return;
                         }
+                        // Portal-only, dead signaling stream, or back-pressure:
+                        // fall through to WebSocket so room chat/file is never
+                        // silently lost on a guest or half-dead relay.
+                        debug!(
+                            "[room] relay signaling unavailable for {:?} via {}…; using WS",
+                            msg_type,
+                            &sn_id[..12.min(sn_id.len())]
+                        );
                     }
                 }
                 match self.supernodes.get(&sn_id) {
                     Some(sn) if sn.connected => {
                         if sn.send_tx.try_send(WsMessage::Text(json.clone())).is_err() {
                             self.note_ws_outbound_drop("supernode-targeted signaling");
+                            if Self::is_relay_signaling_type(&msg_type) {
+                                warn!(
+                                    "[room] WS send failed for {:?} via {}… — frame dropped",
+                                    msg_type,
+                                    &sn_id[..12.min(sn_id.len())]
+                                );
+                            }
                         }
                         return;
                     }
@@ -457,19 +472,101 @@ impl ConnectionManager {
         msg.to_json().ok()
     }
 
-    /// Resolve a signaling `target` to a `supernodes` session key (`identity_pub`).
+    /// Resolve a signaling `target` to a **live** `supernodes` session key.
+    ///
+    /// When the invite / requested member is offline but a verified cluster
+    /// sibling still has a connected session (eager multi-home), rewrite the
+    /// target so room join/list/chat keep working after the original host dies.
+    /// Without this, UI room ops keep targeting the invite supernode and are
+    /// silently dropped once it goes down — voice counts freeze even though
+    /// the client is multi-homed to a live sibling.
     pub(super) fn resolve_supernode_ws_target(&self, target: &str) -> Option<String> {
+        let preferred = self.resolve_supernode_session_key(target)?;
+        if self
+            .supernodes
+            .get(&preferred)
+            .is_some_and(|sn| sn.connected)
+        {
+            return Some(preferred);
+        }
+        if let Some(live) = self.live_cluster_sibling_session(&preferred) {
+            info!(
+                "cluster: rewriting offline supernode target {} → live sibling {}",
+                &preferred[..12.min(preferred.len())],
+                &live[..12.min(live.len())]
+            );
+            return Some(live);
+        }
+        // No live sibling — keep the preferred key so the caller logs a clear
+        // "not connected" drop for the intended host.
+        Some(preferred)
+    }
+
+    /// Map `target` to a key in `self.supernodes` without requiring the session
+    /// to be connected (session may exist but be down mid-reconnect).
+    fn resolve_supernode_session_key(&self, target: &str) -> Option<String> {
         if self.supernodes.contains_key(target) {
             return Some(target.to_owned());
+        }
+        let bare = target.trim_end_matches('=');
+        if bare != target {
+            if let Some((k, _)) = self
+                .supernodes
+                .iter()
+                .find(|(k, _)| k.trim_end_matches('=') == bare)
+            {
+                return Some(k.clone());
+            }
         }
         let canon = self
             .peer_store
             .read()
             .resolve_supernode_identity_pub(target)?;
         if self.supernodes.contains_key(&canon) {
-            Some(canon)
-        } else {
-            None
+            return Some(canon);
         }
+        let canon_bare = canon.trim_end_matches('=');
+        self.supernodes
+            .keys()
+            .find(|k| k.trim_end_matches('=') == canon_bare)
+            .cloned()
+    }
+
+    /// A connected session for a verified cluster sibling of `offline_id`, if any.
+    fn live_cluster_sibling_session(&self, offline_id: &str) -> Option<String> {
+        let offline_bare = offline_id.trim_end_matches('=');
+        let mut member_ids: Vec<String> = Vec::new();
+        for (key, members) in &self.cluster_members {
+            let key_bare = key.trim_end_matches('=');
+            let related = key_bare == offline_bare
+                || members
+                    .iter()
+                    .any(|m| m.identity_pub.trim_end_matches('=') == offline_bare);
+            if !related {
+                continue;
+            }
+            member_ids.push(key.clone());
+            for m in members {
+                member_ids.push(m.identity_pub.clone());
+            }
+        }
+        if member_ids.is_empty() {
+            return None;
+        }
+        for candidate in member_ids {
+            let cand_bare = candidate.trim_end_matches('=');
+            if cand_bare == offline_bare {
+                continue;
+            }
+            for (sid, sn) in &self.supernodes {
+                if !sn.connected {
+                    continue;
+                }
+                if sid.trim_end_matches('=') == cand_bare {
+                    return Some(sid.clone());
+                }
+            }
+        }
+        None
     }
 }

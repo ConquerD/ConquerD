@@ -30,6 +30,7 @@
 //!     manager, which verifies + dispatches it on the normal inbound path.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,10 +86,16 @@ pub struct QuicRelayClient {
     connection: Connection,
     shutdown: Arc<Notify>,
     /// Outbound queue for the reliable signaling stream (`room.chat.v1` /
-    /// `room.file.v1`). `None` if the stream could not be opened — callers
-    /// then fall back to the WebSocket signaling path. Bounded so a stalled
-    /// stream surfaces as back-pressure rather than unbounded growth.
+    /// `room.file.v1`). `None` if the stream could not be opened or this is a
+    /// portal-only guest (signaling withheld server-side) — callers then fall
+    /// back to the WebSocket path. Bounded so a stalled stream surfaces as
+    /// back-pressure rather than unbounded growth.
     signal_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Cleared when the signaling writer task exits so `send_signaling`
+    /// returns false (WS fallback) instead of queueing into a dead channel.
+    signal_live: Arc<AtomicBool>,
+    /// Portal-only guest grant: no room chat/file/audio over this relay.
+    portal_only: bool,
 }
 
 impl std::fmt::Debug for QuicRelayClient {
@@ -98,6 +105,8 @@ impl std::fmt::Debug for QuicRelayClient {
             .field("relay_host", &self.relay_host)
             .field("relay_port", &self.relay_port)
             .field("alive", &self.connection.close_reason().is_none())
+            .field("portal_only", &self.portal_only)
+            .field("signal_live", &self.signal_live.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -121,6 +130,10 @@ impl QuicRelayClient {
     ///
     /// `game_tx`, when set, receives opaque `game.relay.v1` payloads for
     /// in-app portal games (identity path; no WebTransport cert).
+    ///
+    /// `portal_only`: guest grant — portal streams only. Do **not** open the
+    /// reliable signaling stream (the supernode drops it server-side); room
+    /// chat/file must use WebSocket until a full-access ticket arrives.
     pub async fn connect(
         endpoint: &Endpoint,
         supernode_id: impl Into<String>,
@@ -128,6 +141,7 @@ impl QuicRelayClient {
         port: u16,
         reinject_tx: UnboundedSender<RelaySignalingInbound>,
         game_tx: Option<UnboundedSender<RelayGameInbound>>,
+        portal_only: bool,
     ) -> anyhow::Result<Self> {
         let supernode_id = supernode_id.into();
         let addr: SocketAddr = format!("{host}:{port}")
@@ -146,10 +160,11 @@ impl QuicRelayClient {
             .with_context(|| format!("relay handshake to {addr} failed"))?;
 
         info!(
-            "[relay] connected to {}:{} (supernode {})",
+            "[relay] connected to {}:{} (supernode {}{})",
             host,
             port,
-            &supernode_id[..12.min(supernode_id.len())]
+            &supernode_id[..12.min(supernode_id.len())],
+            if portal_only { ", portal-only" } else { "" }
         );
 
         let shutdown = Arc::new(Notify::new());
@@ -166,7 +181,9 @@ impl QuicRelayClient {
         });
 
         // Datagram receive loop — `room.audio.sfu` → signaling reinject;
-        // `game.relay.v1` → portal game queue.
+        // `game.relay.v1` → portal game queue. Portal-only guests have
+        // datagrams dropped server-side; the loop is cheap and still useful
+        // after mid-connection promotion without reconnect.
         let conn_dgram = connection.clone();
         let shutdown_dgram = shutdown.clone();
         let sn_id_dgram = supernode_id.clone();
@@ -185,31 +202,47 @@ impl QuicRelayClient {
         });
 
         // Reliable signaling stream — carries `room.chat.v1` / `room.file.v1`
-        // broadcasts both directions. Opened best-effort: if it can't be
-        // established the client transparently uses the WebSocket path.
-        let signal_tx = match connection.open_bi().await {
-            Ok((send, recv)) => {
-                let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(SIGNAL_OUT_CAPACITY);
-                let shutdown_sig = shutdown.clone();
-                let sn_id_sig = supernode_id.clone();
-                let sn_short_sig = supernode_id[..12.min(supernode_id.len())].to_owned();
-                tokio::spawn(async move {
-                    run_signaling_stream(
-                        send,
-                        recv,
-                        out_rx,
-                        reinject_tx,
-                        shutdown_sig,
-                        sn_id_sig,
-                        sn_short_sig,
-                    )
-                    .await;
-                });
-                Some(out_tx)
-            }
-            Err(e) => {
-                warn!("[relay] could not open signaling stream: {e}; using WS for room chat/file");
-                None
+        // broadcasts both directions. Portal-only guests must not open it:
+        // the supernode drops the stream without hooking it, while a live
+        // `signal_tx` would make `send_signaling` report success and skip
+        // WebSocket fallback — silent room-chat loss.
+        let signal_live = Arc::new(AtomicBool::new(false));
+        let signal_tx = if portal_only {
+            debug!(
+                "[relay {}] portal-only — room chat/file via WS until full access",
+                &supernode_id[..12.min(supernode_id.len())]
+            );
+            None
+        } else {
+            match connection.open_bi().await {
+                Ok((send, recv)) => {
+                    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(SIGNAL_OUT_CAPACITY);
+                    let shutdown_sig = shutdown.clone();
+                    let sn_id_sig = supernode_id.clone();
+                    let sn_short_sig = supernode_id[..12.min(supernode_id.len())].to_owned();
+                    let live = signal_live.clone();
+                    live.store(true, Ordering::Release);
+                    tokio::spawn(async move {
+                        run_signaling_stream(
+                            send,
+                            recv,
+                            out_rx,
+                            reinject_tx,
+                            shutdown_sig,
+                            sn_id_sig,
+                            sn_short_sig,
+                        )
+                        .await;
+                        live.store(false, Ordering::Release);
+                    });
+                    Some(out_tx)
+                }
+                Err(e) => {
+                    warn!(
+                        "[relay] could not open signaling stream: {e}; using WS for room chat/file"
+                    );
+                    None
+                }
             }
         };
 
@@ -220,6 +253,8 @@ impl QuicRelayClient {
             connection,
             shutdown,
             signal_tx,
+            signal_live,
+            portal_only,
         })
     }
 
@@ -246,6 +281,11 @@ impl QuicRelayClient {
     /// True while quinn has not surfaced a close reason.
     pub fn is_alive(&self) -> bool {
         self.connection.close_reason().is_none()
+    }
+
+    /// Portal-only guest grant (no room chat/file/audio over this relay).
+    pub fn is_portal_only(&self) -> bool {
+        self.portal_only
     }
 
     /// Send a signed `SfuAudio` JSON frame as a broadcast room-audio datagram.
@@ -291,11 +331,18 @@ impl QuicRelayClient {
 
     /// Queue a signed signaling frame (`room.chat.v1` / `room.file.v1` JSON)
     /// for delivery over the reliable signaling stream. Returns `false` if the
-    /// stream was never opened, the connection is gone, or the outbound queue
-    /// is full — the caller then falls back to the WebSocket path so a frame is
-    /// never dropped solely because the QUIC stream is unavailable/backed up.
+    /// stream was never opened, is portal-only, the writer task has exited, the
+    /// connection is gone, or the outbound queue is full — the caller then falls
+    /// back to the WebSocket path so a frame is never dropped solely because the
+    /// QUIC stream is unavailable/backed up.
     pub fn send_signaling(&self, json: &[u8]) -> bool {
+        if self.portal_only {
+            return false;
+        }
         if self.connection.close_reason().is_some() {
+            return false;
+        }
+        if !self.signal_live.load(Ordering::Acquire) {
             return false;
         }
         if json.len() > SIGNAL_MAX_FRAME {

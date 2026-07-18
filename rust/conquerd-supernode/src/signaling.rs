@@ -12,11 +12,28 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
+use crate::crypto::normalize_public_id;
 use crate::protocol::{MessageType, SignalingMessage};
 use conquerd_features::ReplayGuard;
 
 /// A connected peer's write channel.
 type PeerTx = mpsc::UnboundedSender<String>;
+
+/// Candidate map keys for an identity (exact, padded, bare) so pad variants
+/// of the same Ed25519 public_id resolve to one live socket.
+fn identity_key_variants(identity_pub: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(3);
+    out.push(identity_pub.to_string());
+    let canon = normalize_public_id(identity_pub);
+    if canon != identity_pub {
+        out.push(canon);
+    }
+    let bare = identity_pub.trim_end_matches('=');
+    if bare != identity_pub {
+        out.push(bare.to_string());
+    }
+    out
+}
 
 /// Shared signaling state.
 pub struct SignalingState {
@@ -97,13 +114,15 @@ impl SignalingServer {
     /// channel has closed.
     pub fn send_to_peer(&self, identity_pub: &str, json: &str) -> bool {
         let st = self.state.read();
-        if let Some(tx) = st.quic_senders.get(identity_pub) {
-            if tx.send(json.to_string()).is_ok() {
-                return true;
+        for key in identity_key_variants(identity_pub) {
+            if let Some(tx) = st.quic_senders.get(&key) {
+                if tx.send(json.to_string()).is_ok() {
+                    return true;
+                }
             }
-        }
-        if let Some(tx) = st.peer_sockets.get(identity_pub) {
-            return tx.send(json.to_string()).is_ok();
+            if let Some(tx) = st.peer_sockets.get(&key) {
+                return tx.send(json.to_string()).is_ok();
+            }
         }
         false
     }
@@ -175,10 +194,13 @@ impl SignalingServer {
     }
 
     /// Check if a peer is currently connected (via WebSocket or QUIC relay
-    /// signaling stream).
+    /// signaling stream). Pad-tolerant so peer-store canonical ids match WS
+    /// senders that may use a different base64url padding form.
     pub fn is_peer_connected(&self, identity_pub: &str) -> bool {
         let st = self.state.read();
-        st.peer_sockets.contains_key(identity_pub) || st.quic_senders.contains_key(identity_pub)
+        identity_key_variants(identity_pub)
+            .into_iter()
+            .any(|key| st.peer_sockets.contains_key(&key) || st.quic_senders.contains_key(&key))
     }
 
     /// Get all connected peer IDs.

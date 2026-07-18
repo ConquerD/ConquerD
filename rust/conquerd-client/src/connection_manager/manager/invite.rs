@@ -196,21 +196,14 @@ pub fn parse_room_invite(encoded: &str) -> Result<RoomInvitePayload, String> {
 }
 
 impl ConnectionManager {
-    pub(super) fn generate_invite_url(&mut self) -> Option<String> {
+    pub(in crate::connection_manager) fn generate_invite_url(&mut self) -> Option<String> {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
-        if !self.ensure_quic_endpoint(0) {
-            return None;
-        }
-        let port = self
-            .quic_endpoint
-            .as_ref()
-            .and_then(|ep| ep.local_addr().ok())
-            .map(|addr| addr.port())?;
-        if port == 0 {
-            return None;
-        }
+        // Best-effort local QUIC listener for LAN dials. Invites still work
+        // without it when both peers share a supernode (relayed INIT/ACCEPT).
+        let _ = self.ensure_quic_endpoint(0);
+        let lan_hint = self.local_quic_hint().unwrap_or_default();
 
         let invite_id = uuid::Uuid::new_v4().to_string();
         let expires_at = std::time::SystemTime::now()
@@ -219,16 +212,26 @@ impl ConnectionManager {
             .unwrap_or(0)
             + 900;
         let inviter_handle = super::peer_session::read_local_display_handle();
-        let payload = serde_json::json!({
+        // X25519 ephemeral public is required by AcceptInvite (session-key /
+        // transcript binding). Peer invites previously omitted it, so every
+        // personal invite failed closed with "missing inviter_ephemeral_pub".
+        let inviter_eph = crate::crypto::generate_ephemeral_keypair();
+        let inviter_ephemeral_pub =
+            crate::crypto::b64url_encode_nopad(inviter_eph.public.as_bytes());
+        let mut payload = serde_json::json!({
             "inviter_peer_id": self.identity.peer_id(),
             "inviter_identity_pub": self.identity.public_id(),
             "invite_id": invite_id,
             "expires_at": expires_at,
-            "lan_hint": self.local_quic_hint()
-                .unwrap_or_else(|| format!("quic://127.0.0.1:{port}")),
+            "inviter_ephemeral_pub": inviter_ephemeral_pub,
             // Peers list label on the joiner before/without a HandleUpdate.
             "inviter_handle": inviter_handle,
         });
+        if !lan_hint.is_empty() {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("lan_hint".to_owned(), serde_json::Value::String(lan_hint));
+            }
+        }
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
         Some(format!("conquerd://invite#{encoded}"))
     }
@@ -482,7 +485,7 @@ impl ConnectionManager {
         });
     }
 
-    pub(super) async fn handle_accept_invite(&mut self, invite_url: String) {
+    pub(in crate::connection_manager) async fn handle_accept_invite(&mut self, invite_url: String) {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
@@ -663,12 +666,40 @@ impl ConnectionManager {
                 );
                 return;
             }
+
+            // Personal peer invites prefer direct QUIC (LAN hint on the invite).
+            // When both peers already share a supernode (common for room users),
+            // also send INVITE_HANDSHAKE_INIT over the supernode WS relay so trust
+            // completes even if LAN QUIC is firewalled, wrong, or missing. The
+            // supernode indexes sockets by identity public_id, so the target is
+            // inviter_identity_pub — not the hex peer_id used for QUIC sessions.
+            let mut attempted = false;
             if let Some((host, port)) = parse_quic_lan_hint(&lan_hint) {
                 self.connect_direct_quic(&inviter_peer_id, &host, port)
                     .await;
-            } else {
+                attempted = true;
+            }
+
+            let supernode_available = self.supernodes.values().any(|sn| sn.connected);
+            if supernode_available {
+                if let Some(pending) = self.pending_invites.get(&invite_id).cloned() {
+                    // Same INIT shape as the post-QUIC path, but targeted at the
+                    // inviter's identity public_id so the supernode can relay it.
+                    let msg =
+                        self.build_invite_handshake_init(&pending, inviter_identity_pub.clone());
+                    info!(
+                        "Peer invite: sending InviteHandshakeInit via supernode relay to {}",
+                        &inviter_identity_pub[..8.min(inviter_identity_pub.len())]
+                    );
+                    self.dispatch_outbound(msg).await;
+                    attempted = true;
+                }
+            }
+
+            if !attempted {
                 self.emit_invite_failed(
-                    "invite has no reachable local QUIC hint; generate a fresh invite",
+                    "invite has no reachable path (no local QUIC hint and no shared supernode online); \
+                     generate a fresh invite while both are online on the same supernode, or on the same LAN",
                 );
             }
             return;

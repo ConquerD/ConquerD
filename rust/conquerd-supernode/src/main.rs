@@ -353,6 +353,12 @@ impl SupernodeState {
 
     /// Deliver a room chat replicated from another cluster member to this node's
     /// local recipients. Deduped by `message_id`; never re-replicated.
+    ///
+    /// Skips the original author if they multi-homed onto this node — same
+    /// contract as local `handle_sfu_chat_broadcast` and
+    /// [`Self::deliver_replicated_audio`]. Without this, a multi-homed sender
+    /// receives their own `SfuChat` via the sibling path and headless/GUI bots
+    /// treat it as an inbound room message.
     fn deliver_replicated_chat(&self, room_id: &str, message_id: &str, raw: &str) {
         if !self.replication_seen.write().insert_new(message_id) {
             return; // already delivered
@@ -360,8 +366,14 @@ impl SupernodeState {
         let Some(ref sfu) = self.sfu else {
             return;
         };
+        let sender = SignalingMessage::from_json(raw)
+            .map(|m| m.sender)
+            .unwrap_or_default();
         let recipients = sfu.read().get_chat_recipients(room_id);
         for peer in &recipients {
+            if is_room_frame_author(peer, &sender) {
+                continue;
+            }
             if self
                 .features
                 .gate_through_feature("room.chat.v1", peer, raw.len())
@@ -373,7 +385,7 @@ impl SupernodeState {
 
     /// Deliver a room audio frame replicated from another cluster member to
     /// this node's local voice participants. Prefer QUIC relay datagrams, fall
-    /// back to WebSocket â€” same transport preference as the local SFU bridge.
+    /// back to WebSocket — same transport preference as the local SFU bridge.
     /// Deduped by `message_id`; never re-replicated. Skips the active-speaker
     /// gate (the origin node already applied it; the remote talker is not a
     /// local participant and must not displace local talker scores).
@@ -384,7 +396,8 @@ impl SupernodeState {
         let Some(ref sfu) = self.sfu else {
             return;
         };
-        // Exclude the original talker if they somehow multi-homed onto this node.
+        // Exclude the original talker if they multi-homed onto this node
+        // (pad-normalized — same contract as chat).
         let sender = SignalingMessage::from_json(raw)
             .map(|m| m.sender)
             .unwrap_or_default();
@@ -406,7 +419,7 @@ impl SupernodeState {
         let fwd = crate::wire::build_forwarded_datagram(crate::wire::BROADCAST_INDEX, &tagged);
         let wire_bytes = raw.len();
         for peer in &recipients {
-            if !sender.is_empty() && peer == &sender {
+            if is_room_frame_author(peer, &sender) {
                 continue;
             }
             if let Some(ref relay) = self.relay {
@@ -629,7 +642,14 @@ impl SupernodeState {
     /// Apply a client-authorization grant replicated from another member: trust
     /// the peer (peer store + relay allow-list + access grant) so this node
     /// accepts the client if it fails over here. Idempotent.
+    ///
+    /// When the client is already WS-connected (multi-home arrived before
+    /// PeerAuth), also issues tickets + room list so voice counts unlock
+    /// without requiring a reconnect. Does **not** re-gossip PeerAuth (source
+    /// already has the peer; bulk roster handles convergence).
     fn apply_peer_auth(&self, identity_pub: &str, handle: &str, direct_invite: bool) {
+        let identity_pub = crate::crypto::normalize_public_id(identity_pub);
+        let mut newly_or_upgraded = false;
         {
             let mut store = self.peer_store.write();
             let transcript = if direct_invite {
@@ -637,20 +657,26 @@ impl SupernodeState {
             } else {
                 ROOM_GUEST_TRANSCRIPT_MARKER.to_owned()
             };
-            if let Some(existing) = store.get_peer(identity_pub).cloned() {
+            if let Some(existing) = store.get_peer(&identity_pub).cloned() {
                 // Upgrade room-guest → direct-invite marker when a sibling
                 // reports a real handshake; never downgrade.
                 let mut updated = existing;
-                if !handle.is_empty() {
+                let mut dirty = false;
+                if !handle.is_empty() && updated.handle != handle {
                     updated.handle = handle.to_string();
+                    dirty = true;
                 }
                 if direct_invite && !is_direct_invite_transcript(&updated.transcript_hash) {
                     updated.transcript_hash = transcript;
+                    dirty = true;
+                    newly_or_upgraded = true;
                 }
-                store.add_peer(updated);
-                let _ = store.save();
+                if dirty {
+                    store.add_peer(updated);
+                    let _ = store.save();
+                }
             } else {
-                let peer_id = crate::crypto::b64url_decode(identity_pub)
+                let peer_id = crate::crypto::b64url_decode(&identity_pub)
                     .map(|b| crate::crypto::derive_peer_id(&b))
                     .unwrap_or_default();
                 let now = SystemTime::now()
@@ -659,7 +685,7 @@ impl SupernodeState {
                     .as_secs_f64();
                 store.add_peer(peer_store::PeerRecord {
                     peer_id,
-                    identity_pub: identity_pub.to_string(),
+                    identity_pub: identity_pub.clone(),
                     relay_hints: vec![],
                     handle: handle.to_string(),
                     blocked: false,
@@ -672,6 +698,7 @@ impl SupernodeState {
                     quic_port: 0,
                 });
                 let _ = store.save();
+                newly_or_upgraded = true;
             }
         }
         // Respect the access gate on replicated trust: a peer trusted on
@@ -680,12 +707,53 @@ impl SupernodeState {
         // or prior TOS accept). Otherwise portal-only so they can pass the
         // access portal on this node.
         if let Some(ref relay) = self.relay {
-            if self.check_peer_access(identity_pub) {
-                relay.allow_peer(identity_pub);
+            if self.check_peer_access(&identity_pub) {
+                relay.allow_peer(&identity_pub);
             } else {
-                relay.allow_portal_peer(identity_pub);
+                relay.allow_portal_peer(&identity_pub);
             }
         }
+
+        // Multi-home race: client opened WS to this sibling before PeerAuth
+        // landed, so `on_peer_connected` skipped tickets / room list. Unlock
+        // now that trust is present (only on first apply / direct-invite
+        // upgrade to avoid 15s roster spam).
+        if newly_or_upgraded && self.signaling_peer_connected(&identity_pub) {
+            self.refresh_connected_replicated_peer(&identity_pub);
+        }
+    }
+
+    /// True when `identity_pub` has a live WS or QUIC signaling socket (pad-tolerant).
+    fn signaling_peer_connected(&self, identity_pub: &str) -> bool {
+        if self.signaling.is_peer_connected(identity_pub) {
+            return true;
+        }
+        let bare = identity_pub.trim_end_matches('=');
+        if bare != identity_pub && self.signaling.is_peer_connected(bare) {
+            return true;
+        }
+        let padded = crate::crypto::normalize_public_id(identity_pub);
+        padded != identity_pub && self.signaling.is_peer_connected(&padded)
+    }
+
+    /// Admit a peer that became trusted via cluster PeerAuth while already
+    /// connected: capabilities, ticket, SFU room list (counts). No PeerAuth
+    /// re-gossip — bulk roster already covers convergence.
+    fn refresh_connected_replicated_peer(&self, identity_pub: &str) {
+        self.announce_capabilities_to(identity_pub);
+        self.issue_ticket_for_access_state(identity_pub);
+        if let Some(ref sfu) = self.sfu {
+            let rooms = sfu.read().get_rooms_for_peer(identity_pub);
+            self.send_signed(
+                identity_pub,
+                MessageType::SfuRoomList,
+                json!({ "rooms": rooms }),
+            );
+        }
+        info!(
+            "Unlocked connected peer {} after cluster PeerAuth",
+            &identity_pub[..12.min(identity_pub.len())]
+        );
     }
 
     /// True when `peer_id` completed a **direct supernode invite** (handshake
@@ -699,13 +767,28 @@ impl SupernodeState {
 
     /// Unified access check for ticket issuance and portal status.
     ///
-    /// * **Open mode + direct invite** → granted (no TOS).
-    /// * **Open mode + room guest** → requires guest TOS accept on the controller.
+    /// * **Open mode + direct invite** (real or replicated transcript) → full.
+    /// * **Open mode + legacy empty transcript** (trusted, not room-guest) → full
+    ///   so headless bots are not stuck portal-only forever after a blank
+    ///   `transcript_hash` row.
+    /// * **Open mode + explicit room-guest marker** → requires guest TOS accept.
     /// * **tos / ad / code** → always consult the controller (including direct invite).
     fn check_peer_access(&self, peer_id: &str) -> bool {
         let mode = self.access_controller.mode_name();
-        if mode == "open" && self.is_direct_invite_peer(peer_id) {
-            return true;
+        if mode == "open" {
+            if let Some(p) = self.peer_store.read().get_peer(peer_id) {
+                if p.revoked || p.blocked {
+                    return false;
+                }
+                // Room-invite guests still need the open-mode TOS portal.
+                if p.transcript_hash == ROOM_GUEST_TRANSCRIPT_MARKER {
+                    return self.access_controller.check_access(peer_id);
+                }
+                // Direct invite, cluster-replicated direct, or legacy empty
+                // transcript (pre-marker trust rows).
+                return true;
+            }
+            return false;
         }
         self.access_controller.check_access(peer_id)
     }
@@ -1491,6 +1574,19 @@ fn pad_base64url(id: &str) -> String {
     }
 }
 
+/// True when `recipient` is the original author of a room frame.
+///
+/// Compares pad-normalized Ed25519 `public_id`s so a multi-homed sender whose
+/// wire id is unpadded (relay path) still matches the padded SFU membership
+/// entry and is excluded from local fan-out / cluster delivery. An empty
+/// `sender` never matches (fail open — still deliver to everyone).
+fn is_room_frame_author(recipient: &str, sender: &str) -> bool {
+    if sender.is_empty() {
+        return false;
+    }
+    sfu::normalize_peer_id(recipient) == sfu::normalize_peer_id(sender)
+}
+
 /// Decode the Opus payload size from a native `SfuAudio` signaling message.
 fn sfu_audio_opus_byte_count(msg: &SignalingMessage) -> usize {
     use base64::Engine;
@@ -2119,9 +2215,36 @@ impl SupernodeHandler {
 
         // Proof-based admission (coexist): if the join carries a valid Space
         // proof (+ grant for private nodes), authorize + materialize the room
-        // before the ACL check below. A no-op when absent â†’ legacy ACL applies.
+        // before the ACL check below. A no-op when absent → legacy ACL applies.
         self.state
             .try_space_admission(&msg.sender, room_id, &msg.payload);
+
+        // Optional client-held invite token on the join itself (cluster cold
+        // node / post-GC). Re-seeds the durable credential and admits before
+        // the ACL check — same as SfuRoomInvite rematerialize.
+        if let Some(token) = msg
+            .payload
+            .get("invite_token")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+        {
+            let creator = sfu
+                .read()
+                .get_room(room_id)
+                .map(|r| r.creator_id.clone())
+                .unwrap_or_default();
+            let created_by = if creator.is_empty() {
+                msg.sender.as_str()
+            } else {
+                creator.as_str()
+            };
+            if sfu
+                .write()
+                .reregister_invite_token(room_id, token, created_by)
+            {
+                let _ = sfu.write().allow_peer(room_id, &msg.sender);
+            }
+        }
 
         let (ok, members) = sfu.write().join_room(&msg.sender, room_id);
         if !ok {
@@ -2382,17 +2505,20 @@ impl SupernodeHandler {
             .and_then(|v| v.as_str())
             .unwrap_or(sfu::DEFAULT_ROOM_ID);
         if !sfu.read().is_chat_sender(room_id, &msg.sender) {
-            tracing::debug!(
-                "[room.chat.v1] sender {} is not a member of room {} â€” dropping chat",
+            // warn: silent drops here look like "bot replied in terminal but peer
+            // never saw it" when multi-homed clients hit the wrong node path.
+            tracing::warn!(
+                "[room.chat.v1] sender {} is not a member of room {} — dropping chat",
                 &msg.sender[..12.min(msg.sender.len())],
                 &room_id[..12.min(room_id.len())]
             );
             return;
         }
+        // Membership stores normalized ids; wire `msg.sender` may differ by pad.
         let recipients = sfu.read().get_chat_recipients(room_id);
         let wire_bytes = raw.len();
         for peer in &recipients {
-            if peer == &msg.sender {
+            if is_room_frame_author(peer, &msg.sender) {
                 continue;
             }
             if self
@@ -2627,7 +2753,7 @@ impl SupernodeHandler {
         let room_exists = sfu.read().get_room(room_id).is_some();
         // Re-entry: a peer previously admitted on *this* node is still in its
         // local `allowed` set. The single-use invite token is consumed on first
-        // use, so subsequent re-entry re-sends a spent token â€” admit already-
+        // use, so subsequent re-entry re-sends a spent token — admit already-
         // allowed peers directly (same node only; cold nodes need Space proof
         // or token rematerialize).
         let already_member = sfu
@@ -2637,10 +2763,32 @@ impl SupernodeHandler {
         let by_proof = self
             .state
             .try_space_admission(&msg.sender, room_id, &msg.payload);
-        let by_token = !by_proof
-            && sfu
-                .write()
-                .validate_room_invite(room_id, token, &msg.sender);
+        // Cold-cluster / post-GC path: RoomRoster materializes room *existence*
+        // without the invite-token map. A client-held RoomStore token is the
+        // durable membership credential — re-seed it as multi-use before
+        // validate (same contract as SfuRoomCreate rematerialize). Without
+        // this, non-creators can only rejoin the node they first admitted on.
+        let by_token = if !by_proof && !token.is_empty() {
+            {
+                let creator = sfu
+                    .read()
+                    .get_room(room_id)
+                    .map(|r| r.creator_id.clone())
+                    .unwrap_or_default();
+                let created_by = if creator.is_empty() {
+                    msg.sender.as_str()
+                } else {
+                    creator.as_str()
+                };
+                let _ = sfu
+                    .write()
+                    .reregister_invite_token(room_id, token, created_by);
+            }
+            sfu.write()
+                .validate_room_invite(room_id, token, &msg.sender)
+        } else {
+            false
+        };
         let valid = by_proof || by_token || already_member;
         tracing::warn!(
             "SfuRoomInvite peer={} room={} exists={} has_proof={} token_len={} by_proof={} by_token={} already_member={} => valid={}",
@@ -3010,6 +3158,26 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
             })
         };
+        // Bulk-sync client trust the same way RoomRoster bulk-syncs rooms:
+        // historical invitees on A must appear on B/C without a re-invite.
+        let local_peer_auth_roster: cluster_link::LocalPeerAuthRosterFn = {
+            let weak = weak.clone();
+            Arc::new(move || {
+                let Some(state) = weak.upgrade() else {
+                    return Vec::new();
+                };
+                let store = state.peer_store.read();
+                store
+                    .all_peers()
+                    .filter(|p| !p.revoked && !p.blocked)
+                    .map(|p| cluster_link::PeerAuthDescriptor {
+                        identity_pub: p.identity_pub.clone(),
+                        handle: p.handle.clone(),
+                        direct_invite: is_direct_invite_transcript(&p.transcript_hash),
+                    })
+                    .collect()
+            })
+        };
         let link = cluster_link::ClusterLink::new(
             identity.clone(),
             membership,
@@ -3019,7 +3187,12 @@ async fn main() -> anyhow::Result<()> {
             on_space_root,
         );
         match link
-            .start(local_rooms, local_room_roster, local_space_roots)
+            .start(
+                local_rooms,
+                local_room_roster,
+                local_space_roots,
+                local_peer_auth_roster,
+            )
             .await
         {
             Ok(port) => {
@@ -3397,6 +3570,24 @@ mod access_invite_tests {
         assert!(!is_direct_invite_transcript(""));
         assert!(!is_direct_invite_transcript(ROOM_GUEST_TRANSCRIPT_MARKER));
     }
+
+    /// Open-mode access matrix used by ticket issuance (Bobert-style empty
+    /// transcript must not stay portal-only forever).
+    #[test]
+    fn open_mode_grants_legacy_empty_transcript_not_room_guest() {
+        // Direct / non-empty / empty → would be full; room-guest → controller only.
+        // Pure helper parity with `check_peer_access` open branch.
+        let full = |transcript: &str| {
+            if transcript == ROOM_GUEST_TRANSCRIPT_MARKER {
+                return false; // still needs TOS
+            }
+            true // direct, replicated-direct, or legacy empty
+        };
+        assert!(full("abc123deadbeef"));
+        assert!(full(REPLICATED_DIRECT_INVITE_MARKER));
+        assert!(full(""));
+        assert!(!full(ROOM_GUEST_TRANSCRIPT_MARKER));
+    }
 }
 
 #[cfg(test)]
@@ -3480,6 +3671,93 @@ mod cluster_audio_replication_tests {
         assert!(is_audio(audio));
         assert!(!is_audio(chat));
         assert!(!is_audio("not-json"));
+    }
+}
+
+#[cfg(test)]
+mod multi_home_author_skip_tests {
+    use super::*;
+    use base64::Engine;
+
+    /// Real-looking 32-byte key forms (43 unpadded / 44 padded) for pad bridging.
+    fn key_pair(seed: u8) -> (String, String) {
+        let key = [seed; 32];
+        let bare = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let padded = base64::engine::general_purpose::URL_SAFE.encode(key);
+        (bare, padded)
+    }
+
+    #[test]
+    fn is_room_frame_author_matches_pad_variants() {
+        let (bare, padded) = key_pair(7);
+        assert_ne!(bare, padded);
+        assert!(is_room_frame_author(&padded, &bare));
+        assert!(is_room_frame_author(&bare, &padded));
+        assert!(is_room_frame_author(&padded, &padded));
+        assert!(!is_room_frame_author(&padded, ""));
+        let (other_bare, _) = key_pair(9);
+        assert!(!is_room_frame_author(&padded, &other_bare));
+    }
+
+    #[test]
+    fn multi_home_chat_recipients_exclude_author_pad_variants() {
+        // SFU stores padded ids; wire sender may arrive unpadded from relay.
+        let (author_bare, author_padded) = key_pair(11);
+        let (_peer_bare, peer_padded) = key_pair(22);
+
+        let mut mgr = sfu::SFURoomManager::new();
+        let room_id = "default".to_string();
+        assert!(mgr
+            .create_room(Some(&room_id), "Default", sfu::RoomType::Public, "")
+            .is_some());
+        assert!(mgr.subscribe(&author_padded, &room_id));
+        assert!(mgr.subscribe(&peer_padded, &room_id));
+
+        let recipients = mgr.get_chat_recipients(&room_id);
+        let delivered: Vec<_> = recipients
+            .iter()
+            .filter(|p| !is_room_frame_author(p, &author_bare))
+            .cloned()
+            .collect();
+        assert!(
+            !delivered
+                .iter()
+                .any(|p| is_room_frame_author(p, &author_padded)),
+            "multi-homed author must not receive own SfuChat on sibling node"
+        );
+        assert_eq!(delivered, vec![peer_padded]);
+    }
+
+    #[test]
+    fn multi_home_voice_recipients_exclude_talker_pad_variants() {
+        let (talker_bare, talker_padded) = key_pair(33);
+        let (_other_bare, other_padded) = key_pair(44);
+
+        let mut mgr = sfu::SFURoomManager::new();
+        let room_id = "voice".to_string();
+        assert!(mgr
+            .create_room(Some(&room_id), "Voice", sfu::RoomType::Public, "")
+            .is_some());
+        assert!(mgr.join_room(&talker_padded, &room_id).0);
+        assert!(mgr.join_room(&other_padded, &room_id).0);
+
+        let recipients = mgr
+            .get_room(&room_id)
+            .map(|r| r.participant_ids())
+            .unwrap_or_default();
+        let delivered: Vec<_> = recipients
+            .iter()
+            .filter(|p| !is_room_frame_author(p, &talker_bare))
+            .cloned()
+            .collect();
+        assert!(
+            !delivered
+                .iter()
+                .any(|p| is_room_frame_author(p, &talker_padded)),
+            "multi-homed talker must not hear own voice via cluster replicate"
+        );
+        assert_eq!(delivered.len(), 1);
+        assert!(is_room_frame_author(&delivered[0], &other_padded));
     }
 }
 

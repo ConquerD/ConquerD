@@ -45,7 +45,56 @@ use super::{
 use super::invite::{build_room_invite_url, parse_room_invite, RoomInviteEntry, RoomInvitePayload};
 use super::room_session::{plan_cluster_failover, FailoverPlan, RoomCreateRequest};
 
+/// Pad-tolerant supernode id compare (URL-safe base64 with/without `=`).
+fn same_supernode_pad(a: &str, b: &str) -> bool {
+    a == b || a.trim_end_matches('=') == b.trim_end_matches('=')
+}
+
 impl ConnectionManager {
+    /// Clear any pending private-join keys for this room (exact host or any
+    /// cluster sibling). Returns whether a pending entry existed.
+    fn take_pending_private_room_join(&mut self, answering_host: &str, room_id: &str) -> bool {
+        Self::take_pending_scoped_key(
+            &mut self.pending_private_room_joins,
+            answering_host,
+            room_id,
+        )
+    }
+
+    /// Clear any pending materialize-only create keys for this room (exact host
+    /// or any cluster sibling). Without room-id matching, a CreateRoom sent to
+    /// B/C after rewrite misses `pending_materialize` and fires `RoomCreated`
+    /// + tray "Private room created" spam on every rematerialize.
+    fn take_pending_materialize(&mut self, answering_host: &str, room_id: &str) -> bool {
+        Self::take_pending_scoped_key(&mut self.pending_materialize, answering_host, room_id)
+    }
+
+    fn take_pending_scoped_key(
+        set: &mut HashSet<String>,
+        answering_host: &str,
+        room_id: &str,
+    ) -> bool {
+        let exact = format!("{answering_host}:{room_id}");
+        let mut hit = set.remove(&exact);
+        let bare = answering_host.trim_end_matches('=');
+        if bare != answering_host {
+            hit |= set.remove(&format!("{bare}:{room_id}"));
+        }
+        let suffix = format!(":{room_id}");
+        let extras: Vec<String> = set
+            .iter()
+            .filter(|k| k.ends_with(&suffix))
+            .cloned()
+            .collect();
+        if !extras.is_empty() {
+            hit = true;
+            for k in extras {
+                set.remove(&k);
+            }
+        }
+        hit
+    }
+
     pub(super) async fn handle_inbound_from_quic(
         &mut self,
         transport_peer_id: String,
@@ -673,9 +722,23 @@ impl ConnectionManager {
                     .unwrap_or(u64::MAX);
                 let sealed = match crate::crypto::b64url_decode(&raw_body) {
                     Ok(b) => b,
-                    Err(_) => return,
+                    Err(e) => {
+                        warn!(
+                            "[room.chat.v1] body b64 decode failed from {}; dropping: {e}",
+                            &msg.sender[..8.min(msg.sender.len())]
+                        );
+                        return;
+                    }
                 };
-                let plaintext = epoch.try_into().ok().and_then(|e: u8| {
+                let epoch_u8: Option<u8> = epoch.try_into().ok();
+                if epoch_u8.is_none() {
+                    warn!(
+                        "[room.chat.v1] invalid epoch {epoch} from {}; dropping",
+                        &msg.sender[..8.min(msg.sender.len())]
+                    );
+                    return;
+                }
+                let plaintext = epoch_u8.and_then(|e| {
                     crate::group_key::open_chat_body(
                         &self.group_keys,
                         &room_id,
@@ -689,8 +752,10 @@ impl ConnectionManager {
                     Some(s) => s,
                     None => {
                         warn!(
-                            "[room.chat.v1] failed to open E2E body from {}; dropping",
-                            &msg.sender[..8.min(msg.sender.len())]
+                            "[room.chat.v1] failed to open E2E body from {} room={} epoch={epoch}; dropping \
+                             (missing group key or wrong epoch)",
+                            &msg.sender[..8.min(msg.sender.len())],
+                            &room_id[..12.min(room_id.len())]
                         );
                         return;
                     }
@@ -849,7 +914,9 @@ impl ConnectionManager {
                 // Open the QUIC relay connection so subsequent
                 // `web.host.app.v1` fetches (and future native SFU paths)
                 // have a live `quinn::Connection` to multiplex over.
-                self.spawn_relay_client_connect(msg.sender.clone(), host, port);
+                // Pass `portal_only` so we do not open a room-chat signaling
+                // stream that the supernode would silently drop.
+                self.spawn_relay_client_connect(msg.sender.clone(), host, port, portal_only);
             }
             MessageType::CapabilityAnnounce => {
                 let raw = msg
@@ -1056,9 +1123,11 @@ impl ConnectionManager {
                 }
                 let supernode_id = msg.sender.clone();
                 let materialize_key = room_scope_key(&supernode_id, &room_id);
-                let materialize_only = self.pending_materialize.remove(&materialize_key);
+                // Match pending by live host *or* any host:room_id (cluster rewrite).
+                let materialize_only = self.take_pending_materialize(&supernode_id, &room_id);
                 if !should_auto_join_on_room_created(denied, room_id.is_empty(), materialize_only) {
-                    // Materialize-only replay: refresh sidebar counts, do not join.
+                    // Materialize-only replay: refresh sidebar counts, do not join,
+                    // and do **not** emit RoomCreated (that drives tray spam).
                     self.send_room_list_request(&supernode_id).await;
                     // Private rooms stay text-active while connected: subscribe
                     // *after* the room exists on the supernode so SfuChat is
@@ -1122,18 +1191,26 @@ impl ConnectionManager {
                     return;
                 }
                 let supernode_id = msg.sender.clone();
-                let key = format!("{supernode_id}:{room_id}");
+                // Cluster: invite was sent to a live sibling while pending was
+                // keyed under the invite host (A). Match by exact key *or* any
+                // pending entry for this room_id, else we never SfuJoin after a
+                // successful B/C invite (Greens Place stuck after valid=true).
+                let was_pending = self.take_pending_private_room_join(&supernode_id, &room_id);
                 if accepted {
-                    let was_pending = self.pending_private_room_joins.remove(&key);
-                    if was_pending {
+                    if was_pending || self.current_room_id == room_id {
                         self.current_supernode_id = supernode_id.clone();
                         self.current_room_id = room_id.clone();
                         self.send_room_join(&supernode_id, &room_id).await;
                         // Counts follow from SfuMembers + post-join broadcast; a
                         // list request here often lands before SfuJoin completes.
+                    } else {
+                        debug!(
+                            "SfuRoomInviteResult accepted for {} from {} but no pending join — ignoring",
+                            &room_id[..8.min(room_id.len())],
+                            &supernode_id[..8.min(supernode_id.len())]
+                        );
                     }
                 } else {
-                    self.pending_private_room_joins.remove(&key);
                     let reason = msg
                         .payload
                         .get("reason")
@@ -1150,7 +1227,8 @@ impl ConnectionManager {
                     // never entered.
                     if self.current_room_id == room_id
                         && (self.current_supernode_id == supernode_id
-                            || self.current_supernode_id.is_empty())
+                            || self.current_supernode_id.is_empty()
+                            || same_supernode_pad(&self.current_supernode_id, &supernode_id))
                     {
                         self.current_room_id.clear();
                         self.current_supernode_id.clear();
@@ -1199,8 +1277,7 @@ impl ConnectionManager {
                     self.current_room_id.clear();
                     self.current_supernode_id.clear();
                 }
-                self.pending_private_room_joins
-                    .remove(&format!("{supernode_id}:{room_id}"));
+                let _ = self.take_pending_private_room_join(&supernode_id, &room_id);
                 // Failover fan-out may leave cold rejoins armed; clear any
                 // pending rejoin for this room so we don't thrash denied nodes.
                 self.pending_failover_rejoin.retain(|_, r| *r != room_id);
@@ -1340,8 +1417,15 @@ impl ConnectionManager {
                 self.dispatch_outbound(reply).await;
                 // Redundant with inviter_handle on ACCEPT, but also covers reconnect
                 // paths that only re-run INIT/ACCEPT without a fresh invite URL.
-                self.send_handle_update(&joiner_peer_id).await;
-                self.send_local_avatar_config(&joiner_peer_id).await;
+                // Prefer the direct QUIC peer_id when connected; otherwise target
+                // the joiner's identity public_id so a shared supernode can relay.
+                let handle_target = if direct_joiner_connected {
+                    joiner_peer_id.as_str()
+                } else {
+                    joiner_identity_pub.as_str()
+                };
+                self.send_handle_update(handle_target).await;
+                self.send_local_avatar_config(handle_target).await;
 
                 self.emit_event(ConnectionEvent::PeerConnected(joiner_peer_id.clone()));
                 self.emit_event(ConnectionEvent::InviteAccepted {
@@ -1436,9 +1520,20 @@ impl ConnectionManager {
                         let _ = store.save();
                     }
                     // Tell the inviter our display name (INIT may have been empty
-                    // if settings loaded after handshake started).
-                    self.send_handle_update(&inviter_peer_id).await;
-                    self.send_local_avatar_config(&inviter_peer_id).await;
+                    // if settings loaded after handshake started). Prefer direct
+                    // peer_id; fall back to identity_pub for supernode-relayed trust.
+                    let direct_inviter = self
+                        .peers
+                        .get(&inviter_peer_id)
+                        .map(|p| p.state == PeerConnectionState::Connected)
+                        .unwrap_or(false);
+                    let handle_target = if direct_inviter {
+                        inviter_peer_id.as_str()
+                    } else {
+                        inviter_identity_pub.as_str()
+                    };
+                    self.send_handle_update(handle_target).await;
+                    self.send_local_avatar_config(handle_target).await;
                     self.emit_event(ConnectionEvent::PeerConnected(inviter_peer_id.clone()));
                     self.emit_event(ConnectionEvent::InviteAccepted {
                         peer_id: inviter_peer_id,

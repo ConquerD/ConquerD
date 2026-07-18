@@ -9,6 +9,24 @@ pub fn b64url_encode(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
+/// Canonical Ed25519 `public_id` form: URL-safe base64 **with** a single `=`
+/// pad for 32-byte keys (43 unpadded chars → 44 padded).
+///
+/// Relay / unpadded encodings and client `URL_SAFE` encodings must resolve to
+/// the same peer-store / SFU / signaling key. Short test labels and non-key
+/// strings are returned unchanged.
+pub fn normalize_public_id(id: &str) -> String {
+    let bare = id.trim_end_matches('=');
+    // URL_SAFE base64 of 32 bytes is always 43 unpadded chars (43 % 4 == 3).
+    if bare.len() != 43 {
+        return id.to_string();
+    }
+    let mut s = String::with_capacity(44);
+    s.push_str(bare);
+    s.push('=');
+    s
+}
+
 /// Base64url decode (handles missing padding).
 pub fn b64url_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     // Add padding if needed

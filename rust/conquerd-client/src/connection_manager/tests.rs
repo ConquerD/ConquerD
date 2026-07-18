@@ -214,6 +214,131 @@ fn room_invite_rejects_missing_required_fields() {
 }
 
 #[test]
+fn personal_invite_url_includes_ephemeral_and_lan_hint() {
+    // AcceptInvite fails closed without inviter_ephemeral_pub; generation must
+    // always mint one. Also ship a lan_hint for the direct-QUIC dial path.
+    let mut t = harness::test_cm();
+    let url =
+        t.cm.generate_invite_url()
+            .expect("generate_invite_url should succeed with a QUIC endpoint");
+    assert!(url.starts_with("conquerd://invite#"), "url={url}");
+    let encoded = url.strip_prefix("conquerd://invite#").unwrap();
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        encoded.trim_end_matches('='),
+    )
+    .expect("invite payload must be base64url");
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("invite JSON");
+    let eph = payload
+        .get("inviter_ephemeral_pub")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        !eph.is_empty(),
+        "personal invites must include inviter_ephemeral_pub; got {payload}"
+    );
+    // lan_hint is best-effort (requires a bound QUIC listener); when present it
+    // must be a quic:// endpoint for the direct dial path.
+    if let Some(lan) = payload.get("lan_hint").and_then(|v| v.as_str()) {
+        assert!(
+            lan.starts_with("quic://"),
+            "lan_hint must be a quic:// URL when present; got {payload}"
+        );
+    }
+    assert_eq!(
+        payload.get("inviter_identity_pub").and_then(|v| v.as_str()),
+        Some(t.identity.public_id().as_str())
+    );
+}
+
+#[tokio::test]
+async fn personal_invite_sends_init_via_shared_supernode_when_online() {
+    // Two local peers sharing a supernode must complete trust without LAN QUIC.
+    use crate::protocol::MessageType;
+    use serde_json::Value;
+
+    let mut inviter = harness::test_cm();
+    let mut joiner = harness::test_cm();
+
+    let url = inviter
+        .cm
+        .generate_invite_url()
+        .expect("inviter generates personal invite");
+
+    // Both already online on the same supernode (room co-presence case).
+    let sn_id = "SN-SHARED";
+    let mut inviter_ws = inviter.cm.test_add_supernode_session(sn_id);
+    let mut joiner_ws = joiner.cm.test_add_supernode_session(sn_id);
+
+    joiner.cm.handle_accept_invite(url).await;
+
+    // Joiner must emit InviteHandshakeInit targeted at inviter identity via
+    // supernode fan-out (no direct QUIC session exists in this harness).
+    let outbound = harness::drain_ws(&mut joiner_ws);
+    let init = outbound
+        .iter()
+        .find(|m| m.msg_type == MessageType::InviteHandshakeInit)
+        .expect("joiner must send InviteHandshakeInit over supernode relay");
+    assert_eq!(
+        init.target.as_deref(),
+        Some(inviter.identity.public_id().as_str()),
+        "INIT must target inviter public_id for supernode socket lookup"
+    );
+    let invite_id = init
+        .payload
+        .get("invite_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    assert!(!invite_id.is_empty());
+
+    // Deliver INIT to the inviter (what the supernode would relay).
+    inviter.cm.handle_inbound(init.clone()).await;
+
+    assert!(
+        inviter
+            .store
+            .read()
+            .get_by_identity(&joiner.identity.public_id())
+            .is_some(),
+        "inviter PeerStore must list the joiner after INIT"
+    );
+
+    // ACCEPT is peer-targeted after the inviter has just trusted the joiner, so
+    // dispatch_outbound may wrap it in EncryptedSignal for supernode opacity.
+    // Deliver the raw outbound frame(s) to the joiner the same way a supernode
+    // would (opaque relay) — handle_inbound unwraps EncryptedSignal itself.
+    let inviter_out = harness::drain_ws(&mut inviter_ws);
+    assert!(
+        !inviter_out.is_empty(),
+        "inviter must emit at least one reply frame after INIT"
+    );
+    let mut joiner_trusted = false;
+    for frame in inviter_out {
+        assert_eq!(
+            frame.target.as_deref(),
+            Some(joiner.identity.public_id().as_str()),
+            "replies must target joiner public_id for supernode relay; got {:?}",
+            frame.msg_type
+        );
+        joiner.cm.handle_inbound(frame).await;
+        if joiner
+            .store
+            .read()
+            .get_by_identity(&inviter.identity.public_id())
+            .is_some()
+        {
+            joiner_trusted = true;
+            break;
+        }
+    }
+    assert!(
+        joiner_trusted,
+        "joiner PeerStore must list the inviter after ACCEPT (invite_id={invite_id})"
+    );
+}
+
+#[test]
 fn loopback_detection() {
     for h in ["localhost", "127.0.0.1", "0.0.0.0", "::1", "::"] {
         assert!(
@@ -622,11 +747,11 @@ fn auto_join_on_room_created_decision_table() {
 
 #[test]
 fn private_room_invite_path_decision_table() {
-    // Non-creator private with token, not yet admitted → invite path.
+    // Non-creator private with token → always invite path (cold cluster members
+    // rematerialize the token; "already admitted" is not host-scoped).
     assert!(should_use_private_room_invite(false, true, false, true));
-    // Already admitted this session → plain join (token spent).
-    assert!(!should_use_private_room_invite(true, true, false, true));
-    // Creator → plain join (self-admit).
+    assert!(should_use_private_room_invite(true, true, false, true));
+    // Creator → plain join (self-admit via creator_id on any cluster member).
     assert!(!should_use_private_room_invite(false, true, true, true));
     // Public room → plain join.
     assert!(!should_use_private_room_invite(false, false, false, true));

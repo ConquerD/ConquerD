@@ -510,13 +510,25 @@ impl ConnectionManager {
                             self.ensure_room_relay(&supernode_id).await;
                         }
                         ConnectionCommand::JoinRoomWithInvite { supernode_id, room_id, invite_token } => {
-                            self.current_supernode_id = supernode_id.clone();
+                            // Pending key must match the *live* host that will
+                            // answer (B/C after A is down). UI still passes the
+                            // invite supernode (A); live_room_route rewrites.
+                            let route = self.live_room_route(&supernode_id);
+                            self.current_supernode_id = route.clone();
                             self.current_room_id = room_id.clone();
-                            let key = format!("{supernode_id}:{room_id}");
-                            self.chat_active_rooms.insert(key.clone());
+                            let key = format!("{route}:{room_id}");
+                            self.chat_active_rooms
+                                .insert(room_scope_key(&route, &room_id));
                             self.pending_private_room_joins.insert(key);
-                            self.send_room_invite(&supernode_id, &room_id, &invite_token).await;
-                            self.ensure_room_relay(&supernode_id).await;
+                            // Also remember under the UI/host id so a race with
+                            // pad variants still matches.
+                            if route != supernode_id {
+                                self.pending_private_room_joins
+                                    .insert(format!("{supernode_id}:{room_id}"));
+                            }
+                            self.send_room_invite(&route, &room_id, &invite_token)
+                                .await;
+                            self.ensure_room_relay(&route).await;
                         }
                         ConnectionCommand::LeaveRoom {
                             supernode_id,
@@ -1257,6 +1269,7 @@ impl ConnectionManager {
         supernode_id: String,
         relay_host: String,
         relay_port: u16,
+        portal_only: bool,
     ) {
         if relay_host.is_empty() || relay_port == 0 {
             warn!(
@@ -1265,9 +1278,24 @@ impl ConnectionManager {
             );
             return;
         }
-        if self.quic_relays.contains_key(&supernode_id) {
-            // Reuse the existing live connection.
-            return;
+        if let Some(existing) = self.quic_relays.get(&supernode_id) {
+            if existing.is_alive() {
+                // Full-access grant after portal-only: drop and reconnect so
+                // we open the room chat/file signaling stream. Same-tier
+                // grants reuse the live connection.
+                let need_upgrade = existing.is_portal_only() && !portal_only;
+                if !need_upgrade {
+                    return;
+                }
+                info!(
+                    "[relay] upgrading portal-only → full access for {}",
+                    &supernode_id[..12.min(supernode_id.len())]
+                );
+            }
+            // Dead or upgrading — remove so the new connect can install.
+            if let Some(old) = self.quic_relays.remove(&supernode_id) {
+                old.close();
+            }
         }
         if !self.ensure_quic_endpoint(0) {
             error!("[relay] no QUIC endpoint — cannot connect to supernode relay");
@@ -1290,6 +1318,7 @@ impl ConnectionManager {
                 relay_port,
                 relay_signaling_tx,
                 Some(relay_game_tx),
+                portal_only,
             )
             .await
             {

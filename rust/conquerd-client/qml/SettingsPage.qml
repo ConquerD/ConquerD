@@ -761,15 +761,84 @@ Item {
                 SettingsSectionHeader { title: "AI" }
 
                 SettingsCard {
+                    id: ollamaCard
                     title: "Ollama Assistant"
-                    subtitle: "Local-only assistant settings."
+                    subtitle: "Local-only assistant. Enable + Save, then restart once. Auto-reply posts Ollama answers into chat when a peer messages you."
+
+                    // Stable ListModel — assigning a JS array to ComboBox.model is
+                    // unreliable with editable Material combos on some Qt 6 builds.
+                    ListModel { id: ollamaModelList }
+
+                    function persistOllamaSettings() {
+                        if (root.settings)
+                            root.settings.save()
+                    }
+
+                    function refreshOllamaModels() {
+                        if (typeof backend === "undefined" || !backend) {
+                            ollamaModelStatus.text = "Backend not ready"
+                            ollamaModelStatus.color = Theme.danger
+                            return
+                        }
+                        ollamaModelStatus.text = "Loading models..."
+                        ollamaModelStatus.color = Theme.muted
+                        var url = root.settings ? root.settings.ollama_base_url : "http://127.0.0.1:11434"
+                        backend.fetchOllamaModels(url || "")
+                    }
+
+                    function applyOllamaModels(modelsJson, errorText) {
+                        var err = (errorText === undefined || errorText === null) ? "" : ("" + errorText)
+                        if (err !== "") {
+                            ollamaModelStatus.text = "Error: " + err
+                            ollamaModelStatus.color = Theme.danger
+                            return
+                        }
+                        var names = []
+                        try {
+                            names = JSON.parse("" + modelsJson)
+                        } catch (e) {
+                            ollamaModelStatus.text = "Error: bad model list from backend"
+                            ollamaModelStatus.color = Theme.danger
+                            return
+                        }
+                        if (!names || names.length === 0) {
+                            ollamaModelStatus.text = "No models found — is Ollama running? Try: ollama list"
+                            ollamaModelStatus.color = Theme.muted
+                            return
+                        }
+
+                        var saved = root.settings ? root.settings.ollama_model : ollamaModelCombo.editText
+                        ollamaModelList.clear()
+                        var idx = -1
+                        for (var i = 0; i < names.length; i++) {
+                            ollamaModelList.append({ name: names[i] })
+                            if (names[i] === saved)
+                                idx = i
+                        }
+                        if (idx >= 0) {
+                            ollamaModelCombo.currentIndex = idx
+                        } else {
+                            // Keep a custom / previously-saved name even if not installed.
+                            ollamaModelCombo.editText = saved || names[0]
+                        }
+                        ollamaModelStatus.text = "Found " + names.length + (names.length === 1 ? " model" : " models")
+                        ollamaModelStatus.color = Theme.muted
+                    }
 
                     SettingSwitch {
                         id: ollamaEnabledSwitch
                         title: "Enable AI assistant"
-                        description: "Uses your local Ollama server."
+                        description: backend && backend.ollama_available
+                                     ? "Plugin running — chat AI is available."
+                                     : "Uses your local Ollama server. Restart ConquerD after enabling so chat AI starts."
                         checked: root.settings ? root.settings.ollama_enabled : false
-                        onChanged: if (root.settings) root.settings.ollama_enabled = checked
+                        onChanged: {
+                            if (!root.settings) return
+                            root.settings.ollama_enabled = checked
+                            persistOllamaSettings()
+                            if (checked)
+                                refreshOllamaModels()
+                        }
                     }
 
                     GridLayout {
@@ -783,17 +852,15 @@ Item {
                         Label { text: "Base URL"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
                         TextField {
                             Layout.fillWidth: true
-                            text: root.settings ? root.settings.ollama_base_url : "http://localhost:11434"
-                            placeholderText: "http://localhost:11434"
+                            text: root.settings ? root.settings.ollama_base_url : "http://127.0.0.1:11434"
+                            placeholderText: "http://127.0.0.1:11434"
                             color: Theme.text
                             placeholderTextColor: Theme.muted
                             background: Rectangle { color: Theme.bg3; radius: Theme.radiusMd; border.color: activeFocus ? Theme.accent : Theme.bg3; border.width: 1 }
                             onEditingFinished: {
                                 if (root.settings) root.settings.ollama_base_url = text
-                                if (backend) {
-                                    ollamaModelStatus.text = "Loading models..."
-                                    backend.fetchOllamaModels(text)
-                                }
+                                persistOllamaSettings()
+                                refreshOllamaModels()
                             }
                         }
 
@@ -804,9 +871,29 @@ Item {
                                 id: ollamaModelCombo
                                 Layout.fillWidth: true
                                 editable: true
-                                model: [root.settings ? root.settings.ollama_model : "llama3"]
-                                Component.onCompleted: editText = root.settings ? root.settings.ollama_model : "llama3"
-                                onEditTextChanged: if (root.settings) root.settings.ollama_model = editText
+                                model: ollamaModelList
+                                textRole: "name"
+                                valueRole: "name"
+                                Component.onCompleted: {
+                                    var initial = root.settings ? root.settings.ollama_model : "llama3"
+                                    if (ollamaModelList.count === 0)
+                                        ollamaModelList.append({ name: initial })
+                                    editText = initial
+                                }
+                                onActivated: {
+                                    if (!root.settings) return
+                                    var name = ollamaModelList.get(currentIndex).name
+                                    if (root.settings.ollama_model !== name) {
+                                        root.settings.ollama_model = name
+                                        persistOllamaSettings()
+                                    }
+                                }
+                                onEditTextChanged: {
+                                    if (!root.settings) return
+                                    if (root.settings.ollama_model === editText) return
+                                    root.settings.ollama_model = editText
+                                    persistOllamaSettings()
+                                }
                             }
                             ToolButton {
                                 implicitWidth: Theme.controlHeight
@@ -821,10 +908,7 @@ Item {
                                     radius: Theme.radiusSm
                                     color: parent.hovered ? Theme.bg3 : "transparent"
                                 }
-                                onClicked: {
-                                    ollamaModelStatus.text = "Loading models..."
-                                    if (backend) backend.fetchOllamaModels(root.settings ? root.settings.ollama_base_url : "")
-                                }
+                                onClicked: refreshOllamaModels()
                             }
                         }
 
@@ -847,39 +931,62 @@ Item {
                             color: Theme.text
                             placeholderTextColor: Theme.muted
                             background: Rectangle { color: Theme.bg3; radius: Theme.radiusMd; border.color: activeFocus ? Theme.accent : Theme.bg3; border.width: 1 }
-                            onActiveFocusChanged: if (!activeFocus && root.settings) root.settings.ollama_system_prompt = text
+                            onActiveFocusChanged: {
+                                if (!activeFocus && root.settings) {
+                                    root.settings.ollama_system_prompt = text
+                                    persistOllamaSettings()
+                                }
+                            }
                         }
 
                         Item {}
                         ColumnLayout {
                             Layout.fillWidth: true
-                            SettingSwitch { title: "Auto-reply to direct messages"; checked: root.settings ? root.settings.ollama_auto_respond_direct : false; onChanged: if (root.settings) root.settings.ollama_auto_respond_direct = checked }
-                            SettingSwitch { title: "Auto-reply to room chat"; checked: root.settings ? root.settings.ollama_auto_respond_room : false; onChanged: if (root.settings) root.settings.ollama_auto_respond_room = checked }
+                            SettingSwitch {
+                                title: "Auto-reply to direct messages"
+                                checked: root.settings ? root.settings.ollama_auto_respond_direct : false
+                                onChanged: {
+                                    if (!root.settings) return
+                                    root.settings.ollama_auto_respond_direct = checked
+                                    persistOllamaSettings()
+                                }
+                            }
+                            SettingSwitch {
+                                title: "Auto-reply to room chat"
+                                checked: root.settings ? root.settings.ollama_auto_respond_room : false
+                                onChanged: {
+                                    if (!root.settings) return
+                                    root.settings.ollama_auto_respond_room = checked
+                                    persistOllamaSettings()
+                                }
+                            }
                         }
                     }
 
-                    Component.onCompleted: if (backend) backend.fetchOllamaModels(root.settings ? root.settings.ollama_base_url : "")
-
+                    // Primary delivery path: qproperty change (snake_case), which
+                    // matches how other cxx-qt settings bindings work in this app.
                     Connections {
                         target: backend
+                        function onOllama_models_jsonChanged() {
+                            ollamaCard.applyOllamaModels(backend.ollama_models_json, backend.ollama_models_error)
+                        }
                         function onOllamaModelsReady(models, error) {
-                            if (error !== "") {
-                                ollamaModelStatus.text = "Error: " + error
-                                return
-                            }
-                            var names = JSON.parse(models)
-                            if (names.length === 0) {
-                                ollamaModelStatus.text = "No models found"
-                                return
-                            }
-                            var saved = ollamaModelCombo.editText
-                            ollamaModelCombo.model = names
-                            var idx = names.indexOf(saved)
-                            if (idx >= 0) ollamaModelCombo.currentIndex = idx
-                            else ollamaModelCombo.editText = saved
-                            ollamaModelStatus.text = "Found " + names.length + (names.length === 1 ? " model" : " models")
+                            ollamaCard.applyOllamaModels(models, error)
                         }
                     }
+
+                    Connections {
+                        target: root
+                        function onCurrentTabChanged() {
+                            if (root.currentTab === 3)
+                                ollamaCard.refreshOllamaModels()
+                        }
+                    }
+
+                    Component.onCompleted: Qt.callLater(function() {
+                        if (root.currentTab === 3)
+                            ollamaCard.refreshOllamaModels()
+                    })
                 }
             }
         }

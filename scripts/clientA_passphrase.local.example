@@ -1,0 +1,10 @@
+# Copy to:  .clientA\passphrase.local
+# One line only — the identity passphrase for ClientA (Bobert).
+# That file is under .clientA/ which is gitignored.
+#
+#   copy scripts\clientA_passphrase.local.example .clientA\passphrase.local
+#   notepad .clientA\passphrase.local
+#
+# Then run:  run_clientA_headless.bat
+#
+your-passphrase-here
