@@ -39,7 +39,7 @@ use super::{
     accept_group_key_epoch, is_elected_keyer, may_send_room_e2e_content, parse_quic_lan_hint,
     room_scope_key, should_auto_join_on_room_created, should_mint_first_room_key,
     should_track_pending_materialize, should_use_private_room_invite, union_members_for_room,
-    unix_now_f64, PendingGroupKeyAck, ROOM_INVITE_SCHEMA,
+    unix_now_f64, PendingGroupKeyAck, PendingRoomJoinRetry, ROOM_INVITE_SCHEMA,
 };
 // Re-exported pure helpers live on manager; also pull invite helpers used in match arms.
 use super::invite::{build_room_invite_url, parse_room_invite, RoomInviteEntry, RoomInvitePayload};
@@ -566,6 +566,13 @@ impl ConnectionManager {
                             .collect()
                     })
                     .unwrap_or_else(|| members.clone());
+                // Confirmed on *some* member — any `room_absent` retries still
+                // in flight for this room (this node or a failover sibling) are
+                // moot now; drop them so the retry timer doesn't keep sending
+                // redundant joins (and eventually a bogus give-up rejection)
+                // after we're already in.
+                self.pending_room_join_retries
+                    .retain(|(_, r), _| r != &room_id);
                 // If a cluster failover fan-out is awaiting confirmation for this
                 // room, the sibling that answered is the one that still holds it
                 // — promote it to the current supernode (correcting the
@@ -1283,6 +1290,21 @@ impl ConnectionManager {
                 self.pending_failover_rejoin.retain(|_, r| *r != room_id);
                 if self.failover_pending_room.as_deref() == Some(room_id.as_str()) {
                     self.failover_pending_room = None;
+                }
+                // `room_absent` usually just means this member hasn't received
+                // the room via cluster `RoomRoster` gossip yet (fresh restart,
+                // cluster_link still reconnecting) — retry the same join with
+                // backoff instead of surfacing a hard failure immediately. Only
+                // arm a fresh retry if one isn't already in flight so we don't
+                // reset its attempt counter/backoff on every denied retry.
+                if reason == "room_absent" {
+                    self.pending_room_join_retries
+                        .entry((supernode_id, room_id))
+                        .or_insert_with(|| PendingRoomJoinRetry {
+                            last_sent: std::time::Instant::now(),
+                            attempts: 0,
+                        });
+                    return;
                 }
                 self.emit_event(ConnectionEvent::RoomJoinRejected {
                     supernode_id,

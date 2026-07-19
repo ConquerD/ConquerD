@@ -64,6 +64,14 @@ pub(super) const GROUP_KEY_MAX_ATTEMPTS: u8 = 16;
 pub(super) const PEER_RECONNECT_TICK_S: u64 = 1;
 /// Cap on exponential backoff between direct-QUIC peer reconnect attempts.
 pub(super) const PEER_RECONNECT_MAX_BACKOFF_S: u64 = 60;
+/// How often we scan for due `room_absent` join retries.
+pub(super) const ROOM_JOIN_RETRY_TICK_MS: u64 = 250;
+/// Base delay before the first `room_absent` join retry.
+pub(super) const ROOM_JOIN_RETRY_BASE_MS: u64 = 500;
+/// Cap on exponential backoff between `room_absent` join retries.
+pub(super) const ROOM_JOIN_RETRY_MAX_MS: u64 = 8_000;
+/// Give up retrying a `room_absent` join after this many attempts.
+pub(super) const ROOM_JOIN_MAX_ATTEMPTS: u8 = 8;
 /// After a callee accepts, how long the caller waits for a direct QUIC session
 /// before falling back to a temporary private SFU room.
 pub(super) const DIRECT_CALL_FALLBACK_GRACE_S: u64 = 5;
@@ -219,12 +227,25 @@ pub struct ConnectionManager {
     /// deadline after which [`Self::start_direct_call_fallback`] fires. Checked
     /// on the 1 s reconnect tick; cleared on QUIC connect or call end.
     pending_call_fallback_checks: HashMap<String, Instant>,
+    /// `SfuJoin`s denied with the transient `room_absent` reason, retried on
+    /// the same supernode with backoff. Keyed by `(supernode_id, room_id)`.
+    /// `room_absent` typically means that cluster member just restarted and
+    /// hasn't received the room via `RoomRoster` gossip yet — see
+    /// [`Self::retry_pending_room_joins`].
+    pending_room_join_retries: HashMap<(String, String), PendingRoomJoinRetry>,
 }
 
 /// One in-flight seal of epoch key material to a room member.
 #[derive(Debug, Clone)]
 pub(super) struct PendingGroupKeyAck {
     pub(super) epoch: u8,
+    pub(super) last_sent: std::time::Instant,
+    pub(super) attempts: u8,
+}
+
+/// A `SfuJoin` awaiting retry after a transient `room_absent` denial.
+#[derive(Debug, Clone)]
+pub(super) struct PendingRoomJoinRetry {
     pub(super) last_sent: std::time::Instant,
     pub(super) attempts: u8,
 }
@@ -343,6 +364,7 @@ impl ConnectionManager {
             pending_peer_reconnects: HashMap::new(),
             direct_fallback: DirectFallbackCoordinator::new(),
             pending_call_fallback_checks: HashMap::new(),
+            pending_room_join_retries: HashMap::new(),
         };
         (cmd_tx, event_rx, mgr)
     }
@@ -384,6 +406,33 @@ impl ConnectionManager {
             },
         );
         send_rx
+    }
+
+    /// Test-only: arm a `room_absent` retry as if a denied `SfuJoin` had just
+    /// been received, so tests can drive [`Self::retry_pending_room_joins`]
+    /// without wiring up the full signed-inbound dispatch pipeline.
+    #[cfg(test)]
+    pub(super) fn test_arm_room_join_retry(
+        &mut self,
+        supernode_id: &str,
+        room_id: &str,
+        attempts: u8,
+        last_sent: std::time::Instant,
+    ) {
+        self.pending_room_join_retries.insert(
+            (supernode_id.to_owned(), room_id.to_owned()),
+            PendingRoomJoinRetry {
+                last_sent,
+                attempts,
+            },
+        );
+    }
+
+    /// Test-only forwarder: [`Self::retry_pending_room_joins`] is
+    /// `pub(super)` to `manager`, one level narrower than `tests` needs.
+    #[cfg(test)]
+    pub(super) async fn test_retry_pending_room_joins(&mut self) {
+        self.retry_pending_room_joins().await;
     }
 
     pub(super) async fn run_inner(mut self) {
@@ -453,6 +502,9 @@ impl ConnectionManager {
         let mut peer_reconnect_interval =
             tokio::time::interval(Duration::from_secs(PEER_RECONNECT_TICK_S));
         peer_reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut room_join_retry_interval =
+            tokio::time::interval(Duration::from_millis(ROOM_JOIN_RETRY_TICK_MS));
+        room_join_retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -543,6 +595,11 @@ impl ConnectionManager {
                                 self.current_room_id.clear();
                                 self.current_supernode_id.clear();
                             }
+                            // An intentional leave outranks any in-flight
+                            // `room_absent` retry for this room — don't let the
+                            // retry timer rejoin a room we just walked away from.
+                            self.pending_room_join_retries
+                                .retain(|(_, r), _| r != &room_id);
                             let room_key = room_scope_key(&supernode_id, &room_id);
                             let keep_chat = self.chat_active_rooms.contains(&room_key);
                             if !keep_chat {
@@ -845,6 +902,9 @@ impl ConnectionManager {
                 _ = peer_reconnect_interval.tick() => {
                     self.tick_peer_reconnects().await;
                     self.tick_call_fallback_checks().await;
+                }
+                _ = room_join_retry_interval.tick() => {
+                    self.retry_pending_room_joins().await;
                 }
             }
         }

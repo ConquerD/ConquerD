@@ -26,6 +26,7 @@ use parking_lot::RwLock;
 use quinn::Endpoint;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::cluster::ClusterMembership;
@@ -36,6 +37,13 @@ use crate::space::SignedSpaceRoot;
 /// Reconnect backoff bounds for dialing a peer member.
 const DIAL_BACKOFF_START: Duration = Duration::from_secs(1);
 const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Bound a single dial attempt so a stalled handshake fails fast and the
+/// `DIAL_BACKOFF_*` cadence actually governs retry timing, instead of QUIC's
+/// own (much longer) handshake timeout silently stretching every failed
+/// attempt. A cold member's `RoomRoster` only reaches its peers once this
+/// link comes up, so a slow dial here directly widens the `room_absent`
+/// window clients hit right after that member restarts.
+const DIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a member re-advertises its local room subscriptions to peers.
 const SUBSCRIPTION_REFRESH: Duration = Duration::from_secs(15);
 /// Max accepted cluster frame size (defensive bound).
@@ -586,7 +594,12 @@ impl ClusterLink {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
         endpoint.set_default_client_config(client_cfg);
 
-        let conn = endpoint.connect(remote, "conquerd")?.await?;
+        let connecting = endpoint.connect(remote, "conquerd")?;
+        let conn = timeout(DIAL_CONNECT_TIMEOUT, connecting)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("connect to {addr} timed out after {DIAL_CONNECT_TIMEOUT:?}")
+            })??;
         // The server cert is self-signed with a non-hex CN, so we don't bind the
         // peer identity here. Authenticity is enforced per-message instead:
         // `run_link`/`read_loop` require every frame to be Ed25519-signed with

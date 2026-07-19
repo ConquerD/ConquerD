@@ -1342,3 +1342,127 @@ async fn inbound_call_request_surfaces_fallback_room_coordinates() {
         other => panic!("expected CallRequest event, got {other:?}"),
     }
 }
+
+/// `room_absent` means the room lives on another cluster member and hasn't
+/// been gossiped to this one yet (see `cluster_link::RoomRoster`) — a
+/// transient condition right after that member restarts. It must be retried
+/// on the same supernode, not surfaced as an immediate hard failure.
+#[tokio::test]
+async fn sfu_join_result_room_absent_is_retried_not_surfaced() {
+    use crate::identity::Identity;
+    use crate::protocol::{MessageType, SignalingMessage};
+    use serde_json::Value;
+
+    let mut t = harness::test_cm();
+    let sn_identity = Identity::generate();
+    let sn_id = sn_identity.public_id();
+    let mut sn_ws = t.cm.test_add_supernode_session(&sn_id);
+
+    let mut deny = SignalingMessage::new(MessageType::SfuJoinResult, sn_id.clone());
+    deny.payload
+        .insert("room_id".to_owned(), Value::String("room-1".to_owned()));
+    deny.payload
+        .insert("accepted".to_owned(), Value::Bool(false));
+    deny.payload
+        .insert("reason".to_owned(), Value::String("room_absent".to_owned()));
+    harness::sign(&sn_identity, &mut deny);
+    t.cm.handle_inbound(deny).await;
+
+    assert!(
+        t.events.try_recv().is_err(),
+        "room_absent must be retried silently, not surfaced as RoomJoinRejected"
+    );
+
+    // Fast-forward past the retry's backoff (real time isn't advanced in a
+    // unit test) and confirm the join gets replayed to the same supernode.
+    t.cm.test_arm_room_join_retry(
+        &sn_id,
+        "room-1",
+        0,
+        std::time::Instant::now() - Duration::from_secs(1),
+    );
+    t.cm.test_retry_pending_room_joins().await;
+    let sent = harness::drain_ws(&mut sn_ws);
+    assert!(
+        sent.iter().any(|m| m.msg_type == MessageType::SfuJoin
+            && m.payload.get("room_id").and_then(Value::as_str) == Some("room-1")),
+        "expected a retried SfuJoin for room-1, got {sent:?}"
+    );
+}
+
+/// Non-transient deny reasons (room full, not on the ACL, ...) must still
+/// surface immediately — only `room_absent` gets the silent-retry treatment.
+#[tokio::test]
+async fn sfu_join_result_not_allowed_surfaces_rejection_immediately() {
+    use super::events::ConnectionEvent;
+    use crate::identity::Identity;
+    use crate::protocol::{MessageType, SignalingMessage};
+    use serde_json::Value;
+
+    let mut t = harness::test_cm();
+    let sn_identity = Identity::generate();
+    let sn_id = sn_identity.public_id();
+    let _sn_ws = t.cm.test_add_supernode_session(&sn_id);
+
+    let mut deny = SignalingMessage::new(MessageType::SfuJoinResult, sn_id.clone());
+    deny.payload
+        .insert("room_id".to_owned(), Value::String("room-1".to_owned()));
+    deny.payload
+        .insert("accepted".to_owned(), Value::Bool(false));
+    deny.payload
+        .insert("reason".to_owned(), Value::String("not_allowed".to_owned()));
+    harness::sign(&sn_identity, &mut deny);
+    t.cm.handle_inbound(deny).await;
+
+    match t.events.try_recv() {
+        Ok(ConnectionEvent::RoomJoinRejected {
+            supernode_id,
+            room_id,
+            reason,
+        }) => {
+            assert_eq!(supernode_id, sn_id);
+            assert_eq!(room_id, "room-1");
+            assert_eq!(reason, "not_allowed");
+        }
+        other => panic!("expected RoomJoinRejected, got {other:?}"),
+    }
+}
+
+/// A `room_absent` retry that never resolves must stop after
+/// `ROOM_JOIN_MAX_ATTEMPTS` and surface the failure the UI never got —
+/// otherwise a permanently roomless node retries forever with no feedback.
+#[tokio::test]
+async fn room_join_retry_gives_up_after_max_attempts() {
+    use super::events::ConnectionEvent;
+    use super::manager::ROOM_JOIN_MAX_ATTEMPTS;
+    use crate::protocol::MessageType;
+
+    let mut t = harness::test_cm();
+    let sn_id = "SN-STALE".to_owned();
+    let mut sn_ws = t.cm.test_add_supernode_session(&sn_id);
+    t.cm.test_arm_room_join_retry(
+        &sn_id,
+        "room-1",
+        ROOM_JOIN_MAX_ATTEMPTS,
+        std::time::Instant::now(),
+    );
+    t.cm.test_retry_pending_room_joins().await;
+
+    match t.events.try_recv() {
+        Ok(ConnectionEvent::RoomJoinRejected {
+            supernode_id,
+            room_id,
+            reason,
+        }) => {
+            assert_eq!(supernode_id, sn_id);
+            assert_eq!(room_id, "room-1");
+            assert_eq!(reason, "room_absent");
+        }
+        other => panic!("expected RoomJoinRejected after exhausting retries, got {other:?}"),
+    }
+    let sent = harness::drain_ws(&mut sn_ws);
+    assert!(
+        !sent.iter().any(|m| m.msg_type == MessageType::SfuJoin),
+        "must not resend once retries are exhausted, got {sent:?}"
+    );
+}

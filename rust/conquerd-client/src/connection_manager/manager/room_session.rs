@@ -39,7 +39,9 @@ use crate::connection_fallback::{DirectFallbackCoordinator, PendingFallback};
 
 use super::invite::{RoomInviteEntry, ROOM_INVITE_SCHEMA};
 use super::{
-    unix_now_f64, PendingGroupKeyAck, GROUP_KEY_MAX_ATTEMPTS, GROUP_KEY_RETRY_INTERVAL_MS,
+    unix_now_f64, PendingGroupKeyAck, PendingRoomJoinRetry, GROUP_KEY_MAX_ATTEMPTS,
+    GROUP_KEY_RETRY_INTERVAL_MS, ROOM_JOIN_MAX_ATTEMPTS, ROOM_JOIN_RETRY_BASE_MS,
+    ROOM_JOIN_RETRY_MAX_MS,
 };
 
 /// The room group-key "elected keyer" tie-break: `me` acts iff it is present
@@ -603,6 +605,79 @@ impl ConnectionManager {
             );
             self.distribute_group_key(&room_id, epoch, &key, &[member])
                 .await;
+        }
+    }
+
+    /// Retry `SfuJoin`s denied with the transient `room_absent` reason.
+    ///
+    /// A cluster member only knows a room exists if it was created there or
+    /// gossiped to it via `RoomRoster`, which is pushed once the member's
+    /// `cluster_link` to the room's home node comes up — not on demand. A
+    /// member that just restarted can deny a join for a room that lives
+    /// elsewhere in the cluster for as long as that link takes to
+    /// reconnect. Retrying the same join with backoff bridges that window
+    /// instead of surfacing a hard failure the instant it opens. Called on a
+    /// short timer from the connection manager run loop.
+    pub(super) async fn retry_pending_room_joins(&mut self) {
+        if self.pending_room_join_retries.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+
+        let mut stale: Vec<(String, String)> = Vec::new();
+        let mut exhausted: Vec<(String, String)> = Vec::new();
+        let mut due: Vec<(String, String)> = Vec::new();
+
+        for ((supernode_id, room_id), pending) in &self.pending_room_join_retries {
+            if !self.supernodes.contains_key(supernode_id) {
+                // Session gone; WsDisconnected handling covers surfacing this.
+                stale.push((supernode_id.clone(), room_id.clone()));
+                continue;
+            }
+            if pending.attempts >= ROOM_JOIN_MAX_ATTEMPTS {
+                exhausted.push((supernode_id.clone(), room_id.clone()));
+                continue;
+            }
+            let delay_ms = ROOM_JOIN_RETRY_BASE_MS
+                .saturating_mul(1u64 << u32::from(pending.attempts))
+                .min(ROOM_JOIN_RETRY_MAX_MS);
+            if now.duration_since(pending.last_sent) >= Duration::from_millis(delay_ms) {
+                due.push((supernode_id.clone(), room_id.clone()));
+            }
+        }
+
+        for k in stale {
+            self.pending_room_join_retries.remove(&k);
+        }
+        for (supernode_id, room_id) in exhausted {
+            self.pending_room_join_retries
+                .remove(&(supernode_id.clone(), room_id.clone()));
+            warn!(
+                "giving up on room_absent join for room {} on {} — room never materialized there",
+                room_id,
+                &supernode_id[..8.min(supernode_id.len())]
+            );
+            self.emit_event(ConnectionEvent::RoomJoinRejected {
+                supernode_id,
+                room_id,
+                reason: "room_absent".to_owned(),
+            });
+        }
+
+        for (supernode_id, room_id) in due {
+            if let Some(pending) = self
+                .pending_room_join_retries
+                .get_mut(&(supernode_id.clone(), room_id.clone()))
+            {
+                pending.attempts += 1;
+                pending.last_sent = now;
+            }
+            debug!(
+                "retrying room_absent join for room {} on {}",
+                room_id,
+                &supernode_id[..8.min(supernode_id.len())]
+            );
+            self.send_room_join(&supernode_id, &room_id).await;
         }
     }
 
