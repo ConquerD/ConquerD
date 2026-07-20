@@ -1064,6 +1064,38 @@ mod tests {
         assert_eq!(ids, vec!["peer1", "peer2"]);
     }
 
+    /// Sidebar peer counts must be voice-only: text-chat subscribers share
+    /// the room for chat/keys but must not inflate `member_count` /
+    /// `participant_ids` on the room list.
+    #[test]
+    fn room_list_member_count_excludes_text_only_subscribers() {
+        let mut mgr = SFURoomManager::new();
+        mgr.create_room(Some("voice-room"), "Voice", RoomType::Public, "creator")
+            .expect("room");
+        assert!(mgr.join_room("speaker", "voice-room").0);
+        // Chat-only peer: subscribed, not a voice participant.
+        assert!(mgr.subscribe("lurker", "voice-room"));
+
+        let rooms = mgr.get_rooms_for_peer("speaker");
+        let room = rooms
+            .iter()
+            .find(|r| r.get("room_id").and_then(|v| v.as_str()) == Some("voice-room"))
+            .expect("room in list");
+        assert_eq!(room.get("member_count").and_then(|v| v.as_u64()), Some(1));
+        let ids: Vec<&str> = room
+            .get("participant_ids")
+            .and_then(|v| v.as_array())
+            .expect("participant_ids")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(ids, vec!["speaker"]);
+        // Chat recipients still include the subscriber for keying / chat.
+        let mut chat = mgr.get_chat_recipients("voice-room");
+        chat.sort();
+        assert_eq!(chat, vec!["lurker".to_string(), "speaker".to_string()]);
+    }
+
     #[test]
     fn test_private_room() {
         let mut mgr = SFURoomManager::new();
