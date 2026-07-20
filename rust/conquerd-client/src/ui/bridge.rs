@@ -1024,6 +1024,12 @@ pub struct AppBridgeRust {
     /// text chat never overwrites who is in the call.
     room_participant_ids: Vec<String>,
 
+    /// Per-room **voice** participant IDs for sidebar peer counts.
+    /// Key: `supernode_id:room_id`. Value: voice `members` only — never text
+    /// chat subscribers. Each room's headphone count is derived from this
+    /// roster (or from `SfuRoomList.participant_ids` when no live roster yet).
+    room_voice_rosters: std::collections::HashMap<String, Vec<String>>,
+
     /// Local cache of the **selected text room** chat members (members panel).
     /// Populated from `chat_members` (participants + subscribers) for
     /// `current_supernode_id` / `current_room_id`.
@@ -1283,6 +1289,7 @@ impl Default for AppBridgeRust {
             mic_test_active: false,
             room_chat_history: std::collections::HashMap::new(),
             room_participant_ids: Vec::new(),
+            room_voice_rosters: std::collections::HashMap::new(),
             text_member_ids: Vec::new(),
             room_display_handles: std::collections::HashMap::new(),
             pending_room_rosters: std::collections::HashMap::new(),
@@ -5028,10 +5035,115 @@ fn apply_room_roster_to_bridge(
         emit_member_list_json(bridge, members, true);
     }
 
-    if let Some(patch) = room_voice_sidebar_patch(bridge.rust(), supernode_id, room_id, members) {
+    // Voice rail + per-room sidebar count both track the voice roster only.
+    update_room_voice_count(bridge, supernode_id, room_id, members);
+}
+
+/// Store the authoritative **voice** roster for one room and push a sidebar
+/// patch so that room's peer count reflects only voice participants — never
+/// text-chat subscribers, and never a different room's membership.
+fn update_room_voice_count(
+    bridge: &mut Pin<&mut ffi::AppBridge>,
+    supernode_id: &str,
+    room_id: &str,
+    voice_members: &[String],
+) {
+    if supernode_id.is_empty() || room_id.is_empty() {
+        return;
+    }
+    let key = room_roster_key(supernode_id, room_id);
+    bridge
+        .as_mut()
+        .rust_mut()
+        .room_voice_rosters
+        .insert(key, voice_members.to_vec());
+    if let Some(patch) =
+        room_voice_sidebar_patch(bridge.rust(), supernode_id, room_id, voice_members)
+    {
         bridge
             .as_mut()
             .sfu_rooms_updated(QString::from(patch.as_str()));
+    }
+}
+
+/// Mutate the cached voice roster for a room (join/leave of a single peer)
+/// and refresh that room's sidebar count. No-op when we have no roster yet
+/// (full `SfuMembers` / `SfuRoomList` will seed it).
+fn adjust_room_voice_member(
+    bridge: &mut Pin<&mut ffi::AppBridge>,
+    supernode_id: &str,
+    room_id: &str,
+    peer_id: &str,
+    joining: bool,
+) {
+    if supernode_id.is_empty() || room_id.is_empty() || peer_id.is_empty() {
+        return;
+    }
+    let key = room_roster_key(supernode_id, room_id);
+    let members = {
+        let rosters = &mut bridge.as_mut().rust_mut().room_voice_rosters;
+        let Some(roster) = rosters.get_mut(&key) else {
+            return;
+        };
+        if joining {
+            if !roster.iter().any(|id| id == peer_id) {
+                roster.push(peer_id.to_owned());
+            }
+        } else {
+            roster.retain(|id| id != peer_id);
+        }
+        roster.clone()
+    };
+    if let Some(patch) = room_voice_sidebar_patch(bridge.rust(), supernode_id, room_id, &members) {
+        bridge
+            .as_mut()
+            .sfu_rooms_updated(QString::from(patch.as_str()));
+    }
+}
+
+/// Seed/refresh per-room voice rosters from an SFU room-list snapshot.
+/// `participant_ids` (voice only) win; bare `member_count` without ids still
+/// drives the displayed count via enrich, but cannot seed the join/leave cache.
+fn seed_voice_rosters_from_room_list(
+    bridge: &mut Pin<&mut ffi::AppBridge>,
+    supernode_id: &str,
+    rooms: &serde_json::Value,
+) {
+    let Some(arr) = rooms.as_array() else {
+        return;
+    };
+    for room in arr {
+        let Some(room_id) = room.get("room_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if room_id.is_empty() {
+            continue;
+        }
+        let participant_ids: Vec<String> = room
+            .get("participant_ids")
+            .or_else(|| room.get("participants"))
+            .and_then(|v| v.as_array())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Only seed when we have an explicit id list — empty array is a valid
+        // "zero voice members" snapshot from the supernode.
+        if room
+            .get("participant_ids")
+            .or_else(|| room.get("participants"))
+            .and_then(|v| v.as_array())
+            .is_some()
+        {
+            let key = room_roster_key(supernode_id, room_id);
+            bridge
+                .as_mut()
+                .rust_mut()
+                .room_voice_rosters
+                .insert(key, participant_ids);
+        }
     }
 }
 
@@ -5362,6 +5474,13 @@ fn enrich_room_voice_participants(
         .iter()
         .map(|room| {
             let mut obj = room.as_object().cloned().unwrap_or_default();
+            // Voice-only identity list from the SFU. Text-chat subscribers are
+            // never included here — they must not inflate the room peer badge.
+            let has_id_list = room
+                .get("participant_ids")
+                .or_else(|| room.get("participants"))
+                .and_then(|v| v.as_array())
+                .is_some();
             let participant_ids: Vec<String> = room
                 .get("participant_ids")
                 .or_else(|| room.get("participants"))
@@ -5373,7 +5492,10 @@ fn enrich_room_voice_participants(
                 })
                 .unwrap_or_default();
 
-            let voice_count = if !participant_ids.is_empty() {
+            // Prefer the explicit voice id list (including empty = 0 voices).
+            // Fall back to member_count / voice_count only when no id list was
+            // provided (legacy / local-only entries). Never use chat_members.
+            let voice_count = if has_id_list {
                 participant_ids.len()
             } else {
                 room.get("member_count")
@@ -5406,10 +5528,21 @@ fn enrich_room_voice_participants(
                 "unknown_peers".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(unknown as u64)),
             );
-            obj.insert(
-                "voice_count".to_owned(),
-                serde_json::Value::Number(serde_json::Number::from(voice_count as u64)),
-            );
+            // Canonical voice-only count fields for the Rooms sidebar badge.
+            let count_num = serde_json::Value::Number(serde_json::Number::from(voice_count as u64));
+            obj.insert("voice_count".to_owned(), count_num.clone());
+            obj.insert("member_count".to_owned(), count_num);
+            if has_id_list {
+                obj.insert(
+                    "participant_ids".to_owned(),
+                    serde_json::Value::Array(
+                        participant_ids
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
             serde_json::Value::Object(obj)
         })
         .collect();
@@ -6485,7 +6618,15 @@ fn dispatch_event(
                         .as_mut()
                         .rust_mut()
                         .pending_room_rosters
-                        .insert(key.clone(), members);
+                        .insert(key.clone(), members.clone());
+                    // Still refresh this room's sidebar voice count from the
+                    // voice roster — chat subscribers must not affect it.
+                    update_room_voice_count(
+                        &mut bridge,
+                        canon.as_str(),
+                        room_id.as_str(),
+                        &members,
+                    );
                 }
                 // Text members panel: chat recipients for the selected room.
                 if should_apply_text_roster(bridge.rust(), canon.as_str(), room_id.as_str()) {
@@ -6541,11 +6682,22 @@ fn dispatch_event(
                         let _ = tx.try_send(CallCommand::ClearRoomMode);
                         let _ = tx.try_send(CallCommand::StopAudio);
                     }
+                    let my_pub = bridge.rust().my_public_id.clone();
                     {
                         let mut r = bridge.as_mut().rust_mut();
                         r.room_participant_ids.clear();
                         r.voice_supernode_id.clear();
                         r.voice_room_id.clear();
+                    }
+                    // Drop our optimistic voice presence from that room's count.
+                    if !my_pub.is_empty() {
+                        adjust_room_voice_member(
+                            &mut bridge,
+                            canon.as_str(),
+                            room_id.as_str(),
+                            &my_pub,
+                            false,
+                        );
                     }
                     clear_room_member_presence(&mut bridge.as_mut().rust_mut());
                     bridge.as_mut().set_voice_active(false);
@@ -6566,7 +6718,9 @@ fn dispatch_event(
         } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 let canon = canon_supernode_id(bridge.rust(), &supernode_id);
-                // Voice participant join — update the voice rail only.
+                // Voice participant join — update the voice rail when this is
+                // the active voice room; always keep that room's sidebar count
+                // in sync from the voice roster cache.
                 if should_apply_voice_roster(bridge.rust(), canon.as_str(), room_id.as_str()) {
                     let cfg = bridge.rust().avatar_config_json.clone();
                     if !cfg.is_empty() {
@@ -6592,6 +6746,14 @@ fn dispatch_event(
                         &ids,
                         canon.as_str(),
                         room_id.as_str(),
+                        true,
+                    );
+                } else {
+                    adjust_room_voice_member(
+                        &mut bridge,
+                        canon.as_str(),
+                        room_id.as_str(),
+                        &peer_id,
                         true,
                     );
                 }
@@ -6628,6 +6790,14 @@ fn dispatch_event(
                         canon.as_str(),
                         room_id.as_str(),
                         true,
+                    );
+                } else {
+                    adjust_room_voice_member(
+                        &mut bridge,
+                        canon.as_str(),
+                        room_id.as_str(),
+                        &peer_id,
+                        false,
                     );
                 }
                 // Voice leave does not remove a text subscriber; SfuMembers
@@ -6803,27 +6973,27 @@ fn dispatch_event(
                 };
                 let remote = serde_json::from_str::<serde_json::Value>(&rooms_json)
                     .unwrap_or(serde_json::Value::Array(vec![]));
+                let my_pub = bridge.rust().my_public_id.clone();
                 let rooms = if let (Some(rs), Some(ps)) = (
-                    bridge.rust().room_store.as_ref(),
-                    bridge.rust().peer_store.as_ref(),
+                    bridge.rust().room_store.clone(),
+                    bridge.rust().peer_store.clone(),
                 ) {
-                    let mut store = rs.write();
-                    sync_saved_rooms_from_list(&mut store, &canon, &remote);
+                    let filtered = {
+                        let mut store = rs.write();
+                        sync_saved_rooms_from_list(&mut store, &canon, &remote);
+                        let peer_store = ps.read();
+                        let local = local_rooms_json_for_supernode(&store, &peer_store, &canon);
+                        let merged = merge_room_list_values(&local, &remote);
+                        filter_sfu_rooms_for_sidebar(&store, &canon, &merged)
+                    };
+                    // Seed per-room voice caches from voice participant_ids only
+                    // (never chat subscribers) so join/leave can patch counts.
+                    seed_voice_rosters_from_room_list(&mut bridge, &canon, &filtered);
                     let peer_store = ps.read();
-                    let local = local_rooms_json_for_supernode(&store, &peer_store, &canon);
-                    let merged = merge_room_list_values(&local, &remote);
-                    let filtered = filter_sfu_rooms_for_sidebar(&store, &canon, &merged);
-                    enrich_room_voice_participants(
-                        filtered,
-                        Some(&peer_store),
-                        bridge.rust().my_public_id.as_str(),
-                    )
+                    enrich_room_voice_participants(filtered, Some(&peer_store), my_pub.as_str())
                 } else {
-                    enrich_room_voice_participants(
-                        remote,
-                        None,
-                        bridge.rust().my_public_id.as_str(),
-                    )
+                    seed_voice_rosters_from_room_list(&mut bridge, &canon, &remote);
+                    enrich_room_voice_participants(remote, None, my_pub.as_str())
                 };
                 let wrapped = serde_json::json!({
                     "supernode_id": canon,
@@ -7263,10 +7433,67 @@ fn dispatch_call_event(
 }
 
 #[cfg(test)]
+mod room_voice_count_tests {
+    use super::enrich_room_voice_participants;
+
+    #[test]
+    fn enrich_uses_participant_ids_as_voice_count() {
+        let rooms = serde_json::json!([{
+            "room_id": "a",
+            "member_count": 99,
+            "participant_ids": ["p1", "p2"],
+        }]);
+        let out = enrich_room_voice_participants(rooms, None, "me");
+        let room = &out.as_array().unwrap()[0];
+        assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(room.get("member_count").and_then(|v| v.as_u64()), Some(2));
+    }
+
+    #[test]
+    fn enrich_empty_participant_ids_is_zero_voices() {
+        // Explicit empty voice roster must win over a stale member_count.
+        let rooms = serde_json::json!([{
+            "room_id": "a",
+            "member_count": 5,
+            "participant_ids": [],
+        }]);
+        let out = enrich_room_voice_participants(rooms, None, "me");
+        let room = &out.as_array().unwrap()[0];
+        assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(room.get("member_count").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    #[test]
+    fn enrich_falls_back_to_member_count_without_id_list() {
+        let rooms = serde_json::json!([{
+            "room_id": "a",
+            "member_count": 3,
+        }]);
+        let out = enrich_room_voice_participants(rooms, None, "me");
+        let room = &out.as_array().unwrap()[0];
+        assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(3));
+    }
+
+    #[test]
+    fn enrich_ignores_chat_members_field() {
+        // chat_members must never drive the sidebar badge.
+        let rooms = serde_json::json!([{
+            "room_id": "a",
+            "participant_ids": ["speaker"],
+            "chat_members": ["speaker", "lurker", "lurker2"],
+            "member_count": 1,
+        }]);
+        let out = enrich_room_voice_participants(rooms, None, "me");
+        let room = &out.as_array().unwrap()[0];
+        assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(1));
+    }
+}
+
+#[cfg(test)]
 mod cluster_grouping_tests {
     use super::{
         cluster_full_set, cluster_representative, cluster_rollup_connected,
-        pick_live_cluster_member, ClusterSiblings, MemberConnected,
+        pick_live_cluster_member, pub_id_eq, ClusterSiblings, MemberConnected,
     };
 
     /// A 3-member cluster where each member's verified roster lists the other
