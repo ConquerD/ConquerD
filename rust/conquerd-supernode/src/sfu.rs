@@ -536,18 +536,26 @@ impl SFURoomManager {
 
     /// Remove peer from ALL rooms (participants and subscribers).
     pub fn remove_peer_from_all(&mut self, peer_id: &str) -> Vec<(String, Vec<String>)> {
+        // `participants`/`subscribers` are keyed by the normalized (padded)
+        // id — same as `remove_peer_entirely` below. Without normalizing
+        // here too, an un-padded caller finds zero matching rooms (exact
+        // string miss against the padded key) and this becomes a silent
+        // no-op: the peer lingers as a permanent ghost participant, showing
+        // a phantom voice-room count that only "resolves" when they
+        // actually rejoin (re-adding an already-present key is a no-op).
+        let peer_id = normalize_peer_id(peer_id);
         let mut results = vec![];
         let room_ids: Vec<String> = self
             .rooms
             .iter()
             .filter(|(_, r)| {
-                r.participants.contains_key(peer_id) || r.subscribers.contains(peer_id)
+                r.participants.contains_key(&peer_id) || r.subscribers.contains(&peer_id)
             })
             .map(|(id, _)| id.clone())
             .collect();
         for room_id in room_ids {
             if let Some(room) = self.rooms.get_mut(&room_id) {
-                let was_present = room.remove_peer_entirely(peer_id);
+                let was_present = room.remove_peer_entirely(&peer_id);
                 if was_present {
                     let members = room.participant_ids();
                     // GC anonymous rooms when empty
@@ -687,6 +695,10 @@ impl SFURoomManager {
                     "room_id": r.room_id,
                     "name": r.room_name,
                     "member_count": r.participant_count(),
+                    // Distinct from `member_count` (voice-only): everyone who
+                    // receives this room's text chat, i.e. voice participants
+                    // plus chat-only subscribers. Sidebar shows both badges.
+                    "chat_count": r.chat_recipient_ids().len(),
                     "participant_ids": r.participant_ids(),
                     "room_type": r.room_type,
                     "creator_id": r.creator_id,
@@ -1094,6 +1106,9 @@ mod tests {
         let mut chat = mgr.get_chat_recipients("voice-room");
         chat.sort();
         assert_eq!(chat, vec!["lurker".to_string(), "speaker".to_string()]);
+        // The room list's separate `chat_count` badge, unlike `member_count`,
+        // counts the subscriber too (speaker + lurker = 2).
+        assert_eq!(room.get("chat_count").and_then(|v| v.as_u64()), Some(2));
     }
 
     #[test]
@@ -1316,6 +1331,27 @@ mod tests {
         assert!(mgr.join_room(&padded, "priv").0); // idempotent
                                                    // Short labels are not rewritten.
         assert_eq!(normalize_peer_id("peer1"), "peer1");
+    }
+
+    /// Regression: `remove_peer_from_all` (used by the WS disconnect path)
+    /// must find and remove a participant even when called with the peer's
+    /// un-padded id — `participants` is keyed by the padded form. Before
+    /// normalizing here too, an un-padded caller silently matched zero rooms
+    /// and the peer lingered forever as a phantom voice participant (a
+    /// stale "1" in the room list that only "resolves" once they rejoin).
+    #[test]
+    fn remove_peer_from_all_finds_participant_by_unpadded_id() {
+        let mut mgr = SFURoomManager::new();
+        let unpadded: String = std::iter::repeat('B').take(43).collect();
+        let padded = normalize_peer_id(&unpadded);
+
+        mgr.create_room(Some("pub"), "Public", RoomType::Public, "creator");
+        assert!(mgr.join_room(&padded, "pub").0);
+        assert_eq!(mgr.get_room("pub").unwrap().participant_count(), 1);
+
+        let left = mgr.remove_peer_from_all(&unpadded);
+        assert_eq!(left.len(), 1, "expected the room to report the departure");
+        assert_eq!(mgr.get_room("pub").unwrap().participant_count(), 0);
     }
 
     #[test]
