@@ -328,6 +328,21 @@ ApplicationWindow {
             || (room.member_count !== undefined && room.member_count !== null)
     }
 
+    // Text-chat occupancy (voice participants + chat-only subscribers) —
+    // distinct from roomVoiceCount, which is voice-only. Server sends this
+    // alongside voice_count/member_count on a full room list; incremental
+    // voice-only patches never carry it, so callers gate on roomHasChatCount
+    // (via count_known, shared with the voice fields — both land together).
+    function roomChatCount(room) {
+        if (room.chat_count !== undefined && room.chat_count !== null)
+            return root.numericRoomCount(room.chat_count)
+        return 0
+    }
+
+    function roomHasChatCount(room) {
+        return room.chat_count !== undefined && room.chat_count !== null
+    }
+
     function roomKnownPeers(room) {
         if (!room.known_peers || !Array.isArray(room.known_peers))
             return []
@@ -414,7 +429,7 @@ ApplicationWindow {
                     && incoming.is_default === undefined)
                 continue
             if ((j === "voice_count" || j === "member_count" || j === "count"
-                    || j === "known_peers" || j === "unknown_peers")
+                    || j === "known_peers" || j === "unknown_peers" || j === "chat_count")
                     && incoming.count_known === false)
                 continue
             if (j === "count_known" && v === false && existing.count_known === true)
@@ -505,6 +520,7 @@ ApplicationWindow {
                 name: r.name || r.room_name || r.room_id || "Room",
                 kind: r.kind || r.room_type || "voice",
                 voice_count: voiceCount,
+                chat_count: root.roomChatCount(r),
                 known_peers: knownPeers,
                 unknown_peers: root.roomUnknownPeerCount(r, voiceCount, knownPeers),
                 count_known: countKnown,
@@ -1646,6 +1662,7 @@ ApplicationWindow {
                                             required property string name
                                             required property string kind
                                             required property int voice_count
+                                            required property int chat_count
                                             required property var known_peers
                                             required property int unknown_peers
                                             readonly property var knownPeers:
@@ -1943,6 +1960,84 @@ ApplicationWindow {
                                                                     color: Theme.muted
                                                                     font.pixelSize: Theme.fontSizeCaption
                                                                 }
+                                                            }
+                                                        }
+                                                    }
+
+                                                    Rectangle {
+                                                        id: roomChatBubble
+                                                        // Text-chat occupancy (voice participants + chat-only
+                                                        // subscribers) — distinct from roomVoiceBubble, which is
+                                                        // voice-only. Same staleness rule: a disconnected supernode
+                                                        // has no live refresh path, so show "—" instead of a
+                                                        // possibly-stale number.
+                                                        readonly property bool countIsStale: !roomGroup.connected
+                                                        Layout.alignment: Qt.AlignVCenter
+                                                        Layout.preferredWidth: chatBubbleRow.implicitWidth + 10
+                                                        Layout.preferredHeight: 22
+                                                        radius: 11
+                                                        color: (!roomChatBubble.countIsStale && roomDelegate.chat_count > 0)
+                                                            ? Theme.semanticTint(Theme.accent, 0.16)
+                                                            : Theme.bg2
+                                                        border.color: (!roomChatBubble.countIsStale && roomDelegate.chat_count > 0)
+                                                            ? Theme.accent
+                                                            : Theme.divider
+                                                        border.width: 1
+
+                                                        Row {
+                                                            id: chatBubbleRow
+                                                            anchors.centerIn: parent
+                                                            spacing: 4
+
+                                                            Image {
+                                                                source: "qrc:/qt/qml/ConquerD/Client/icons/speech.svg"
+                                                                sourceSize.width: 12
+                                                                sourceSize.height: 12
+                                                                width: 12
+                                                                height: 12
+                                                                anchors.verticalCenter: parent.verticalCenter
+                                                                fillMode: Image.PreserveAspectFit
+                                                                opacity: (!roomChatBubble.countIsStale && roomDelegate.chat_count > 0) ? 1.0 : 0.55
+                                                            }
+
+                                                            Label {
+                                                                text: roomChatBubble.countIsStale ? "—" : roomDelegate.chat_count.toString()
+                                                                color: (!roomChatBubble.countIsStale && roomDelegate.chat_count > 0) ? Theme.accent : Theme.muted
+                                                                font.pixelSize: Theme.fontSizeCaption
+                                                                font.bold: !roomChatBubble.countIsStale && roomDelegate.chat_count > 0
+                                                                anchors.verticalCenter: parent.verticalCenter
+                                                            }
+                                                        }
+
+                                                        HoverHandler { id: roomChatHover }
+
+                                                        Popup {
+                                                            id: roomChatPopup
+                                                            parent: roomChatBubble
+                                                            visible: roomChatHover.hovered
+                                                            modal: false
+                                                            focus: false
+                                                            closePolicy: Popup.NoAutoClose
+                                                            padding: 10
+                                                            width: 180
+                                                            x: roomChatBubble.width + 6
+                                                            y: Math.round((roomChatBubble.height - implicitHeight) / 2)
+
+                                                            background: Rectangle {
+                                                                color: Theme.bg2
+                                                                radius: Theme.radiusMd
+                                                                border.color: Theme.divider
+                                                                border.width: 1
+                                                            }
+
+                                                            contentItem: Label {
+                                                                width: roomChatPopup.availableWidth
+                                                                text: roomChatBubble.countIsStale
+                                                                    ? "Supernode offline — counts may be stale"
+                                                                    : ("In room chat: " + roomDelegate.chat_count)
+                                                                color: Theme.text
+                                                                font.pixelSize: Theme.fontSizeCaption
+                                                                wrapMode: Text.WordWrap
                                                             }
                                                         }
                                                     }
