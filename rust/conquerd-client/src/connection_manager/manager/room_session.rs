@@ -948,7 +948,10 @@ impl ConnectionManager {
         let rid_opt = room_id.filter(|s| !s.is_empty());
         if should_track_pending_materialize(materialize_only, rid_opt) {
             if let Some(rid) = rid_opt {
-                self.pending_materialize.insert(room_scope_key(&route, rid));
+                *self
+                    .pending_materialize
+                    .entry(room_scope_key(&route, rid))
+                    .or_insert(0) += 1;
             }
         }
         let sender = self.identity.public_id();

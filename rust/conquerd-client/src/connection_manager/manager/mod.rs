@@ -172,9 +172,14 @@ pub struct ConnectionManager {
     transport_stats: HashMap<String, PeerTransportStats>,
     /// WS Ping/Pong RTT trackers keyed by supernode identity pubkey.
     supernode_ping: HashMap<String, SupernodePingTracker>,
-    /// `supernode_id:room_id` keys for in-flight materialize-only creates.
-    /// `SfuRoomCreated` must not auto-join these rooms.
-    pending_materialize: HashSet<String>,
+    /// `supernode_id:room_id` → count of in-flight materialize-only creates.
+    /// `SfuRoomCreated` must not auto-join these rooms. A count (not a bare
+    /// set membership flag) because rematerialize can legitimately fire more
+    /// than once for the same key before the first reply lands (connect +
+    /// a cluster-roster update racing in) — a plain `HashSet` would have the
+    /// second `SfuRoomCreated` find nothing pending and fall through to a
+    /// real, unwanted voice join.
+    pending_materialize: HashMap<String, u32>,
     /// `supernode_id:room_id` keys waiting for private-room invite validation
     /// before sending the count-producing `SfuJoin`.
     pending_private_room_joins: HashSet<String>,
@@ -347,7 +352,7 @@ impl ConnectionManager {
             replay_guard: ReplayGuard::new(Self::MAX_MESSAGE_AGE_SECS),
             transport_stats: HashMap::new(),
             supernode_ping: HashMap::new(),
-            pending_materialize: HashSet::new(),
+            pending_materialize: HashMap::new(),
             pending_private_room_joins: HashSet::new(),
             pending_room_invite_entries: HashMap::new(),
             relay_signaling_tx,
@@ -426,6 +431,31 @@ impl ConnectionManager {
                 attempts,
             },
         );
+    }
+
+    /// Test-only: seed an in-flight materialize-only create count directly,
+    /// so tests can reproduce N outstanding `CreateRoom(materialize_only)`
+    /// requests for the same room without wiring up `send_room_create`.
+    #[cfg(test)]
+    pub(super) fn test_seed_pending_materialize(
+        &mut self,
+        supernode_id: &str,
+        room_id: &str,
+        count: u32,
+    ) {
+        self.pending_materialize
+            .insert(room_scope_key(supernode_id, room_id), count);
+    }
+
+    /// Test-only forwarder: [`Self::take_pending_materialize`] lives in the
+    /// `inbound` submodule.
+    #[cfg(test)]
+    pub(super) fn test_take_pending_materialize(
+        &mut self,
+        supernode_id: &str,
+        room_id: &str,
+    ) -> bool {
+        self.take_pending_materialize(supernode_id, room_id)
     }
 
     /// Test-only forwarder: [`Self::retry_pending_room_joins`] is

@@ -330,9 +330,13 @@ ApplicationWindow {
 
     // Text-chat occupancy (voice participants + chat-only subscribers) —
     // distinct from roomVoiceCount, which is voice-only. Server sends this
-    // alongside voice_count/member_count on a full room list; incremental
-    // voice-only patches never carry it, so callers gate on roomHasChatCount
-    // (via count_known, shared with the voice fields — both land together).
+    // alongside voice_count/member_count on a full room list. Incremental
+    // voice-roster patches (SfuMembers/PeerJoined/PeerLeft — fired on every
+    // voice join/leave, including your own SfuSubscribe when you click a
+    // room) never carry it, and DO carry a real voice_count, so gating on
+    // the shared `count_known` would treat those patches as authoritative
+    // for chat_count too and zero it out. Use a dedicated
+    // `chat_count_known` instead (see mergeRoomEntry).
     function roomChatCount(room) {
         if (room.chat_count !== undefined && room.chat_count !== null)
             return root.numericRoomCount(room.chat_count)
@@ -429,10 +433,17 @@ ApplicationWindow {
                     && incoming.is_default === undefined)
                 continue
             if ((j === "voice_count" || j === "member_count" || j === "count"
-                    || j === "known_peers" || j === "unknown_peers" || j === "chat_count")
+                    || j === "known_peers" || j === "unknown_peers")
                     && incoming.count_known === false)
                 continue
             if (j === "count_known" && v === false && existing.count_known === true)
+                continue
+            // chat_count has its own staleness flag — a voice-only patch
+            // (incoming.count_known === true, since it has a real
+            // voice_count) must not zero out the last known chat_count.
+            if (j === "chat_count" && incoming.chat_count_known === false)
+                continue
+            if (j === "chat_count_known" && v === false && existing.chat_count_known === true)
                 continue
             // Keep a known Space parent when a supernode-sourced update (which
             // has no tree metadata) would otherwise blank it out.
@@ -521,6 +532,7 @@ ApplicationWindow {
                 kind: r.kind || r.room_type || "voice",
                 voice_count: voiceCount,
                 chat_count: root.roomChatCount(r),
+                chat_count_known: root.roomHasChatCount(r),
                 known_peers: knownPeers,
                 unknown_peers: root.roomUnknownPeerCount(r, voiceCount, knownPeers),
                 count_known: countKnown,
@@ -1663,6 +1675,7 @@ ApplicationWindow {
                                             required property string kind
                                             required property int voice_count
                                             required property int chat_count
+                                            required property bool chat_count_known
                                             required property var known_peers
                                             required property int unknown_peers
                                             readonly property var knownPeers:
@@ -1968,10 +1981,12 @@ ApplicationWindow {
                                                         id: roomChatBubble
                                                         // Text-chat occupancy (voice participants + chat-only
                                                         // subscribers) — distinct from roomVoiceBubble, which is
-                                                        // voice-only. Same staleness rule: a disconnected supernode
-                                                        // has no live refresh path, so show "—" instead of a
-                                                        // possibly-stale number.
-                                                        readonly property bool countIsStale: !roomGroup.connected
+                                                        // voice-only. Stale when the supernode is offline (no live
+                                                        // refresh path) OR we've never received a real chat_count
+                                                        // yet (only voice-roster patches have landed so far) —
+                                                        // show "—" rather than a possibly-wrong 0 in either case.
+                                                        readonly property bool countIsStale:
+                                                            !roomGroup.connected || !roomDelegate.chat_count_known
                                                         Layout.alignment: Qt.AlignVCenter
                                                         Layout.preferredWidth: chatBubbleRow.implicitWidth + 10
                                                         Layout.preferredHeight: 22
@@ -2032,9 +2047,11 @@ ApplicationWindow {
 
                                                             contentItem: Label {
                                                                 width: roomChatPopup.availableWidth
-                                                                text: roomChatBubble.countIsStale
+                                                                text: !roomGroup.connected
                                                                     ? "Supernode offline — counts may be stale"
-                                                                    : ("In room chat: " + roomDelegate.chat_count)
+                                                                    : (!roomDelegate.chat_count_known
+                                                                        ? "Waiting for room list — count not yet known"
+                                                                        : ("In room chat: " + roomDelegate.chat_count))
                                                                 color: Theme.text
                                                                 font.pixelSize: Theme.fontSizeCaption
                                                                 wrapMode: Text.WordWrap

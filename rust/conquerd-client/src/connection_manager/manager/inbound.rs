@@ -61,12 +61,52 @@ impl ConnectionManager {
         )
     }
 
-    /// Clear any pending materialize-only create keys for this room (exact host
-    /// or any cluster sibling). Without room-id matching, a CreateRoom sent to
-    /// B/C after rewrite misses `pending_materialize` and fires `RoomCreated`
-    /// + tray "Private room created" spam on every rematerialize.
-    fn take_pending_materialize(&mut self, answering_host: &str, room_id: &str) -> bool {
-        Self::take_pending_scoped_key(&mut self.pending_materialize, answering_host, room_id)
+    /// Consume one pending materialize-only create for this room (exact host,
+    /// a pad variant, or any cluster sibling). Without room-id matching, a
+    /// CreateRoom sent to B/C after rewrite misses `pending_materialize` and
+    /// fires `RoomCreated` + tray "Private room created" spam on every
+    /// rematerialize. Decrements by one rather than clearing the whole entry —
+    /// rematerialize can legitimately fire twice for the same key (connect +
+    /// a racing cluster-roster update) before either reply lands, and each
+    /// `SfuRoomCreated` must independently see "yes, this was materialize-only".
+    pub(super) fn take_pending_materialize(&mut self, answering_host: &str, room_id: &str) -> bool {
+        let exact = format!("{answering_host}:{room_id}");
+        if Self::decrement_pending(&mut self.pending_materialize, &exact) {
+            return true;
+        }
+        let bare = answering_host.trim_end_matches('=');
+        if bare != answering_host {
+            let bare_key = format!("{bare}:{room_id}");
+            if Self::decrement_pending(&mut self.pending_materialize, &bare_key) {
+                return true;
+            }
+        }
+        let suffix = format!(":{room_id}");
+        let Some(key) = self
+            .pending_materialize
+            .keys()
+            .find(|k| k.ends_with(&suffix))
+            .cloned()
+        else {
+            return false;
+        };
+        Self::decrement_pending(&mut self.pending_materialize, &key)
+    }
+
+    /// Decrement `key`'s pending count by one, removing the entry once it
+    /// reaches zero. Returns whether `key` had a positive count to consume.
+    fn decrement_pending(map: &mut HashMap<String, u32>, key: &str) -> bool {
+        match map.get_mut(key) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                true
+            }
+            Some(_) => {
+                map.remove(key);
+                true
+            }
+            None => false,
+        }
     }
 
     fn take_pending_scoped_key(

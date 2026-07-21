@@ -5304,6 +5304,13 @@ fn replay_saved_rooms_on_supernode_connect(
     } else {
         room_store.list_for_cluster_members(peer_store, source_member_ids)
     };
+    // Built-in public room — always present on the supernode; chat-only
+    // subscribe so its text-member count reflects us immediately, without
+    // waiting for a manual click. Mirrors headless_rematerialize_and_subscribe.
+    let _ = conn_cmd_tx.try_send(ConnectionCommand::SubscribeRoomChat {
+        supernode_id: target_host.to_owned(),
+        room_id: "default".to_owned(),
+    });
     for entry in entries {
         if entry.room_id == "default" {
             continue;
@@ -5333,6 +5340,15 @@ fn replay_saved_rooms_on_supernode_connect(
             invite_policy: entry.invite_policy.clone(),
             // Re-seed after idle GC / cold-node start so private rejoin works.
             invite_token: entry.invite_token.clone(),
+        });
+        // Every room on our own list is a room we're a member of — stay
+        // subscribed to its text chat regardless of which room is currently
+        // selected in the sidebar (previously this only happened lazily, on
+        // the first manual click, so unopened rooms undercounted by 1 — you
+        // — until clicked at least once).
+        let _ = conn_cmd_tx.try_send(ConnectionCommand::SubscribeRoomChat {
+            supernode_id: target_host.to_owned(),
+            room_id: entry.room_id.clone(),
         });
     }
     // Space-root re-broadcast: prefer invite-host space id when present.

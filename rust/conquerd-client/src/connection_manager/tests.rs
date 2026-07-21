@@ -731,6 +731,33 @@ fn pending_materialize_tracking_requires_id_and_flag() {
     assert!(!should_track_pending_materialize(false, Some("abc")));
 }
 
+/// Regression: rematerialize can legitimately fire twice for the same room
+/// before either `SfuRoomCreated` reply lands (e.g. connect + a racing
+/// cluster-roster update both call `CreateRoom(materialize_only: true)`).
+/// A bare set-membership flag would have the *second* reply find nothing
+/// pending and fall through to a real, unwanted voice join — this is
+/// exactly the "single click silently joins voice" bug. A count must let
+/// both replies independently see "yes, this was materialize-only".
+#[test]
+fn pending_materialize_survives_two_in_flight_creates() {
+    let mut t = harness::test_cm();
+    t.cm.test_seed_pending_materialize("SN-AAAA", "room-1", 2);
+
+    assert!(
+        t.cm.test_take_pending_materialize("SN-AAAA", "room-1"),
+        "first SfuRoomCreated reply must see the pending materialize"
+    );
+    assert!(
+        t.cm.test_take_pending_materialize("SN-AAAA", "room-1"),
+        "second SfuRoomCreated reply must ALSO see it — this is the bug \
+         a plain HashSet would fail to catch"
+    );
+    assert!(
+        !t.cm.test_take_pending_materialize("SN-AAAA", "room-1"),
+        "a third, unexpected reply has nothing left to consume"
+    );
+}
+
 #[test]
 fn auto_join_on_room_created_decision_table() {
     // User-initiated create → auto-join.
