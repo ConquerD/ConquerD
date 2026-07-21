@@ -7487,6 +7487,23 @@ mod room_voice_count_tests {
         let room = &out.as_array().unwrap()[0];
         assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(1));
     }
+
+    /// The server's `chat_count` (text-chat occupancy, distinct from the
+    /// voice-only badge) must survive enrichment untouched — this function
+    /// only ever inserts/overwrites the voice-specific keys.
+    #[test]
+    fn enrich_preserves_chat_count() {
+        let rooms = serde_json::json!([{
+            "room_id": "a",
+            "participant_ids": ["speaker"],
+            "member_count": 1,
+            "chat_count": 3,
+        }]);
+        let out = enrich_room_voice_participants(rooms, None, "me");
+        let room = &out.as_array().unwrap()[0];
+        assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(room.get("chat_count").and_then(|v| v.as_u64()), Some(3));
+    }
 }
 
 #[cfg(test)]
