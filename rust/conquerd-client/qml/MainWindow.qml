@@ -1682,10 +1682,12 @@ ApplicationWindow {
                                                 Array.isArray(roomDelegate.known_peers)
                                                     ? roomDelegate.known_peers
                                                     : []
+                                            // Derive Unknown from the same voice_count the badge shows
+                                            // (minus the named/known peers) so the tooltip can never
+                                            // disagree with the number on the bubble — named peers +
+                                            // Unknown always sums to the badge count.
                                             readonly property int unknownPeers:
-                                                roomDelegate.unknown_peers !== undefined
-                                                    ? root.numericRoomCount(roomDelegate.unknown_peers)
-                                                    : Math.max(0, roomDelegate.voice_count - roomDelegate.knownPeers.length)
+                                                Math.max(0, roomDelegate.voice_count - roomDelegate.knownPeers.length)
                                             required property string creator_id
                                             required property bool is_default
                                             // Space-tree metadata from roomTreeOrder.
@@ -1929,6 +1931,17 @@ ApplicationWindow {
                                                             id: roomVoicePopup
                                                             parent: roomVoiceBubble
                                                             visible: roomStatsHover.hovered
+                                                            // TEMP DIAGNOSTIC — dump what the delegate actually
+                                                            // received for this room. Remove after triage.
+                                                            onVisibleChanged: if (visible) backend.logEvent(
+                                                                "[qml-tooltip] room=" + roomDelegate.room_id
+                                                                + " vc=" + roomDelegate.voice_count
+                                                                + " kp_typeof=" + (typeof roomDelegate.known_peers)
+                                                                + " kp_isArr=" + Array.isArray(roomDelegate.known_peers)
+                                                                + " kp=" + JSON.stringify(roomDelegate.known_peers)
+                                                                + " up_role=" + roomDelegate.unknown_peers
+                                                                + " knownPeersLen=" + roomDelegate.knownPeers.length
+                                                                + " unknownPeers=" + roomDelegate.unknownPeers)
                                                             modal: false
                                                             focus: false
                                                             closePolicy: Popup.NoAutoClose
@@ -1957,7 +1970,24 @@ ApplicationWindow {
                                                                     wrapMode: Text.WordWrap
                                                                 }
 
+                                                                // Live but empty voice room — say so plainly rather
+                                                                // than showing a permanent "Known: none / Unknown: 0".
                                                                 Label {
+                                                                    visible: !roomVoiceBubble.countIsStale
+                                                                        && roomDelegate.voice_count === 0
+                                                                    width: roomVoicePopup.availableWidth
+                                                                    text: "No one in voice"
+                                                                    color: Theme.muted
+                                                                    font.pixelSize: Theme.fontSizeCaption
+                                                                    wrapMode: Text.WordWrap
+                                                                }
+
+                                                                // Only render the roster breakdown when we have a live
+                                                                // count with people in it — a stale ("—") badge has no
+                                                                // trustworthy roster to describe.
+                                                                Label {
+                                                                    visible: !roomVoiceBubble.countIsStale
+                                                                        && roomDelegate.voice_count > 0
                                                                     width: roomVoicePopup.availableWidth
                                                                     text: roomDelegate.knownPeers.length > 0
                                                                         ? "Known: " + roomDelegate.knownPeers.join(", ")
@@ -1968,6 +1998,9 @@ ApplicationWindow {
                                                                 }
 
                                                                 Label {
+                                                                    visible: !roomVoiceBubble.countIsStale
+                                                                        && roomDelegate.voice_count > 0
+                                                                        && roomDelegate.unknownPeers > 0
                                                                     width: roomVoicePopup.availableWidth
                                                                     text: "Unknown: " + roomDelegate.unknownPeers
                                                                     color: Theme.muted
