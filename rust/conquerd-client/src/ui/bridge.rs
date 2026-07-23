@@ -211,6 +211,12 @@ pub mod ffi {
         #[rust_name = "paste_invite"]
         fn pasteInvite(self: Pin<&mut AppBridge>, url: &QString);
 
+        /// Append a QML-originated diagnostic line to the client log (visible in
+        /// `~/.conquerd/logs/conquerd-client.log` at info level).
+        #[qinvokable]
+        #[rust_name = "log_event"]
+        fn logEvent(self: Pin<&mut AppBridge>, message: &QString);
+
         /// Apply the onboarding direct-P2P listener choice.
         #[qinvokable]
         #[rust_name = "configure_direct_p2p"]
@@ -2568,6 +2574,10 @@ impl ffi::AppBridge {
             info!("Identity locked — keyring entry removed");
         }
         std::process::exit(0);
+    }
+
+    fn log_event(self: Pin<&mut Self>, message: &QString) {
+        info!("[qml] {}", message.to_string());
     }
 
     fn paste_invite(self: Pin<&mut Self>, url: &QString) {
@@ -5463,17 +5473,42 @@ fn filter_sfu_rooms_for_sidebar(
     serde_json::Value::Array(filtered)
 }
 
+/// Re-pad a base64url `public_id` to its canonical padded form. Relay-sourced
+/// SFU roster ids frequently arrive un-padded, whereas `my_public_id` and the
+/// peer store's `identity_pub` keep the padding — so a raw `==` / lookup on an
+/// un-padded id misses. A 32-byte Ed25519 key is 43 chars unpadded / 44 padded;
+/// this is idempotent on already-padded input.
+fn repad_public_id(id: &str) -> String {
+    let bare = id.trim_end_matches('=');
+    match bare.len() % 4 {
+        0 => bare.to_owned(),
+        rem => {
+            let mut s = String::with_capacity(bare.len() + (4 - rem));
+            s.push_str(bare);
+            s.extend(std::iter::repeat('=').take(4 - rem));
+            s
+        }
+    }
+}
+
 fn room_member_display_name(
     peer_store: &crate::peer_store::PeerStore,
     my_public_id: &str,
     peer_id: &str,
 ) -> Option<String> {
-    if peer_id == my_public_id {
+    // Pad-tolerant self check — the roster id and `my_public_id` are the same
+    // key modulo base64url padding (see `pub_id_eq`).
+    if pub_id_eq(peer_id, my_public_id) {
         return Some("You".to_owned());
     }
+    // `identity_pub` is stored padded; re-pad the (possibly un-padded) roster id
+    // before matching so known peers resolve to their handle instead of falling
+    // through to the "unknown" tally.
+    let padded = repad_public_id(peer_id);
     peer_store
         .get(peer_id)
         .or_else(|| peer_store.get_by_identity(peer_id))
+        .or_else(|| peer_store.get_by_identity(&padded))
         .filter(|rec| !rec.is_supernode)
         .map(|rec| rec.display_name())
 }
@@ -5534,6 +5569,19 @@ fn enrich_room_voice_participants(
             known.sort();
 
             let unknown = voice_count.saturating_sub(known.len());
+            // TEMP DIAGNOSTIC (voice tooltip Known/Unknown) — remove after triage.
+            if voice_count > 0 {
+                info!(
+                    "[voice-tooltip] room={} has_id_list={} voice_count={} my_pub={} pids={:?} known={:?} unknown={}",
+                    obj.get("room_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                    has_id_list,
+                    voice_count,
+                    my_public_id,
+                    participant_ids,
+                    known,
+                    unknown,
+                );
+            }
             obj.insert(
                 "known_peers".to_owned(),
                 serde_json::Value::Array(
@@ -7450,7 +7498,23 @@ fn dispatch_call_event(
 
 #[cfg(test)]
 mod room_voice_count_tests {
-    use super::enrich_room_voice_participants;
+    use super::{enrich_room_voice_participants, repad_public_id};
+
+    #[test]
+    fn repad_restores_canonical_padding() {
+        // A 32-byte Ed25519 public_id is 43 chars unpadded / 44 padded. An
+        // un-padded roster id (as relay peers deliver) must round-trip back to
+        // the padded form the peer store and `my_public_id` are keyed on.
+        let padded = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ="; // 44 chars, 1 '='
+        let unpadded = padded.trim_end_matches('=');
+        assert_eq!(unpadded.len(), 43);
+        assert_eq!(repad_public_id(unpadded), padded);
+        // Idempotent on already-padded input.
+        assert_eq!(repad_public_id(padded), padded);
+        // A value that needs two '=' pads (bare len % 4 == 2).
+        assert_eq!(repad_public_id("AB"), "AB==");
+        assert_eq!(repad_public_id("AB=="), "AB==");
+    }
 
     #[test]
     fn enrich_uses_participant_ids_as_voice_count() {
