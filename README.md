@@ -43,14 +43,14 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Up to 32 participants per room.
 - Room (and sub-room) membership is backed by a client-signed, authenticated **Space** tree (Merkle inclusion proofs over room definitions) so any cluster member can admit a proven joiner even if it never saw the room's original grant; remaining Space work is tracked in `backlog.md`.
 - Invited members of a private room can always rejoin, even after the supernode's temporary room state was cleared (idle timeout or restart) — no need to request a fresh invite link.
-- If a room join is refused (full, private without access, etc.), the app now tells you rather than leaving you looking stuck "in" a room you never actually entered.
+- If a room join is refused (full, private without access, etc.), the app reports the denial and rolls back optimistic room state. A transient `room_absent` denial from a cold cluster member is retried with bounded exponential backoff before it is surfaced.
 - On a clustered deployment (multiple supernodes hosting the same room), voice now carries across every node in the cluster, matching how room chat already worked.
 
 ### In-App Supernode Portal & Browser Games
-- Supernodes with `web.host.app.v1` serve an in-app portal over a QUIC bidi-stream channel. The native client browses `conquerd://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no public game ports, no TLS certs.
+- Supernodes with `web.host.app.v1` serve an in-app portal over a QUIC bidi-stream channel. The native client browses `conquerd://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no public game ports, and no public web TLS certificates.
 - **`game.relay.v1`** — opaque datagram relay for in-app portal games: the supernode fans raw QUIC-relay datagrams among peers that joined the same game session (identity path; no external browser / WebTransport). Three demo games are bundled: **cursor relay**, **brick breaker**, **shared drawing**.
 - Game pages are served from `<data_dir>/games/<slug>/` and reachable only via the native portal at `conquerd://<supernode_id>/games/<slug>/`. The `window.conquerd` JS bridge exposes channel APIs over the authenticated QUIC session.
-- Self-signed TLS cert (13-day validity, ECDSA P-256, `serverAuth` EKU) is generated automatically on first start and rotated after 7 days. The SHA-256 fingerprint is delivered to native clients in `SUPERNODE_INFO` and forwarded to game pages via `/_conquerd/ctx.json`.
+- Portal requests use the identity-authenticated QUIC connection; there is no public HTTPS/WebTransport listener, game TLS certificate, or certificate fingerprint passed to portal pages.
 
 ### Security & Identity
 - Cryptographic identity via long-term Ed25519 keys with derived peer IDs (SHA-256).
@@ -64,7 +64,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Per-feature token-bucket rate limiting (inbound and outbound) enforced at the QUIC transport layer — each capability (`core.chat.v1`, `core.file.v1`, `core.audio.opus`, `room.audio.sfu`, tagged feature channels) has independent byte/datagram quota buckets per peer, preventing any single peer from flooding a channel beyond descriptor-defined rates.
 
 #### Supply-Chain Trust
-- **Code Signing**: Windows (SignPath.io), macOS (Apple Developer Program), all platforms (GitHub Sigstore attestations).
+- **Code Signing policy**: Windows uses SignPath.io when available, macOS uses Apple Developer ID, and release CI can publish GitHub/Sigstore attestations. Early builds may be unsigned at the platform-binary layer; the project Ed25519 release manifest remains the application trust root.
 - **Release Manifest**: Signed JSON listing official builds (version, platform, build_hash) verified by installer.
 - **Peer Attestation**: Runtime challenges where peers prove they're running official builds via nonce-signed claims.
 - **Policy Enforcement**: Configurable attestation policy (off/warn/strict) gating relay access for unverified peers.
@@ -96,7 +96,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 
 ### Updates
 - Update notifications via the GitHub Releases API; the bundled `conquerd-installer` binary downloads and applies signed releases.
-- Releases are code-signed (Windows via [SignPath.io](https://signpath.io), macOS via Apple Developer ID) and accompanied by Sigstore attestations.
+- Release automation supports Windows SignPath, macOS Apple Developer ID, and Sigstore attestations when credentials/services are available. The installer always relies on the project-signed Ed25519 release manifest; see [Code Signing Policy](#code-signing-policy) for the initial-release fallback.
 
 ---
 
@@ -214,10 +214,11 @@ Conquerd is pure Rust.
 | Supernode relay server (SFU + QUIC relay + portal) | **`conquerd-supernode`** (standalone binary) |
 | Installer / updater | **`conquerd-installer`** (standalone binary) |
 
-`conquerd-client` is the sole desktop client. Built with `cargo build --features qt-ui` (from `rust/conquerd-client/`); requires Qt 6.x (`QMAKE` or `CMAKE_PREFIX_PATH`). Audio (CPAL + Opus + spectral-gate noise suppression + jitter buffer), crypto (Ed25519, X25519, AES-GCM, HKDF, Argon2id), and QUIC transport (quinn) are implemented as Rust modules inside `conquerd-client` — no separate extension crates required. Headless builds (without `--features qt-ui`) are used for CI integration tests.
+`conquerd-client` is the sole desktop client. Built with `cargo build --features qt-ui` (from `rust/conquerd-client/`); requires Qt 6.x (`QMAKE` or `CMAKE_PREFIX_PATH`). The audio pipeline (CPAL, spectral-gate noise suppression, jitter buffer), crypto (Ed25519, X25519, AES-GCM, HKDF, Argon2id), and QUIC transport (quinn) are Rust modules in `conquerd-client`; Opus codec support comes from the first-party `conquerd-opus` crate. Headless builds (without `--features qt-ui`) are used for CI integration tests.
 
 ### Transport Stack
 - **Direct calls**: QUIC peer-to-peer via `ConnectionManager` (`quinn::Endpoint`, inside `conquerd-client`).
+- **Direct-call fallback**: after a call is accepted, the caller waits up to 5 seconds for direct QUIC. If it is still unavailable, both peers are moved to a temporary private SFU room on a mutually trusted supernode.
 - **Room audio and room broadcasts**: QUIC relay (`QuicRelayClient` → supernode `QUICRelayServer`) for room audio plus room chat/file signaling when available; WebSocket handles room membership and remains the fallback signaling path.
 - **Signaling/chat**: Ed25519-signed, transcript-bound messages; prefers QUIC signaling stream when a peer session is connected, falls back to WebSocket.
 - **Relay**: QUIC relay protocol on supernodes (transport-only; no app-layer decryption).
@@ -251,13 +252,14 @@ CPAL capture
 **Room audio (multi-peer via supernode)**
 ```
 OpusEncoder
-  → QuicRelayClient.send_audio([0xFF][opus])   ← broadcast index
-  ──────→ supernode QUICRelayServer
-           distributes [peer_idx][opus] to each room member
-  ──────→ QuicRelayClient.on_audio_received([peer_idx][opus])
-  → OpusDecoder (per sender) → playback
+  → E2E seal under the current room sender key
+  → Ed25519-signed SfuAudio JSON
+  → QuicRelayClient.send_room_audio([0xFF][ROOM_AUDIO_TAG=0x04][signed JSON])
+  ──────→ supernode QUICRelayServer (quota + membership checks; opaque fan-out)
+  ──────→ [sender_idx][ROOM_AUDIO_TAG][same signed JSON]
+  → verify signature → decrypt room frame → OpusDecoder (per sender) → playback
 
-Room membership (join/leave/state) flows over WebSocket. Room chat/file broadcasts prefer the QUIC relay signaling stream when a live relay session exists and fall back to WebSocket otherwise.
+Room membership (join/leave/state) flows over WebSocket. Room audio falls back to the same signed, E2E-sealed `SfuAudio` envelope over WebSocket when no relay datagram path is available. Room chat/file broadcasts prefer the QUIC relay signaling stream when a live full-access relay session exists and fall back to WebSocket otherwise.
 ```
 
 **Room lifecycle (definitions vs hosting)**
@@ -313,11 +315,10 @@ For the precise runtime contract (auth tier enforcement order, quota symmetry ac
 | `core.chat.v1` | stream | trusted-peer | desktop client |
 | `core.audio.opus` | datagram | trusted-peer | `conquerd-client` (via `conquerd-opus`) |
 | `core.file.v1` | stream | trusted-peer | desktop client |
-| `room.audio.sfu` | datagram | room-member | supernode `SfuRoomModule` |
-| `room.chat.v1` | stream | room-member | supernode `SfuRoomModule` |
+| `room.audio.sfu` | datagram | room-member | supernode SFU/relay routing (`sfu.rs`, `main.rs`) |
+| `room.chat.v1` | stream | room-member | supernode SFU/relay routing (`sfu.rs`, `main.rs`) |
 | `room.file.v1` | stream | room-member | supernode SFU file broadcast |
 | `web.host.app.v1` | stream | public | supernode QUIC bidi-stream portal (`conquerd://` pages for native client) |
-
 | `game.relay.v1` | datagram | room-member | opaque in-app portal game session relay over identity QUIC |
 
 ### Enabling Features on a Supernode
@@ -334,7 +335,7 @@ enabled = true
 [[feature]]
 id = "room.audio.sfu"
 enabled = true
-params = { codec = "opus", quota_bytes_per_sec = 32768 }
+params = { codec = "opus", quota_bytes_per_sec = 131072 }
 
 [[feature]]
 id = "room.chat.v1"
@@ -343,8 +344,6 @@ enabled = true
 [[feature]]
 id = "room.file.v1"
 enabled = true
-
-[[feature]]
 
 [[feature]]
 id = "x.acme.matchmaker"                # bespoke third-party module
@@ -514,12 +513,12 @@ When uncoordinated hole punching fails due to timing mismatch, a trusted superno
 
 ## Supernode Relay
 
-A supernode is a volunteer peer that provides QUIC relay and SFU (group voice) hosting. Supernodes are **transport-only** — they never store identity, messages, room definitions, or chat history, and do not act as a central server. SFU rooms are held in memory while active and dropped after ~15 minutes idle; clients rematerialize saved rooms from `my_rooms.dat` on reconnect.
+A supernode is a volunteer peer that provides QUIC relay and SFU (group voice) hosting. Supernodes are **content-opaque transport helpers**: they persist their own identity and trusted-peer public records for access control, but they are not identity authorities and never store message bodies, room definitions, chat history, audio, or file content. SFU rooms are held in memory while active and dropped after ~15 minutes idle; clients rematerialize saved rooms from `my_rooms.dat` on reconnect.
 
 ### Connecting to a Supernode
 1. Get the supernode's invite link from the operator.
 2. Paste it into Conquerd's **Join** dialog.
-3. The handshake completes — the supernode appears in your peer list.
+3. The handshake completes — the supernode appears in the **Rooms** sidebar. Supernodes are intentionally excluded from the ordinary **Peers** list.
 4. Your session banner shows the connection mode:
 
 | Banner | Meaning |
@@ -615,7 +614,7 @@ On startup, the supernode will:
 3. Begin accepting QUIC relay connections on port `3478` (UDP).
 4. Begin accepting WebSocket signaling connections on port `34935` (TCP).
 
-The invite link is also persisted in `~/.conquerd/supernode_invite.json` and survives restarts.
+The invite link is also persisted in `~/.conquerd/reusable_invite.json` and survives restarts.
 
 ### Supernode Configuration
 
@@ -780,7 +779,7 @@ The Rust binary embeds all templates at compile time — overrides are loaded fr
 
 ### Supernode Stats Dashboard
 
-The supernode exposes a `/health` page with live stats (uptime, version, connected/trusted peers, QUIC relay stats, SFU room details) and an `/api/stats` JSON endpoint (requires a valid session token). The dashboard auto-refreshes every 30 seconds. The `/arena` page redirects unauthenticated visitors to `/portal`.
+The in-app QUIC portal exposes a `/health` page with live stats (uptime, version, connected/trusted peers, QUIC relay stats, SFU room details) and an `/api/stats` JSON endpoint. Access is bound to the caller's authenticated QUIC identity rather than a separate HTTP session token. The dashboard auto-refreshes every 30 seconds; gated guests are directed through the in-app access page before receiving full relay access.
 
 ---
 
@@ -788,7 +787,7 @@ The supernode exposes a `/health` page with live stats (uptime, version, connect
 
 Conquerd checks the GitHub Releases API in the background and offers in-app upgrade prompts when a newer signed release is available. The bundled `conquerd-installer` binary downloads, verifies, and applies the release.
 
-- Release artefacts (Windows: SignPath; macOS: Apple Developer ID) and accompanying Sigstore attestations are verified before any file is replaced.
+- Before replacing files, the installer verifies the project Ed25519 release manifest and the archive SHA-256 recorded in it. Platform signatures (Windows SignPath / macOS Apple Developer ID) and Sigstore attestations are additional distribution checks when available.
 - `VERSION_ANNOUNCE` is still exchanged between peers so each side can show the other peer's version in the event log, but application code is **not** pushed peer-to-peer — a connected peer running an older build is informational only.
 - The *Check for updates* setting is persisted but background checks are not yet gated on that preference in 1.0.0; block `api.github.com` or run on a restricted network to prevent the startup check.
 
@@ -847,15 +846,18 @@ All Conquerd data is stored under `CONQUERD_HOME` (default `~/.conquerd/`):
 | `my_rooms.dat` | Client-owned SFU room definitions per supernode (encrypted); used to rematerialize rooms on reconnect. Sidebar hide list is stored here too. |
 | `installer.log` | Installer/updater activity (when `conquerd-installer` runs) |
 
-Received files are saved to your OS **Downloads** folder on completion (not under `CONQUERD_HOME`). The desktop client logs to **stderr** via `tracing` (`RUST_LOG`); there is no persistent client log file by default. An optional OS keyring entry (`conquerd` service) caches your unlock key locally.
+Received files are saved to your OS **Downloads** folder on completion (not under `CONQUERD_HOME`). The desktop client logs through `tracing` to stderr and to the current-session file `~/.conquerd/logs/conquerd-client.log` (truncated on each launch). The **Verbose debug logging** setting changes the runtime/file filter immediately; an explicit `RUST_LOG` overrides it. An optional OS keyring entry (`conquerd` service) caches your unlock key locally.
 
 Supernodes additionally store:
 
 | File | Purpose |
 |------|---------|
-| `supernode_invite.json` | Persistent invite link |
+| `identity.json` | The supernode's Ed25519 node identity |
+| `reusable_invite.json` | Persistent invite payload/link |
 | `supernode_endpoints.json` | Endpoint mailbox for peer reconnection (24h TTL) |
 | `peers.json` | Trusted peer records for relay/SFU access control |
+| `supernode.toml` | Typed listener, cluster, and hosted-capability manifest (when operator-provided) |
+| `trusted_module_keys.txt` | Optional trusted signer keys for native feature modules |
 
 SFU **room state is not persisted** on the supernode — rooms exist in memory while in use and are idle-GC'd after ~15 minutes empty. Room definitions and chat history live on clients.
 
@@ -911,20 +913,24 @@ cargo build --release -p conquerd-supernode
 cargo build --release -p conquerd-installer
 ```
 
-`conquerd-client` lives in its own Cargo workspace (`rust/conquerd-client/Cargo.toml`) so the Windows-local `cxx-qt` patch stays isolated and does not affect server-side builds on Linux. The outer workspace (`rust/Cargo.toml`) contains `conquerd-features`, `conquerd-supernode`, and `conquerd-installer`.
+`conquerd-client` lives in its own Cargo workspace (`rust/conquerd-client/Cargo.toml`) so Qt/CXX-Qt dependencies stay isolated from server-side builds. The outer workspace (`rust/Cargo.toml`) contains `conquerd-features`, `conquerd-supernode`, `conquerd-installer`, and `conquerd-opus`. The cluster-operations tool is a third workspace at `rust/conquerd-supernode-manager/`.
 
 ### Run Tests
 ```powershell
-# Outer workspace (features + supernode + installer)
+# Outer workspace (features + supernode + installer + Opus)
 cd rust
 cargo test --workspace
 
 # Conquerd-client (binary crate; tests run from its own workspace)
 cd conquerd-client
 cargo test
+
+# Supernode manager (separate cluster-ops workspace)
+cd ..\conquerd-supernode-manager
+cargo test --workspace
 ```
 
-See `agents.md` (Roadmap & Status) for the current authoritative test counts, coverage areas, and P0–P2 delivery status. The test suite emphasises capability negotiation, quota symmetry (inbound/outbound), replay protection, relay/SFU/room flows, and installer manifest verification.
+See `agents.md` (Roadmap & Status) for current coverage areas and P0–P2 delivery status. Test inventories change frequently; use `cargo test -- --list` in each workspace when an exact count is needed. The suite emphasises capability negotiation, quota symmetry (inbound/outbound), replay protection, relay/SFU/room flows, and installer manifest verification.
 
 ### Coverage % (line / region)
 
@@ -1045,8 +1051,8 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 
 ```
 ├── rust/
-│   ├── Cargo.toml                 # Outer workspace: features + supernode + installer
-│   ├── conquerd-client/           # Native desktop binary (own workspace; Qt 6 / QML via CXX-Qt; 139 unit tests)
+│   ├── Cargo.toml                 # Outer workspace: features + supernode + installer + Opus
+│   ├── conquerd-client/           # Native desktop binary (own workspace; Qt 6 / QML via CXX-Qt)
 │   │   ├── Cargo.toml             # features: qt-ui, webengine, console
 │   │   ├── build.rs               # CXX-Qt codegen + windres icon embedding
 │   │   ├── assets.qrc / icons.qrc # Qt resource bundles (QML + icons)
@@ -1072,9 +1078,11 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 │   │       ├── github_updater.rs  # GitHub Releases API poll + installer spawn
 │   │       ├── ringtone.rs / taskbar_badge.rs / upnp.rs / uri_scheme.rs / web_app_client.rs
 │   │       └── ui/                # AppBridge QObject + QML models (Peer/Chat/Call/Room/Settings/FileTransfer)
-│   ├── conquerd-features/         # rlib: capability registry, FeatureModule trait, quota enforcement (114 unit tests)
+│   ├── conquerd-features/         # rlib: capability registry, FeatureModule trait, quota enforcement
 │   ├── conquerd-supernode/        # Standalone binary: QUIC relay, ephemeral SFU, WS signaling, in-app portal
-│   └── conquerd-installer/        # Standalone binary: signed-release download + apply
+│   ├── conquerd-installer/        # Standalone binary: signed-release download + apply
+│   ├── conquerd-opus/             # First-party libopus wrapper (DRED + OSCE)
+│   └── conquerd-supernode-manager/ # Separate workspace: provisioning, cluster sync, deploy, remote exec
 ├── web-sdk/conquerd.mjs           # In-app portal game SDK (identity QUIC channel; no WebTransport)
 ├── games/                         # Example portal games (conquerd:// only)
 ├── packaging/                     # Linux .desktop file, macOS Info.plist template, AppRun
@@ -1103,19 +1111,24 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 | Relay Access | `relay_payment_required`, `relay_access_granted`, `relay_access_denied` |
 | Supernode Info | `supernode_info`, `supernode_info_request` |
 | Room Mgmt | `hello`, `welcome`, `room_join`, `room_leave`, `room_state`, `room_peer_joined`, `room_peer_left`, `room_list_request`, `room_list_response` |
-| SFU / Room | `sfu_join`, `sfu_leave`, `sfu_members`, `sfu_offer`, `sfu_answer`, `sfu_audio`, `sfu_chat`, `sfu_room_list`, `sfu_peer_joined`, `sfu_peer_left` |
+| SFU / Room | `sfu_join`, `sfu_join_result`, `sfu_leave`, `sfu_members`, `sfu_offer`, `sfu_answer`, `sfu_audio`, `sfu_chat`, `sfu_room_list`, `sfu_peer_joined`, `sfu_peer_left` |
 | SFU Subscription | `sfu_subscribe`, `sfu_unsubscribe` |
 | SFU Room Mgmt | `sfu_room_create`, `sfu_room_created`, `sfu_room_invite`, `sfu_room_invite_result`, `sfu_room_invite_generate` |
 | SFU File Transfer | `sfu_file_offer`, `sfu_file_chunk`, `sfu_file_complete` |
+| SFU Group Key | `sfu_group_key`, `sfu_group_key_ack` (inside `encrypted_signal`) |
+| Space Tree | `space_root_announce` |
 | File Transfer | `file_transfer_offer`, `file_transfer_accept`, `file_transfer_reject`, `file_transfer_chunk`, `file_transfer_complete`, `file_transfer_ack`, `file_transfer_error` |
 | Trust | `trust_request`, `trust_accept` |
 | Peer Room Invite | `peer_room_invite` |
 | Hole Punch | `punch_register`, `punch_ready` |
 | Endpoint | `endpoint_update` |
 | Handle | `handle_update` |
+| Avatar | `avatar_config` |
 | Encrypted | `encrypted_signal` |
 | Peer Updates | `version_announce` |
+| Build Attestation | `build_attestation`, `attestation_response` |
 | Capability | `capability_announce`, `capability_invoke` |
+| Game Relay | `game_relay_join`, `game_relay_leave`, `game_relay_joined` |
 | Utility | `ping`, `pong`, `error`, `speaking_state`, `presence_update` |
 
 ## Technology Stack
