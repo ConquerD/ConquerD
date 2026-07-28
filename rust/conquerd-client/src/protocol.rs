@@ -106,6 +106,16 @@ pub enum MessageType {
     SfuFileComplete,
     SfuAudio,
 
+    // Room video control plane. There is deliberately no `SfuVideo` message:
+    // video frames ride a lean binary datagram path (`ROOM_VIDEO_TAG`) because
+    // the signed-JSON envelope costs more than half of each 1200-byte datagram
+    // at video frame rates. Only these low-rate control messages use JSON.
+    /// Peer → peer (via supernode): "send me a keyframe, I can't decode".
+    SfuVideoKeyframeRequest,
+    /// Peer → room: "my camera just turned on/off", so receivers can light up
+    /// or tear down a tile without waiting for the first frame to arrive.
+    SfuVideoState,
+
     // E2E room group-key distribution (sealed per member; supernode forwards blind)
     SfuGroupKey,
     /// Member → keyer: confirmed install of `(room_id, epoch)` (also EncryptedSignal-sealed).
@@ -220,6 +230,8 @@ impl MessageType {
             Self::SfuFileChunk => "sfu_file_chunk",
             Self::SfuFileComplete => "sfu_file_complete",
             Self::SfuAudio => "sfu_audio",
+            Self::SfuVideoKeyframeRequest => "sfu_video_keyframe_request",
+            Self::SfuVideoState => "sfu_video_state",
             Self::SfuGroupKey => "sfu_group_key",
             Self::SfuGroupKeyAck => "sfu_group_key_ack",
             Self::SpaceRootAnnounce => "space_root_announce",

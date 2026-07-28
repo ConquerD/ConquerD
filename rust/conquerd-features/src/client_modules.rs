@@ -151,6 +151,39 @@ impl FeatureModule for RoomAudioSfuModule {
     // on_message: inherits default no-op — audio is handled in connection_manager.
 }
 
+/// `core.video.vp8` — direct peer video (VP8 over QUIC datagrams).
+///
+/// Advertisement-only, for the same reason as [`CoreAudioOpusModule`]: video
+/// fragments ride a dedicated low-tag datagram path rather than the generic
+/// feature-datagram multiplexer. The descriptor exists for capability
+/// negotiation and quota definition; outbound sends are still gated through
+/// `gate_through_feature`.
+pub struct CoreVideoVp8Module;
+
+impl FeatureModule for CoreVideoVp8Module {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::core_video_vp8()
+    }
+
+    // on_message: inherits default no-op — video routes through datagram callback.
+}
+
+/// `room.video.sfu` — SFU room video relayed via supernode.
+///
+/// Advertisement-only, mirroring [`RoomAudioSfuModule`]. Inbound video
+/// fragments are reassembled in `connection_manager` and gated through
+/// `FeatureRegistry::dispatch_message` for per-sender quota enforcement;
+/// outbound fragments are gated in `send_room_video`.
+pub struct RoomVideoSfuModule;
+
+impl FeatureModule for RoomVideoSfuModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::room_video_sfu()
+    }
+
+    // on_message: inherits default no-op — video is handled in connection_manager.
+}
+
 /// `room.chat.v1` — advertisement-only descriptor for SFU room text chat.
 ///
 /// Advertisement-only on the desktop client: inbound `SfuChat` messages are
@@ -167,11 +200,11 @@ impl FeatureModule for RoomChatModule {
     }
 }
 
-/// Register the three first-party client modules into *registry*.
+/// Register the first-party client modules into *registry*.
 ///
-/// Descriptors are taken from their `wellknown` constructors.  All three
-/// use the no-hook (advertisement-only) variant.  Callers that need
-/// `on_message` dispatch should use the `with_hook` constructors directly.
+/// Descriptors are taken from their `wellknown` constructors.  All use the
+/// no-hook (advertisement-only) variant.  Callers that need `on_message`
+/// dispatch should use the `with_hook` constructors directly.
 ///
 /// Returns `Err` if any registration fails (e.g. duplicate id).
 pub fn register_client_modules(registry: &FeatureRegistry) -> Result<(), FeatureError> {
@@ -181,6 +214,8 @@ pub fn register_client_modules(registry: &FeatureRegistry) -> Result<(), Feature
         Arc::new(CoreFileModule::new()),
         Arc::new(RoomFileModule),
         Arc::new(RoomAudioSfuModule),
+        Arc::new(CoreVideoVp8Module),
+        Arc::new(RoomVideoSfuModule),
         Arc::new(RoomChatModule),
     ];
     for m in modules {
@@ -202,6 +237,8 @@ mod tests {
         assert!(reg.get("core.file.v1").is_some());
         assert!(reg.get("room.file.v1").is_some());
         assert!(reg.get("room.audio.sfu").is_some());
+        assert!(reg.get("core.video.vp8").is_some());
+        assert!(reg.get("room.video.sfu").is_some());
         assert!(reg.get("room.chat.v1").is_some());
     }
 
@@ -271,5 +308,7 @@ mod tests {
         assert_eq!(CoreAudioOpusModule.descriptor().id, "core.audio.opus");
         assert_eq!(CoreFileModule::new().descriptor().id, "core.file.v1");
         assert_eq!(RoomAudioSfuModule.descriptor().id, "room.audio.sfu");
+        assert_eq!(CoreVideoVp8Module.descriptor().id, "core.video.vp8");
+        assert_eq!(RoomVideoSfuModule.descriptor().id, "room.video.sfu");
     }
 }

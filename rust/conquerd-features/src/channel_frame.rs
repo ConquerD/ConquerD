@@ -20,6 +20,8 @@
 //! | `0x03` | file transfer          | `core.file.v1`    |
 //! | `0x04` | room (SFU) audio       | `room.audio.sfu`  |
 //! | `0x05` | game relay             | `game.relay.v1`   |
+//! | `0x06` | direct video           | `core.video.vp8`  |
+//! | `0x07` | room (SFU) video       | `room.video.sfu`  |
 //!
 //! The room-audio tag (`0x04`) only appears on the *relayed* datagram path
 //! (a peer's QUIC relay session to a supernode that fans the frame out to
@@ -27,6 +29,19 @@
 //! leaves it in [`FrameClass::Other`]; the relay client decodes it manually.
 //! It exists as a fixed tag purely so relay quota accounting attributes the
 //! frame to `room.audio.sfu` rather than the direct `core.audio.opus`.
+//!
+//! The video tags follow the same split: `0x06` rides the direct peer fabric
+//! and is classified as [`FrameClass::Video`], while `0x07` is relay-only and
+//! stays in [`FrameClass::Other`] exactly like room audio.
+//!
+//! Unlike audio, a single encoded video frame does not fit one datagram, so
+//! both video tags carry a *fragment* rather than a whole frame. The fragment
+//! header and reassembly rules live in the client's `video::fragment` module;
+//! this module only owns the tag. Note that room video deliberately carries a
+//! lean binary payload rather than the signed-JSON envelope used by room
+//! audio — at video frame rates the JSON + base64 + per-datagram signature
+//! overhead costs more than half the usable datagram and forces a full JSON
+//! parse per datagram on the supernode.
 //!
 //! The game-relay tag (`0x05`) is likewise relay-only: native portal pages
 //! send opaque `game.relay.v1` datagrams over the identity QUIC relay (no
@@ -56,6 +71,14 @@ pub const ROOM_AUDIO_TAG: u8 = 0x04;
 /// session for in-app portal games. Distinct from room audio so quota and
 /// fan-out stay scoped to game sessions (not SFU voice rooms).
 pub const GAME_RELAY_TAG: u8 = 0x05;
+/// Direct peer video (`core.video.vp8`) — unreliable datagrams carrying one
+/// fragment of an encoded frame. Distinct from [`AUDIO_TAG`] so a congested
+/// video stream is quota-accounted (and can be shed) independently of the
+/// call audio it accompanies.
+pub const VIDEO_TAG: u8 = 0x06;
+/// Room (SFU) video (`room.video.sfu`) — unreliable datagrams on a relay
+/// session. Relay-only, mirroring [`ROOM_AUDIO_TAG`]'s role for audio.
+pub const ROOM_VIDEO_TAG: u8 = 0x07;
 
 /// Highest fixed first-party tag. Tags above this up to
 /// [`DYNAMIC_TAG_START`](crate::channel_tag::DYNAMIC_TAG_START) stay
@@ -84,6 +107,8 @@ pub fn fixed_tag_for(feature_id: &str) -> Option<u8> {
         "core.file.v1" => Some(FILE_TAG),
         "room.audio.sfu" => Some(ROOM_AUDIO_TAG),
         "game.relay.v1" => Some(GAME_RELAY_TAG),
+        "core.video.vp8" => Some(VIDEO_TAG),
+        "room.video.sfu" => Some(ROOM_VIDEO_TAG),
         _ => None,
     }
 }
@@ -96,6 +121,8 @@ pub fn feature_for_fixed_tag(tag: u8) -> Option<&'static str> {
         FILE_TAG => Some("core.file.v1"),
         ROOM_AUDIO_TAG => Some("room.audio.sfu"),
         GAME_RELAY_TAG => Some("game.relay.v1"),
+        VIDEO_TAG => Some("core.video.vp8"),
+        ROOM_VIDEO_TAG => Some("room.video.sfu"),
         _ => None,
     }
 }
@@ -125,6 +152,9 @@ pub enum FrameClass<'a> {
     Chat(&'a [u8]),
     /// File frame (`0x03`); payload is the signed `core.file.v1` JSON.
     File(&'a [u8]),
+    /// Direct video datagram (`0x06`); payload is one fragment of an encoded
+    /// frame, headed by the `video::fragment` header (not a whole frame).
+    Video(&'a [u8]),
     /// Any other reserved/dynamic tag; carries the raw `(tag, payload)`.
     Other(u8, &'a [u8]),
 }
@@ -138,6 +168,9 @@ pub fn classify(frame: &[u8]) -> Option<FrameClass<'_>> {
         AUDIO_TAG => FrameClass::Audio(rest),
         CHAT_TAG => FrameClass::Chat(rest),
         FILE_TAG => FrameClass::File(rest),
+        VIDEO_TAG => FrameClass::Video(rest),
+        // ROOM_VIDEO_TAG (0x07) is deliberately absent: like ROOM_AUDIO_TAG it
+        // is relay-only and never rides the direct peer fabric.
         other => FrameClass::Other(other, rest),
     })
 }
@@ -154,6 +187,8 @@ mod tests {
             ("core.file.v1", FILE_TAG),
             ("room.audio.sfu", ROOM_AUDIO_TAG),
             ("game.relay.v1", GAME_RELAY_TAG),
+            ("core.video.vp8", VIDEO_TAG),
+            ("room.video.sfu", ROOM_VIDEO_TAG),
         ] {
             assert_eq!(fixed_tag_for(fid), Some(tag));
             assert_eq!(feature_for_fixed_tag(tag), Some(fid));
@@ -171,9 +206,48 @@ mod tests {
             FILE_TAG,
             ROOM_AUDIO_TAG,
             GAME_RELAY_TAG,
+            VIDEO_TAG,
+            ROOM_VIDEO_TAG,
         ] {
             assert!(tag <= MAX_FIRST_PARTY_TAG);
             assert!(tag < crate::channel_tag::DYNAMIC_TAG_START);
+        }
+    }
+
+    #[test]
+    fn video_tag_classifies_but_room_video_tag_stays_other() {
+        // 0x06 rides the direct peer fabric and is classified.
+        assert_eq!(
+            classify(&[VIDEO_TAG, 1, 2, 3]),
+            Some(FrameClass::Video(&[1, 2, 3][..]))
+        );
+        // 0x07 is relay-only — the relay client decodes it manually, exactly
+        // as it does for ROOM_AUDIO_TAG.
+        assert_eq!(
+            classify(&[ROOM_VIDEO_TAG, 1, 2, 3]),
+            Some(FrameClass::Other(ROOM_VIDEO_TAG, &[1, 2, 3][..]))
+        );
+        assert_eq!(
+            classify(&[ROOM_AUDIO_TAG, 9]),
+            Some(FrameClass::Other(ROOM_AUDIO_TAG, &[9][..]))
+        );
+    }
+
+    #[test]
+    fn fixed_tags_are_unique() {
+        let tags = [
+            CONTROL_TAG,
+            AUDIO_TAG,
+            CHAT_TAG,
+            FILE_TAG,
+            ROOM_AUDIO_TAG,
+            GAME_RELAY_TAG,
+            VIDEO_TAG,
+            ROOM_VIDEO_TAG,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for tag in tags {
+            assert!(seen.insert(tag), "duplicate fixed channel tag {tag:#04x}");
         }
     }
 

@@ -164,6 +164,16 @@ pub enum MessageType {
     SfuFileComplete,
     #[serde(rename = "sfu_audio")]
     SfuAudio,
+    // Room video control plane. There is deliberately no `SfuVideo` message:
+    // video frames ride a lean binary datagram path (`ROOM_VIDEO_TAG`) that the
+    // relay forwards opaquely, without a JSON parse. Only these low-rate
+    // control messages use the signed JSON envelope.
+    /// Peer → peer (forwarded by the supernode): request a keyframe.
+    #[serde(rename = "sfu_video_keyframe_request")]
+    SfuVideoKeyframeRequest,
+    /// Peer → room: camera turned on/off.
+    #[serde(rename = "sfu_video_state")]
+    SfuVideoState,
     /// Owner announces a signed Space root; the supernode verifies, stores, and
     /// cluster-gossips it (authenticated room-set sync).
     #[serde(rename = "space_root_announce")]

@@ -125,6 +125,11 @@ fn compute_source_hash() -> String {
 }
 
 fn main() {
+    // Declared unconditionally: the cfg is *set* only in the qt-ui path, but it
+    // is *read* by src/video/sink.rs in every build, so a non-qt-ui build would
+    // otherwise warn about an unexpected cfg name.
+    println!("cargo:rustc-check-cfg=cfg(qt_multimedia)");
+
     // Windows PE version / signing metadata.
     // Keep ProductVersion in sync with conquerd-client/Cargo.toml version.
     #[cfg(windows)]
@@ -250,6 +255,38 @@ fn build_qt_ui() {
 
     // Assemble the QML file list. WebEngine-dependent files are only included
     // when the `webengine` feature is active and Qt WebEngine is installed.
+    // Probe the Qt installation for the Multimedia component. Uses the same
+    // lib directory cxx-qt-build will link against, so the answer here matches
+    // what the linker would actually find.
+    fn qt_multimedia_available() -> bool {
+        let Some(lib_dir) = qt_lib_dir() else {
+            return false;
+        };
+        [
+            "Qt6Multimedia.lib",
+            "libQt6Multimedia.so",
+            "libQt6Multimedia.dylib",
+        ]
+        .iter()
+        .any(|name| lib_dir.join(name).exists())
+            || lib_dir.join("QtMultimedia.framework").exists()
+    }
+
+    /// Resolve Qt's `lib` directory via qmake, mirroring how the Qt build
+    /// scripts locate the installation.
+    fn qt_lib_dir() -> Option<std::path::PathBuf> {
+        let qmake = std::env::var("QMAKE").unwrap_or_else(|_| "qmake".to_string());
+        let out = std::process::Command::new(qmake)
+            .args(["-query", "QT_INSTALL_LIBS"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+    }
+
     let qml_files: Vec<QmlFile> = vec![
         QmlFile::from("qml/Theme.qml").singleton(true),
         QmlFile::from("qml/MainWindow.qml"),
@@ -281,6 +318,7 @@ fn build_qt_ui() {
         QmlFile::from("qml/ConnectionStatsChip.qml"),
         QmlFile::from("qml/VoiceRail.qml"),
         QmlFile::from("qml/Avatar.qml"),
+        QmlFile::from("qml/PeerVolumePopup.qml"),
     ];
     #[cfg(feature = "webengine")]
     let qml_files: Vec<QmlFile> = {
@@ -290,6 +328,24 @@ fn build_qt_ui() {
             QmlFile::from("qml/FilePreviewPanel.qml"),
             QmlFile::from("qml/BrowserPanel.qml"),
         ]);
+        v
+    };
+
+    let has_multimedia = qt_multimedia_available();
+
+    // VideoTile.qml has `import QtMultimedia`, so it is only compiled into the
+    // qrc when that module exists — otherwise qmlcachegen fails the entire
+    // build over an unresolvable import, turning an optional feature into a
+    // hard build break.
+    let qml_files: Vec<QmlFile> = {
+        let mut v = qml_files;
+        if has_multimedia {
+            v.push(QmlFile::from("qml/VideoTile.qml"));
+            // VideoRegion instantiates VideoTile, so it is equally
+            // multimedia-dependent.
+            v.push(QmlFile::from("qml/VideoRegion.qml"));
+            v.push(QmlFile::from("qml/VideoPopoutWindow.qml"));
+        }
         v
     };
 
@@ -304,6 +360,38 @@ fn build_qt_ui() {
     .qt_module("Quick")
     .qt_module("QuickControls2")
     .qt_module("Svg");
+
+    // Multimedia supplies QVideoSink / QVideoFrame and the QtMultimedia QML
+    // module behind `VideoOutput`. Only the base module is linked: the video
+    // path pushes pre-decoded frames into a sink, so QMediaPlayer / QCamera and
+    // the FFmpeg media backend plugin are never exercised. MultimediaQuick is
+    // deliberately absent — it ships no public headers and its QML plugin is
+    // resolved at runtime.
+    //
+    // Linked **only when present**. Qt Multimedia is a separate component of
+    // the Qt installation, and unconditionally requesting it makes the whole
+    // application fail to link with `LNK1181: cannot open Qt6Multimedia.lib` on
+    // any machine that has not added it — turning an optional feature into a
+    // hard build break. Instead the video surface degrades: `cfg(qt_multimedia)`
+    // gates the Rust side and `Theme.hasMultimedia` gates the QML side.
+    // Re-run detection when the Qt lib directory changes, so installing the
+    // module later actually takes effect. Without this the probe result is
+    // cached in the build script's output and a fresh Qt Multimedia install is
+    // silently ignored until some unrelated edit forces build.rs to re-run.
+    if let Some(lib_dir) = qt_lib_dir() {
+        println!("cargo:rerun-if-changed={}", lib_dir.display());
+    }
+    let builder = if has_multimedia {
+        println!("cargo:rustc-cfg=qt_multimedia");
+        builder.qt_module("Multimedia")
+    } else {
+        println!(
+            "cargo:warning=Qt Multimedia not found — video rendering is disabled. \
+             Add it with: python -m aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 \
+             -m qtmultimedia -O C:\\Qt   (or run scripts/install_qt_windows.ps1)"
+        );
+        builder
+    };
     #[cfg(feature = "webengine")]
     let builder = builder
         .qt_module("WebEngineCore")
@@ -338,6 +426,10 @@ fn build_qt_ui() {
     compile_window_chrome_cpp();
 
     compile_qml_startup_cpp();
+
+    if has_multimedia {
+        compile_video_sink_cpp();
+    }
 }
 
 #[cfg(feature = "qt-ui")]
@@ -510,6 +602,74 @@ fn compile_window_chrome_cpp() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=conquerd_window_chrome");
+}
+
+/// Compile the QVideoSink registry shim.
+///
+/// Only built when Qt Multimedia is present; without it there is no
+/// `QVideoSink` to compile against, and the app links fine without video.
+#[cfg(feature = "qt-ui")]
+fn compile_video_sink_cpp() {
+    use std::path::PathBuf;
+
+    println!("cargo:rerun-if-changed=src/ui/video_sink_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/ui/video_sink_bridge.h");
+
+    let Some(qt_prefix) = resolve_qt_prefix() else {
+        eprintln!("cargo:warning=video_sink_bridge: cannot find Qt prefix; skipping");
+        return;
+    };
+    let Ok(out_dir) = std::env::var("OUT_DIR") else {
+        eprintln!("cargo:warning=video_sink_bridge: OUT_DIR is not set; skipping");
+        return;
+    };
+    let out_dir = PathBuf::from(out_dir);
+
+    // The registry exposes Q_INVOKABLE methods to QML, which requires moc —
+    // `cc` does not run it, so generate the meta-object source explicitly and
+    // compile it alongside.
+    let moc = qt_prefix
+        .join("bin")
+        .join(if cfg!(windows) { "moc.exe" } else { "moc" });
+    let moc_out = out_dir.join("moc_video_sink_bridge.cpp");
+    let status = std::process::Command::new(&moc)
+        .arg("src/ui/video_sink_bridge.h")
+        .arg("-o")
+        .arg(&moc_out)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!(
+                "cargo:warning=video_sink_bridge: moc failed at {}; skipping video shim",
+                moc.display()
+            );
+            return;
+        }
+    }
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .std("c++17")
+        .file("src/ui/video_sink_bridge.cpp")
+        .file(&moc_out)
+        .include("src/ui");
+    if cfg!(target_env = "msvc") {
+        build
+            .flag("/EHsc")
+            .flag("/Zc:__cplusplus")
+            .flag("/permissive-");
+    }
+    configure_qt_cpp_build(
+        &mut build,
+        &qt_prefix,
+        &["QtCore", "QtGui", "QtQml", "QtMultimedia"],
+    );
+    build.compile("conquerd_video_sink");
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=conquerd_video_sink");
 }
 
 #[cfg(feature = "qt-ui")]

@@ -752,7 +752,9 @@ ApplicationWindow {
             MouseArea {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
-                onClicked: { navIndex = 2; settingsTab = 1 }
+                // 2 = Identity, where the avatar editor lives. Shifted from 1
+                // when the Video section was inserted after Audio.
+                onClicked: { navIndex = 2; settingsTab = settingsPage.tabIdentity }
             }
         }
     }
@@ -771,6 +773,152 @@ ApplicationWindow {
 
     // Settings section index (0=Audio … 7=Diagnostics). Drives SettingsPage.currentTab.
     property int settingsTab: 0
+
+    // ── Video expand / popout state ──────────────────────────────────────────
+
+    /// Peers shown in the shared region above chat, in insertion order.
+    property var expandedVideoPeers: []
+    /// Peer ids currently sending video, as a set (`{peerId: true}`).
+    ///
+    /// Held here rather than read back off the participant model, because
+    /// neither model can answer the question outside a delegate: `RoomModel` is
+    /// a QAbstractListModel whose roles only reach delegates, and
+    /// `directCallModel` is a plain ListModel with no videoActive field at all.
+    /// Anything iterating peer *ids* (the video region does) therefore saw
+    /// "not streaming" for everyone and rendered the camera-off placeholder
+    /// permanently. A plain map is model-independent and, reassigned whole,
+    /// re-triggers the bindings that depend on it.
+    property var videoActivePeers: ({})
+
+    /// Record a peer's camera state. Rebuilds the map so QML sees a new
+    /// identity and re-evaluates; mutating in place would not notify.
+    function setPeerVideoActive(peerId, active) {
+        if (!peerId || peerId === "")
+            return
+        var next = {}
+        for (var k in root.videoActivePeers)
+            next[k] = true
+        if (active)
+            next[peerId] = true
+        else
+            delete next[peerId]
+        root.videoActivePeers = next
+    }
+    /// Fraction of the content area the region occupies (persisted).
+    property real videoRegionRatio: 0.4
+    /// Live popout windows keyed by peer id.
+    property var videoPopouts: ({})
+
+    function isVideoExpanded(peerId) {
+        return root.expandedVideoPeers.indexOf(peerId) !== -1
+    }
+
+    /// Toggle a peer in the shared region.
+    ///
+    /// Reassigns the array rather than mutating it: QML only re-evaluates
+    /// bindings on assignment, so an in-place push would leave the grid stale.
+    function toggleVideoExpanded(peerId) {
+        if (!peerId)
+            return
+        var next = root.expandedVideoPeers.slice()
+        var i = next.indexOf(peerId)
+        if (i === -1)
+            next.push(peerId)
+        else
+            next.splice(i, 1)
+        root.expandedVideoPeers = next
+    }
+
+    function collapseVideo(peerId) {
+        var next = root.expandedVideoPeers.slice()
+        var i = next.indexOf(peerId)
+        if (i !== -1) {
+            next.splice(i, 1)
+            root.expandedVideoPeers = next
+        }
+    }
+
+    /// Move a peer from the shared region into its own window.
+    function popoutVideo(peerId) {
+        if (!peerId)
+            return
+        // Already popped out — raise the existing window instead of opening a
+        // second one showing the same stream.
+        if (root.videoPopouts[peerId]) {
+            root.videoPopouts[peerId].raise()
+            root.videoPopouts[peerId].requestActivate()
+            return
+        }
+        var comp = Qt.createComponent(
+            "qrc:/qt/qml/ConquerD/Client/qml/VideoPopoutWindow.qml")
+        if (comp.status === Component.Error) {
+            console.warn("[video] popout unavailable:", comp.errorString())
+            return
+        }
+        var win = comp.createObject(null, {
+            peerId: peerId,
+            displayName: root.videoPeerName(peerId)
+        })
+        if (!win) {
+            console.warn("[video] popout window could not be created")
+            return
+        }
+        // Bound after creation, not passed in: createObject's property map sets
+        // static values, and this one has to keep tracking the peer's camera.
+        win.streaming = Qt.binding(() => root.videoActivePeers[peerId] === true)
+        var map = root.videoPopouts
+        map[peerId] = win
+        root.videoPopouts = map
+        win.closed.connect(function() { root.forgetVideoPopout(peerId) })
+        // Leaving it in the region too would decode the same stream into two
+        // sinks for no benefit; popping out is a move, not a copy.
+        root.collapseVideo(peerId)
+    }
+
+    function forgetVideoPopout(peerId) {
+        var map = root.videoPopouts
+        if (map[peerId]) {
+            delete map[peerId]
+            root.videoPopouts = map
+        }
+    }
+
+    /// Close every popout. Called before quitting so no detached window
+    /// outlives the main one and keeps the process alive.
+    function closeAllVideoPopouts() {
+        for (var pid in root.videoPopouts) {
+            if (root.videoPopouts[pid])
+                root.videoPopouts[pid].close()
+        }
+        root.videoPopouts = ({})
+    }
+
+    /// Resolve a peer's display name from the active voice roster.
+    function videoPeerName(peerId) {
+        var model = backend.voice_active && backend.in_room ? roomModel : directCallModel
+        if (model && model.rowCount) {
+            for (var i = 0; i < model.rowCount(); i++) {
+                var row = model.get ? model.get(i) : null
+                if (row && row.peerId === peerId)
+                    return row.handle || peerId
+            }
+        }
+        return peerId
+    }
+
+    // Debounced persist of the region ratio, mirroring the window-geometry
+    // timer below: a drag emits a value per frame and each save rewrites the
+    // settings file.
+    Timer {
+        id: videoRegionRatioSaveTimer
+        interval: 600
+        onTriggered: {
+            if (settingsModel) {
+                settingsModel.video_region_ratio = root.videoRegionRatio
+                settingsModel.save()
+            }
+        }
+    }
 
     // Auto-switch to room tab when voice join succeeds. Leaving voice must not
     // kick the user off the room text panel when a text room is still selected.
@@ -833,6 +981,17 @@ ApplicationWindow {
         // ── Push saved avatar config into the bridge so avatarSvg() uses it ─
         backend.setAvatarConfigJson(settingsModel.avatar_config_json)
 
+        // Restore the video region split, clamped to the same bounds the drag
+        // handler enforces so a hand-edited settings file cannot wedge the
+        // region open or shut.
+        if (settingsModel.video_region_ratio > 0)
+            root.videoRegionRatio = Math.max(0.2, Math.min(0.7, settingsModel.video_region_ratio))
+
+        // Replay listener-local per-peer mute/volume into the mixer, so
+        // choices made in an earlier session apply to peers we have not
+        // interacted with yet this run.
+        backend.applyPeerAudioPrefs(settingsModel.peer_audio_prefs_json)
+
         // ── Restore window geometry (clamp to minimum usable size) ───────
         root._restoringGeometry = true
         if (settingsModel.window_width > 0)
@@ -881,6 +1040,11 @@ ApplicationWindow {
         })
         backend.peerLevelChanged.connect(function(peerId, level) {
             roomModel.setAudioLevel(peerId, level)
+        })
+        backend.peerVideoStateChanged.connect(function(peerId, active) {
+            roomModel.setVideoActive(peerId, active)
+            // Drives the video region, which cannot read model roles.
+            root.setPeerVideoActive(peerId, active)
         })
         // File transfer model wiring
         backend.fileOffered.connect(fileTransferModel.upsertTransfer)
@@ -2207,9 +2371,52 @@ ApplicationWindow {
             Layout.minimumWidth: 200
             Layout.fillHeight: true
 
+            // Shared video area. Only chat and room views yield space to it —
+            // settings and the portal keep the full area, so the region never
+            // overlaps a page that has nothing to do with a call.
+            Loader {
+                id: videoRegionLoader
+                anchors { top: parent.top; left: parent.left; right: parent.right }
+                z: 40
+                // Loaded lazily: a build without Qt Multimedia has no
+                // VideoRegion in the qrc at all, and MainWindow must still parse.
+                active: root.expandedVideoPeers.length > 0
+                source: "qrc:/qt/qml/ConquerD/Client/qml/VideoRegion.qml"
+
+                readonly property bool showing:
+                    active && (navIndex === 0 || navIndex === 1)
+                visible: showing
+                height: showing
+                    ? Math.round(contentArea.height * root.videoRegionRatio)
+                    : 0
+
+                Behavior on height {
+                    NumberAnimation { duration: Theme.animFast; easing.type: Easing.InOutQuad }
+                }
+
+                onLoaded: {
+                    item.expandedPeers = Qt.binding(() => root.expandedVideoPeers)
+                    item.videoActivePeers = Qt.binding(() => root.videoActivePeers)
+                    item.participantModel = Qt.binding(() =>
+                        backend.voice_active && backend.in_room ? roomModel : directCallModel)
+                    item.heightRatio = Qt.binding(() => root.videoRegionRatio)
+                    item.collapseRequested.connect(root.collapseVideo)
+                    item.popoutRequested.connect(root.popoutVideo)
+                    item.ratioChanged.connect(function(r) {
+                        root.videoRegionRatio = r
+                        videoRegionRatioSaveTimer.restart()
+                    })
+                }
+            }
+
             ChatPanel {
                 id: chatPanel
-                anchors.fill: parent
+                anchors {
+                    top: videoRegionLoader.bottom
+                    left: parent.left
+                    right: parent.right
+                    bottom: parent.bottom
+                }
                 visible: navIndex === 0
                 chatModel: chatModel
                 fileTransferModel: fileTransferModel
@@ -2230,7 +2437,12 @@ ApplicationWindow {
 
             RoomPanel {
                 id: roomPanel
-                anchors.fill: parent
+                anchors {
+                    top: videoRegionLoader.bottom
+                    left: parent.left
+                    right: parent.right
+                    bottom: parent.bottom
+                }
                 visible: navIndex === 1
                 // Text members only — never the active voice roster (voice rail
                 // owns roomModel). Peers who share this room's chat space.
@@ -2240,6 +2452,8 @@ ApplicationWindow {
                 youtubePreviewEnabled: settingsModel ? settingsModel.youtube_preview_enabled : true
                 youtubeInlineAck: settingsModel ? settingsModel.youtube_inline_ack : false
                 onLeaveRoom: {
+                    root.closeAllVideoPopouts()
+                    root.expandedVideoPeers = []
                     backend.leaveRoom()
                     navIndex = 0
                 }
@@ -2371,6 +2585,11 @@ ApplicationWindow {
             durationSecs: backend.call_duration_secs
 
             onEndCallRequested: {
+                // Collapse expand/popout UI before the session ends so tiles
+                // unregister and we do not keep a detached window on a stream
+                // that is about to stop.
+                root.closeAllVideoPopouts()
+                root.expandedVideoPeers = []
                 if (backend.voice_active && backend.in_room) {
                     backend.leaveRoom()
                     // Stay on the room text panel when a text room is still selected.
@@ -2381,6 +2600,32 @@ ApplicationWindow {
                 }
             }
             onMuteToggled: (m) => backend.setMuted(m)
+
+            videoOn: backend.video_active
+
+            onVideoToggled: (on) => {
+                // The backend reports what actually happened — asking for the
+                // camera can fail (no device, in use elsewhere), so the button
+                // must follow the real state rather than the requested one.
+                var got = backend.setVideoEnabled(
+                    on,
+                    settingsModel.video_input_device,
+                    settingsModel.video_quality)
+                if (on && !got)
+                    console.warn("[video] could not start the camera")
+                // Reflect our own state on our own tile straight away; remote
+                // members learn about it from the SfuVideoState announcement.
+                // `public_id` is the exposed Q_PROPERTY — `my_public_id` is the
+                // internal Rust field name and reads as undefined from QML,
+                // which silently skipped this whole branch.
+                if (roomModel && roomModel.setVideoActive && backend.public_id)
+                    roomModel.setVideoActive(backend.public_id, got)
+                root.setPeerVideoActive(backend.public_id, got)
+            }
+
+            expandedPeers: root.expandedVideoPeers
+            onExpandVideoRequested: (pid) => root.toggleVideoExpanded(pid)
+            onPopoutVideoRequested: (pid) => root.popoutVideo(pid)
         }
     }
 
@@ -2472,6 +2717,10 @@ ApplicationWindow {
             close.accepted = false
             hideToTray()
         } else {
+            // Close popouts before quitting. They are separate top-level
+            // windows, so leaving them open would both keep the process alive
+            // and leave their HWNDs in the chrome tracking set during teardown.
+            root.closeAllVideoPopouts()
             Qt.quit()
         }
     }

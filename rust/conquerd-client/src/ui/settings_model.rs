@@ -1,4 +1,4 @@
-//! SettingsModel — writable app-settings QObject singleton.
+//! SettingsModel â€” writable app-settings QObject singleton.
 //!
 //! Compiled only when the `qt-ui` Cargo feature is enabled.
 //!
@@ -43,6 +43,12 @@ pub mod ffi {
         #[qproperty(QString, ptt_key)]
         #[qproperty(QString, audio_input_device)]
         #[qproperty(QString, audio_output_device)]
+        #[qproperty(QString, video_input_device)]
+        #[qproperty(bool, video_enabled)]
+        #[qproperty(QString, video_quality)]
+        #[qproperty(QString, peer_audio_prefs_json)]
+        #[qproperty(f32, video_region_ratio)]
+        #[qproperty(QString, video_popout_geometry_json)]
         #[qproperty(QString, local_handle)]
         #[qproperty(bool, update_check_enabled)]
         #[qproperty(i32, relay_port)]
@@ -134,6 +140,25 @@ struct SettingsSnapshot {
     #[serde(default)]
     audio_output_device: String,
     #[serde(default)]
+    video_input_device: String,
+    #[serde(default)]
+    video_enabled: bool,
+    #[serde(default = "default_video_quality")]
+    video_quality: String,
+    /// Listener-local per-peer mute/volume, as
+    /// `{"<peer>":{"muted":bool,"volume":int}}`. One blob rather than a field
+    /// per peer, which would grow without bound.
+    #[serde(default = "default_prefs_blob")]
+    peer_audio_prefs_json: String,
+    /// Fraction of the content area the shared video region occupies.
+    #[serde(default = "default_video_region_ratio")]
+    video_region_ratio: f32,
+    /// Per-peer popout window geometry, `{"<peer>":{"x":..,"y":..,"w":..,"h":..}}`.
+    /// One blob rather than four properties per peer, which would grow without
+    /// bound as peers come and go.
+    #[serde(default = "default_prefs_blob")]
+    video_popout_geometry_json: String,
+    #[serde(default)]
     local_handle: String,
     #[serde(default = "default_true")]
     update_check_enabled: bool,
@@ -186,7 +211,7 @@ fn default_direct_p2p_port() -> i32 {
     61_045
 }
 fn default_ollama_url() -> String {
-    // Prefer 127.0.0.1 over localhost (Windows can resolve localhost → ::1 while
+    // Prefer 127.0.0.1 over localhost (Windows can resolve localhost â†’ ::1 while
     // Ollama typically binds IPv4 only). fetch_model_list also rewrites localhost.
     "http://127.0.0.1:11434".to_string()
 }
@@ -208,6 +233,24 @@ fn default_ptt_key() -> String {
 fn default_noise_strength() -> String {
     "moderate".to_string()
 }
+/// Capture quality preset: "low" (320x180), "balanced" (640x360), "high"
+/// (1280x720). Balanced is the default because it is the size the encoder's
+/// bitrate defaults are tuned for.
+/// Default share of the content area for the video region: a little under
+/// half, so chat stays usable without the video feeling cramped.
+fn default_video_region_ratio() -> f32 {
+    0.4
+}
+
+fn default_video_quality() -> String {
+    "balanced".to_string()
+}
+
+/// Empty JSON object — no per-peer overrides.
+fn default_prefs_blob() -> String {
+    "{}".to_string()
+}
+
 fn default_voice_bitrate() -> String {
     "ultra".to_string()
 }
@@ -237,6 +280,12 @@ impl Default for SettingsSnapshot {
             ptt_key: "space".to_string(),
             audio_input_device: String::new(),
             audio_output_device: String::new(),
+            video_input_device: String::new(),
+            video_enabled: false,
+            video_quality: default_video_quality(),
+            peer_audio_prefs_json: default_prefs_blob(),
+            video_region_ratio: default_video_region_ratio(),
+            video_popout_geometry_json: default_prefs_blob(),
             local_handle: String::new(),
             update_check_enabled: true,
             relay_port: 0,
@@ -284,6 +333,12 @@ pub struct SettingsModelRust {
     ptt_key: QString,
     audio_input_device: QString,
     audio_output_device: QString,
+    video_input_device: QString,
+    video_enabled: bool,
+    video_quality: QString,
+    peer_audio_prefs_json: QString,
+    video_region_ratio: f32,
+    video_popout_geometry_json: QString,
     local_handle: QString,
     update_check_enabled: bool,
     relay_port: i32,
@@ -328,6 +383,12 @@ impl Default for SettingsModelRust {
             ptt_key: QString::from(s.ptt_key.as_str()),
             audio_input_device: QString::default(),
             audio_output_device: QString::default(),
+            video_input_device: QString::default(),
+            video_enabled: s.video_enabled,
+            video_quality: QString::from(s.video_quality.as_str()),
+            peer_audio_prefs_json: QString::from(s.peer_audio_prefs_json.as_str()),
+            video_region_ratio: s.video_region_ratio,
+            video_popout_geometry_json: QString::from(s.video_popout_geometry_json.as_str()),
             local_handle: QString::default(),
             update_check_enabled: s.update_check_enabled,
             relay_port: s.relay_port,
@@ -386,6 +447,12 @@ impl ffi::SettingsModel {
             ptt_key: r.ptt_key.to_string(),
             audio_input_device: r.audio_input_device.to_string(),
             audio_output_device: r.audio_output_device.to_string(),
+            video_input_device: r.video_input_device.to_string(),
+            video_enabled: r.video_enabled,
+            video_quality: r.video_quality.to_string(),
+            peer_audio_prefs_json: r.peer_audio_prefs_json.to_string(),
+            video_region_ratio: r.video_region_ratio,
+            video_popout_geometry_json: r.video_popout_geometry_json.to_string(),
             local_handle: r.local_handle.to_string(),
             update_check_enabled: r.update_check_enabled,
             relay_port: r.relay_port,
@@ -431,11 +498,11 @@ impl ffi::SettingsModel {
         let path = settings_file();
         let snap: SettingsSnapshot = match std::fs::read_to_string(&path) {
             Ok(txt) => serde_json::from_str(&txt).unwrap_or_else(|e| {
-                warn!("SettingsModel::load parse error: {e} — using defaults");
+                warn!("SettingsModel::load parse error: {e} â€” using defaults");
                 SettingsSnapshot::default()
             }),
             Err(_) => {
-                debug!("No settings file at {} — using defaults", path.display());
+                debug!("No settings file at {} â€” using defaults", path.display());
                 SettingsSnapshot::default()
             }
         };
@@ -468,6 +535,18 @@ impl ffi::SettingsModel {
             .set_audio_input_device(QString::from(snap.audio_input_device.as_str()));
         self.as_mut()
             .set_audio_output_device(QString::from(snap.audio_output_device.as_str()));
+        self.as_mut()
+            .set_video_input_device(QString::from(snap.video_input_device.as_str()));
+        self.as_mut().set_video_enabled(snap.video_enabled);
+        self.as_mut()
+            .set_video_quality(QString::from(snap.video_quality.as_str()));
+        self.as_mut()
+            .set_peer_audio_prefs_json(QString::from(snap.peer_audio_prefs_json.as_str()));
+        self.as_mut()
+            .set_video_region_ratio(snap.video_region_ratio);
+        self.as_mut().set_video_popout_geometry_json(QString::from(
+            snap.video_popout_geometry_json.as_str(),
+        ));
         self.as_mut()
             .set_local_handle(QString::from(snap.local_handle.as_str()));
         self.as_mut()

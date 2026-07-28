@@ -36,7 +36,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
-use conquerd_features::channel_frame::{GAME_RELAY_TAG, RELAY_SIGNAL_STREAM_MAGIC, ROOM_AUDIO_TAG};
+use conquerd_features::channel_frame::{
+    GAME_RELAY_TAG, RELAY_SIGNAL_STREAM_MAGIC, ROOM_AUDIO_TAG, ROOM_VIDEO_TAG,
+};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::Notify;
@@ -69,6 +71,32 @@ pub struct RelaySignalingInbound {
 pub struct RelayGameInbound {
     pub supernode_id: String,
     pub payload: Vec<u8>,
+}
+
+/// Where a relay connection delivers each kind of inbound traffic.
+///
+/// Grouped rather than passed as loose parameters because they are one
+/// cohesive thing — the caller's inbound routing table — and because each
+/// optional channel independently enables a feature: leaving `video` as `None`
+/// disables inbound room video without touching audio or chat.
+pub struct RelayInboundSinks {
+    /// Signed signaling frames (room chat/file broadcasts, room audio).
+    pub signaling: UnboundedSender<RelaySignalingInbound>,
+    /// Opaque `game.relay.v1` payloads for in-app portal games.
+    pub game: Option<UnboundedSender<RelayGameInbound>>,
+    /// `room.video.sfu` fragments, pre-reassembly.
+    pub video: Option<UnboundedSender<RelayVideoInbound>>,
+}
+
+/// One `room.video.sfu` fragment received over a QUIC relay.
+///
+/// Carries a single fragment rather than a whole frame: reassembly, signature
+/// verification, and unsealing all happen in the connection manager, which owns
+/// the per-sender reassembly state.
+#[derive(Debug, Clone)]
+pub struct RelayVideoInbound {
+    pub supernode_id: String,
+    pub fragment: Vec<u8>,
 }
 
 /// Datagram target index meaning "broadcast to all room members"
@@ -120,16 +148,13 @@ impl QuicRelayClient {
     /// `supernode_id` is the supernode's identity pubkey (peer_id); kept
     /// here so callers can identify the relay later without re-parsing
     /// the cert.
-    /// `reinject_tx` receives signed signaling frames that arrive over the
-    /// relay — both `SfuAudio` extracted from inbound `room.audio.sfu`
-    /// datagrams and `room.chat.v1` / `room.file.v1` broadcasts delivered on
-    /// the reliable signaling stream. Each frame carries the hosting
-    /// supernode's identity pubkey. The connection manager owns the receiver
-    /// and re-injects each frame on its normal inbound path (signature
-    /// verification + freshness + replay + quota + dispatch).
-    ///
-    /// `game_tx`, when set, receives opaque `game.relay.v1` payloads for
-    /// in-app portal games (identity path; no WebTransport cert).
+    /// `sinks` routes inbound traffic (see [`RelayInboundSinks`]). Signaling
+    /// frames — `SfuAudio` extracted from inbound `room.audio.sfu` datagrams,
+    /// plus `room.chat.v1` / `room.file.v1` broadcasts on the reliable stream —
+    /// each carry the hosting supernode's identity pubkey. The connection
+    /// manager owns the receivers and re-injects signaling frames on its normal
+    /// inbound path (signature verification + freshness + replay + quota +
+    /// dispatch).
     ///
     /// `portal_only`: guest grant — portal streams only. Do **not** open the
     /// reliable signaling stream (the supernode drops it server-side); room
@@ -139,10 +164,14 @@ impl QuicRelayClient {
         supernode_id: impl Into<String>,
         host: &str,
         port: u16,
-        reinject_tx: UnboundedSender<RelaySignalingInbound>,
-        game_tx: Option<UnboundedSender<RelayGameInbound>>,
+        sinks: RelayInboundSinks,
         portal_only: bool,
     ) -> anyhow::Result<Self> {
+        let RelayInboundSinks {
+            signaling: reinject_tx,
+            game: game_tx,
+            video: video_tx,
+        } = sinks;
         let supernode_id = supernode_id.into();
         let addr: SocketAddr = format!("{host}:{port}")
             .parse()
@@ -195,6 +224,7 @@ impl QuicRelayClient {
                 shutdown_dgram,
                 reinject_dgram,
                 game_tx,
+                video_tx,
                 sn_id_dgram,
                 sn_short_dgram,
             )
@@ -305,6 +335,33 @@ impl QuicRelayClient {
     /// the frame to peers in the sender's active portal game session.
     pub fn send_game_relay(&self, payload: &[u8]) -> bool {
         self.send_broadcast_tagged(GAME_RELAY_TAG, payload)
+    }
+
+    /// Send one video fragment as a broadcast room-video datagram.
+    ///
+    /// Builds `[BROADCAST_INDEX][ROOM_VIDEO_TAG][fragment]`. Unlike
+    /// [`send_room_audio`](Self::send_room_audio) the payload is the lean
+    /// binary fragment from [`crate::video::fragment`], not signed JSON — the
+    /// supernode forwards it opaquely without parsing.
+    ///
+    /// There is no WebSocket fallback for video. Returning `false` means this
+    /// fragment is simply lost, which also loses the whole frame it belongs to;
+    /// that is the intended trade, since a video frame that arrives late is
+    /// worth less than the head-of-line blocking a reliable retry would cost.
+    pub fn send_room_video(&self, fragment: &[u8]) -> bool {
+        self.send_broadcast_tagged(ROOM_VIDEO_TAG, fragment)
+    }
+
+    /// Usable fragment payload for this connection, after the relay's index and
+    /// tag bytes. Callers size fragments against this so
+    /// [`send_broadcast_tagged`](Self::send_broadcast_tagged) never has to drop
+    /// an oversized frame.
+    pub fn max_video_fragment_len(&self) -> usize {
+        // `send_broadcast_tagged` prepends BROADCAST_INDEX + tag.
+        self.connection
+            .max_datagram_size()
+            .unwrap_or(crate::video::DEFAULT_MAX_DATAGRAM)
+            .saturating_sub(2)
     }
 
     fn send_broadcast_tagged(&self, tag: u8, payload: &[u8]) -> bool {
@@ -427,6 +484,7 @@ async fn recv_room_datagrams(
     shutdown: Arc<Notify>,
     reinject_tx: UnboundedSender<RelaySignalingInbound>,
     game_tx: Option<UnboundedSender<RelayGameInbound>>,
+    video_tx: Option<UnboundedSender<RelayVideoInbound>>,
     supernode_id: String,
     sn_short: String,
 ) {
@@ -465,6 +523,19 @@ async fn recv_room_datagrams(
                                     .is_err()
                                 {
                                     // Portal queue dropped — keep reading for audio.
+                                }
+                            }
+                        } else if tag == ROOM_VIDEO_TAG {
+                            if let Some(ref vtx) = video_tx {
+                                if vtx
+                                    .send(RelayVideoInbound {
+                                        supernode_id: supernode_id.clone(),
+                                        fragment: body.to_vec(),
+                                    })
+                                    .is_err()
+                                {
+                                    // Video queue dropped — keep reading for audio.
+                                    // Losing video must never cost the call.
                                 }
                             }
                         }

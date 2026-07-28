@@ -51,7 +51,7 @@ pip install --disable-pip-version-check 'aqtinstall==3.3.0'
 $aqtArgs = @(
     'install-qt', 'windows', 'desktop', $Version, 'win64_msvc2022_64',
     '-O', $OutputDir,
-    '-m', 'qtwebengine', 'qtwebchannel', 'qtpositioning',
+    '-m', 'qtwebengine', 'qtwebchannel', 'qtpositioning', 'qtmultimedia',
     '--external', $sevenZip
 )
 

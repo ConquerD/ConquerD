@@ -225,6 +225,25 @@ pub enum ConnectionEvent {
     SfuAudioReceived { peer_id: String, opus_data: Vec<u8> },
     /// Inbound direct-peer audio (Opus bytes from a 1:1 QUIC session).
     DirectAudioReceived { peer_id: String, opus_data: Vec<u8> },
+    /// A room member's camera turned on or off.
+    ///
+    /// Separate from frame arrival so an indicator can appear immediately and,
+    /// more importantly, disappear promptly — inferring "off" from an absence
+    /// of frames cannot distinguish a stopped camera from a stalled network.
+    PeerVideoStateChanged { peer_id: String, active: bool },
+    /// A receiver asked us for a keyframe because it cannot decode.
+    VideoKeyframeRequested { peer_id: String },
+    /// A complete video frame, reassembled from fragments and authenticated.
+    ///
+    /// One event covers both the room and direct paths: by the time a frame
+    /// reaches here its fragments have been reassembled, its per-frame
+    /// signature verified, and (for room video) its GCM seal opened. The
+    /// payload is codec bytes still awaiting decode.
+    VideoFrameReceived {
+        peer_id: String,
+        encoded: Vec<u8>,
+        keyframe: bool,
+    },
     /// An invite handshake completed and the peer was added to the store.
     InviteAccepted { peer_id: String, handle: String },
     /// An invite could not be accepted or routed.
@@ -328,6 +347,17 @@ pub enum ConnectionCommand {
     SendAudioFrame {
         peer_id: String,
         opus_data: Vec<u8>,
+    },
+    /// Send one encoded video frame to a specific peer over QUIC datagrams.
+    ///
+    /// `encoded` is a whole frame; the transport fragments it, since a video
+    /// frame does not fit one datagram the way an Opus frame does. `keyframe`
+    /// rides the fragment header so a receiver can tell whether it may start
+    /// decoding here.
+    SendVideoFrame {
+        peer_id: String,
+        encoded: Vec<u8>,
+        keyframe: bool,
     },
     /// Send a typing indicator to a peer.
     SendTyping {
@@ -460,6 +490,40 @@ pub enum ConnectionCommand {
     /// Used as a WebSocket fallback when direct QUIC is unavailable.
     SendRoomAudio {
         opus_data: Vec<u8>,
+    },
+    /// Send one encoded video frame to the current SFU room via the supernode.
+    ///
+    /// Unlike [`SendRoomAudio`](Self::SendRoomAudio) there is no WebSocket
+    /// fallback: room video is relay-datagram-only, so members reachable only
+    /// over WebSocket receive audio but no video.
+    SendRoomVideo {
+        encoded: Vec<u8>,
+        keyframe: bool,
+    },
+    /// Ask `peer_id` for a keyframe because we cannot decode their stream.
+    ///
+    /// Rate-limited in the manager, not here. Without that limit, N receivers
+    /// hitting any packet loss produce a request storm, the sender emits
+    /// keyframes continuously, bitrate spikes, loss worsens, and more requests
+    /// follow — the standard way a first video implementation collapses.
+    RequestVideoKeyframe {
+        peer_id: String,
+    },
+    /// Announce our camera going on or off.
+    ///
+    /// Low rate, so it rides the signed JSON signaling path rather than the
+    /// binary media path. Lets receivers light up or tear down an indicator
+    /// immediately instead of inferring it from frame arrival, which would be
+    /// both slow to appear and ambiguous when frames simply stop.
+    ///
+    /// `direct_peer` selects the route: `None` fans the announcement out to the
+    /// current room through the supernode, `Some(peer)` sends it to that peer
+    /// over the direct session. The caller decides because only it knows
+    /// whether this is a room session or a 1:1 call — the connection manager
+    /// tracks rooms and peer connections but not call membership.
+    SendVideoState {
+        active: bool,
+        direct_peer: Option<String>,
     },
     /// Announce a freshly-signed Space root to `supernode_id`, which verifies,
     /// stores the highest epoch, and cluster-gossips it (authenticated room-set

@@ -228,6 +228,46 @@ pub fn room_audio_sfu() -> CapabilityDescriptor {
         .with_auth(AuthTier::RoomMember)
 }
 
+/// `core.video.vp8` — direct peer video (VP8 over QUIC datagrams).
+///
+/// Unlike audio, one encoded frame spans many datagrams: the sender fragments
+/// each frame to fit the 1200-byte relay ceiling. At the 640x360 / 30 fps /
+/// ~600 kbps default that is roughly 4 fragments per frame (~120 datagrams/s),
+/// spiking to ~25 for a keyframe. Quotas are sized ~3x that ceiling so ABR
+/// overshoot and keyframe bursts do not trip supernode shedding — the same
+/// headroom rationale as [`room_audio_sfu`].
+pub fn core_video_vp8() -> CapabilityDescriptor {
+    CapabilityDescriptor::new("core.video.vp8", "1.0", ChannelKind::Datagram)
+        .with_params(json!({
+            "codec": "vp8",
+            "quota_bytes_per_sec": 512 * 1024,
+            "quota_datagrams_per_sec": 1200,
+        }))
+        .with_auth(AuthTier::TrustedPeer)
+}
+
+/// `room.video.sfu` — SFU room video via QUIC relay.
+///
+/// Byte quota covers the **lean binary fragment wire format**, not a JSON
+/// envelope: room video deliberately does not reuse the signed-JSON framing
+/// that room audio uses. At video frame rates the base64 + envelope + per
+/// datagram signature overhead consumes more than half of each datagram and
+/// forces a full JSON parse per datagram on the supernode. Each fragment
+/// instead carries a fixed 56-byte binary header, and authenticity comes from
+/// one Ed25519 signature per *frame* (carried in fragment 0) rather than one
+/// per datagram.
+pub fn room_video_sfu() -> CapabilityDescriptor {
+    CapabilityDescriptor::new("room.video.sfu", "1.0", ChannelKind::Datagram)
+        .with_params(json!({
+            "codec": "vp8",
+            "quota_bytes_per_sec": 512 * 1024,
+            "quota_datagrams_per_sec": 1200,
+            "allow_public_rooms": false,
+            "allow_private_rooms": true,
+        }))
+        .with_auth(AuthTier::RoomMember)
+}
+
 /// `room.chat.v1` — SFU room text chat.
 pub fn room_chat_v1() -> CapabilityDescriptor {
     CapabilityDescriptor::new("room.chat.v1", "1.0", ChannelKind::Stream)
@@ -316,6 +356,8 @@ pub fn local_capabilities() -> Vec<CapabilityDescriptor> {
         core_file_v1(),
         core_audio_opus(),
         room_audio_sfu(),
+        core_video_vp8(),
+        room_video_sfu(),
         room_chat_v1(),
         room_file_v1(),
         web_host_app_v1(),
@@ -360,6 +402,11 @@ mod tests {
             "core.file.v1",
             "core.audio.opus",
             "room.audio.sfu",
+            // Added for video calling. Purely additive: peers that predate
+            // these simply won't advertise them, and negotiation degrades to
+            // audio-only, so no migration window is needed.
+            "core.video.vp8",
+            "room.video.sfu",
             "room.chat.v1",
             "room.file.v1",
             "web.host.app.v1",

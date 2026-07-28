@@ -85,6 +85,11 @@ arboard = { version = "3", default-features = false }
 # Windows taskbar overlay badge (unread count)
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
+    # Lets us implement COM interfaces in Rust, not just call them. Needed for
+    # IMFAsyncCallback: hardware (asynchronous) Media Foundation transforms
+    # deliver METransformNeedInput / METransformHaveOutput only through
+    # BeginGetEvent + a callback, so without this there is no way to drive them.
+    "implement",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -93,7 +98,38 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_Security",
+    # Media Foundation: hardware-accelerated H.264 encode/decode. The hardware
+    # MFT enumeration path picks up NVENC / QuickSync / AMF automatically, and
+    # the OS holds the AVC licence so there is no MPEG-LA exposure of our own.
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    # Screen / window / game capture. Windows.Graphics.Capture is the only
+    # Windows API that covers all three: Desktop Duplication is monitors-only
+    # and does not survive fullscreen-exclusive games, and GDI BitBlt cannot
+    # see hardware-accelerated content at all.
+    #
+    # WGC hands back D3D11 textures, hence the Direct3D/DXGI entries: the frame
+    # has to be copied to a CPU-readable staging texture before it can be
+    # converted to I420 for the encoder.
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Dxgi",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_UI_HiDpi",
+    # DwmGetWindowAttribute, to skip "cloaked" windows — suspended UWP apps sit
+    # in the window list but capture as solid black.
+    "Win32_Graphics_Dwm",
 ] }
+# The `#[implement]` macro expands to `windows_core::…` paths, so the crate has
+# to be nameable directly rather than only via `windows::core`.
+windows-core = "0.58"
 
 [build-dependencies]
 # Only needed when `qt-ui` feature is active; always listed here because

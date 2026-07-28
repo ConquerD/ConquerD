@@ -58,6 +58,7 @@ mod taskbar_badge;
 mod ui;
 mod upnp;
 mod uri_scheme;
+mod video;
 mod web_app_client;
 
 use std::collections::{HashMap, HashSet};
@@ -175,6 +176,11 @@ fn run_qt_ui() {
     unsafe {
         ui::scheme::conquerd_install_scheme_handler();
     }
+
+    // Must precede `engine.load()`: QML resolves `import ConquerD.Native` at
+    // parse time, so registering afterwards would leave VideoTile unable to
+    // find the registry.
+    video::sink::register_singleton();
 
     let mut engine = QQmlApplicationEngine::new();
     if let Some(mut engine) = engine.as_mut() {
@@ -1250,6 +1256,11 @@ async fn handle_event(
         | ConnectionEvent::RelayPaymentRequired { .. }
         | ConnectionEvent::SfuAudioReceived { .. }
         | ConnectionEvent::DirectAudioReceived { .. }
+        // Headless has no display, so video has nowhere to go and no camera to
+        // send from — the indicator and keyframe events are equally moot.
+        | ConnectionEvent::VideoFrameReceived { .. }
+        | ConnectionEvent::PeerVideoStateChanged { .. }
+        | ConnectionEvent::VideoKeyframeRequested { .. }
         | ConnectionEvent::AvatarConfigUpdated { .. }
         | ConnectionEvent::RoomFailedOver { .. }
         | ConnectionEvent::ConnectionStats { .. }

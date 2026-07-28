@@ -13,6 +13,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     "core.chat.v1",
     "room.chat.v1",
     "room.audio.sfu",
+    "room.video.sfu",
     "room.file.v1",
     "core.file.v1",
     "web.host.app.v1",

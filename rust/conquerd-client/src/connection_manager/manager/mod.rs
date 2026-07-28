@@ -12,6 +12,7 @@ mod invite;
 mod peer_session;
 mod room_session;
 mod routing;
+mod video_session;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -34,7 +35,9 @@ use crate::group_key::SenderKeysGroup;
 use crate::identity::Identity;
 use crate::peer_store::PeerStore;
 use crate::protocol::{MessageType, SignalingMessage};
-use crate::quic_relay_client::{QuicRelayClient, RelayGameInbound, RelaySignalingInbound};
+use crate::quic_relay_client::{
+    QuicRelayClient, RelayGameInbound, RelaySignalingInbound, RelayVideoInbound,
+};
 use crate::quic_tls;
 use crate::web_app_client::{self, WebAppResponse};
 
@@ -76,6 +79,14 @@ pub(super) const ROOM_JOIN_MAX_ATTEMPTS: u8 = 8;
 /// before falling back to a temporary private SFU room.
 pub(super) const DIRECT_CALL_FALLBACK_GRACE_S: u64 = 5;
 pub(super) const AUDIO_CHANNEL_TAG: u8 = channel_frame::AUDIO_TAG;
+pub(super) const VIDEO_CHANNEL_TAG: u8 = channel_frame::VIDEO_TAG;
+/// Minimum gap between keyframe requests to the same peer.
+///
+/// One second is the standard choice: long enough that a burst of undecodable
+/// frames produces one request rather than thirty, short enough that genuine
+/// recovery is not noticeably delayed.
+pub(super) const VIDEO_KEYFRAME_REQUEST_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(1);
 pub(super) const DEFAULT_QUIC_LISTENER_PORT: u16 = 61_045;
 pub(super) const QUIC_PORT_SEARCH_LIMIT: u16 = 128;
 pub(super) const QUIC_PORT_FILE: &str = "quic_listener_port";
@@ -203,6 +214,10 @@ pub struct ConnectionManager {
     relay_game_tx: mpsc::UnboundedSender<RelayGameInbound>,
     /// Receiver side of [`Self::relay_game_tx`], polled in the run loop.
     relay_game_rx: mpsc::UnboundedReceiver<RelayGameInbound>,
+    /// Sender for inbound `room.video.sfu` fragments from the relay.
+    relay_video_tx: mpsc::UnboundedSender<RelayVideoInbound>,
+    /// Receiver side of [`Self::relay_video_tx`], polled in the run loop.
+    relay_video_rx: mpsc::UnboundedReceiver<RelayVideoInbound>,
     /// Sender-keys group keying for E2E room audio + room chat. The room's
     /// elected keyer (see [`Self::sync_room_membership`]) generates/rotates
     /// epoch keys and seals them to members over `SfuGroupKey`; every member
@@ -215,6 +230,22 @@ pub struct ConnectionManager {
     /// GCM AAD (`conv_id ‖ sender ‖ sequence`) and carried as the envelope
     /// `seq` field so the receiver can reconstruct the AAD.
     room_audio_seq: u64,
+    /// Per-frame counter for outbound room video. Separate from
+    /// `room_audio_seq` because the two streams are independent; the
+    /// `MediaKind` domain separator in `group_key` is what stops the two
+    /// counters colliding in the AEAD's associated data.
+    room_video_seq: u32,
+    /// Per-frame counter for outbound direct video, keyed by peer id. Direct
+    /// calls are 1:1 but several can be live at once, and each needs its own
+    /// monotonic sequence for the receiver's reassembly ordering.
+    direct_video_seq: HashMap<String, u32>,
+    /// Reassembles inbound video fragments from every sender, direct and room
+    /// alike. One instance covers both paths because the fragment format is
+    /// identical and its own per-sender caps bound the memory.
+    video_reassembler: crate::video::fragment::Reassembler,
+    /// Last keyframe request sent per peer, for the rate limit in
+    /// [`Self::send_video_keyframe_request`].
+    video_keyframe_last: HashMap<String, std::time::Instant>,
     /// Space proof-based admission creds carried by a pasted room invite, keyed
     /// by `room_id`, attached to the next `SfuJoin` for that room. JSON text
     /// `(space_root, space_proof, space_grant)`; `""` for any absent field.
@@ -322,6 +353,7 @@ impl ConnectionManager {
         let (relay_signaling_tx, relay_signaling_rx) =
             mpsc::unbounded_channel::<RelaySignalingInbound>();
         let (relay_game_tx, relay_game_rx) = mpsc::unbounded_channel::<RelayGameInbound>();
+        let (relay_video_tx, relay_video_rx) = mpsc::unbounded_channel::<RelayVideoInbound>();
 
         let mgr = Self {
             identity,
@@ -359,11 +391,17 @@ impl ConnectionManager {
             relay_signaling_rx,
             relay_game_tx,
             relay_game_rx,
+            relay_video_tx,
+            relay_video_rx,
             room_relay_fail_streak: 0,
             room_relay_cooldown_frames: 0,
             group_keys: SenderKeysGroup::new(),
             room_group_members: HashMap::new(),
             room_audio_seq: 0,
+            room_video_seq: 0,
+            direct_video_seq: HashMap::new(),
+            video_reassembler: crate::video::fragment::Reassembler::new(),
+            video_keyframe_last: HashMap::new(),
             pending_join_space_creds: HashMap::new(),
             pending_group_key_acks: HashMap::new(),
             pending_peer_reconnects: HashMap::new(),
@@ -677,6 +715,18 @@ impl ConnectionManager {
                         ConnectionCommand::SendRoomAudio { opus_data } => {
                             self.send_room_audio(opus_data).await;
                         }
+                        ConnectionCommand::SendVideoFrame { peer_id, encoded, keyframe } => {
+                            self.send_video_datagram(&peer_id, encoded, keyframe).await;
+                        }
+                        ConnectionCommand::SendRoomVideo { encoded, keyframe } => {
+                            self.send_room_video(encoded, keyframe).await;
+                        }
+                        ConnectionCommand::SendVideoState { active, direct_peer } => {
+                            self.send_video_state(active, direct_peer).await;
+                        }
+                        ConnectionCommand::RequestVideoKeyframe { peer_id } => {
+                            self.send_video_keyframe_request(&peer_id).await;
+                        }
                         ConnectionCommand::AnnounceSpaceRoot { supernode_id, root_json } => {
                             self.send_space_root_announce(&supernode_id, &root_json).await;
                         }
@@ -908,6 +958,26 @@ impl ConnectionManager {
                         supernode_id: game.supernode_id,
                         payload: game.payload,
                     });
+                }
+                Some(video) = self.relay_video_rx.recv() => {
+                    // Charge inbound quota per fragment, against the relaying
+                    // supernode: a flooding sender must be shed before we
+                    // buffer its bytes. The real sender is not known until the
+                    // fragment parses, and trusting a self-declared id for
+                    // accounting would let one peer exhaust another's budget.
+                    let sn = video.supernode_id.clone();
+                    if !self.check_inbound_feature_quota(
+                        "room.video.sfu",
+                        &sn,
+                        video.fragment.len(),
+                    ) {
+                        debug!(
+                            "[room.video.sfu] inbound quota exceeded via {}; dropping fragment",
+                            &sn[..8.min(sn.len())]
+                        );
+                    } else {
+                        self.accept_video_fragment(&sn, &video.fragment, true).await;
+                    }
                 }
                 // Accept incoming QUIC connections
                 incoming = async {
@@ -1204,6 +1274,25 @@ impl ConnectionManager {
                             }
                         }
                     }
+                    // Direct peer video: one fragment of an encoded frame.
+                    // Quota is charged per fragment as it arrives (unlike the
+                    // outbound side, which gates whole frames) because a
+                    // flooding peer must be shed before we buffer its bytes.
+                    Some(FrameClass::Video(fragment)) => {
+                        if !self.check_inbound_feature_quota(
+                            "core.video.vp8",
+                            &canonical_peer_id,
+                            fragment.len(),
+                        ) {
+                            debug!(
+                                "[core.video.vp8] inbound quota exceeded for {}; dropping fragment",
+                                &canonical_peer_id[..8.min(canonical_peer_id.len())]
+                            );
+                        } else {
+                            self.accept_video_fragment(&canonical_peer_id, fragment, false)
+                                .await;
+                        }
+                    }
                     // Chat / file / control all carry signed JSON; route
                     // through the common inbound path (signature + replay +
                     // freshness checks, then feature dispatch). The channel
@@ -1399,6 +1488,7 @@ impl ConnectionManager {
         let internal_tx = self.internal_tx.clone();
         let relay_signaling_tx = self.relay_signaling_tx.clone();
         let relay_game_tx = self.relay_game_tx.clone();
+        let relay_video_tx = self.relay_video_tx.clone();
         let sn_id_for_task = supernode_id.clone();
         tokio::spawn(async move {
             let client = match QuicRelayClient::connect(
@@ -1406,8 +1496,11 @@ impl ConnectionManager {
                 sn_id_for_task.clone(),
                 &relay_host,
                 relay_port,
-                relay_signaling_tx,
-                Some(relay_game_tx),
+                crate::quic_relay_client::RelayInboundSinks {
+                    signaling: relay_signaling_tx,
+                    game: Some(relay_game_tx),
+                    video: Some(relay_video_tx),
+                },
                 portal_only,
             )
             .await

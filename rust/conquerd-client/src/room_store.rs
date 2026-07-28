@@ -1,10 +1,10 @@
-//! Room store — client-owned, encrypted persistence for voice room definitions.
+﻿//! Room store â€” client-owned, encrypted persistence for voice room definitions.
 //!
 //! The supernode never persists rooms; rooms are client-owned data. When the
 //! client connects to a supernode, saved rooms are sent via `SFU_ROOM_CREATE`
 //! to be recreated on the fly.
 //!
-//! File: `~/.conquerd/my_rooms.dat` — AES-256-GCM envelope keyed by HKDF
+//! File: `~/.conquerd/my_rooms.dat` â€” AES-256-GCM envelope keyed by HKDF
 //! subkey of the user's Identity.
 //!
 //! ## Schema versioning
@@ -96,7 +96,7 @@ impl RoomEntry {
     }
 
     /// Set the room's invite-mint policy (`"owner"` or `"members"`). Empty
-    /// stays empty (interpreted as "unset" — the supernode defaults to
+    /// stays empty (interpreted as "unset" â€” the supernode defaults to
     /// `"owner"`); any non-`"members"` value is left as-is here (normalization
     /// to a known value happens supernode-side).
     pub fn with_invite_policy(mut self, policy: impl Into<String>) -> Self {
@@ -117,7 +117,7 @@ struct StoreData {
     #[serde(default)]
     deleted_ids: Vec<String>,
     /// Owner-held Space trees (Layer 1), keyed on disk by insertion order.
-    /// Additive `#[serde(default)]` field — no schema bump per the file's rule.
+    /// Additive `#[serde(default)]` field â€” no schema bump per the file's rule.
     #[serde(default)]
     spaces: Vec<crate::space::Space>,
 }
@@ -255,10 +255,10 @@ impl RoomStore {
 
     /// Adopt `room_id` as a Room node in the owner's Space for `supernode_id`,
     /// creating the Space (Server root) on first use. The room leaf's `node_id`
-    /// is the existing `room_id` (design §3.3) so live room state and sidebar
+    /// is the existing `room_id` (design Â§3.3) so live room state and sidebar
     /// keys don't churn.
     ///
-    /// `parent_node_id` selects where the room nests: `""` → directly under the
+    /// `parent_node_id` selects where the room nests: `""` â†’ directly under the
     /// Server node (a top-level room); otherwise the given node id (a nested
     /// sub-room under another room). Bumps the epoch, re-signs the root with
     /// `sign` (e.g. `|b| identity.sign(b)`), persists, stamps the stored
@@ -276,7 +276,7 @@ impl RoomStore {
         sign: impl Fn(&[u8]) -> Vec<u8>,
     ) -> Result<crate::space::SignedSpaceRoot> {
         let space_id = Self::space_id_for(owner_pub, supernode_id);
-        // Empty / self-referential parent → nest directly under the Server node.
+        // Empty / self-referential parent â†’ nest directly under the Server node.
         let parent_id = if parent_node_id.is_empty() || parent_node_id == room_id {
             space_id.clone()
         } else {
@@ -366,6 +366,20 @@ impl RoomStore {
 
     /// Merge a room entry with any existing record (keeps non-empty prior fields).
     pub fn upsert(&mut self, entry: RoomEntry) -> Result<()> {
+        if self.merge_in_memory(entry)? {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Merge `entry` into the in-memory map **without persisting**.
+    ///
+    /// Returns whether anything actually changed, so callers can skip the write
+    /// entirely. That matters because [`save`](Self::save) re-serialises,
+    /// re-encrypts and rewrites the *whole* store: a room list arriving with 4
+    /// unchanged rooms previously cost 4 full-file writes for no state change,
+    /// and a reconnect replays that list several times over.
+    fn merge_in_memory(&mut self, entry: RoomEntry) -> Result<bool> {
         if entry.supernode_id.is_empty() {
             return Err(crate::error::ClientError::Store(
                 "room entry missing supernode_id".to_owned(),
@@ -389,7 +403,7 @@ impl RoomStore {
                 && (existing.is_creator || !existing.invite_token.is_empty())
             {
                 // Passive room-list sync must not downgrade a stored private room
-                // back to public — that flips join_room off the invite path and the
+                // back to public â€” that flips join_room off the invite path and the
                 // supernode silently denies SfuJoin for non-members.
                 m.room_type = existing.room_type.clone();
             }
@@ -417,7 +431,52 @@ impl RoomStore {
         } else {
             entry
         };
-        self.add(merged)
+
+        let hide_key = Self::sidebar_hide_key(&merged.supernode_id, &merged.room_id);
+        let was_hidden = self.deleted_ids.remove(&hide_key);
+        let unchanged = self.rooms.get(&key).is_some_and(|cur| *cur == merged);
+        if unchanged && !was_hidden {
+            return Ok(false);
+        }
+
+        info!(
+            "RoomStore: saving room '{}' ({}) on supernode {}",
+            merged.room_name,
+            &merged.room_id[..merged.room_id.len().min(12)],
+            &merged.supernode_id[..merged.supernode_id.len().min(12)]
+        );
+        self.rooms.insert(key, merged);
+        Ok(true)
+    }
+
+    /// Merge many entries, persisting **once** at the end.
+    ///
+    /// The room-list sync path calls this instead of upserting per room: with
+    /// per-room saves, a 4-room list cost 4 whole-file re-encrypts, and a single
+    /// reconnect replayed that list around eleven times â€” 44 rewrites of the
+    /// entire store where at most one was needed.
+    pub fn upsert_many_from_remote(
+        &mut self,
+        entries: impl IntoIterator<Item = RoomEntry>,
+    ) -> Result<()> {
+        let mut dirty = false;
+        for entry in entries {
+            // Same tombstone rule as `upsert_from_remote`: a room the user hid
+            // locally must not be resurrected by a passive list sync.
+            if !entry.supernode_id.is_empty()
+                && self.is_hidden_from_sidebar(&entry.supernode_id, &entry.room_id)
+            {
+                continue;
+            }
+            match self.merge_in_memory(entry) {
+                Ok(changed) => dirty |= changed,
+                Err(e) => warn!("room_store sync from list error: {e}"),
+            }
+        }
+        if dirty {
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// Passive-sync variant of [`upsert`] for the supernode's room list.
@@ -426,7 +485,7 @@ impl RoomStore {
     /// resurrected: [`add`] clears the hide tombstone, so upserting every listed
     /// room would un-hide them all the moment a room list arrives (e.g. right
     /// after accepting an invite). When the room is currently hidden this is a
-    /// no-op — the tombstone and stored entry are left untouched. Explicit user
+    /// no-op â€” the tombstone and stored entry are left untouched. Explicit user
     /// actions (create / join / accept-invite) still go through [`upsert`] and
     /// intentionally un-hide.
     pub fn upsert_from_remote(&mut self, entry: RoomEntry) -> Result<()> {
@@ -703,7 +762,7 @@ mod tests {
             )
             .unwrap();
         let ps = crate::peer_store::PeerStore::open(&id, None).unwrap();
-        // Empty peer store — match by bare supernode_id only.
+        // Empty peer store â€” match by bare supernode_id only.
         let members = vec!["node-A-pub".into(), "node-B-pub".into()];
         let got = store.list_for_cluster_members(&ps, &members);
         assert_eq!(got.len(), 1);
@@ -880,6 +939,129 @@ mod tests {
         let rooms = room_store.list_for_supernode("b64_sn");
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].room_id, "room-1");
+    }
+
+    // â”€â”€ Write amplification on room-list sync â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Re-syncing an unchanged room list must not rewrite the store at all.
+    ///
+    /// Regression guard for a real symptom: on every reconnect the supernode's
+    /// room list was replayed about eleven times, and each listed room did a
+    /// full re-serialise + re-encrypt + whole-file write. Four rooms became
+    /// ~44 rewrites of the entire store, for no state change.
+    #[test]
+    fn resyncing_an_unchanged_list_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+
+        let listing = || {
+            vec![
+                RoomEntry::new("r1", "Alpha").with_supernode("sn-a"),
+                RoomEntry::new("r2", "Beta").with_supernode("sn-a"),
+            ]
+        };
+
+        store.upsert_many_from_remote(listing()).unwrap();
+        let after_first = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let bytes_first = std::fs::read(&path).unwrap();
+
+        // Replay the identical list several times, as a reconnect does.
+        for _ in 0..10 {
+            store.upsert_many_from_remote(listing()).unwrap();
+        }
+
+        let after_replays = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            after_first, after_replays,
+            "an unchanged room list must not touch the file"
+        );
+        assert_eq!(
+            bytes_first,
+            std::fs::read(&path).unwrap(),
+            "store contents must be untouched"
+        );
+    }
+
+    #[test]
+    fn batch_sync_persists_real_changes_once() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+
+        store
+            .upsert_many_from_remote(vec![
+                RoomEntry::new("r1", "Alpha").with_supernode("sn-a"),
+                RoomEntry::new("r2", "Beta").with_supernode("sn-a"),
+            ])
+            .unwrap();
+
+        // Reopening proves the batch actually hit disk â€” batching must not
+        // trade write amplification for lost writes.
+        let reopened = RoomStore::open(&id, Some(&path)).unwrap();
+        let mut names: Vec<String> = reopened
+            .list()
+            .iter()
+            .map(|e| e.room_name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Alpha".to_string(), "Beta".to_string()]);
+    }
+
+    #[test]
+    fn batch_sync_respects_hide_tombstones() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+
+        store
+            .add(RoomEntry::new("r1", "Alpha").with_supernode("sn-a"))
+            .unwrap();
+        store.hide_from_sidebar("sn-a", "r1").unwrap();
+
+        store
+            .upsert_many_from_remote(vec![
+                RoomEntry::new("r1", "Alpha").with_supernode("sn-a"),
+                RoomEntry::new("r2", "Beta").with_supernode("sn-a"),
+            ])
+            .unwrap();
+
+        assert!(
+            store.is_hidden_from_sidebar("sn-a", "r1"),
+            "batch sync must not resurrect a locally hidden room"
+        );
+        assert!(
+            store.list().iter().any(|e| e.room_id == "r2"),
+            "other rooms in the same batch must still be stored"
+        );
+    }
+
+    #[test]
+    fn changed_room_in_batch_triggers_a_write() {
+        let dir = tempdir().unwrap();
+        let id = make_identity();
+        let path = dir.path().join(ROOM_STORE_FILE);
+        let mut store = RoomStore::open(&id, Some(&path)).unwrap();
+
+        store
+            .upsert_many_from_remote(vec![RoomEntry::new("r1", "Alpha").with_supernode("sn-a")])
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // A genuinely new room must still persist.
+        store
+            .upsert_many_from_remote(vec![
+                RoomEntry::new("r1", "Alpha").with_supernode("sn-a"),
+                RoomEntry::new("r9", "Gamma").with_supernode("sn-a"),
+            ])
+            .unwrap();
+
+        assert_ne!(before, std::fs::read(&path).unwrap());
+        let reopened = RoomStore::open(&id, Some(&path)).unwrap();
+        assert!(reopened.list().iter().any(|e| e.room_id == "r9"));
     }
 
     #[test]

@@ -3,6 +3,11 @@
     <qresource prefix="/qt/qml/ConquerD/Client">
         <file alias="icons/mic.svg">qml/icons/mic.svg</file>
         <file alias="icons/mic-off.svg">qml/icons/mic-off.svg</file>
+        <file alias="icons/video.svg">qml/icons/video.svg</file>
+        <file alias="icons/video-off.svg">qml/icons/video-off.svg</file>
+        <file alias="icons/popout.svg">qml/icons/popout.svg</file>
+        <file alias="icons/expand.svg">qml/icons/expand.svg</file>
+        <file alias="icons/collapse.svg">qml/icons/collapse.svg</file>
         <file alias="icons/phone.svg">qml/icons/phone.svg</file>
         <file alias="icons/search.svg">qml/icons/search.svg</file>
         <file alias="icons/attach.svg">qml/icons/attach.svg</file>

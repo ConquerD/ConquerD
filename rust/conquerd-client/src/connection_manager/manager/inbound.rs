@@ -846,6 +846,26 @@ impl ConnectionManager {
             MessageType::SfuFileComplete => {
                 self.handle_sfu_file_complete(&msg).await;
             }
+            MessageType::SfuVideoState => {
+                // A room member's camera turned on or off. Signed and routed
+                // like any signaling message, so the sender is authenticated by
+                // the time we get here.
+                let active = msg
+                    .payload
+                    .get("active")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.emit_event(ConnectionEvent::PeerVideoStateChanged {
+                    peer_id: msg.sender.clone(),
+                    active,
+                });
+            }
+            MessageType::SfuVideoKeyframeRequest => {
+                // A receiver cannot decode and wants a fresh keyframe.
+                self.emit_event(ConnectionEvent::VideoKeyframeRequested {
+                    peer_id: msg.sender.clone(),
+                });
+            }
             MessageType::SfuAudio => {
                 // Inbound room audio relayed by the supernode.  The `sender`
                 // field is the originating peer (preserved by the supernode

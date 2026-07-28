@@ -39,6 +39,7 @@ Rectangle {
             clip: true
             model: ListModel {
                 ListElement { label: "Audio"; icon: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg" }
+                ListElement { label: "Video"; icon: "qrc:/qt/qml/ConquerD/Client/icons/video.svg" }
                 ListElement { label: "Identity"; icon: "qrc:/qt/qml/ConquerD/Client/icons/person.svg" }
                 ListElement { label: "General"; icon: "qrc:/qt/qml/ConquerD/Client/icons/gear.svg" }
                 ListElement { label: "AI"; icon: "qrc:/qt/qml/ConquerD/Client/icons/lightning.svg" }

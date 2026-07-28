@@ -236,23 +236,62 @@ fn voice_aad(conv_id: &str, sender: &str, sequence: u64) -> Vec<u8> {
     aad
 }
 
-/// Seal one Opus frame for `conv_id` into `[epoch:u8][nonce:12][aesgcm(opus)]`.
+/// Which media stream a sealed frame belongs to.
+///
+/// Audio and video each run their own `sequence` counter starting at 0, so
+/// without a domain separator a video frame at `seq = 5` and an audio frame at
+/// `seq = 5` would share identical AAD under the same group key — letting an
+/// attacker substitute one for the other and still pass the GCM tag check.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MediaKind {
+    /// Opus voice frames (`room.audio.sfu`, `core.audio.opus`).
+    Voice,
+    /// VP8 video frames (`room.video.sfu`, `core.video.vp8`).
+    Video,
+}
+
+/// AAD for a media frame, domain-separated by [`MediaKind`].
+///
+/// **`MediaKind::Voice` deliberately appends nothing**, so its bytes stay
+/// identical to what [`voice_aad`] has always produced. That is a wire-format
+/// compatibility requirement, not a stylistic choice: every deployed client
+/// computes the audio AAD the old way, and any change here makes their frames
+/// fail to open — the whole network goes silent through an upgrade.
+///
+/// Putting the kind byte at the *front* would read more cleanly. Do not do it;
+/// it changes the audio bytes. New kinds must only ever *append*.
+fn media_aad(kind: MediaKind, conv_id: &str, sender: &str, sequence: u64) -> Vec<u8> {
+    let mut aad = voice_aad(conv_id, sender, sequence);
+    match kind {
+        MediaKind::Voice => {}
+        MediaKind::Video => aad.push(0x02),
+    }
+    aad
+}
+
+/// Seal one media frame for `conv_id` into `[epoch:u8][nonce:12][aesgcm(pt)]`.
 ///
 /// Returns `None` when `keys` holds no current key for `conv_id` (the caller
 /// then decides whether to drop the frame or fall back to a cleartext path).
 /// The 96-bit nonce is fresh-random per frame, so nonce uniqueness under a
 /// given key does not depend on `sequence`.
-pub fn seal_voice_frame(
+///
+/// For video the caller seals the **whole encoded frame once** and fragments
+/// the resulting ciphertext; fragments are not sealed individually (a partial
+/// frame cannot be decoded anyway, so per-fragment sealing would cost 28 bytes
+/// and one GCM operation per fragment for no benefit).
+pub fn seal_media_frame(
     keys: &dyn GroupKeySource,
+    kind: MediaKind,
     conv_id: &str,
     sender: &str,
     sequence: u64,
-    opus: &[u8],
+    plaintext: &[u8],
 ) -> Option<Vec<u8>> {
     let epoch = keys.current_epoch(conv_id);
     let key = keys.epoch_key(conv_id, epoch)?;
-    let aad = voice_aad(conv_id, sender, sequence);
-    let (nonce, ct) = aesgcm_encrypt(&key, opus, &aad).ok()?;
+    let aad = media_aad(kind, conv_id, sender, sequence);
+    let (nonce, ct) = aesgcm_encrypt(&key, plaintext, &aad).ok()?;
     debug_assert_eq!(nonce.len(), VOICE_NONCE_LEN);
     let mut frame = Vec::with_capacity(VOICE_HEADER_LEN + ct.len());
     frame.push(epoch);
@@ -261,13 +300,15 @@ pub fn seal_voice_frame(
     Some(frame)
 }
 
-/// Open a frame produced by [`seal_voice_frame`], recovering the Opus bytes.
+/// Open a frame produced by [`seal_media_frame`], recovering the plaintext.
 ///
 /// Returns `None` on any failure — short frame, unknown epoch, or a failed GCM
 /// tag (wrong key, tampered ciphertext, or an AAD mismatch: a `conv_id`,
-/// `sender`, or `sequence` that differs from what the sender bound in).
-pub fn open_voice_frame(
+/// `sender`, `sequence`, or [`MediaKind`] that differs from what the sender
+/// bound in).
+pub fn open_media_frame(
     keys: &dyn GroupKeySource,
+    kind: MediaKind,
     conv_id: &str,
     sender: &str,
     sequence: u64,
@@ -280,8 +321,32 @@ pub fn open_voice_frame(
     let nonce = &frame[1..VOICE_HEADER_LEN];
     let ct = &frame[VOICE_HEADER_LEN..];
     let key = keys.epoch_key(conv_id, epoch)?;
-    let aad = voice_aad(conv_id, sender, sequence);
+    let aad = media_aad(kind, conv_id, sender, sequence);
     aesgcm_decrypt(&key, nonce, ct, &aad).ok()
+}
+
+/// Seal one Opus frame. Thin wrapper over [`seal_media_frame`] with
+/// [`MediaKind::Voice`]; the produced bytes are unchanged from before video
+/// existed.
+pub fn seal_voice_frame(
+    keys: &dyn GroupKeySource,
+    conv_id: &str,
+    sender: &str,
+    sequence: u64,
+    opus: &[u8],
+) -> Option<Vec<u8>> {
+    seal_media_frame(keys, MediaKind::Voice, conv_id, sender, sequence, opus)
+}
+
+/// Open a frame produced by [`seal_voice_frame`], recovering the Opus bytes.
+pub fn open_voice_frame(
+    keys: &dyn GroupKeySource,
+    conv_id: &str,
+    sender: &str,
+    sequence: u64,
+    frame: &[u8],
+) -> Option<Vec<u8>> {
+    open_media_frame(keys, MediaKind::Voice, conv_id, sender, sequence, frame)
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +497,70 @@ mod tests {
         let keys = owner_group();
         let frame = seal_voice_frame(&keys, CONV, SENDER, 7, b"data").unwrap();
         assert!(open_voice_frame(&keys, CONV, SENDER, 8, &frame).is_none());
+    }
+
+    /// GOLDEN: the voice AAD byte layout is frozen. Every deployed client
+    /// computes these exact bytes; changing them makes existing peers fail to
+    /// open our frames (and us theirs), so the network goes silent through an
+    /// upgrade. If this test fails, the change is wrong — not the test.
+    #[test]
+    fn voice_aad_bytes_are_frozen() {
+        let aad = voice_aad("room-1", "alice", 7);
+        assert_eq!(
+            aad,
+            vec![
+                0, 0, 0, 6, // conv_id length (u32 BE)
+                b'r', b'o', b'o', b'm', b'-', b'1', //
+                0, 0, 0, 5, // sender length (u32 BE)
+                b'a', b'l', b'i', b'c', b'e', //
+                0, 0, 0, 0, 0, 0, 0, 7, // sequence (u64 BE)
+            ]
+        );
+    }
+
+    /// GOLDEN: `MediaKind::Voice` must append nothing, so the wrapper stays
+    /// byte-identical to the pre-video `voice_aad`.
+    #[test]
+    fn voice_media_aad_is_identical_to_legacy_voice_aad() {
+        assert_eq!(
+            media_aad(MediaKind::Voice, CONV, SENDER, 42),
+            voice_aad(CONV, SENDER, 42)
+        );
+    }
+
+    #[test]
+    fn video_aad_differs_from_voice_at_same_seq() {
+        let voice = media_aad(MediaKind::Voice, CONV, SENDER, 5);
+        let video = media_aad(MediaKind::Video, CONV, SENDER, 5);
+        assert_ne!(voice, video);
+        // Video appends its separator, so voice remains a strict prefix.
+        assert_eq!(&video[..voice.len()], &voice[..]);
+        assert_eq!(video.len(), voice.len() + 1);
+    }
+
+    /// The substitution attack the domain separator exists to stop: a video
+    /// frame at sequence N must not open as audio at sequence N, or vice
+    /// versa, even though both are sealed under the same group key.
+    #[test]
+    fn video_frame_cannot_be_substituted_for_voice_frame() {
+        let keys = owner_group();
+        let payload = b"frame bytes";
+
+        let video = seal_media_frame(&keys, MediaKind::Video, CONV, SENDER, 5, payload).unwrap();
+        assert!(open_voice_frame(&keys, CONV, SENDER, 5, &video).is_none());
+
+        let voice = seal_voice_frame(&keys, CONV, SENDER, 5, payload).unwrap();
+        assert!(open_media_frame(&keys, MediaKind::Video, CONV, SENDER, 5, &voice).is_none());
+    }
+
+    #[test]
+    fn video_frame_roundtrips() {
+        let keys = owner_group();
+        let encoded = b"\x9d\x01\x2a fake vp8 keyframe \x00\xff";
+        let sealed = seal_media_frame(&keys, MediaKind::Video, CONV, SENDER, 3, encoded).unwrap();
+        assert_eq!(sealed[0], 0); // epoch 0
+        let out = open_media_frame(&keys, MediaKind::Video, CONV, SENDER, 3, &sealed).unwrap();
+        assert_eq!(out, encoded);
     }
 
     #[test]

@@ -1378,6 +1378,8 @@ mod tests {
             conquerd_features::wellknown::core_file_v1(),
             conquerd_features::wellknown::game_relay_v1(),
             conquerd_features::wellknown::room_audio_sfu(),
+            conquerd_features::wellknown::core_video_vp8(),
+            conquerd_features::wellknown::room_video_sfu(),
         ] {
             let _ = r.upsert(cap);
         }
@@ -1470,6 +1472,56 @@ mod tests {
         // Untagged opaque payload still accounts as game.relay for quota.
         let (fid, _) = relay_datagram_feature(b"opaque-game-payload");
         assert_eq!(fid, "game.relay.v1");
+
+        // Video rides its own fixed tags, so a congested video stream is
+        // metered (and shed) independently of the call audio beside it.
+        let (fid, _) = relay_datagram_feature(&encode_frame(
+            conquerd_features::channel_frame::VIDEO_TAG,
+            b"fragment",
+        ));
+        assert_eq!(fid, "core.video.vp8");
+
+        let (fid, _) = relay_datagram_feature(&encode_frame(
+            conquerd_features::channel_frame::ROOM_VIDEO_TAG,
+            b"fragment",
+        ));
+        assert_eq!(fid, "room.video.sfu");
+    }
+
+    /// Room video needs **no dedicated arm** in `handle_datagram`: it is not
+    /// `room.audio.sfu` (so it skips the SFU bridge, which would try to parse
+    /// it as JSON and fail) and not `game.relay.v1` (so it skips the game
+    /// session lookup), leaving it to the generic broadcast that forwards to
+    /// `st.rooms[from.room_id]` opaquely.
+    ///
+    /// This test exists because that behaviour is load-bearing but invisible:
+    /// adding an arm above the generic broadcast, or making the audio bridge
+    /// match more broadly, would silently break room video.
+    #[test]
+    fn room_video_is_forwarded_opaquely_without_a_dedicated_arm() {
+        use conquerd_features::channel_frame::{encode_frame, ROOM_VIDEO_TAG};
+
+        // A binary fragment: deliberately not valid UTF-8, let alone JSON, so
+        // any code path that tries to parse it would be caught here.
+        let fragment = [0x01u8, 0xFF, 0x00, 0x80, 0xFE];
+        let payload = encode_frame(ROOM_VIDEO_TAG, &fragment);
+
+        let (fid, bytes) = relay_datagram_feature(&payload);
+        assert_eq!(fid, "room.video.sfu");
+        assert_eq!(bytes, payload.len());
+
+        // Neither special-case arm in `handle_datagram` may claim it.
+        assert_ne!(fid, "room.audio.sfu");
+        assert_ne!(fid, "game.relay.v1");
+
+        // The JSON room-id extractor must decline rather than panic, since it
+        // is only reached for room audio.
+        assert_eq!(room_id_from_room_audio_payload(&payload), None);
+
+        // Fan-out re-frames with the sender index and leaves the body intact.
+        let fwd = wire::build_forwarded_datagram(3, &payload);
+        assert_eq!(fwd[0], 3);
+        assert_eq!(&fwd[1..], &payload[..]);
     }
 
     // ── QUICRelayServer (no live QUIC needed) ───────────────────────────────

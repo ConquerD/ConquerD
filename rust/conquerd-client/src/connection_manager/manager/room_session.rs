@@ -41,7 +41,7 @@ use super::invite::{RoomInviteEntry, ROOM_INVITE_SCHEMA};
 use super::{
     unix_now_f64, PendingGroupKeyAck, PendingRoomJoinRetry, GROUP_KEY_MAX_ATTEMPTS,
     GROUP_KEY_RETRY_INTERVAL_MS, ROOM_JOIN_MAX_ATTEMPTS, ROOM_JOIN_RETRY_BASE_MS,
-    ROOM_JOIN_RETRY_MAX_MS,
+    ROOM_JOIN_RETRY_MAX_MS, VIDEO_KEYFRAME_REQUEST_INTERVAL,
 };
 
 /// The room group-key "elected keyer" tie-break: `me` acts iff it is present
@@ -996,6 +996,198 @@ impl ConnectionManager {
     pub(super) fn check_room_audio_outbound_quota(&self, target: &str, byte_count: usize) -> bool {
         self.feature_registry
             .gate_through_feature("room.audio.sfu", target, byte_count)
+    }
+
+    /// Ask one peer for a keyframe, at most once per second per peer.
+    ///
+    /// The rate limit is the whole point of routing this through the manager:
+    /// the decode thread will ask on every failed frame, and at 30 fps with
+    /// several receivers that becomes a storm which makes the loss it is trying
+    /// to recover from worse.
+    pub(super) async fn send_video_keyframe_request(&mut self, peer_id: &str) {
+        // Rate-limited before the routing decision, so a direct call gets the
+        // same storm protection a room does.
+        let now = std::time::Instant::now();
+        if let Some(last) = self.video_keyframe_last.get(peer_id) {
+            if now.duration_since(*last) < VIDEO_KEYFRAME_REQUEST_INTERVAL {
+                return;
+            }
+        }
+        self.video_keyframe_last.insert(peer_id.to_owned(), now);
+
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::SfuVideoKeyframeRequest, sender);
+
+        if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
+            // Direct 1:1 call: ask the peer straight out. The receiver's
+            // handler keys off `msg.sender`, so it does not care which
+            // transport carried the request.
+            msg.target = Some(peer_id.to_owned());
+        } else {
+            let room_id = self.current_room_id.clone();
+            let supernode_id = self.live_room_route(&self.current_supernode_id.clone());
+            msg.target = Some(supernode_id);
+            msg.payload
+                .insert("room_id".to_owned(), Value::String(room_id));
+            // The supernode relays to this member; on the direct path the
+            // target is the envelope target, so this key is room-only.
+            msg.payload
+                .insert("target_peer".to_owned(), Value::String(peer_id.to_owned()));
+        }
+        self.dispatch_outbound(msg).await;
+    }
+
+    /// Tell the room, or a single peer, that our camera turned on or off.
+    ///
+    /// Uses the signed JSON signaling envelope, unlike the media frames
+    /// themselves: this is one message per toggle, so the envelope's cost is
+    /// irrelevant and its authenticity guarantees come for free.
+    ///
+    /// `direct_peer` picks the route — see
+    /// [`ConnectionCommand::SendVideoState`](crate::connection_manager::events::ConnectionCommand::SendVideoState).
+    /// The same `SfuVideoState` type serves both because the receiver's handler
+    /// reads only `active` and the signed `sender`; a separate direct-only
+    /// message type would be a second wire format conveying identical facts.
+    pub(super) async fn send_video_state(&mut self, active: bool, direct_peer: Option<String>) {
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::SfuVideoState, sender);
+
+        match direct_peer {
+            Some(peer) if !peer.is_empty() => {
+                msg.target = Some(peer);
+            }
+            _ => {
+                if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
+                    return;
+                }
+                let room_id = self.current_room_id.clone();
+                let supernode_id = self.live_room_route(&self.current_supernode_id.clone());
+                msg.target = Some(supernode_id);
+                msg.payload
+                    .insert("room_id".to_owned(), Value::String(room_id));
+            }
+        }
+        msg.payload.insert("active".to_owned(), Value::Bool(active));
+
+        // dispatch_outbound signs and routes (relay stream or WS fallback).
+        self.dispatch_outbound(msg).await;
+    }
+
+    pub(super) fn check_room_video_outbound_quota(&self, target: &str, byte_count: usize) -> bool {
+        self.feature_registry
+            .gate_through_feature("room.video.sfu", target, byte_count)
+    }
+
+    /// Send one encoded video frame to the supernode for SFU fan-out.
+    ///
+    /// Structurally different from [`send_room_audio`](Self::send_room_audio)
+    /// in three ways, each deliberate:
+    ///
+    /// 1. **No JSON envelope.** The payload is the binary fragment format from
+    ///    [`crate::video::fragment`]. The signed-JSON framing room audio uses
+    ///    would eat over half of each 1200-byte datagram and force the
+    ///    supernode to `serde_json`-parse every datagram — at video frame rates
+    ///    that is a serious cluster-wide CPU regression.
+    /// 2. **One signature per frame, not per datagram.** The group key is
+    ///    shared, so GCM alone cannot tell room members apart; the signature is
+    ///    what preserves per-sender authenticity. It rides fragment 0.
+    /// 3. **No WebSocket fallback.** A late video frame is worth less than the
+    ///    head-of-line blocking that reliable delivery would impose, so a frame
+    ///    that cannot go out as datagrams is simply dropped.
+    ///
+    /// Quota is charged once for the whole frame's wire size, including every
+    /// fragment header, so it matches what the supernode meters inbound.
+    pub(super) async fn send_room_video(&mut self, encoded: Vec<u8>, keyframe: bool) {
+        if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
+            return; // Not in a room
+        }
+        let sender = self.identity.public_id();
+        let room_id = self.current_room_id.clone();
+        let supernode_id = self.live_room_route(&self.current_supernode_id.clone());
+
+        // Same fail-closed rule as audio: never emit content the relay could
+        // derive. The deterministic fallback key is a function of room_id, so
+        // it is not supernode-opaque.
+        if !may_send_room_e2e_content(self.group_keys.has_real_key(&room_id)) {
+            warn!("[room.video.sfu] no real group key yet; dropping frame");
+            return;
+        }
+
+        let seq = self.room_video_seq;
+        let Some(sealed) = crate::group_key::seal_media_frame(
+            &self.group_keys,
+            crate::group_key::MediaKind::Video,
+            &room_id,
+            &sender,
+            u64::from(seq),
+            &encoded,
+        ) else {
+            warn!("[room.video.sfu] seal failed; dropping frame");
+            return;
+        };
+
+        let signing_bytes =
+            crate::video::video_frame_signing_bytes(&room_id, &sender, seq, &sealed);
+        let sig_vec = self.identity.sign(&signing_bytes);
+        let Ok(signature) = <[u8; crate::video::fragment::SIGNATURE_LEN]>::try_from(&sig_vec[..])
+        else {
+            warn!("[room.video.sfu] unexpected signature length; dropping frame");
+            return;
+        };
+
+        // Relay session decides the real datagram budget; without one there is
+        // nowhere to send anyway.
+        let Some(relay) = self
+            .quic_relays
+            .get(&supernode_id)
+            .filter(|r| r.is_alive())
+            .cloned()
+        else {
+            debug!("[room.video.sfu] no live relay session; dropping frame");
+            return;
+        };
+
+        let Some(fragments) = crate::video::fragment::fragment_frame(
+            &sender,
+            seq,
+            keyframe,
+            &signature,
+            &sealed,
+            relay.max_video_fragment_len(),
+        ) else {
+            warn!(
+                "[room.video.sfu] frame of {}B does not fit the fragment budget; dropping",
+                sealed.len()
+            );
+            return;
+        };
+
+        // Charge the whole frame at once. Per-fragment gating would let a
+        // partially-sent frame through, which wastes bandwidth on something the
+        // receiver must discard anyway.
+        let wire_bytes: usize = fragments.iter().map(|f| f.len() + 2).sum();
+        if !self.check_room_video_outbound_quota(&supernode_id, wire_bytes) {
+            debug!(
+                "[room.video.sfu] outbound quota exceeded for {}; dropping frame",
+                &supernode_id[..8.min(supernode_id.len())]
+            );
+            return;
+        }
+
+        self.room_video_seq = self.room_video_seq.wrapping_add(1);
+        let total = fragments.len();
+        let mut sent = 0usize;
+        for fragment in &fragments {
+            if relay.send_room_video(fragment) {
+                sent += 1;
+            }
+        }
+        if sent != total {
+            // Partial sends are expected under congestion; the receiver's
+            // reassembly timeout collects the remains. Logged at debug because
+            // at 30 fps this must never become a per-frame warning.
+            debug!("[room.video.sfu] sent {sent}/{total} fragments for seq {seq}");
+        }
     }
 
     /// Send a room audio frame to the supernode for SFU fan-out.

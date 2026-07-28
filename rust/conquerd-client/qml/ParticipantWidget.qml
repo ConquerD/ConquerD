@@ -42,6 +42,19 @@ Item {
     /// When true, show a name pill on the avatar (room voice rail).
     property bool showNameBubbles: false
 
+    /// Whether this peer is currently sending video. Drives the indicator only —
+    /// video itself never renders in the 200 px rail, but in the expand region
+    /// or a popout window.
+    property bool videoActive: false
+    /// Muted by *this listener*, as opposed to `isMuted` which is the peer's own
+    /// microphone state and is visible to everyone.
+    property bool locallyMuted: false
+
+    /// Right-click: open the shared peer menu.
+    signal contextMenuRequested()
+    /// Clicking the video badge expands this peer — the primary action.
+    signal expandVideoRequested()
+
     readonly property string peerLabelText: {
         if (root.displayName && root.displayName !== "Unknown" && root.displayName !== "")
             return root.displayName
@@ -142,13 +155,79 @@ Item {
         }
     }
 
+    // ── Streaming-video indicator ─────────────────────────────────────────
+    //
+    // Top-right is the only free corner: the muted badge owns bottom-right and
+    // the name pill owns bottom-centre. Deliberately mirrors the muted badge's
+    // size and shape so the two read as one family.
+    Rectangle {
+        id: videoBadge
+        visible: root.videoActive
+        anchors {
+            right: parent.right
+            top: parent.top
+            margins: 4
+        }
+        width: 18
+        height: 18
+        radius: width / 2
+        color: Theme.accent
+
+        Image {
+            anchors.centerIn: parent
+            source: "qrc:/qt/qml/ConquerD/Client/icons/video.svg"
+            sourceSize.width: 12
+            sourceSize.height: 12
+            width: 12
+            height: 12
+            fillMode: Image.PreserveAspectFit
+        }
+
+        TapHandler {
+            acceptedButtons: Qt.LeftButton
+            onTapped: root.expandVideoRequested()
+        }
+        HoverHandler { id: videoHover; cursorShape: Qt.PointingHandCursor }
+
+        ToolTip.text: qsTr("Streaming video — click to expand")
+        ToolTip.visible: videoHover.hovered
+        ToolTip.delay: 300
+    }
+
+    // ── Locally-muted marker ──────────────────────────────────────────────
+    //
+    // Distinct from the peer's own mute badge: this one says "I muted them",
+    // which only this listener can see. Drawn as a ring rather than another
+    // badge so the two are not confusable at a glance.
+    Rectangle {
+        visible: root.locallyMuted
+        anchors.centerIn: parent
+        width: 54
+        height: 54
+        radius: width / 2
+        color: "transparent"
+        border.width: 2
+        border.color: Theme.danger
+        opacity: 0.75
+    }
+
     HoverHandler { id: hover }
+
+    // TapHandler rather than a MouseArea: a full-cover MouseArea would swallow
+    // hover events and kill the tooltip below.
+    TapHandler {
+        acceptedButtons: Qt.RightButton
+        onTapped: root.contextMenuRequested()
+    }
 
     ToolTip {
         visible: hover.hovered
-        text: (root.displayName && root.displayName !== "Unknown" && root.displayName !== "")
-            ? root.displayName
-            : root.peerId
+        text: {
+            var who = (root.displayName && root.displayName !== "Unknown" && root.displayName !== "")
+                ? root.displayName
+                : root.peerId
+            return root.locallyMuted ? who + qsTr(" (muted for you)") : who
+        }
         delay: 300
         timeout: 5000
     }

@@ -15,6 +15,13 @@ mod room_roles {
     pub const AUDIO_LEVEL: i32 = 260;
     pub const IS_SELF: i32 = 261;
     pub const ONLINE: i32 = 262;
+    /// Muted by *this listener* only — distinct from [`MUTED`], which is the
+    /// participant's own microphone state and is visible to everyone.
+    pub const LOCAL_MUTED: i32 = 263;
+    /// This listener's playback volume for the participant (0â€“200, 100 = unity).
+    pub const LOCAL_VOLUME: i32 = 264;
+    /// Whether the participant is currently sending video.
+    pub const VIDEO_ACTIVE: i32 = 265;
 }
 
 #[cxx_qt::bridge]
@@ -77,6 +84,26 @@ pub mod ffi {
         #[rust_name = "set_audio_level"]
         fn setAudioLevel(self: Pin<&mut Self>, peer_id: &QString, level: f32);
 
+        /// Mirror this listener's local mute/volume preference for a peer.
+        #[qinvokable]
+        #[rust_name = "set_local_audio"]
+        fn setLocalAudio(self: Pin<&mut Self>, peer_id: &QString, muted: bool, volume: i32);
+
+        /// Flag whether a peer is currently sending video.
+        #[qinvokable]
+        #[rust_name = "set_video_active"]
+        fn setVideoActive(self: Pin<&mut Self>, peer_id: &QString, active: bool);
+
+        /// Display handle for one peer, or an empty string if unknown.
+        ///
+        /// Exists because a `QAbstractListModel` exposes its roles only to
+        /// delegates — QML code outside a delegate (the video region iterates
+        /// expanded peer ids, not model rows) has no way to read them. Without
+        /// this, such code falls back to showing the raw 44-character peer id.
+        #[qinvokable]
+        #[rust_name = "handle_for"]
+        fn handleFor(&self, peer_id: &QString) -> QString;
+
         #[inherit]
         #[rust_name = "begin_reset_model"]
         fn beginResetModel(self: Pin<&mut Self>);
@@ -107,6 +134,12 @@ fn default_online() -> bool {
     true
 }
 
+/// serde default for `local_volume`: unity, so a producer that omits the field
+/// never accidentally silences a participant.
+fn default_volume() -> i32 {
+    100
+}
+
 #[derive(Clone)]
 pub struct RoomParticipant {
     pub peer_id: String,
@@ -119,6 +152,13 @@ pub struct RoomParticipant {
     /// this is normally `true`; it exists so the members list can render an
     /// online/offline indicator without inventing UI-only state.
     pub online: bool,
+    /// Muted by this listener only. Never sent to the peer.
+    pub local_muted: bool,
+    /// This listener's playback volume for this peer (100 = unity).
+    pub local_volume: i32,
+    /// Whether this peer is currently sending video, which drives the voice
+    /// rail's streaming indicator.
+    pub video_active: bool,
 }
 
 impl Default for RoomParticipant {
@@ -131,6 +171,9 @@ impl Default for RoomParticipant {
             audio_level: 0.0,
             is_self: false,
             online: true,
+            local_muted: false,
+            local_volume: 100,
+            video_active: false,
         }
     }
 }
@@ -143,6 +186,15 @@ pub struct RoomModelRust {
 impl ffi::RoomModel {
     fn row_count(&self, _parent: &QModelIndex) -> i32 {
         self.participants.len() as i32
+    }
+
+    fn handle_for(&self, peer_id: &QString) -> QString {
+        let wanted = peer_id.to_string();
+        self.participants
+            .iter()
+            .find(|p| p.peer_id == wanted)
+            .map(|p| QString::from(p.handle.as_str()))
+            .unwrap_or_default()
     }
 
     fn participant_count(&self) -> i32 {
@@ -160,6 +212,9 @@ impl ffi::RoomModel {
             r if r == room_roles::AUDIO_LEVEL => (&p.audio_level).into(),
             r if r == room_roles::IS_SELF => QVariant::from(&p.is_self),
             r if r == room_roles::ONLINE => QVariant::from(&p.online),
+            r if r == room_roles::LOCAL_MUTED => QVariant::from(&p.local_muted),
+            r if r == room_roles::LOCAL_VOLUME => QVariant::from(&p.local_volume),
+            r if r == room_roles::VIDEO_ACTIVE => QVariant::from(&p.video_active),
             _ => QVariant::default(),
         }
     }
@@ -173,6 +228,9 @@ impl ffi::RoomModel {
         h.insert(room_roles::AUDIO_LEVEL, QByteArray::from("audioLevel"));
         h.insert(room_roles::IS_SELF, QByteArray::from("isSelf"));
         h.insert(room_roles::ONLINE, QByteArray::from("online"));
+        h.insert(room_roles::LOCAL_MUTED, QByteArray::from("localMuted"));
+        h.insert(room_roles::LOCAL_VOLUME, QByteArray::from("localVolume"));
+        h.insert(room_roles::VIDEO_ACTIVE, QByteArray::from("videoActive"));
         h
     }
 
@@ -192,6 +250,15 @@ impl ffi::RoomModel {
             is_self: bool,
             #[serde(default = "default_online")]
             online: bool,
+            // These three are listener-local UI state rather than roster
+            // facts, so a producer that omits them gets sensible defaults
+            // instead of silently muting or hiding someone.
+            #[serde(default)]
+            local_muted: bool,
+            #[serde(default = "default_volume")]
+            local_volume: i32,
+            #[serde(default)]
+            video_active: bool,
         }
         if let Ok(rows) = serde_json::from_str::<Vec<Row>>(&json.to_string()) {
             self.as_mut().begin_reset_model();
@@ -205,6 +272,9 @@ impl ffi::RoomModel {
                     audio_level: r.audio_level,
                     is_self: r.is_self,
                     online: r.online,
+                    local_muted: r.local_muted,
+                    local_volume: r.local_volume,
+                    video_active: r.video_active,
                 })
                 .collect();
             self.as_mut().end_reset_model();
@@ -255,6 +325,55 @@ impl ffi::RoomModel {
             }
             self.as_mut().rust_mut().participants[idx].audio_level = next;
             emit_row_changed(self.as_mut(), idx as i32, &[room_roles::AUDIO_LEVEL]);
+        }
+    }
+
+    /// Record this listener's mute/volume preference for one participant.
+    ///
+    /// Purely a UI mirror: the audio path is driven separately by
+    /// `CallCommand::SetPeerMuted` / `SetPeerVolume`, so this only keeps the
+    /// checkmark and slider in the context menu consistent.
+    fn set_local_audio(mut self: Pin<&mut Self>, peer_id: &QString, muted: bool, volume: i32) {
+        let id = peer_id.to_string();
+        if let Some(idx) = self
+            .rust()
+            .participants
+            .iter()
+            .position(|p| p.peer_id == id)
+        {
+            let volume = volume.clamp(0, 200);
+            let current = &self.rust().participants[idx];
+            if current.local_muted == muted && current.local_volume == volume {
+                return;
+            }
+            {
+                let p = &mut self.as_mut().rust_mut().participants[idx];
+                p.local_muted = muted;
+                p.local_volume = volume;
+            }
+            emit_row_changed(
+                self.as_mut(),
+                idx as i32,
+                &[room_roles::LOCAL_MUTED, room_roles::LOCAL_VOLUME],
+            );
+        }
+    }
+
+    /// Flag whether a participant is sending video, driving the voice-rail
+    /// indicator. Deduped because the underlying signal is state, not an event.
+    fn set_video_active(mut self: Pin<&mut Self>, peer_id: &QString, active: bool) {
+        let id = peer_id.to_string();
+        if let Some(idx) = self
+            .rust()
+            .participants
+            .iter()
+            .position(|p| p.peer_id == id)
+        {
+            if self.rust().participants[idx].video_active == active {
+                return;
+            }
+            self.as_mut().rust_mut().participants[idx].video_active = active;
+            emit_row_changed(self.as_mut(), idx as i32, &[room_roles::VIDEO_ACTIVE]);
         }
     }
 }

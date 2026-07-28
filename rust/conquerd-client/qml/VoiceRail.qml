@@ -8,6 +8,7 @@
 // panel expands and contracts smoothly.
 
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import ConquerD.Client 1.0
@@ -47,6 +48,9 @@ Rectangle {
 
     /// Whether the local mic is muted.
     property bool muted: false
+
+    /// Whether the local camera is on.
+    property bool videoOn: false
 
     /// Elapsed call seconds (driven by bridge.call_duration_secs).
     property int durationSecs: 0
@@ -148,6 +152,21 @@ Rectangle {
 
     signal endCallRequested()
     signal muteToggled(bool muted)
+    /// Camera button pressed; `on` is the requested new state.
+    signal videoToggled(bool on)
+
+    /// A peer's video should be shown in the centre expand region.
+    signal expandVideoRequested(string peerId)
+    /// A peer's video should be shown in its own detached window.
+    signal popoutVideoRequested(string peerId)
+
+    /// Peers currently expanded in the centre region, so the menu can offer
+    /// "Collapse" instead of "Expand" for those already showing.
+    property var expandedPeers: []
+
+    function isExpanded(pid) {
+        return root.expandedPeers.indexOf(pid) !== -1
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────
     function pad(n) { return n < 10 ? "0" + n : n.toString() }
@@ -157,6 +176,100 @@ Rectangle {
         anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
         width: 1
         color: Theme.divider
+    }
+
+    // ── Shared peer context menu ──────────────────────────────────────────
+    //
+    // One instance for the whole rail, retargeted before each popup(). Putting
+    // a Menu inside the Repeater delegate would create one per participant.
+    Menu {
+        id: peerMenu
+
+        property string targetPeerId: ""
+        property string targetName: ""
+        property bool targetLocalMuted: false
+        property int targetVolume: 100
+        property bool targetVideoActive: false
+        property bool targetIsSelf: false
+
+        function openFor(pid, name, muted, volume, videoActive, isSelf) {
+            peerMenu.targetPeerId = pid
+            peerMenu.targetName = name
+            peerMenu.targetLocalMuted = muted
+            peerMenu.targetVolume = volume
+            peerMenu.targetVideoActive = videoActive
+            peerMenu.targetIsSelf = isSelf
+            peerMenu.popup()
+        }
+
+        MenuItem {
+            // Muting yourself locally would be meaningless — you don't hear
+            // your own playback — so the entry is disabled rather than absent,
+            // keeping the menu's shape stable between peers.
+            enabled: !peerMenu.targetIsSelf
+            checkable: true
+            checked: peerMenu.targetLocalMuted
+            text: qsTr("Mute for me")
+            onTriggered: {
+                var next = !peerMenu.targetLocalMuted
+                peerMenu.targetLocalMuted = next
+                backend.setPeerAudioPref(peerMenu.targetPeerId, next, peerMenu.targetVolume)
+                if (root.participantModel && root.participantModel.setLocalAudio)
+                    root.participantModel.setLocalAudio(peerMenu.targetPeerId, next, peerMenu.targetVolume)
+            }
+        }
+
+        MenuItem {
+            enabled: !peerMenu.targetIsSelf
+            text: qsTr("Volume…")
+            onTriggered: volumePopup.openFor(
+                peerMenu.targetPeerId, peerMenu.targetName, peerMenu.targetVolume)
+        }
+
+        MenuSeparator {}
+
+        MenuItem {
+            // Collapsing stays available after the camera goes off. Gating both
+            // directions on `targetVideoActive` stranded the tile: the peer
+            // stops sharing, the entry greys out, and the only control that
+            // removes the tile is gone. Expanding still requires a live camera.
+            enabled: peerMenu.targetVideoActive || root.isExpanded(peerMenu.targetPeerId)
+            text: root.isExpanded(peerMenu.targetPeerId)
+                ? qsTr("Collapse video")
+                : qsTr("Expand video")
+            onTriggered: root.expandVideoRequested(peerMenu.targetPeerId)
+        }
+
+        MenuItem {
+            enabled: peerMenu.targetVideoActive
+            text: qsTr("Pop out video")
+            onTriggered: root.popoutVideoRequested(peerMenu.targetPeerId)
+        }
+
+        MenuSeparator {}
+
+        MenuItem {
+            text: qsTr("Copy Peer ID")
+            onTriggered: backend.copyToClipboard(peerMenu.targetPeerId)
+        }
+    }
+
+    PeerVolumePopup {
+        id: volumePopup
+        x: Math.round((root.width - width) / 2)
+        y: Math.round((root.height - height) / 2)
+        onVolumeChanged: function(pid, pct) {
+            // Unmute implicitly when the listener raises the volume — leaving
+            // someone muted while their slider reads 80% would be baffling.
+            var muted = pct === 0
+            backend.setPeerAudioPref(pid, muted, pct)
+            if (root.participantModel && root.participantModel.setLocalAudio)
+                root.participantModel.setLocalAudio(pid, muted, pct)
+            if (peerMenu.targetPeerId === pid) {
+                peerMenu.targetVolume = pct
+                peerMenu.targetLocalMuted = muted
+            }
+        }
     }
 
     ColumnLayout {
@@ -305,6 +418,17 @@ Rectangle {
                     isSelf:      model.isSelf
                     ringStore:   root.ringStateForPeer(model.peerId)
                     showNameBubbles: root.showNameBubbles
+                    videoActive: model.videoActive === true
+                    locallyMuted: model.localMuted === true
+
+                    onContextMenuRequested: peerMenu.openFor(
+                        model.peerId,
+                        model.handle || model.peerId || "",
+                        model.localMuted === true,
+                        model.localVolume === undefined ? 100 : model.localVolume,
+                        model.videoActive === true,
+                        model.isSelf === true)
+                    onExpandVideoRequested: root.expandVideoRequested(model.peerId)
                 }
             }
         }
@@ -386,6 +510,36 @@ Rectangle {
                     ToolTip.text: root.muted ? "Unmute microphone" : "Mute microphone"
                     ToolTip.visible: muteHover.hovered
                     HoverHandler { id: muteHover }
+                }
+
+                // Camera toggle
+                Rectangle {
+                    width: 36; height: 36; radius: Theme.radiusPill
+                    color: root.videoOn ? Theme.accent : Theme.bg2
+
+                    Behavior on color { ColorAnimation { duration: Theme.animFast } }
+
+                    Image {
+                        anchors.centerIn: parent
+                        source: root.videoOn
+                            ? "qrc:/qt/qml/ConquerD/Client/icons/video.svg"
+                            : "qrc:/qt/qml/ConquerD/Client/icons/video-off.svg"
+                        sourceSize.width: 18
+                        sourceSize.height: 18
+                        width: 18
+                        height: 18
+                        fillMode: Image.PreserveAspectFit
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.videoToggled(!root.videoOn)
+                    }
+
+                    ToolTip.text: root.videoOn ? qsTr("Turn off camera") : qsTr("Turn on camera")
+                    ToolTip.visible: camHover.hovered
+                    HoverHandler { id: camHover }
                 }
 
                 Item { Layout.fillWidth: true }

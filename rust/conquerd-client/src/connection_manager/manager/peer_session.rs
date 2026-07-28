@@ -37,7 +37,7 @@ use super::ConnectionManager;
 
 use super::{
     unix_now_f64, AUDIO_CHANNEL_TAG, DEFAULT_QUIC_LISTENER_PORT, PEER_RECONNECT_MAX_BACKOFF_S,
-    QUIC_PORT_FILE, QUIC_PORT_SEARCH_LIMIT,
+    QUIC_PORT_FILE, QUIC_PORT_SEARCH_LIMIT, VIDEO_CHANNEL_TAG,
 };
 
 pub fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
@@ -593,6 +593,92 @@ impl ConnectionManager {
     pub(super) fn check_audio_quota(&self, target: &str, byte_count: usize) -> bool {
         self.feature_registry
             .gate_through_feature("core.audio.opus", target, byte_count)
+    }
+
+    #[inline]
+    pub(super) fn check_video_quota(&self, target: &str, byte_count: usize) -> bool {
+        self.feature_registry
+            .gate_through_feature("core.video.vp8", target, byte_count)
+    }
+
+    /// Send one encoded video frame to a directly-connected peer.
+    ///
+    /// Extends the same documented bypass as
+    /// [`send_audio_datagram`](Self::send_audio_datagram) — a dedicated low tag
+    /// rather than the generic feature-datagram multiplexer — for the same
+    /// real-time reasons, with capability negotiation (`CoreVideoVp8Module`)
+    /// and outbound quota still honoured.
+    ///
+    /// Two differences from the audio path:
+    ///
+    /// * One frame becomes several datagrams, so it is fragmented first.
+    /// * **The frame is not app-layer encrypted**, matching direct audio: on a
+    ///   direct session confidentiality comes from the QUIC mTLS channel, and
+    ///   there is no untrusted relay in the middle to hide content from. Room
+    ///   video, which does traverse a relay, is sealed — see `send_room_video`.
+    ///
+    /// The per-frame signature is still attached even though mTLS already
+    /// authenticates the peer. It is cheap at frame rates (tens of signatures a
+    /// second) and it means the receiver runs exactly one verification path
+    /// instead of branching on how the frame arrived.
+    pub(super) async fn send_video_datagram(
+        &mut self,
+        peer_id: &str,
+        encoded: Vec<u8>,
+        keyframe: bool,
+    ) {
+        // Clone the sender handle so the `self.peers` borrow ends before the
+        // per-peer sequence counter is advanced below.
+        let Some(qtx) = self.peers.get(peer_id).and_then(|c| c.quic_out_tx.clone()) else {
+            return; // No QUIC (or no peer): drop. Video never falls back to WS.
+        };
+
+        let sender = self.identity.public_id();
+        let seq = self.direct_video_seq.get(peer_id).copied().unwrap_or(0);
+        let conv_id = crate::video::direct_conv_id(&sender, peer_id);
+        let signing_bytes =
+            crate::video::video_frame_signing_bytes(&conv_id, &sender, seq, &encoded);
+        let sig_vec = self.identity.sign(&signing_bytes);
+        let Ok(signature) = <[u8; crate::video::fragment::SIGNATURE_LEN]>::try_from(&sig_vec[..])
+        else {
+            return;
+        };
+
+        // One byte of channel tag rides ahead of each fragment.
+        let budget = crate::video::DEFAULT_MAX_DATAGRAM.saturating_sub(1);
+        let Some(fragments) = crate::video::fragment::fragment_frame(
+            &sender, seq, keyframe, &signature, &encoded, budget,
+        ) else {
+            warn!(
+                "[core.video.vp8] frame of {}B does not fit the fragment budget; dropping",
+                encoded.len()
+            );
+            return;
+        };
+
+        // Gate the whole frame: a half-sent frame is bandwidth spent on
+        // something the receiver is guaranteed to discard.
+        let wire_bytes: usize = fragments.iter().map(|f| f.len() + 1).sum();
+        if !self.check_video_quota(peer_id, wire_bytes) {
+            debug!(
+                "[core.video.vp8] outbound quota exceeded for {}; dropping frame",
+                &peer_id[..8.min(peer_id.len())]
+            );
+            return;
+        }
+
+        self.direct_video_seq
+            .insert(peer_id.to_owned(), seq.wrapping_add(1));
+
+        for fragment in fragments {
+            let mut framed = Vec::with_capacity(1 + fragment.len());
+            framed.push(VIDEO_CHANNEL_TAG);
+            framed.extend_from_slice(&fragment);
+            if qtx.try_send(PeerOutbound::Datagram(framed)).is_err() {
+                use super::super::internal::drop_metrics;
+                drop_metrics::note(&drop_metrics::PEER_OUTBOUND);
+            }
+        }
     }
 
     /// Emit a consolidated [`ConnectionEvent::SessionStateUpdate`] for `peer_id`

@@ -69,6 +69,8 @@ pub mod ffi {
         #[qproperty(f32, mic_level)]
         /// True while a microphone test is in progress.
         #[qproperty(bool, mic_test_active)]
+        /// True while the local camera is capturing and sending.
+        #[qproperty(bool, video_active)]
         type AppBridge = super::AppBridgeRust;
 
         // ── Signals ───────────────────────────────────────────────────────
@@ -654,6 +656,12 @@ pub mod ffi {
         #[rust_name = "peer_level_changed"]
         fn peerLevelChanged(self: Pin<&mut AppBridge>, peer_id: QString, level: f32);
 
+        /// Emitted when a room peer's camera turns on or off. Drives the
+        /// voice-rail streaming indicator.
+        #[qsignal]
+        #[rust_name = "peer_video_state_changed"]
+        fn peerVideoStateChanged(self: Pin<&mut AppBridge>, peer_id: QString, active: bool);
+
         /// Start a microphone test: starts audio capture and emits live level
         /// updates via the `mic_level` property.
         #[qinvokable]
@@ -728,6 +736,50 @@ pub mod ffi {
         #[qinvokable]
         #[rust_name = "list_audio_devices"]
         fn listAudioDevices(self: Pin<&mut AppBridge>) -> QString;
+
+        /// Return available cameras as `{"cameras":[{"id":..,"name":..}]}`.
+        ///
+        /// Empty on platforms without a capture backend, so the settings UI can
+        /// show "no cameras found" rather than failing.
+        #[qinvokable]
+        #[rust_name = "list_video_devices"]
+        fn listVideoDevices(self: Pin<&mut AppBridge>) -> QString;
+
+        /// Turn the local camera on or off.
+        ///
+        /// Starts (or stops) capture+encode on a dedicated thread and announces
+        /// the change to the room so other members' indicators update. Returns
+        /// the resulting state, which may be `false` even when `on` was `true`
+        /// if no camera could be opened.
+        #[qinvokable]
+        #[rust_name = "set_video_enabled"]
+        fn setVideoEnabled(
+            self: Pin<&mut AppBridge>,
+            on: bool,
+            device_id: &QString,
+            quality: &QString,
+        ) -> bool;
+
+        /// Set this listener's local mute / volume for one peer.
+        ///
+        /// Local only: the peer is never told and keeps transmitting. Writes
+        /// through to the audio mixer, mirrors into the room model so the menu
+        /// stays consistent, and persists so the choice survives a restart.
+        #[qinvokable]
+        #[rust_name = "set_peer_audio_pref"]
+        fn setPeerAudioPref(
+            self: Pin<&mut AppBridge>,
+            peer_id: &QString,
+            muted: bool,
+            volume_pct: i32,
+        );
+
+        /// Replay a stored preference blob (`{"<peer>":{"muted":..,"volume":..}}`)
+        /// into the mixer, so choices saved in an earlier session take effect
+        /// when a call starts.
+        #[qinvokable]
+        #[rust_name = "apply_peer_audio_prefs"]
+        fn applyPeerAudioPrefs(self: Pin<&mut AppBridge>, prefs_json: &QString);
 
         /// Return a deterministic SVG identicon for `peer_id`.
         ///
@@ -926,6 +978,16 @@ pub struct AppBridgeRust {
     // Channels to background tasks (populated during initialize_backend)
     conn_cmd_tx: Option<mpsc::Sender<ConnectionCommand>>,
     call_cmd_tx: Option<mpsc::Sender<CallCommand>>,
+    /// Backing field for the `video_active` Q_PROPERTY.
+    video_active: bool,
+    /// Decode thread for inbound video, created lazily on the first frame so
+    /// a client that never receives video never spawns it.
+    video_receiver: Option<crate::video::receiver::VideoReceiver>,
+    /// Running camera capture+encode thread, `None` when the camera is off.
+    ///
+    /// Dropping this stops the thread and releases the device, which is what
+    /// turns the hardware capture light off — so it must not be leaked.
+    video_sender: Option<crate::video::sender::VideoSender>,
     sfu_cmd_tx: Option<mpsc::Sender<SfuCommand>>,
     updater_cmd_tx: Option<mpsc::Sender<crate::github_updater::UpdaterCommand>>,
 
@@ -1263,6 +1325,9 @@ impl Default for AppBridgeRust {
             incoming_call_fallback: None,
             conn_cmd_tx: None,
             call_cmd_tx: None,
+            video_active: false,
+            video_receiver: None,
+            video_sender: None,
             sfu_cmd_tx: None,
             updater_cmd_tx: None,
             my_peer_id: String::new(),
@@ -1878,6 +1943,9 @@ impl ffi::AppBridge {
     }
 
     fn end_call(mut self: Pin<&mut Self>) {
+        // Stop the camera before tearing the call down so a leftover capture
+        // thread cannot keep the hardware light on with nowhere to send.
+        self.as_mut().stop_local_video();
         if let Some(ref tx) = self.rust().call_cmd_tx {
             let _ = tx.try_send(CallCommand::StopAudio);
         }
@@ -1895,10 +1963,15 @@ impl ffi::AppBridge {
         }
         self.as_mut().set_call_state(QString::from("idle"));
         self.as_mut().set_voice_active(false);
+        self.as_mut().reset_inbound_video();
         emit_peers_updated(self.as_mut());
     }
 
     fn leave_room(mut self: Pin<&mut Self>) {
+        // Announce camera-off *before* LeaveRoom so the CM still has room
+        // membership and can fan the SfuVideoState to remaining members.
+        // Order on the same conn_cmd channel is preserved.
+        self.as_mut().stop_local_video();
         let (prev_sn, prev_rid) = {
             let r = self.rust();
             (r.voice_supernode_id.clone(), r.voice_room_id.clone())
@@ -1933,6 +2006,7 @@ impl ffi::AppBridge {
         clear_room_member_presence(&mut self.as_mut().rust_mut());
         self.as_mut().set_in_room(false);
         self.as_mut().set_voice_active(false);
+        self.as_mut().reset_inbound_video();
         emit_peers_updated(self.as_mut());
     }
 
@@ -2335,6 +2409,267 @@ impl ffi::AppBridge {
 
         let json = serde_json::json!({ "inputs": inputs, "outputs": outputs });
         QString::from(json.to_string().as_str())
+    }
+
+    fn set_video_enabled(
+        mut self: Pin<&mut Self>,
+        on: bool,
+        device_id: &QString,
+        quality: &QString,
+    ) -> bool {
+        // Stopping first also covers the restart case (device or quality
+        // changed while running): the old thread must release the camera
+        // before a new one can open it.
+        if let Some(sender) = self.as_mut().rust_mut().video_sender.take() {
+            sender.stop();
+        }
+
+        if !on {
+            self.as_mut().set_video_active(false);
+            self.as_mut().announce_video_state(false);
+            return false;
+        }
+
+        let Some(conn_tx) = self.rust().conn_cmd_tx.clone() else {
+            warn!("[video] cannot start camera before the backend is initialised");
+            return false;
+        };
+
+        let quality = crate::video::sender::Quality::from_name(&quality.to_string());
+        let encoder = match crate::video::mediafoundation::MfEncoder::new(
+            crate::video::mediafoundation::MfEncoderConfig {
+                width: quality.width,
+                height: quality.height,
+                bitrate_bps: quality.bitrate_bps,
+                fps: quality.fps,
+                keyframe_interval_secs: 4,
+            },
+        ) {
+            Ok(e) => {
+                info!("[video] encoder ready ({:?})", e.acceleration());
+                e
+            }
+            Err(e) => {
+                warn!("[video] no usable H.264 encoder: {e}");
+                return false;
+            }
+        };
+
+        // `device_id` doubles as the source selector: a `monitor:` / `window:`
+        // prefix means screen capture, anything else is a camera device id.
+        // One field rather than two because exactly one source is ever live —
+        // the wire format allows a peer only one video stream.
+        let raw_source = device_id.to_string();
+        let source = if raw_source.starts_with("monitor:") || raw_source.starts_with("window:") {
+            crate::video::sender::SourceSpec::Screen {
+                target_id: raw_source,
+            }
+        } else {
+            crate::video::sender::SourceSpec::Camera {
+                device_id: (!raw_source.is_empty()).then_some(raw_source),
+            }
+        };
+
+        // Route frames to the room, or to the one peer of a direct 1:1 call.
+        //
+        // Decided once here rather than per frame: the session cannot change
+        // underneath a running capture, because every path that ends a call or
+        // leaves a room calls `stop_local_video` first. A room takes priority
+        // when both look set, since a direct call that fell back to a temporary
+        // room is genuinely a room session by then.
+        let sink = match self.rust().direct_video_target() {
+            Some(peer_id) => {
+                crate::video::sender::ChannelSink::new(conn_tx, move |encoded, keyframe| {
+                    ConnectionCommand::SendVideoFrame {
+                        peer_id: peer_id.clone(),
+                        encoded,
+                        keyframe,
+                    }
+                })
+            }
+            None => crate::video::sender::ChannelSink::new(conn_tx, |encoded, keyframe| {
+                ConnectionCommand::SendRoomVideo { encoded, keyframe }
+            }),
+        };
+
+        // Our own id, so the capture thread can feed the local preview tile.
+        let preview_id = {
+            let id = self.rust().my_public_id.clone();
+            (!id.is_empty()).then_some(id)
+        };
+        let sender =
+            crate::video::sender::VideoSender::start(source, quality, encoder, sink, preview_id);
+        self.as_mut().rust_mut().video_sender = Some(sender);
+        self.as_mut().set_video_active(true);
+        self.as_mut().announce_video_state(true);
+        true
+    }
+
+    /// Stop the local camera if running and announce camera-off to the room.
+    ///
+    /// Idempotent: safe when video is already off. Used by leave-room / end-call
+    /// so the capture light cannot stay on after the session ends, and so other
+    /// members' indicators clear without waiting for the stream to time out.
+    ///
+    /// The announce is queued on `conn_cmd_tx` and must be issued **before**
+    /// `LeaveRoom` on that same channel so the connection manager still has
+    /// room membership when it fans the state out.
+    fn stop_local_video(mut self: Pin<&mut Self>) {
+        let had_sender = self.rust().video_sender.is_some();
+        let was_active = self.rust().video_active;
+        if let Some(sender) = self.as_mut().rust_mut().video_sender.take() {
+            sender.stop();
+        }
+        if had_sender || was_active {
+            self.as_mut().set_video_active(false);
+            self.as_mut().announce_video_state(false);
+        }
+    }
+
+    /// Drop every inbound decoder and blank every video tile.
+    ///
+    /// Called when the local voice/video session ends so a subsequent join
+    /// cannot reuse stale decoder state (or paint a previous peer's last frame).
+    fn reset_inbound_video(mut self: Pin<&mut Self>) {
+        if let Some(rx) = self.rust().video_receiver.as_ref() {
+            rx.forget_all();
+        }
+        // Drop the thread entirely: leave is rare relative to frames, and a
+        // fresh decode thread on the next inbound frame is cheaper than
+        // keeping an idle one around with leftover COM state.
+        let _ = self.as_mut().rust_mut().video_receiver.take();
+        // Belt-and-braces blank in case the receiver was never started (no
+        // inbound frames this session) but tiles still hold a last frame from
+        // a prior session that shared the process.
+        crate::video::sink::clear_all();
+    }
+
+    /// Drop one peer's decoder and blank their tile(s).
+    ///
+    /// Used when a remote peer leaves the room or turns their camera off.
+    fn forget_peer_video(self: Pin<&mut Self>, peer_id: &str) {
+        if peer_id.is_empty() {
+            return;
+        }
+        if let Some(rx) = self.rust().video_receiver.as_ref() {
+            rx.forget(peer_id);
+        } else {
+            // No decode thread yet — still blank any tile that was showing a
+            // stale frame from an earlier session.
+            crate::video::sink::clear_peer(peer_id);
+        }
+    }
+
+    /// Tell the room our camera state so members' indicators update without
+    /// waiting for (or missing) the first frame.
+    ///
+    /// Always queued when a conn channel exists; the connection manager
+    /// no-ops if we are not currently in a room. The bridge deliberately does
+    /// not gate on `current_room_id` here — leave-room announces off while the
+    /// local voice ids are about to clear, and the CM's own membership is the
+    /// source of truth.
+    fn announce_video_state(self: Pin<&mut Self>, active: bool) {
+        let Some(tx) = self.rust().conn_cmd_tx.clone() else {
+            return;
+        };
+        let direct_peer = self.rust().direct_video_target();
+        let _ = tx.try_send(ConnectionCommand::SendVideoState {
+            active,
+            direct_peer,
+        });
+    }
+
+    fn list_video_devices(self: Pin<&mut Self>) -> QString {
+        let cameras: Vec<serde_json::Value> = crate::video::camera::list_devices()
+            .into_iter()
+            .map(|d| serde_json::json!({ "id": d.id, "name": d.name }))
+            .collect();
+
+        // Screens and windows are enumerated fresh on every call, never cached:
+        // windows open and close constantly, and a stale handle would name a
+        // different window (Windows recycles them) rather than simply failing.
+        #[cfg(target_os = "windows")]
+        let (screens, windows): (Vec<serde_json::Value>, Vec<serde_json::Value>) = {
+            let all = crate::video::screen::list_sources();
+            let to_json = |s: &crate::video::screen::CaptureSource| serde_json::json!({ "id": s.id, "name": s.name });
+            (
+                all.iter().filter(|s| s.is_monitor).map(to_json).collect(),
+                all.iter().filter(|s| !s.is_monitor).map(to_json).collect(),
+            )
+        };
+        #[cfg(not(target_os = "windows"))]
+        let (screens, windows): (Vec<serde_json::Value>, Vec<serde_json::Value>) =
+            (Vec::new(), Vec::new());
+
+        QString::from(
+            serde_json::json!({
+                "cameras": cameras,
+                "screens": screens,
+                "windows": windows,
+            })
+            .to_string()
+            .as_str(),
+        )
+    }
+
+    fn set_peer_audio_pref(self: Pin<&mut Self>, peer_id: &QString, muted: bool, volume_pct: i32) {
+        let id = peer_id.to_string();
+        if id.is_empty() {
+            return;
+        }
+        let volume = volume_pct.clamp(0, 200);
+
+        // 1. Drive the mixer.
+        if let Some(tx) = self.rust().call_cmd_tx.clone() {
+            let _ = tx.try_send(CallCommand::SetPeerMuted {
+                peer_id: id.clone(),
+                muted,
+            });
+            let _ = tx.try_send(CallCommand::SetPeerVolume {
+                peer_id: id.clone(),
+                pct: volume as u32,
+            });
+        }
+
+        // Persistence deliberately lives on SettingsModel, which owns the
+        // settings file: QML writes `settingsModel.peer_audio_prefs_json` and
+        // calls save(). Duplicating that here would give two writers for one
+        // piece of state.
+        let _ = (id, volume);
+    }
+
+    /// Apply a whole stored preference blob to the mixer.
+    ///
+    /// Called when a call starts, so preferences saved in a previous session
+    /// take effect rather than only applying to peers touched this run.
+    fn apply_peer_audio_prefs(self: Pin<&mut Self>, prefs_json: &QString) {
+        let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(
+            &prefs_json.to_string(),
+        ) else {
+            return;
+        };
+        let Some(tx) = self.rust().call_cmd_tx.clone() else {
+            return;
+        };
+        for (peer_id, entry) in map {
+            let muted = entry
+                .get("muted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let volume = entry
+                .get("volume")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(100)
+                .clamp(0, 200) as u32;
+            let _ = tx.try_send(CallCommand::SetPeerMuted {
+                peer_id: peer_id.clone(),
+                muted,
+            });
+            let _ = tx.try_send(CallCommand::SetPeerVolume {
+                peer_id,
+                pct: volume,
+            });
+        }
     }
 
     fn load_room_chat_history(mut self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) {
@@ -3376,6 +3711,9 @@ impl ffi::AppBridge {
 
         let voice_on_removed = self.rust().voice_supernode_id == canon;
         if voice_on_removed {
+            // Same order as leave_room: announce camera-off while CM still has
+            // the room, then LeaveRoom, then tear inbound video down.
+            self.as_mut().stop_local_video();
             let leaving_voice = self.rust().voice_room_id.clone();
             if let Some(ref tx) = self.rust().conn_cmd_tx {
                 if !leaving_voice.is_empty() {
@@ -3394,6 +3732,7 @@ impl ffi::AppBridge {
             r.voice_room_id.clear();
             r.room_participant_ids.clear();
             self.as_mut().set_voice_active(false);
+            self.as_mut().reset_inbound_video();
         }
         if self.rust().current_supernode_id == canon {
             let mut r = self.as_mut().rust_mut();
@@ -4730,6 +5069,17 @@ fn apply_room_member_presence(rust: &mut AppBridgeRust, member_pids: &[String]) 
     }
 }
 
+impl AppBridgeRust {
+    /// The peer to send video to, or `None` when video belongs to a room.
+    ///
+    /// The rule itself lives in [`crate::video::video_route`] so it is covered
+    /// by the default test suite — bridge code only compiles under `qt-ui`, so
+    /// a test here would not run in a normal `cargo test`.
+    fn direct_video_target(&self) -> Option<String> {
+        crate::video::video_route(&self.voice_room_id, &self.active_direct_call_peer_id)
+    }
+}
+
 fn set_active_direct_call_presence(
     rust: &mut AppBridgeRust,
     peer_id: &str,
@@ -5205,6 +5555,7 @@ fn sync_saved_rooms_from_list(
     let Some(arr) = rooms.as_array() else {
         return;
     };
+    let mut pending: Vec<crate::room_store::RoomEntry> = Vec::with_capacity(arr.len());
     for room in arr {
         let room_id = room
             .get("room_id")
@@ -5261,12 +5612,15 @@ fn sync_saved_rooms_from_list(
                 is_creator,
             )
             .with_invite_token(invite_token);
-        // `upsert_from_remote` (not `upsert`) so a room the user hid locally is
-        // not resurrected: a plain upsert clears the hide tombstone, which would
-        // un-hide every listed room each time a room list arrives.
-        if let Err(e) = room_store.upsert_from_remote(entry) {
-            warn!("room_store sync from list error: {e}");
-        }
+        pending.push(entry);
+    }
+
+    // Persist once for the whole list rather than once per room. `*_from_remote`
+    // semantics are preserved inside: a room the user hid locally is not
+    // resurrected, since a plain upsert would clear the hide tombstone and
+    // un-hide every listed room each time a room list arrives.
+    if let Err(e) = room_store.upsert_many_from_remote(pending) {
+        warn!("room_store sync from list error: {e}");
     }
 }
 
@@ -5743,6 +6097,14 @@ fn room_participants_json(
                     // online by construction. The field is explicit so the room
                     // members list can bind a presence indicator directly.
                     "online": true,
+                    // Listener-local UI state. Emitted explicitly even though
+                    // `Row` defaults them: every field here is `#[serde(default)]`
+                    // on the consuming side, so a key omitted by mistake shows
+                    // up as a plausible-looking `false`/`0` with no error at any
+                    // layer. Naming them keeps that failure impossible.
+                    "local_muted": false,
+                    "local_volume": 100,
+                    "video_active": false,
                 })
             })
             .collect::<Vec<_>>(),
@@ -6741,7 +7103,9 @@ fn dispatch_event(
 
                 if voice_match {
                     // Roll back optimistic join_room_with_voice: stop SFU audio
-                    // mode and clear voice scope so we don't look "in call".
+                    // mode, camera, and clear voice scope so we don't look "in call".
+                    // Announce camera-off first so the CM can still route it.
+                    bridge.as_mut().stop_local_video();
                     if let Some(ref tx) = bridge.rust().call_cmd_tx {
                         let _ = tx.try_send(CallCommand::ClearRoomMode);
                         let _ = tx.try_send(CallCommand::StopAudio);
@@ -6766,6 +7130,7 @@ fn dispatch_event(
                     clear_room_member_presence(&mut bridge.as_mut().rust_mut());
                     bridge.as_mut().set_voice_active(false);
                     bridge.as_mut().set_in_room(false);
+                    bridge.as_mut().reset_inbound_video();
                 }
                 if current_match {
                     let mut r = bridge.as_mut().rust_mut();
@@ -6855,6 +7220,10 @@ fn dispatch_event(
                         room_id.as_str(),
                         true,
                     );
+                    // Drop their decoder and blank any tile still showing them.
+                    // Without this a departed peer's last frame (and the HW
+                    // decoder surfaces behind it) survive until we leave too.
+                    bridge.as_mut().forget_peer_video(&peer_id);
                 } else {
                     adjust_room_voice_member(
                         &mut bridge,
@@ -6869,6 +7238,69 @@ fn dispatch_event(
                 // drop from text panel only if they are not also a chat
                 // subscriber — full roster arrives via RoomMembersChanged.
                 emit_peers_updated(bridge.as_mut());
+            });
+        }
+        ConnectionEvent::VideoFrameReceived {
+            peer_id,
+            encoded,
+            keyframe,
+        } => {
+            // Hand straight to the decode thread. Decoding here would run on
+            // the connection-manager task; decoding after the Qt hop would run
+            // on the GUI thread. Both are wrong for a blocking codec call.
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                if bridge.rust().video_receiver.is_none() {
+                    // Spawned on first inbound frame rather than at startup, so
+                    // a client that never receives video never pays for a
+                    // decode thread.
+                    let conn_tx = bridge.rust().conn_cmd_tx.clone();
+                    let receiver = crate::video::receiver::VideoReceiver::start(
+                        || {
+                            crate::video::mediafoundation::MfDecoder::new()
+                                .map(|d| Box::new(d) as Box<dyn crate::video::codec::VideoDecoder>)
+                                .map_err(|e| warn!("[video] no H.264 decoder: {e}"))
+                                .ok()
+                        },
+                        move |peer_id| {
+                            if let Some(tx) = conn_tx.as_ref() {
+                                let _ = tx.try_send(ConnectionCommand::RequestVideoKeyframe {
+                                    peer_id: peer_id.to_owned(),
+                                });
+                            }
+                        },
+                    );
+                    bridge.as_mut().rust_mut().video_receiver = Some(receiver);
+                }
+                if let Some(rx) = bridge.rust().video_receiver.as_ref() {
+                    rx.submit(&peer_id, encoded, keyframe);
+                }
+            });
+        }
+        ConnectionEvent::PeerVideoStateChanged { peer_id, active } => {
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                bridge
+                    .as_mut()
+                    .peer_video_state_changed(QString::from(peer_id.as_str()), active);
+                // Camera-off: free the decoder (inter-frame state is useless
+                // across a stream restart) and blank the tile so the last
+                // frame does not stick after the indicator goes dark.
+                if !active {
+                    bridge.forget_peer_video(&peer_id);
+                }
+            });
+        }
+        ConnectionEvent::VideoKeyframeRequested { peer_id } => {
+            // Ask the capture thread for a keyframe on its next frame. Deferred
+            // rather than encoded here: producing a frame outside the capture
+            // cadence would disturb the encoder's rate control.
+            let _ = qt_thread.queue(move |bridge: Pin<&mut ffi::AppBridge>| {
+                if let Some(sender) = bridge.rust().video_sender.as_ref() {
+                    debug!(
+                        "[video] keyframe requested by {}",
+                        &peer_id[..8.min(peer_id.len())]
+                    );
+                    sender.request_keyframe();
+                }
             });
         }
         ConnectionEvent::SfuAudioReceived { peer_id, opus_data } => {
@@ -7348,6 +7780,13 @@ fn dispatch_event(
                     let rtt_ms = v.get("rtt_ms").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
                     if let Some(ref tx) = bridge.rust().call_cmd_tx {
                         let _ = tx.try_send(CallCommand::UpdateNetworkQuality { loss_pct, rtt_ms });
+                    }
+                    // Same measurement steers video. Adapting both media from
+                    // one reading keeps them from fighting: two independent
+                    // estimators on one link would each read the other's
+                    // back-off as headroom and climb into it.
+                    if let Some(sender) = bridge.as_mut().rust_mut().video_sender.as_mut() {
+                        sender.apply_network_quality(loss_pct);
                     }
                 }
                 bridge

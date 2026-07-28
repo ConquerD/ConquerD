@@ -1,4 +1,4 @@
-// SettingsPage.qml - token-driven settings content panel.
+﻿// SettingsPage.qml - token-driven settings content panel.
 
 import QtQuick
 import QtQuick.Controls.Material
@@ -10,6 +10,21 @@ Item {
 
     property var settings: null
     property int currentTab: 0
+
+    // Section indices, in the order SettingsSidebar lists them and the order
+    // the StackLayout below declares its pages. Named rather than inlined
+    // because inserting a section shifts every later index — when Video was
+    // added after Audio, bare `=== 3` comparisons silently started matching
+    // Network instead of AI.
+    readonly property int tabAudio: 0
+    readonly property int tabVideo: 1
+    readonly property int tabIdentity: 2
+    readonly property int tabGeneral: 3
+    readonly property int tabAi: 4
+    readonly property int tabNetwork: 5
+    readonly property int tabSecurity: 6
+    readonly property int tabPrivacy: 7
+    readonly property int tabDiagnostics: 8
 
     readonly property var avatarGridSizes: [8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
     readonly property var avatarDualHueModes: ["topbot", "checker", "quad"]
@@ -126,7 +141,7 @@ Item {
 
     StackLayout {
         anchors.fill: parent
-        currentIndex: Math.max(0, Math.min(root.currentTab, 7))
+        currentIndex: Math.max(0, Math.min(root.currentTab, root.tabDiagnostics))
 
         ScrollView {
             contentWidth: availableWidth
@@ -434,6 +449,156 @@ Item {
                             inputDeviceCombo.currentIndex = inputIndex >= 0 ? inputIndex : 0
                             var outputIndex = outputDeviceCombo.find(root.settings.audio_output_device)
                             outputDeviceCombo.currentIndex = outputIndex >= 0 ? outputIndex : 0
+                        }
+                    }
+                }
+
+            }
+        }
+
+        ScrollView {
+            contentWidth: availableWidth
+            clip: true
+
+            ColumnLayout {
+                width: Math.max(0, root.width - Theme.spacingXl * 2)
+                x: Theme.spacingXl
+                y: Theme.spacingLg
+                spacing: Theme.spacingLg
+
+                SettingsSectionHeader { title: "Video" }
+
+                SettingsCard {
+                    id: cameraCard
+                    title: "Camera"
+                    subtitle: "Used when you turn video on during a call."
+
+                    // Cameras are chosen by *name* but reopened by *id* (a
+                    // device symbolic link), so the ids are kept alongside the
+                    // combo's display model. Storing the name would break the
+                    // moment two identical webcams are attached.
+                    property var cameraIds: []
+
+                    function applyCameraSettings() {
+                        if (!root.settings || !backend) return
+                        // Restart capture when it is already running so a device
+                        // or quality change takes effect immediately rather than
+                        // at the next call.
+                        if (backend.video_active) {
+                            backend.setVideoEnabled(
+                                true,
+                                root.settings.video_input_device,
+                                root.settings.video_quality)
+                        }
+                    }
+
+                    GridLayout {
+                        Layout.fillWidth: true
+                        columns: 2
+                        columnSpacing: Theme.spacingLg
+                        rowSpacing: Theme.spacingMd
+
+                        Label { text: "Source"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        ComboBox {
+                            id: cameraCombo
+                            Layout.fillWidth: true
+                            model: ["Default camera"]
+                            onActivated: {
+                                if (!root.settings) return
+                                // Index 0 is "Default" — an empty id means
+                                // "first available camera".
+                                root.settings.video_input_device =
+                                    currentIndex === 0 ? "" : (cameraCard.cameraIds[currentIndex - 1] || "")
+                                root.settings.save()
+                                cameraCard.applyCameraSettings()
+                            }
+                        }
+
+                        Label { text: "Quality"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        ComboBox {
+                            id: qualityCombo
+                            Layout.fillWidth: true
+                            // Display order matches `Quality::from_name`; the
+                            // stored value is the lowercase key, not the label.
+                            model: ["Low (320x180)", "Balanced (640x360)", "High (1280x720)"]
+                            property var keys: ["low", "balanced", "high"]
+                            onActivated: {
+                                if (!root.settings) return
+                                root.settings.video_quality = keys[currentIndex] || "balanced"
+                                root.settings.save()
+                                cameraCard.applyCameraSettings()
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.spacingMd
+
+                        Label {
+                            text: cameraCombo.count <= 1
+                                ? "No capture sources detected."
+                                : (backend && backend.video_active
+                                    ? "Sharing is on."
+                                    : "Sharing is off.")
+                            color: cameraCombo.count <= 1 ? Theme.warn : Theme.muted
+                            font.pixelSize: Theme.fontSizeCaption
+                        }
+
+                        StyledButton {
+                            // Windows come and go constantly, so the list is a
+                            // snapshot rather than live — this is how the user
+                            // picks up an app opened since the page loaded.
+                            text: "Rescan"
+                            onClicked: cameraCard.reloadCameras()
+                        }
+
+                        Item { Layout.fillWidth: true }
+                    }
+
+                    // Cameras, displays, and windows share one list because only
+                    // one can be live: a video frame identifies its stream by
+                    // sender alone, so a peer cannot send camera and screen at
+                    // once. Presenting them as one choice matches what the
+                    // transport can actually carry.
+                    function reloadCameras() {
+                        if (!backend) return
+                        var names = []
+                        var ids = []
+                        try {
+                            var res = JSON.parse(backend.listVideoDevices())
+                            var groups = [
+                                { items: res.cameras || [], prefix: "Camera — " },
+                                { items: res.screens || [], prefix: "" },
+                                { items: res.windows || [], prefix: "Window — " }
+                            ]
+                            for (var g = 0; g < groups.length; g++) {
+                                var items = groups[g].items
+                                for (var i = 0; i < items.length; i++) {
+                                    names.push(groups[g].prefix + (items[i].name || items[i].id))
+                                    ids.push(items[i].id)
+                                }
+                            }
+                        } catch (e) {}
+                        cameraCard.cameraIds = ids
+                        cameraCombo.model = ["Default camera"].concat(names)
+
+                        // Reselect the saved source by id. A camera can be
+                        // unplugged and a window closed between sessions, so
+                        // falling back to Default is expected, not an error.
+                        var idx = 0
+                        if (root.settings && root.settings.video_input_device !== "") {
+                            var at = ids.indexOf(root.settings.video_input_device)
+                            idx = at >= 0 ? at + 1 : 0
+                        }
+                        cameraCombo.currentIndex = idx
+                    }
+
+                    Component.onCompleted: {
+                        cameraCard.reloadCameras()
+                        if (root.settings) {
+                            var q = qualityCombo.keys.indexOf(root.settings.video_quality)
+                            qualityCombo.currentIndex = q >= 0 ? q : 1
                         }
                     }
                 }
@@ -765,7 +930,7 @@ Item {
                     title: "Ollama Assistant"
                     subtitle: "Local-only assistant. Enable + Save, then restart once. Auto-reply posts Ollama answers into chat when a peer messages you."
 
-                    // Stable ListModel — assigning a JS array to ComboBox.model is
+                    // Stable ListModel â€” assigning a JS array to ComboBox.model is
                     // unreliable with editable Material combos on some Qt 6 builds.
                     ListModel { id: ollamaModelList }
 
@@ -802,7 +967,7 @@ Item {
                             return
                         }
                         if (!names || names.length === 0) {
-                            ollamaModelStatus.text = "No models found — is Ollama running? Try: ollama list"
+                            ollamaModelStatus.text = "No models found â€” is Ollama running? Try: ollama list"
                             ollamaModelStatus.color = Theme.muted
                             return
                         }
@@ -829,7 +994,7 @@ Item {
                         id: ollamaEnabledSwitch
                         title: "Enable AI assistant"
                         description: backend && backend.ollama_available
-                                     ? "Plugin running — chat AI is available."
+                                     ? "Plugin running â€” chat AI is available."
                                      : "Uses your local Ollama server. Restart ConquerD after enabling so chat AI starts."
                         checked: root.settings ? root.settings.ollama_enabled : false
                         onChanged: {
@@ -978,13 +1143,15 @@ Item {
                     Connections {
                         target: root
                         function onCurrentTabChanged() {
-                            if (root.currentTab === 3)
+                            // 4 = AI. Shifted from 3 when the Video section was
+                            // inserted after Audio.
+                            if (root.currentTab === root.tabAi)
                                 ollamaCard.refreshOllamaModels()
                         }
                     }
 
                     Component.onCompleted: Qt.callLater(function() {
-                        if (root.currentTab === 3)
+                        if (root.currentTab === root.tabAi)
                             ollamaCard.refreshOllamaModels()
                     })
                 }

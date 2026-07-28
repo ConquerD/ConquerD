@@ -15,6 +15,8 @@
 #include <QAbstractNativeEventFilter>
 #include <QGuiApplication>
 #include <QByteArray>
+#include <QHash>
+#include <QPointer>
 #include <QWindow>
 
 #include <cstdio>
@@ -36,8 +38,14 @@ constexpr int kResizeBorderDip = 6;
 
 #if defined(Q_OS_WIN)
 
-static QWindow *g_mainWindow = nullptr;
-static HWND g_mainHwnd = nullptr;
+// Every window we apply custom chrome to, not just the main one.
+//
+// Video popouts are top-level windows that want the same frameless chrome, so
+// a single-HWND global cannot express the set. Keeping a map (rather than only
+// a set) also lets `handleNcHitTest` scale hit-test metrics by the *correct*
+// window's DPI, which matters the moment a popout is dragged to a monitor with
+// a different scale factor.
+static QHash<HWND, QPointer<QWindow>> g_chromeWindows;
 
 static int dipToPx(const QWindow *win, int dip)
 {
@@ -49,7 +57,14 @@ static int dipToPx(const QWindow *win, int dip)
 
 static bool isOurWindow(HWND hwnd)
 {
-    return g_mainHwnd && hwnd == g_mainHwnd;
+    return hwnd && g_chromeWindows.contains(hwnd);
+}
+
+/// The QWindow for an HWND we manage, or null.
+static QWindow *windowFor(HWND hwnd)
+{
+    auto it = g_chromeWindows.constFind(hwnd);
+    return it == g_chromeWindows.constEnd() ? nullptr : it.value().data();
 }
 
 static void applySnapFriendlyStyle(HWND hwnd)
@@ -143,7 +158,12 @@ private:
 
     static bool handleNcHitTest(MSG *msg, qintptr *result)
     {
-        if (!g_mainWindow || !result) {
+        // Resolve the specific window this message targets. Using a single
+        // global here would scale a popout's resize border by the main
+        // window's DPI, so the grips land in the wrong place on a
+        // differently-scaled monitor.
+        QWindow *win = windowFor(msg->hwnd);
+        if (!win || !result) {
             return false;
         }
 
@@ -162,7 +182,7 @@ private:
             return false;
         }
 
-        const int border = dipToPx(g_mainWindow, kResizeBorderDip);
+        const int border = dipToPx(win, kResizeBorderDip);
         const bool onLeft = x >= wr.left && x < wr.left + border;
         const bool onRight = x < wr.right && x >= wr.right - border;
         const bool onTop = y >= wr.top && y < wr.top + border;
@@ -229,8 +249,10 @@ extern "C" void conquerd_enable_windows_snap(void *qwindow_ptr)
         return;
     }
 
-    g_mainWindow = window;
-    g_mainHwnd = hwnd;
+    // Insert, not overwrite. Overwriting was safe while only the main window
+    // existed; with popouts it would silently strip chrome from whichever
+    // window registered first.
+    g_chromeWindows.insert(hwnd, QPointer<QWindow>(window));
     applySnapFriendlyStyle(hwnd);
 
     if (!g_filterInstalled) {
@@ -240,8 +262,37 @@ extern "C" void conquerd_enable_windows_snap(void *qwindow_ptr)
         }
     }
 
-    fprintf(stderr, "[chrome] Windows snap chrome enabled (hwnd=%p)\n",
-            static_cast<void *>(hwnd));
+    fprintf(stderr, "[chrome] Windows snap chrome enabled (hwnd=%p, %lld tracked)\n",
+            static_cast<void *>(hwnd),
+            static_cast<long long>(g_chromeWindows.size()));
+#else
+    (void)qwindow_ptr;
+#endif
+}
+
+extern "C" void conquerd_disable_windows_snap(void *qwindow_ptr)
+{
+#if defined(Q_OS_WIN)
+    auto *window = static_cast<QWindow *>(qwindow_ptr);
+    if (!window) {
+        return;
+    }
+    auto hwnd = reinterpret_cast<HWND>(window->winId());
+    if (hwnd) {
+        g_chromeWindows.remove(hwnd);
+    }
+
+    // Also reap entries whose QWindow is already gone. This is not tidiness:
+    // Windows *recycles* HWND values, so a stale entry would make us apply
+    // WM_NCCALCSIZE / WM_NCHITTEST handling to an unrelated window that
+    // happened to inherit the same handle.
+    for (auto it = g_chromeWindows.begin(); it != g_chromeWindows.end();) {
+        if (it.value().isNull()) {
+            it = g_chromeWindows.erase(it);
+        } else {
+            ++it;
+        }
+    }
 #else
     (void)qwindow_ptr;
 #endif
