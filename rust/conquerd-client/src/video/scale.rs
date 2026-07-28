@@ -13,6 +13,28 @@
 //! content screen capture is for — text and thin UI lines shimmer and break up
 //! as the window moves. Averaging also feeds the encoder a cleaner signal, so
 //! it spends fewer bits on high-frequency noise that was a sampling artefact.
+//!
+//! Geometry helpers such as [`fit_within`] live here (not in the Windows-only
+//! screen module) so the letterbox path compiles on every platform CI targets.
+
+/// Scale `(w, h)` down to fit inside `(max_w, max_h)`, preserving aspect ratio
+/// and keeping both dimensions even.
+///
+/// Even dimensions are mandatory, not tidiness: I420 subsamples chroma 2x2, and
+/// the H.264 encoder rejects odd sizes outright.
+pub fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let (w, h) = (w.max(2), h.max(2));
+    let (max_w, max_h) = (max_w.max(2), max_h.max(2));
+    // Scale only downward — upscaling a small window to the preset would spend
+    // bitrate inventing detail that was never captured.
+    if w <= max_w && h <= max_h {
+        return (w & !1, h & !1);
+    }
+    let scale = f64::min(max_w as f64 / w as f64, max_h as f64 / h as f64);
+    let out_w = ((w as f64 * scale).round() as u32).max(2) & !1;
+    let out_h = ((h as f64 * scale).round() as u32).max(2) & !1;
+    (out_w, out_h)
+}
 
 /// BT.601 studio-swing coefficients, matching what [`super::nv12`] assumes on
 /// the camera path so both sources land in the same colour space.
@@ -162,7 +184,7 @@ pub fn bgra_to_i420_letterboxed(
     if dst_w == 0 || dst_h == 0 || dst_w % 2 != 0 || dst_h % 2 != 0 {
         return None;
     }
-    let (cw, ch) = super::screen::fit_within(src_w, src_h, dst_w, dst_h);
+    let (cw, ch) = fit_within(src_w, src_h, dst_w, dst_h);
     let content = bgra_to_i420_scaled(src, stride, src_w, src_h, cw, ch)?;
     if cw == dst_w && ch == dst_h {
         return Some(content);
@@ -389,5 +411,50 @@ mod tests {
         let f = bgra_to_i420_scaled(&buf, stride, 4, 4, 8, 8).unwrap();
         assert_eq!((f.width, f.height), (8, 8));
         assert!(f.is_consistent());
+    }
+
+    #[test]
+    fn fit_within_preserves_aspect_ratio() {
+        // 16:9 source into a 16:9 box scales cleanly to the box.
+        assert_eq!(fit_within(1920, 1080, 640, 360), (640, 360));
+        // 4K into 720p keeps the ratio.
+        assert_eq!(fit_within(3840, 2160, 1280, 720), (1280, 720));
+    }
+
+    #[test]
+    fn fit_within_never_upscales() {
+        // A small window must not be blown up to the preset — that spends
+        // bitrate on detail the capture never had.
+        assert_eq!(fit_within(320, 240, 1280, 720), (320, 240));
+    }
+
+    #[test]
+    fn fit_within_always_returns_even_dimensions() {
+        // I420 chroma is subsampled 2x2 and the H.264 encoder rejects odd
+        // sizes, so every result must be even regardless of input.
+        for (w, h) in [(1921u32, 1081u32), (333, 777), (2, 3), (999, 1)] {
+            let (ow, oh) = fit_within(w, h, 640, 360);
+            assert_eq!(ow % 2, 0, "{w}x{h} -> width {ow} must be even");
+            assert_eq!(oh % 2, 0, "{w}x{h} -> height {oh} must be even");
+            assert!(ow >= 2 && oh >= 2, "{w}x{h} produced a degenerate size");
+        }
+    }
+
+    #[test]
+    fn fit_within_letterboxes_a_tall_source() {
+        // A portrait window into a landscape box is limited by height.
+        let (w, h) = fit_within(1080, 1920, 640, 360);
+        assert!(h <= 360 && w <= 640);
+        // Aspect ratio preserved within rounding to even pixels.
+        let src = 1080.0 / 1920.0;
+        let got = w as f64 / h as f64;
+        assert!((src - got).abs() < 0.02, "aspect drifted: {src} vs {got}");
+    }
+
+    #[test]
+    fn fit_within_handles_degenerate_input() {
+        // Must not divide by zero or return a zero dimension.
+        assert_eq!(fit_within(0, 0, 640, 360), (2, 2));
+        assert_eq!(fit_within(100, 100, 0, 0), (2, 2));
     }
 }

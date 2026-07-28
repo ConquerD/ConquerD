@@ -2436,73 +2436,89 @@ impl ffi::AppBridge {
         };
 
         let quality = crate::video::sender::Quality::from_name(&quality.to_string());
-        let encoder = match crate::video::mediafoundation::MfEncoder::new(
-            crate::video::mediafoundation::MfEncoderConfig {
-                width: quality.width,
-                height: quality.height,
-                bitrate_bps: quality.bitrate_bps,
-                fps: quality.fps,
-                keyframe_interval_secs: 4,
-            },
-        ) {
-            Ok(e) => {
-                info!("[video] encoder ready ({:?})", e.acceleration());
-                e
-            }
-            Err(e) => {
-                warn!("[video] no usable H.264 encoder: {e}");
-                return false;
-            }
-        };
 
-        // `device_id` doubles as the source selector: a `monitor:` / `window:`
-        // prefix means screen capture, anything else is a camera device id.
-        // One field rather than two because exactly one source is ever live —
-        // the wire format allows a peer only one video stream.
-        let raw_source = device_id.to_string();
-        let source = if raw_source.starts_with("monitor:") || raw_source.starts_with("window:") {
-            crate::video::sender::SourceSpec::Screen {
-                target_id: raw_source,
-            }
-        } else {
-            crate::video::sender::SourceSpec::Camera {
-                device_id: (!raw_source.is_empty()).then_some(raw_source),
-            }
-        };
+        // Capture + H.264 encode are Windows/Media Foundation only for now.
+        // Soft-fail elsewhere so non-Windows builds (CI, mac/linux nightlies)
+        // still compile the rest of the UI; the camera toggle simply reports off.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (conn_tx, quality, device_id);
+            warn!("[video] capture/encode is not implemented on this platform");
+            return false;
+        }
 
-        // Route frames to the room, or to the one peer of a direct 1:1 call.
-        //
-        // Decided once here rather than per frame: the session cannot change
-        // underneath a running capture, because every path that ends a call or
-        // leaves a room calls `stop_local_video` first. A room takes priority
-        // when both look set, since a direct call that fell back to a temporary
-        // room is genuinely a room session by then.
-        let sink = match self.rust().direct_video_target() {
-            Some(peer_id) => {
-                crate::video::sender::ChannelSink::new(conn_tx, move |encoded, keyframe| {
-                    ConnectionCommand::SendVideoFrame {
-                        peer_id: peer_id.clone(),
-                        encoded,
-                        keyframe,
-                    }
-                })
-            }
-            None => crate::video::sender::ChannelSink::new(conn_tx, |encoded, keyframe| {
-                ConnectionCommand::SendRoomVideo { encoded, keyframe }
-            }),
-        };
+        #[cfg(target_os = "windows")]
+        {
+            let encoder = match crate::video::mediafoundation::MfEncoder::new(
+                crate::video::mediafoundation::MfEncoderConfig {
+                    width: quality.width,
+                    height: quality.height,
+                    bitrate_bps: quality.bitrate_bps,
+                    fps: quality.fps,
+                    keyframe_interval_secs: 4,
+                },
+            ) {
+                Ok(e) => {
+                    info!("[video] encoder ready ({:?})", e.acceleration());
+                    e
+                }
+                Err(e) => {
+                    warn!("[video] no usable H.264 encoder: {e}");
+                    return false;
+                }
+            };
 
-        // Our own id, so the capture thread can feed the local preview tile.
-        let preview_id = {
-            let id = self.rust().my_public_id.clone();
-            (!id.is_empty()).then_some(id)
-        };
-        let sender =
-            crate::video::sender::VideoSender::start(source, quality, encoder, sink, preview_id);
-        self.as_mut().rust_mut().video_sender = Some(sender);
-        self.as_mut().set_video_active(true);
-        self.as_mut().announce_video_state(true);
-        true
+            // `device_id` doubles as the source selector: a `monitor:` / `window:`
+            // prefix means screen capture, anything else is a camera device id.
+            // One field rather than two because exactly one source is ever live —
+            // the wire format allows a peer only one video stream.
+            let raw_source = device_id.to_string();
+            let source = if raw_source.starts_with("monitor:") || raw_source.starts_with("window:")
+            {
+                crate::video::sender::SourceSpec::Screen {
+                    target_id: raw_source,
+                }
+            } else {
+                crate::video::sender::SourceSpec::Camera {
+                    device_id: (!raw_source.is_empty()).then_some(raw_source),
+                }
+            };
+
+            // Route frames to the room, or to the one peer of a direct 1:1 call.
+            //
+            // Decided once here rather than per frame: the session cannot change
+            // underneath a running capture, because every path that ends a call
+            // or leaves a room calls `stop_local_video` first. A room takes
+            // priority when both look set, since a direct call that fell back to
+            // a temporary room is genuinely a room session by then.
+            let sink = match self.rust().direct_video_target() {
+                Some(peer_id) => {
+                    crate::video::sender::ChannelSink::new(conn_tx, move |encoded, keyframe| {
+                        ConnectionCommand::SendVideoFrame {
+                            peer_id: peer_id.clone(),
+                            encoded,
+                            keyframe,
+                        }
+                    })
+                }
+                None => crate::video::sender::ChannelSink::new(conn_tx, |encoded, keyframe| {
+                    ConnectionCommand::SendRoomVideo { encoded, keyframe }
+                }),
+            };
+
+            // Our own id, so the capture thread can feed the local preview tile.
+            let preview_id = {
+                let id = self.rust().my_public_id.clone();
+                (!id.is_empty()).then_some(id)
+            };
+            let sender = crate::video::sender::VideoSender::start(
+                source, quality, encoder, sink, preview_id,
+            );
+            self.as_mut().rust_mut().video_sender = Some(sender);
+            self.as_mut().set_video_active(true);
+            self.as_mut().announce_video_state(true);
+            true
+        }
     }
 
     /// Stop the local camera if running and announce camera-off to the room.
@@ -7256,10 +7272,21 @@ fn dispatch_event(
                     let conn_tx = bridge.rust().conn_cmd_tx.clone();
                     let receiver = crate::video::receiver::VideoReceiver::start(
                         || {
-                            crate::video::mediafoundation::MfDecoder::new()
-                                .map(|d| Box::new(d) as Box<dyn crate::video::codec::VideoDecoder>)
-                                .map_err(|e| warn!("[video] no H.264 decoder: {e}"))
-                                .ok()
+                            // Decode is Windows/MF only for now; other platforms
+                            // drop inbound frames until a portable decoder lands.
+                            #[cfg(target_os = "windows")]
+                            {
+                                crate::video::mediafoundation::MfDecoder::new()
+                                    .map(|d| {
+                                        Box::new(d) as Box<dyn crate::video::codec::VideoDecoder>
+                                    })
+                                    .map_err(|e| warn!("[video] no H.264 decoder: {e}"))
+                                    .ok()
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                None
+                            }
                         },
                         move |peer_id| {
                             if let Some(tx) = conn_tx.as_ref() {

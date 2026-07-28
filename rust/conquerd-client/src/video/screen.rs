@@ -268,24 +268,10 @@ pub enum CaptureTarget {
     Window(isize),
 }
 
-/// Scale `(w, h)` down to fit inside `(max_w, max_h)`, preserving aspect ratio
-/// and keeping both dimensions even.
-///
-/// Even dimensions are mandatory, not tidiness: I420 subsamples chroma 2x2, and
-/// the H.264 encoder rejects odd sizes outright.
-pub fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
-    let (w, h) = (w.max(2), h.max(2));
-    let (max_w, max_h) = (max_w.max(2), max_h.max(2));
-    // Scale only downward — upscaling a small window to the preset would spend
-    // bitrate inventing detail that was never captured.
-    if w <= max_w && h <= max_h {
-        return (w & !1, h & !1);
-    }
-    let scale = f64::min(max_w as f64 / w as f64, max_h as f64 / h as f64);
-    let out_w = ((w as f64 * scale).round() as u32).max(2) & !1;
-    let out_h = ((h as f64 * scale).round() as u32).max(2) & !1;
-    (out_w, out_h)
-}
+// Geometry helpers (`fit_within`) live in [`super::scale`] so the letterbox
+// path compiles on non-Windows CI. Re-export for any Windows-only caller that
+// still expects the name on this module.
+pub use super::scale::fit_within;
 
 /// One thing the user can pick in the source list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,44 +513,6 @@ fn direct3d_device_from(device: &ID3D11Device) -> anyhow::Result<IDirect3DDevice
 mod tests {
     use super::*;
 
-    #[test]
-    fn fit_within_preserves_aspect_ratio() {
-        // 16:9 source into a 16:9 box scales cleanly to the box.
-        assert_eq!(fit_within(1920, 1080, 640, 360), (640, 360));
-        // 4K into 720p keeps the ratio.
-        assert_eq!(fit_within(3840, 2160, 1280, 720), (1280, 720));
-    }
-
-    #[test]
-    fn fit_within_never_upscales() {
-        // A small window must not be blown up to the preset — that spends
-        // bitrate on detail the capture never had.
-        assert_eq!(fit_within(320, 240, 1280, 720), (320, 240));
-    }
-
-    #[test]
-    fn fit_within_always_returns_even_dimensions() {
-        // I420 chroma is subsampled 2x2 and the H.264 encoder rejects odd
-        // sizes, so every result must be even regardless of input.
-        for (w, h) in [(1921u32, 1081u32), (333, 777), (2, 3), (999, 1)] {
-            let (ow, oh) = fit_within(w, h, 640, 360);
-            assert_eq!(ow % 2, 0, "{w}x{h} -> width {ow} must be even");
-            assert_eq!(oh % 2, 0, "{w}x{h} -> height {oh} must be even");
-            assert!(ow >= 2 && oh >= 2, "{w}x{h} produced a degenerate size");
-        }
-    }
-
-    #[test]
-    fn fit_within_letterboxes_a_tall_source() {
-        // A portrait window into a landscape box is limited by height.
-        let (w, h) = fit_within(1080, 1920, 640, 360);
-        assert!(h <= 360 && w <= 640);
-        // Aspect ratio preserved within rounding to even pixels.
-        let src = 1080.0 / 1920.0;
-        let got = w as f64 / h as f64;
-        assert!((src - got).abs() < 0.02, "aspect drifted: {src} vs {got}");
-    }
-
     /// Exercises the real Win32 enumeration. Ignored by default because CI has
     /// no desktop session; run on a workstation:
     /// `cargo test --bins -- --ignored screen`
@@ -654,12 +602,5 @@ mod tests {
         ] {
             assert!(parse_target(bad).is_none(), "{bad:?} should not parse");
         }
-    }
-
-    #[test]
-    fn fit_within_handles_degenerate_input() {
-        // Must not divide by zero or return a zero dimension.
-        assert_eq!(fit_within(0, 0, 640, 360), (2, 2));
-        assert_eq!(fit_within(100, 100, 0, 0), (2, 2));
     }
 }
