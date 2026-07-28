@@ -262,29 +262,69 @@ fn build_qt_ui() {
         let Some(lib_dir) = qt_lib_dir() else {
             return false;
         };
-        [
+        let has_lib = [
             "Qt6Multimedia.lib",
             "libQt6Multimedia.so",
             "libQt6Multimedia.dylib",
         ]
         .iter()
         .any(|name| lib_dir.join(name).exists())
-            || lib_dir.join("QtMultimedia.framework").exists()
+            || lib_dir.join("QtMultimedia.framework").exists();
+        if !has_lib {
+            return false;
+        }
+        // The C++ shim needs moc, so its absence means the whole video surface
+        // is unbuildable regardless of the library being present. Folding that
+        // into the single probe is what keeps the cfg, the QML file list, the
+        // linked Qt module, and the compiled shim from disagreeing — they all
+        // read this one answer.
+        if qt_moc_path().is_none() {
+            println!(
+                "cargo:warning=Qt Multimedia found but moc was not — video disabled. \
+                 Qt 6 puts moc in libexec/ on Linux and macOS, bin/ on Windows."
+            );
+            return false;
+        }
+        true
     }
 
     /// Resolve Qt's `lib` directory via qmake, mirroring how the Qt build
     /// scripts locate the installation.
     fn qt_lib_dir() -> Option<std::path::PathBuf> {
-        let qmake = std::env::var("QMAKE").unwrap_or_else(|_| "qmake".to_string());
-        let out = std::process::Command::new(qmake)
-            .args(["-query", "QT_INSTALL_LIBS"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
+        // Prefer an explicit qmake, then bare `qmake` on PATH, then the
+        // binary next to QT_DIR / CMAKE_PREFIX_PATH so CI runners that only
+        // export QT_DIR (without putting bin/ on PATH) still resolve libs.
+        let candidates: Vec<std::path::PathBuf> = {
+            let mut v = Vec::new();
+            if let Ok(q) = std::env::var("QMAKE") {
+                v.push(std::path::PathBuf::from(q));
+            }
+            v.push(std::path::PathBuf::from("qmake"));
+            v.push(std::path::PathBuf::from("qmake6"));
+            if let Some(prefix) = resolve_qt_prefix() {
+                let bin = prefix.join("bin");
+                v.push(bin.join(if cfg!(windows) { "qmake6.exe" } else { "qmake" }));
+                v.push(bin.join(if cfg!(windows) { "qmake.exe" } else { "qmake6" }));
+            }
+            v
+        };
+        for qmake in candidates {
+            let Ok(out) = std::process::Command::new(&qmake)
+                .args(["-query", "QT_INSTALL_LIBS"])
+                .output()
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(std::path::PathBuf::from(path));
+            }
         }
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+        // Last resort: <prefix>/lib when qmake is unavailable.
+        resolve_qt_prefix().map(|p| p.join("lib"))
     }
 
     let qml_files: Vec<QmlFile> = vec![
@@ -331,7 +371,28 @@ fn build_qt_ui() {
         v
     };
 
+    // Probe Multimedia *and* compile the QVideoSink C++ shim before deciding
+    // whether to enable `cfg(qt_multimedia)`. Linking QtMultimedia without the
+    // shim (e.g. moc failed to generate the meta-object sources) leaves the
+    // Rust side with unresolved `conquerd_video_*` symbols at final link —
+    // exactly the failure Linux CI saw after qtmultimedia was added to the
+    // aqt install. The shim is compiled here, before CxxQtBuilder runs, so a
+    // hard error surfaces early and we never advertise a feature we cannot
+    // deliver.
+    if let Some(lib_dir) = qt_lib_dir() {
+        println!("cargo:rerun-if-changed={}", lib_dir.display());
+    }
     let has_multimedia = qt_multimedia_available();
+    let video_shim_ok = has_multimedia && compile_video_sink_cpp();
+    if has_multimedia && !video_shim_ok {
+        // compile_video_sink_cpp already printed the root cause; refuse to
+        // continue with a half-enabled video path rather than failing at link.
+        panic!(
+            "Qt Multimedia is present but the video sink C++ shim failed to build. \
+             See cargo:warning lines from video_sink_bridge above."
+        );
+    }
+    let has_multimedia = video_shim_ok;
 
     // VideoTile.qml has `import QtMultimedia`, so it is only compiled into the
     // qrc when that module exists — otherwise qmlcachegen fails the entire
@@ -374,13 +435,6 @@ fn build_qt_ui() {
     // any machine that has not added it — turning an optional feature into a
     // hard build break. Instead the video surface degrades: `cfg(qt_multimedia)`
     // gates the Rust side and `Theme.hasMultimedia` gates the QML side.
-    // Re-run detection when the Qt lib directory changes, so installing the
-    // module later actually takes effect. Without this the probe result is
-    // cached in the build script's output and a fresh Qt Multimedia install is
-    // silently ignored until some unrelated edit forces build.rs to re-run.
-    if let Some(lib_dir) = qt_lib_dir() {
-        println!("cargo:rerun-if-changed={}", lib_dir.display());
-    }
     let builder = if has_multimedia {
         println!("cargo:rustc-cfg=qt_multimedia");
         builder.qt_module("Multimedia")
@@ -426,10 +480,8 @@ fn build_qt_ui() {
     compile_window_chrome_cpp();
 
     compile_qml_startup_cpp();
-
-    if has_multimedia {
-        compile_video_sink_cpp();
-    }
+    // Video sink C++ is compiled earlier (before CxxQtBuilder) so we can gate
+    // `cfg(qt_multimedia)` on a successful shim build.
 }
 
 #[cfg(feature = "qt-ui")]
@@ -456,6 +508,53 @@ fn resolve_qt_prefix() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Locate Qt's `moc`.
+///
+/// Qt 6 moved the host tools out of `bin` on Linux and macOS — `moc` lives in
+/// `libexec` there while staying in `bin` on Windows. Looking only in `bin`
+/// finds it on a developer's Windows box and silently misses it in Linux CI,
+/// which is exactly how the video shim came to be skipped on one platform
+/// while the Rust side still expected its symbols.
+///
+/// [`resolve_qt_prefix`] is consulted **before** falling back to a bare `qmake`
+/// on PATH, because that is the same Qt whose headers the shim compiles
+/// against. CI sets only `QT_DIR`; if an unrelated system qmake happens to be
+/// on PATH, trusting it here would pair one Qt's moc output with another Qt's
+/// headers — a mismatch that fails in far more confusing ways than not finding
+/// moc at all.
+#[cfg(feature = "qt-ui")]
+fn qt_moc_path() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let exe = if cfg!(windows) { "moc.exe" } else { "moc" };
+
+    if let Some(prefix) = resolve_qt_prefix() {
+        // `libexec` first: on Linux and macOS that is where Qt 6 keeps moc, and
+        // some layouts leave an unrelated stub in `bin`.
+        for sub in ["libexec", "bin"] {
+            let candidate = prefix.join(sub).join(exe);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let qmake = std::env::var("QMAKE").unwrap_or_else(|_| "qmake".to_string());
+    let out = std::process::Command::new(&qmake)
+        .args(["-query", "QT_HOST_LIBEXECS"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if dir.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(dir).join(exe);
+    candidate.is_file().then_some(candidate)
 }
 
 #[cfg(feature = "qt-ui")]
@@ -606,45 +705,111 @@ fn compile_window_chrome_cpp() {
 
 /// Compile the QVideoSink registry shim.
 ///
-/// Only built when Qt Multimedia is present; without it there is no
-/// `QVideoSink` to compile against, and the app links fine without video.
+/// Returns `true` when the static library was produced and the linker flags
+/// were emitted. Callers must only set `cfg(qt_multimedia)` on success —
+/// enabling the Rust externs without this library is what produced the Linux
+/// CI undefined-reference failures for `conquerd_video_*`.
+///
+/// Only meaningful when Qt Multimedia is present; without it there is no
+/// `QVideoSink` to compile against.
 #[cfg(feature = "qt-ui")]
-fn compile_video_sink_cpp() {
+fn compile_video_sink_cpp() -> bool {
     use std::path::PathBuf;
+    use std::process::Command;
 
     println!("cargo:rerun-if-changed=src/ui/video_sink_bridge.cpp");
     println!("cargo:rerun-if-changed=src/ui/video_sink_bridge.h");
 
     let Some(qt_prefix) = resolve_qt_prefix() else {
         eprintln!("cargo:warning=video_sink_bridge: cannot find Qt prefix; skipping");
-        return;
+        return false;
     };
     let Ok(out_dir) = std::env::var("OUT_DIR") else {
         eprintln!("cargo:warning=video_sink_bridge: OUT_DIR is not set; skipping");
-        return;
+        return false;
     };
     let out_dir = PathBuf::from(out_dir);
+
+    // Absolute paths so moc / cc still work if the build script cwd is not the
+    // package root (some tooling sets CARGO_MANIFEST_DIR without chdir).
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()));
+    let header = manifest_dir.join("src/ui/video_sink_bridge.h");
+    let cpp = manifest_dir.join("src/ui/video_sink_bridge.cpp");
+    if !header.is_file() || !cpp.is_file() {
+        eprintln!(
+            "cargo:warning=video_sink_bridge: sources missing under {}",
+            manifest_dir.display()
+        );
+        return false;
+    }
 
     // The registry exposes Q_INVOKABLE methods to QML, which requires moc —
     // `cc` does not run it, so generate the meta-object source explicitly and
     // compile it alongside.
-    let moc = qt_prefix
-        .join("bin")
-        .join(if cfg!(windows) { "moc.exe" } else { "moc" });
+    let Some(moc) = qt_moc_path() else {
+        eprintln!(
+            "cargo:warning=video_sink_bridge: moc not found (QT_HOST_LIBEXECS / \
+             <prefix>/libexec / <prefix>/bin); skipping"
+        );
+        return false;
+    };
+
+    let headers = qt_install_headers(&qt_prefix);
     let moc_out = out_dir.join("moc_video_sink_bridge.cpp");
-    let status = std::process::Command::new(&moc)
-        .arg("src/ui/video_sink_bridge.h")
-        .arg("-o")
-        .arg(&moc_out)
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        _ => {
+
+    // moc must see Qt includes: the header pulls in QtCore / QtMultimedia, and
+    // without -I it fails on Linux CI (aqt layout) even when the same sources
+    // moc fine on a developer Windows box where include paths leak from the
+    // ambient environment. That silent skip used to leave `cfg(qt_multimedia)`
+    // set with no `conquerd_video_*` symbols at link time.
+    let mut moc_cmd = Command::new(&moc);
+    moc_cmd.arg(&header).arg("-o").arg(&moc_out);
+    if headers.is_dir() {
+        moc_cmd.arg(format!("-I{}", headers.display()));
+    }
+    for module in ["QtCore", "QtGui", "QtQml", "QtMultimedia"] {
+        let sub = headers.join(module);
+        if sub.is_dir() {
+            moc_cmd.arg(format!("-I{}", sub.display()));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let fw_headers = qt_prefix
+                .join("lib")
+                .join(format!("{module}.framework"))
+                .join("Headers");
+            if fw_headers.is_dir() {
+                moc_cmd.arg(format!("-I{}", fw_headers.display()));
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let fw_lib = qt_prefix.join("lib");
+        if fw_lib.is_dir() {
+            moc_cmd.arg(format!("-F{}", fw_lib.display()));
+        }
+    }
+
+    match moc_cmd.output() {
+        Ok(out) if out.status.success() && moc_out.is_file() => {}
+        Ok(out) => {
             eprintln!(
-                "cargo:warning=video_sink_bridge: moc failed at {}; skipping video shim",
+                "cargo:warning=video_sink_bridge: moc at {} failed (status {:?})\nstdout:\n{}\nstderr:\n{}",
+                moc.display(),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            return false;
+        }
+        Err(e) => {
+            eprintln!(
+                "cargo:warning=video_sink_bridge: could not run moc at {}: {e}",
                 moc.display()
             );
-            return;
+            return false;
         }
     }
 
@@ -652,24 +817,29 @@ fn compile_video_sink_cpp() {
     build
         .cpp(true)
         .std("c++17")
-        .file("src/ui/video_sink_bridge.cpp")
+        .file(&cpp)
         .file(&moc_out)
-        .include("src/ui");
+        .include(manifest_dir.join("src/ui"));
     if cfg!(target_env = "msvc") {
         build
             .flag("/EHsc")
             .flag("/Zc:__cplusplus")
             .flag("/permissive-");
     }
+    #[cfg(not(windows))]
+    build.flag("-fPIC");
     configure_qt_cpp_build(
         &mut build,
         &qt_prefix,
         &["QtCore", "QtGui", "QtQml", "QtMultimedia"],
     );
+    // `compile` panics on failure, which is what we want: a half-built video
+    // path must not reach the final link with missing symbols.
     build.compile("conquerd_video_sink");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=conquerd_video_sink");
+    true
 }
 
 #[cfg(feature = "qt-ui")]
