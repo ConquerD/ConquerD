@@ -18,7 +18,7 @@ mod room_roles {
     /// Muted by *this listener* only — distinct from [`MUTED`], which is the
     /// participant's own microphone state and is visible to everyone.
     pub const LOCAL_MUTED: i32 = 263;
-    /// This listener's playback volume for the participant (0â€“200, 100 = unity).
+    /// This listener's playback volume for the participant (0–200, 100 = unity).
     pub const LOCAL_VOLUME: i32 = 264;
     /// Whether the participant is currently sending video.
     pub const VIDEO_ACTIVE: i32 = 265;

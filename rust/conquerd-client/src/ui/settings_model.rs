@@ -1,4 +1,4 @@
-//! SettingsModel â€” writable app-settings QObject singleton.
+//! SettingsModel — writable app-settings QObject singleton.
 //!
 //! Compiled only when the `qt-ui` Cargo feature is enabled.
 //!
@@ -211,7 +211,7 @@ fn default_direct_p2p_port() -> i32 {
     61_045
 }
 fn default_ollama_url() -> String {
-    // Prefer 127.0.0.1 over localhost (Windows can resolve localhost â†’ ::1 while
+    // Prefer 127.0.0.1 over localhost (Windows can resolve localhost → ::1 while
     // Ollama typically binds IPv4 only). fetch_model_list also rewrites localhost.
     "http://127.0.0.1:11434".to_string()
 }
@@ -498,11 +498,11 @@ impl ffi::SettingsModel {
         let path = settings_file();
         let snap: SettingsSnapshot = match std::fs::read_to_string(&path) {
             Ok(txt) => serde_json::from_str(&txt).unwrap_or_else(|e| {
-                warn!("SettingsModel::load parse error: {e} â€” using defaults");
+                warn!("SettingsModel::load parse error: {e} — using defaults");
                 SettingsSnapshot::default()
             }),
             Err(_) => {
-                debug!("No settings file at {} â€” using defaults", path.display());
+                debug!("No settings file at {} — using defaults", path.display());
                 SettingsSnapshot::default()
             }
         };

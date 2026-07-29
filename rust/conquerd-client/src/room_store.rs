@@ -1,10 +1,10 @@
-﻿//! Room store â€” client-owned, encrypted persistence for voice room definitions.
+//! Room store — client-owned, encrypted persistence for voice room definitions.
 //!
 //! The supernode never persists rooms; rooms are client-owned data. When the
 //! client connects to a supernode, saved rooms are sent via `SFU_ROOM_CREATE`
 //! to be recreated on the fly.
 //!
-//! File: `~/.conquerd/my_rooms.dat` â€” AES-256-GCM envelope keyed by HKDF
+//! File: `~/.conquerd/my_rooms.dat` — AES-256-GCM envelope keyed by HKDF
 //! subkey of the user's Identity.
 //!
 //! ## Schema versioning
@@ -96,7 +96,7 @@ impl RoomEntry {
     }
 
     /// Set the room's invite-mint policy (`"owner"` or `"members"`). Empty
-    /// stays empty (interpreted as "unset" â€” the supernode defaults to
+    /// stays empty (interpreted as "unset" — the supernode defaults to
     /// `"owner"`); any non-`"members"` value is left as-is here (normalization
     /// to a known value happens supernode-side).
     pub fn with_invite_policy(mut self, policy: impl Into<String>) -> Self {
@@ -117,7 +117,7 @@ struct StoreData {
     #[serde(default)]
     deleted_ids: Vec<String>,
     /// Owner-held Space trees (Layer 1), keyed on disk by insertion order.
-    /// Additive `#[serde(default)]` field â€” no schema bump per the file's rule.
+    /// Additive `#[serde(default)]` field — no schema bump per the file's rule.
     #[serde(default)]
     spaces: Vec<crate::space::Space>,
 }
@@ -255,10 +255,10 @@ impl RoomStore {
 
     /// Adopt `room_id` as a Room node in the owner's Space for `supernode_id`,
     /// creating the Space (Server root) on first use. The room leaf's `node_id`
-    /// is the existing `room_id` (design Â§3.3) so live room state and sidebar
+    /// is the existing `room_id` (design §3.3) so live room state and sidebar
     /// keys don't churn.
     ///
-    /// `parent_node_id` selects where the room nests: `""` â†’ directly under the
+    /// `parent_node_id` selects where the room nests: `""` → directly under the
     /// Server node (a top-level room); otherwise the given node id (a nested
     /// sub-room under another room). Bumps the epoch, re-signs the root with
     /// `sign` (e.g. `|b| identity.sign(b)`), persists, stamps the stored
@@ -276,7 +276,7 @@ impl RoomStore {
         sign: impl Fn(&[u8]) -> Vec<u8>,
     ) -> Result<crate::space::SignedSpaceRoot> {
         let space_id = Self::space_id_for(owner_pub, supernode_id);
-        // Empty / self-referential parent â†’ nest directly under the Server node.
+        // Empty / self-referential parent → nest directly under the Server node.
         let parent_id = if parent_node_id.is_empty() || parent_node_id == room_id {
             space_id.clone()
         } else {
@@ -403,7 +403,7 @@ impl RoomStore {
                 && (existing.is_creator || !existing.invite_token.is_empty())
             {
                 // Passive room-list sync must not downgrade a stored private room
-                // back to public â€” that flips join_room off the invite path and the
+                // back to public — that flips join_room off the invite path and the
                 // supernode silently denies SfuJoin for non-members.
                 m.room_type = existing.room_type.clone();
             }
@@ -453,7 +453,7 @@ impl RoomStore {
     ///
     /// The room-list sync path calls this instead of upserting per room: with
     /// per-room saves, a 4-room list cost 4 whole-file re-encrypts, and a single
-    /// reconnect replayed that list around eleven times â€” 44 rewrites of the
+    /// reconnect replayed that list around eleven times — 44 rewrites of the
     /// entire store where at most one was needed.
     pub fn upsert_many_from_remote(
         &mut self,
@@ -485,7 +485,7 @@ impl RoomStore {
     /// resurrected: [`add`] clears the hide tombstone, so upserting every listed
     /// room would un-hide them all the moment a room list arrives (e.g. right
     /// after accepting an invite). When the room is currently hidden this is a
-    /// no-op â€” the tombstone and stored entry are left untouched. Explicit user
+    /// no-op — the tombstone and stored entry are left untouched. Explicit user
     /// actions (create / join / accept-invite) still go through [`upsert`] and
     /// intentionally un-hide.
     pub fn upsert_from_remote(&mut self, entry: RoomEntry) -> Result<()> {
@@ -762,7 +762,7 @@ mod tests {
             )
             .unwrap();
         let ps = crate::peer_store::PeerStore::open(&id, None).unwrap();
-        // Empty peer store â€” match by bare supernode_id only.
+        // Empty peer store — match by bare supernode_id only.
         let members = vec!["node-A-pub".into(), "node-B-pub".into()];
         let got = store.list_for_cluster_members(&ps, &members);
         assert_eq!(got.len(), 1);
@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(rooms[0].room_id, "room-1");
     }
 
-    // â”€â”€ Write amplification on room-list sync â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Write amplification on room-list sync ───────────────────────────────
 
     /// Re-syncing an unchanged room list must not rewrite the store at all.
     ///
@@ -998,7 +998,7 @@ mod tests {
             ])
             .unwrap();
 
-        // Reopening proves the batch actually hit disk â€” batching must not
+        // Reopening proves the batch actually hit disk — batching must not
         // trade write amplification for lost writes.
         let reopened = RoomStore::open(&id, Some(&path)).unwrap();
         let mut names: Vec<String> = reopened

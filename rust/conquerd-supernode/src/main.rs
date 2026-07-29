@@ -1,4 +1,4 @@
-﻿// ConquerD Supernode Ã¢â‚¬â€ main.rs
+// ConquerD Supernode — main.rs
 // Standalone Rust supernode binary: QUIC relay + SFU + WebSocket signaling + in-app portal (web.host.app.v1).
 
 mod access;
@@ -60,7 +60,7 @@ const ENDPOINT_MAX_AGE_S: f64 = 86400.0;
 /// `cdylib_manifest` path are loaded via [`NativeModuleLoader`]. Signer
 /// keys must be listed in `<data_dir>/trusted_module_keys.txt`; unknown
 /// keys cause the entry to be skipped with a warning (no interactive
-/// prompt on the supernode Ã¢â‚¬â€ add keys to the file to pre-authorise them).
+/// prompt on the supernode — add keys to the file to pre-authorise them).
 fn load_manifest(config: &Config) -> manifest::SupernodeManifest {
     match manifest::SupernodeManifest::load_or_default(&config.data_dir) {
         Ok(m) => m,
@@ -94,11 +94,11 @@ fn build_feature_registry(
         }
     }
 
-    // Ã¢â€â‚¬Ã¢â€â‚¬ Native module loading (Phase 5) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+    // ── Native module loading (Phase 5) ─────────────────────────────────────
     //
     // Load cdylib entries from the manifest. Uses the trust store at
     // `<data_dir>/trusted_module_keys.txt`; unknown keys are denied with
-    // a warning (headless supernode Ã¢â‚¬â€ no interactive prompt).
+    // a warning (headless supernode — no interactive prompt).
     let native_entries: Vec<_> = manifest.native_module_entries().cloned().collect();
     if !native_entries.is_empty() {
         let keys_path = config.data_dir.join("trusted_module_keys.txt");
@@ -183,7 +183,7 @@ fn build_feature_registry(
 /// Sized against what it coalesces, not tuned by feel: a client's
 /// rematerialization burst lands within a couple of milliseconds, so anything
 /// above that captures the whole burst. Kept small enough to stay imperceptible
-/// in the sidebar â€” a room appearing 150 ms late is invisible, while the
+/// in the sidebar — a room appearing 150 ms late is invisible, while the
 /// redundant broadcasts it removes are not.
 const ROOM_LIST_COALESCE: std::time::Duration = std::time::Duration::from_millis(150);
 
@@ -197,18 +197,18 @@ struct SupernodeState {
     signaling: SignalingServer,
     access_controller: Box<dyn access::AccessController>,
     start_time: Instant,
-    /// peer_id Ã¢â€ â€™ ticket expiry timestamp
+    /// peer_id → ticket expiry timestamp
     ticket_expiry: RwLock<HashMap<String, f64>>,
-    /// peer_id Ã¢â€ â€™ raw ENDPOINT_UPDATE message
+    /// peer_id → raw ENDPOINT_UPDATE message
     endpoint_mailbox: RwLock<HashMap<String, String>>,
-    /// Pending hole-punch registrations: (peer_a, peer_b) canonical key Ã¢â€ â€™ PunchRegistration
+    /// Pending hole-punch registrations: (peer_a, peer_b) canonical key → PunchRegistration
     pending_punches: RwLock<HashMap<(String, String), PunchRegistration>>,
     /// Capabilities advertised in `SUPERNODE_INFO`.
     features: Arc<FeatureRegistry>,
     /// Which SFU room types peers may materialize (`room.audio.sfu` params).
     sfu_room_policy: manifest::SfuRoomCreationPolicy,
     /// This node's cluster membership, when an `[cluster]` section is configured.
-    /// `None` Ã¢â€¡â€™ standalone supernode.
+    /// `None` ⇒ standalone supernode.
     cluster: Option<cluster::ClusterMembership>,
     /// Live intra-cluster transport (set after startup when clustering is on).
     cluster_link: RwLock<Option<Arc<cluster_link::ClusterLink>>>,
@@ -231,16 +231,16 @@ struct SupernodeState {
 }
 
 /// Highest verified [`space::SignedSpaceRoot`] per `space_id`. `space_id` embeds
-/// the owner (`derive_node_id("", owner_pub, Ã¢â‚¬Â¦)`), so it is effectively bound to
+/// the owner (`derive_node_id("", owner_pub, …)`), so it is effectively bound to
 /// one signer; we still pin the signer and refuse epoch regression (monotonic
 /// for equivocation containment).
 #[derive(Default)]
 struct SpaceRootStore {
     roots: HashMap<String, space::SignedSpaceRoot>,
-    /// `space_id` Ã¢â€ â€™ count of detected equivocations (two differently-hashed,
+    /// `space_id` → count of detected equivocations (two differently-hashed,
     /// validly-signed roots seen for the same `(space_id, epoch)`). We chose a
     /// set tree, not an append-only log, so there is no consistency proof
-    /// between epochs Ã¢â‚¬â€ a malicious owner *can* sign two roots for one epoch.
+    /// between epochs — a malicious owner *can* sign two roots for one epoch.
     /// Lighter mitigation (flag conflicts; CT-style history tree is deferred in
     /// `backlog.md`): we cannot tell which root is "true", so we keep the
     /// first-seen one (unchanged behavior) but make the conflict observable for
@@ -300,16 +300,16 @@ impl SpaceRootStore {
     }
 }
 
-/// Pure proof-based admission decision (no side effects) Ã¢â‚¬â€ does the presented
+/// Pure proof-based admission decision (no side effects) — does the presented
 /// `proof` (+ `grant` for private nodes) admit `sender` to `room_id` against the
 /// current signed `root`? `now` is unix seconds (grant expiry). Extracted so the
 /// security matrix is unit-testable without a full `SupernodeState`.
 ///
 /// - proof must be for exactly `room_id` and verify against `root` (which pins
-///   the epoch Ã¢â€ â€™ current-epoch-only admission);
+///   the epoch → current-epoch-only admission);
 /// - **public** node: the proof alone admits;
 /// - **private** node: additionally an owner-signed grant bound to this peer,
-///   not expired, whose epoch is already active (`Ã¢â€°Â¤ root.epoch`).
+///   not expired, whose epoch is already active (`≤ root.epoch`).
 fn space_admission_ok(
     root: &space::SignedSpaceRoot,
     proof: &space::SpaceInclusionProof,
@@ -322,7 +322,7 @@ fn space_admission_ok(
         return false;
     }
     if proof.node.node_type != "private" {
-        return true; // public node Ã¢â‚¬â€ proof-only admission
+        return true; // public node — proof-only admission
     }
     let Some(grant) = grant else {
         return false;
@@ -340,7 +340,7 @@ fn space_admission_ok(
 /// A pending hole-punch registration waiting for both peers.
 struct PunchRegistration {
     registered_at: f64,
-    /// peer_id Ã¢â€ â€™ endpoint string
+    /// peer_id → endpoint string
     endpoints: HashMap<String, String>,
 }
 
@@ -374,7 +374,7 @@ impl SupernodeState {
     /// Deliver a room chat replicated from another cluster member to this node's
     /// local recipients. Deduped by `message_id`; never re-replicated.
     ///
-    /// Skips the original author if they multi-homed onto this node â€” same
+    /// Skips the original author if they multi-homed onto this node — same
     /// contract as local `handle_sfu_chat_broadcast` and
     /// [`Self::deliver_replicated_audio`]. Without this, a multi-homed sender
     /// receives their own `SfuChat` via the sibling path and headless/GUI bots
@@ -405,7 +405,7 @@ impl SupernodeState {
 
     /// Deliver a room audio frame replicated from another cluster member to
     /// this node's local voice participants. Prefer QUIC relay datagrams, fall
-    /// back to WebSocket â€” same transport preference as the local SFU bridge.
+    /// back to WebSocket — same transport preference as the local SFU bridge.
     /// Deduped by `message_id`; never re-replicated. Skips the active-speaker
     /// gate (the origin node already applied it; the remote talker is not a
     /// local participant and must not displace local talker scores).
@@ -417,7 +417,7 @@ impl SupernodeState {
             return;
         };
         // Exclude the original talker if they multi-homed onto this node
-        // (pad-normalized â€” same contract as chat).
+        // (pad-normalized — same contract as chat).
         let sender = SignalingMessage::from_json(raw)
             .map(|m| m.sender)
             .unwrap_or_default();
@@ -476,7 +476,7 @@ impl SupernodeState {
     }
 
     /// Local-only room admit: materialize the room if absent and authorize
-    /// `peer` on *this* node. Does **not** cluster-replicate membership Ã¢â‚¬â€
+    /// `peer` on *this* node. Does **not** cluster-replicate membership —
     /// cold members admit via Space proof (or creator / rematerialized token).
     fn local_allow_room_peer(&self, room_id: &str, room_name: &str, room_type: &str, peer: &str) {
         let Some(ref sfu) = self.sfu else {
@@ -487,18 +487,18 @@ impl SupernodeState {
             _ => sfu::RoomType::Private,
         };
         let mut s = sfu.write();
-        // creator "" Ã¢â€ â€™ no implicit creator privileges; access is via the
+        // creator "" → no implicit creator privileges; access is via the
         // explicit allow below.
         s.create_room(Some(room_id), room_name, rtype, "");
         s.allow_peer(room_id, peer);
     }
 
     /// Materialize a durable room advertised in a peer's `RoomRoster` so this
-    /// member can accept a failed-over join for it. Idempotent Ã¢â‚¬â€ `create_room`
+    /// member can accept a failed-over join for it. Idempotent — `create_room`
     /// leaves an existing room untouched. Preserves the advertised `creator_id`
     /// so the room owner retains self-admit/invite authority on any member.
     /// Non-owner private members re-admit via Space proof on join (or local
-    /// invite-token rematerialize) Ã¢â‚¬â€ not via cluster ACL push.
+    /// invite-token rematerialize) — not via cluster ACL push.
     fn apply_room_roster(&self, desc: &cluster_link::RoomDescriptor) {
         let Some(ref sfu) = self.sfu else {
             return;
@@ -516,8 +516,8 @@ impl SupernodeState {
         );
     }
 
-    /// Verify + store a signed Space root (highest epoch per space), and Ã¢â‚¬â€ if it
-    /// was newly accepted Ã¢â‚¬â€ cluster-gossip it to peer members. Returns whether it
+    /// Verify + store a signed Space root (highest epoch per space), and — if it
+    /// was newly accepted — cluster-gossip it to peer members. Returns whether it
     /// was newly stored. Used by the owner announce path and by client-carried
     /// roots on join.
     fn accept_and_gossip_space_root(&self, root: space::SignedSpaceRoot) -> bool {
@@ -534,7 +534,7 @@ impl SupernodeState {
     /// Proof-based Space admission. If `payload` carries space fields that
     /// verify against the current signed root for the space, authorize
     /// `sender`, materialize the room from the proven node, and return `true`.
-    /// Returns `false` to fall through to the local invite-token path Ã¢â‚¬â€
+    /// Returns `false` to fall through to the local invite-token path —
     /// absence or verification failure just means "not admitted by proof", never
     /// an outright denial. Cluster-wide membership is proof-carried; there is no
     /// supernode-to-supernode room ACL push.
@@ -556,10 +556,10 @@ impl SupernodeState {
             return false;
         }
         // A client always carries its current signed root (MTC "fallback
-        // certificate", Ã‚Â§5) so admission never blocks on gossip propagation.
+        // certificate", §5) so admission never blocks on gossip propagation.
         // Accept it (verify + highest-epoch), then verify the proof against the
-        // CURRENT held root Ã¢â‚¬â€ enforcing current-epoch-only admission (revocation
-        // = exclusion, Ã‚Â§8): a stale proof against a superseded root is rejected.
+        // CURRENT held root — enforcing current-epoch-only admission (revocation
+        // = exclusion, §8): a stale proof against a superseded root is rejected.
         let Some(carried) = payload
             .get("space_root")
             .cloned()
@@ -577,8 +577,8 @@ impl SupernodeState {
         }
 
         // The proof shows the room provably exists in the signed Space, so
-        // **materialize** it from the proven node if absent (Ã‚Â§5.1: a proof is an
-        // equally authoritative description) Ã¢â‚¬â€ even when entry is still gated by
+        // **materialize** it from the proven node if absent (§5.1: a proof is an
+        // equally authoritative description) — even when entry is still gated by
         // a local invite token below. This is the roster-free existence
         // guarantee: any cluster member the joiner reaches can serve the room.
         let rtype = if proof.node.node_type == "private" {
@@ -593,7 +593,7 @@ impl SupernodeState {
                 sfu::RoomType::Public
             };
             // Carry the proven SpaceNode's `invite_policy` onto the
-            // materialized room (Ã‚Â§7 "proven SpaceNode" resolution). It is first
+            // materialized room (§7 "proven SpaceNode" resolution). It is first
             // created with an empty `creator_id`; the adopt step below binds it
             // to the proven Space owner.
             let mut s = sfu.write();
@@ -608,7 +608,7 @@ impl SupernodeState {
             // inclusion proof (verified against the current signed root above)
             // authenticates `proof.node.owner_pub` as the room's owner, so
             // adopting it as `creator_id` restores owner minting + self-admit
-            // for a room re-materialized after a restart/idle-GC Ã¢â‚¬â€ the durable
+            // for a room re-materialized after a restart/idle-GC — the durable
             // replacement for the deferred Layer 2 node-key capability path.
             if s.adopt_creator_if_empty(room_id, &proof.node.owner_pub) {
                 info!(
@@ -619,7 +619,7 @@ impl SupernodeState {
             }
         }
 
-        // Admission decision: public Ã¢â€ â€™ proof-only; private Ã¢â€ â€™ owner-signed grant
+        // Admission decision: public → proof-only; private → owner-signed grant
         // bound to this peer. Only on a full pass do we allow locally.
         let grant = payload
             .get("space_grant")
@@ -631,7 +631,7 @@ impl SupernodeState {
             .unwrap_or(0);
         if !space_admission_ok(&root, &proof, grant.as_ref(), sender, room_id, now) {
             // Materialized but not admitted by proof (e.g. private room via a
-            // shareable link carrying no grant) Ã¢â€ â€™ fall through to the local
+            // shareable link carrying no grant) → fall through to the local
             // token path, which can now validate against the just-materialized room.
             return false;
         }
@@ -678,7 +678,7 @@ impl SupernodeState {
                 ROOM_GUEST_TRANSCRIPT_MARKER.to_owned()
             };
             if let Some(existing) = store.get_peer(&identity_pub).cloned() {
-                // Upgrade room-guest â†’ direct-invite marker when a sibling
+                // Upgrade room-guest → direct-invite marker when a sibling
                 // reports a real handshake; never downgrade.
                 let mut updated = existing;
                 let mut dirty = false;
@@ -758,7 +758,7 @@ impl SupernodeState {
 
     /// Admit a peer that became trusted via cluster PeerAuth while already
     /// connected: capabilities, ticket, SFU room list (counts). No PeerAuth
-    /// re-gossip â€” bulk roster already covers convergence.
+    /// re-gossip — bulk roster already covers convergence.
     fn refresh_connected_replicated_peer(&self, identity_pub: &str) {
         self.announce_capabilities_to(identity_pub);
         self.issue_ticket_for_access_state(identity_pub);
@@ -787,12 +787,12 @@ impl SupernodeState {
 
     /// Unified access check for ticket issuance and portal status.
     ///
-    /// * **Open mode + direct invite** (real or replicated transcript) â†’ full.
-    /// * **Open mode + legacy empty transcript** (trusted, not room-guest) â†’ full
+    /// * **Open mode + direct invite** (real or replicated transcript) → full.
+    /// * **Open mode + legacy empty transcript** (trusted, not room-guest) → full
     ///   so headless bots are not stuck portal-only forever after a blank
     ///   `transcript_hash` row.
-    /// * **Open mode + explicit room-guest marker** â†’ requires guest TOS accept.
-    /// * **tos / ad / code** â†’ always consult the controller (including direct invite).
+    /// * **Open mode + explicit room-guest marker** → requires guest TOS accept.
+    /// * **tos / ad / code** → always consult the controller (including direct invite).
     fn check_peer_access(&self, peer_id: &str) -> bool {
         let mode = self.access_controller.mode_name();
         if mode == "open" {
@@ -876,7 +876,7 @@ impl SupernodeState {
     /// Broadcast a room's authoritative rosters to every chat recipient (voice
     /// participants **and** text-chat subscribers).
     ///
-    /// `members` is the voice roster â€” it drives the voice rail, the UI member
+    /// `members` is the voice roster — it drives the voice rail, the UI member
     /// list and P2P audio init on the client (unchanged semantics). `chat_members`
     /// is the full key-group roster (participants + subscribers) that drives E2E
     /// group-key distribution: the client feeds it into keyer election / sealing,
@@ -970,7 +970,7 @@ impl SupernodeState {
     /// Ensure a room-admitted peer can open the portal / room-audio QUIC path
     /// even when they never completed a full supernode invite handshake.
     ///
-    /// Room invites (`conquerd://room#â€¦`) deliberately skip the handshake, so
+    /// Room invites (`conquerd://room#…`) deliberately skip the handshake, so
     /// the peer is WS-connected and in the SFU ACL but not in `peers.json`.
     /// Without a relay ticket the client shows "Portal unavailable" because
     /// `web.host.app.v1` rides the identity QUIC relay only. Trusting the
@@ -999,7 +999,7 @@ impl SupernodeState {
                         revoked: false,
                         auto_connect: false,
                         is_supernode: false,
-                        // Room-invite path â€” not a direct supernode handshake.
+                        // Room-invite path — not a direct supernode handshake.
                         // Marker keeps open-mode guest TOS required.
                         transcript_hash: ROOM_GUEST_TRANSCRIPT_MARKER.to_owned(),
                         created_at: now,
@@ -1033,7 +1033,7 @@ impl SupernodeState {
         let external = self.config.external_host.as_deref().unwrap_or("0.0.0.0");
         if external == "0.0.0.0" {
             warn!(
-                "Relay ticket for {} uses 0.0.0.0 Ã¢â‚¬â€ set supernode_host env var",
+                "Relay ticket for {} uses 0.0.0.0 — set supernode_host env var",
                 &peer_pub[..12.min(peer_pub.len())]
             );
         }
@@ -1154,14 +1154,14 @@ impl SupernodeState {
     /// Note that the room set changed; a broadcast will follow shortly.
     ///
     /// Coalesced rather than sent inline. Every room-set change calls this, and
-    /// a connecting client rematerializes each saved room in turn â€” so a client
+    /// a connecting client rematerializes each saved room in turn — so a client
     /// with four rooms previously produced four full room-list broadcasts to
     /// *every* trusted peer, within milliseconds, all but the last immediately
     /// superseded. Across a three-node cluster that multiplied again.
     ///
     /// Callers keep the same one-line usage; the delay is bounded by
     /// [`ROOM_LIST_COALESCE`] and the flush always reads the room set fresh, so
-    /// no change is ever lost â€” only redundant sends are.
+    /// no change is ever lost — only redundant sends are.
     fn broadcast_room_list(&self) {
         self.room_list_dirty
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1193,7 +1193,7 @@ impl SupernodeState {
                 return Some(format!("{}:{}", addr.ip(), addr.port()));
             }
         }
-        // 2. Endpoint mailbox Ã¢â‚¬â€ parse the raw JSON to extract listener
+        // 2. Endpoint mailbox — parse the raw JSON to extract listener
         if let Some(raw) = self.endpoint_mailbox.read().get(peer_id) {
             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(raw) {
                 if let Some(listener) = msg
@@ -1201,7 +1201,7 @@ impl SupernodeState {
                     .and_then(|p| p.get("listener"))
                     .and_then(|v| v.as_str())
                 {
-                    // listener is typically ws://ip:port Ã¢â‚¬â€ extract host:port
+                    // listener is typically ws://ip:port — extract host:port
                     if let Some(stripped) = listener.strip_prefix("ws://") {
                         return Some(stripped.to_string());
                     }
@@ -1221,7 +1221,7 @@ impl SupernodeState {
             Some(ep) => ep,
             None => {
                 debug!(
-                    "[relay-punch] No endpoint for new peer {} Ã¢â‚¬â€ skipping",
+                    "[relay-punch] No endpoint for new peer {} — skipping",
                     &new_peer[..12.min(new_peer.len())]
                 );
                 return;
@@ -1236,7 +1236,7 @@ impl SupernodeState {
                 Some(ep) => ep,
                 None => {
                     debug!(
-                        "[relay-punch] No endpoint for peer {} Ã¢â‚¬â€ skipping pair",
+                        "[relay-punch] No endpoint for peer {} — skipping pair",
                         &other_peer[..12.min(other_peer.len())]
                     );
                     continue;
@@ -1275,7 +1275,7 @@ impl SupernodeState {
             }),
         );
         info!(
-            "[punch] PUNCH_READY sent to {} Ã¢â€ â€ {} (punch_at={:.3})",
+            "[punch] PUNCH_READY sent to {} ↔ {} (punch_at={:.3})",
             &peer_a[..12.min(peer_a.len())],
             &peer_b[..12.min(peer_b.len())],
             punch_at,
@@ -1327,7 +1327,7 @@ impl SupernodeState {
             .insert(sender.to_string(), sender_endpoint.to_string());
 
         info!(
-            "[punch] Registration from {} Ã¢â€ â€™ {} (endpoint={})",
+            "[punch] Registration from {} → {} (endpoint={})",
             &sender[..12.min(sender.len())],
             &target_peer[..12.min(target_peer.len())],
             sender_endpoint,
@@ -1602,7 +1602,7 @@ fn is_direct_invite_transcript(transcript_hash: &str) -> bool {
 /// `extract_peer_id`) into the padded form used by the SFU / signaling layer
 /// (`public_id`). Appends `=` until the length is a multiple of 4; a string
 /// that is already padded (or whose length is already aligned) is returned
-/// unchanged. Cheap and infallible Ã¢â‚¬â€ no decode/re-encode round-trip.
+/// unchanged. Cheap and infallible — no decode/re-encode round-trip.
 fn pad_base64url(id: &str) -> String {
     match id.len() % 4 {
         0 => id.to_string(),
@@ -1621,7 +1621,7 @@ fn pad_base64url(id: &str) -> String {
 /// Compares pad-normalized Ed25519 `public_id`s so a multi-homed sender whose
 /// wire id is unpadded (relay path) still matches the padded SFU membership
 /// entry and is excluded from local fan-out / cluster delivery. An empty
-/// `sender` never matches (fail open â€” still deliver to everyone).
+/// `sender` never matches (fail open — still deliver to everyone).
 fn is_room_frame_author(recipient: &str, sender: &str) -> bool {
     if sender.is_empty() {
         return false;
@@ -1770,7 +1770,7 @@ async fn handle_relay_signaling_stream(
         };
         if msg.sender != peer_id {
             warn!(
-                "Relay signaling sender {} != stream peer {} Ã¢â‚¬â€ dropping {:?}",
+                "Relay signaling sender {} != stream peer {} — dropping {:?}",
                 &msg.sender[..12.min(msg.sender.len())],
                 &peer_id[..12.min(peer_id.len())],
                 msg.msg_type,
@@ -1867,7 +1867,7 @@ impl SignalingHandler for SupernodeHandler {
                 self.handle_punch_register(&msg);
             }
             MessageType::ChatMessage => {
-                // Peer-targeted relay only Ã¢â‚¬â€ do not log or inspect payload fields;
+                // Peer-targeted relay only — do not log or inspect payload fields;
                 // content may be E2E-encrypted inside `encrypted_signal` envelopes.
             }
             MessageType::TrustRequest | MessageType::TrustAccept => {
@@ -1876,14 +1876,14 @@ impl SignalingHandler for SupernodeHandler {
                 if let Some(target_id) = msg.payload.get("target").and_then(|v| v.as_str()) {
                     self.state.signaling.send_to_peer(target_id, raw);
                     debug!(
-                        "Relayed {:?} from {} Ã¢â€ â€™ {}",
+                        "Relayed {:?} from {} → {}",
                         msg.msg_type,
                         &msg.sender[..12.min(msg.sender.len())],
                         &target_id[..12.min(target_id.len())],
                     );
                 } else {
                     debug!(
-                        "[trust] {:?} from {} missing payload.target Ã¢â‚¬â€ dropped",
+                        "[trust] {:?} from {} missing payload.target — dropped",
                         msg.msg_type,
                         &msg.sender[..12.min(msg.sender.len())],
                     );
@@ -1915,7 +1915,7 @@ impl SignalingHandler for SupernodeHandler {
             | MessageType::AttestationResponse
             | MessageType::CapabilityAnnounce
             | MessageType::Pong => {
-                // Peer-to-peer relay only Ã¢â‚¬â€ forwarding handled by signaling.rs.
+                // Peer-to-peer relay only — forwarding handled by signaling.rs.
             }
             MessageType::CapabilityInvoke => {
                 // Route to a targeted peer when the payload carries a `target` field;
@@ -1923,7 +1923,7 @@ impl SignalingHandler for SupernodeHandler {
                 if let Some(target_id) = msg.payload.get("target").and_then(|v| v.as_str()) {
                     self.state.signaling.send_to_peer(target_id, raw);
                     debug!(
-                        "Relayed CAPABILITY_INVOKE from {} Ã¢â€ â€™ {}",
+                        "Relayed CAPABILITY_INVOKE from {} → {}",
                         &msg.sender[..12.min(msg.sender.len())],
                         &target_id[..12.min(target_id.len())],
                     );
@@ -1931,7 +1931,7 @@ impl SignalingHandler for SupernodeHandler {
                     let feature_id = msg.payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     if feature_id.is_empty() {
                         debug!(
-                            "CAPABILITY_INVOKE from {} missing 'id' Ã¢â‚¬â€ dropped",
+                            "CAPABILITY_INVOKE from {} missing 'id' — dropped",
                             &msg.sender[..12.min(msg.sender.len())],
                         );
                     } else {
@@ -1965,7 +1965,7 @@ impl SignalingHandler for SupernodeHandler {
                     .is_some_and(|sfu| sfu.read().is_room_authorized_peer(&msg.sender));
                 if trusted || room_authorized {
                     debug!(
-                        "[relay] RelayRequest from {} â€” issuing ticket (trusted={} room={})",
+                        "[relay] RelayRequest from {} — issuing ticket (trusted={} room={})",
                         &msg.sender[..12.min(msg.sender.len())],
                         trusted,
                         room_authorized
@@ -1989,7 +1989,7 @@ impl SignalingHandler for SupernodeHandler {
                 self.handle_game_relay_leave(&msg);
             }
             _ => {
-                // Unexpected message type Ã¢â‚¬â€ log for diagnostics.
+                // Unexpected message type — log for diagnostics.
                 debug!(
                     "Unhandled message type {:?} from {}",
                     msg.msg_type,
@@ -2003,7 +2003,7 @@ impl SignalingHandler for SupernodeHandler {
         let is_trusted = self.state.peer_store.read().is_trusted(identity_pub);
         if !is_trusted {
             info!(
-                "Peer {} connected but NOT trusted Ã¢â‚¬â€ ignoring (handshake required)",
+                "Peer {} connected but NOT trusted — ignoring (handshake required)",
                 &identity_pub[..12.min(identity_pub.len())],
             );
             return;
@@ -2207,7 +2207,7 @@ impl SupernodeHandler {
         }
     }
 
-    /// Portal game session join Ã¢â‚¬â€ relay membership only (no SFU voice room).
+    /// Portal game session join — relay membership only (no SFU voice room).
     /// Session id is taken from `payload.room` / `payload.room_id` (game lobby).
     fn handle_game_relay_join(&self, msg: &SignalingMessage) {
         let room = msg
@@ -2225,7 +2225,7 @@ impl SupernodeHandler {
         let trusted = self.state.peer_store.read().is_trusted(&msg.sender);
         if !trusted {
             debug!(
-                "[game.relay] join from untrusted {} Ã¢â‚¬â€ dropped",
+                "[game.relay] join from untrusted {} — dropped",
                 &msg.sender[..12.min(msg.sender.len())]
             );
             return;
@@ -2263,13 +2263,13 @@ impl SupernodeHandler {
 
         // Proof-based admission (coexist): if the join carries a valid Space
         // proof (+ grant for private nodes), authorize + materialize the room
-        // before the ACL check below. A no-op when absent â†’ legacy ACL applies.
+        // before the ACL check below. A no-op when absent → legacy ACL applies.
         self.state
             .try_space_admission(&msg.sender, room_id, &msg.payload);
 
         // Optional client-held invite token on the join itself (cluster cold
         // node / post-GC). Re-seeds the durable credential and admits before
-        // the ACL check â€” same as SfuRoomInvite rematerialize.
+        // the ACL check — same as SfuRoomInvite rematerialize.
         if let Some(token) = msg
             .payload
             .get("invite_token")
@@ -2322,7 +2322,7 @@ impl SupernodeHandler {
                 reason,
                 detail
             );
-            // Tell the client so optimistic voice/UI can roll back Ã¢â‚¬â€ a silent
+            // Tell the client so optimistic voice/UI can roll back — a silent
             // deny previously left peers "in room" with no SFU membership.
             self.state.send_signed(
                 &msg.sender,
@@ -2343,7 +2343,7 @@ impl SupernodeHandler {
 
         // Send member list to joiner. Include `chat_members` (participants +
         // text subscribers) so the joiner's key-group view matches everyone
-        // else's from the first snapshot â€” otherwise a members-only frame could
+        // else's from the first snapshot — otherwise a members-only frame could
         // race the broadcast below and transiently drop subscribers from keying.
         let chat_members = sfu.read().get_chat_recipients(room_id);
         self.state.send_signed(
@@ -2521,7 +2521,7 @@ impl SupernodeHandler {
             }
         }
         // Cross-node room members (attached to a sibling supernode) only hear
-        // this talker if we fan the same opaque frame over the cluster link Ã¢â‚¬â€
+        // this talker if we fan the same opaque frame over the cluster link —
         // parity with room.chat.v1's replicate_room_chat path.
         self.state.replicate_room_audio(room_id, msg, raw);
     }
@@ -2556,7 +2556,7 @@ impl SupernodeHandler {
             // warn: silent drops here look like "bot replied in terminal but peer
             // never saw it" when multi-homed clients hit the wrong node path.
             tracing::warn!(
-                "[room.chat.v1] sender {} is not a member of room {} â€” dropping chat",
+                "[room.chat.v1] sender {} is not a member of room {} — dropping chat",
                 &msg.sender[..12.min(msg.sender.len())],
                 &room_id[..12.min(room_id.len())]
             );
@@ -2674,7 +2674,7 @@ impl SupernodeHandler {
             );
             // Announce the widened key-group roster so the elected keyer seals
             // the current epoch to the new subscriber (and the subscriber learns
-            // the set) â€” this is what lets text chat work without a voice join.
+            // the set) — this is what lets text chat work without a voice join.
             self.state.broadcast_sfu_members(room_id);
         }
     }
@@ -2697,7 +2697,7 @@ impl SupernodeHandler {
             &msg.sender[..12.min(msg.sender.len())],
             &room_id[..12.min(room_id.len())]
         );
-        // Roster shrank â€” reannounce so the keyer rotates the epoch (forward
+        // Roster shrank — reannounce so the keyer rotates the epoch (forward
         // secrecy) and reseals to whoever remains.
         self.state.broadcast_sfu_members(room_id);
     }
@@ -2799,7 +2799,7 @@ impl SupernodeHandler {
         //     RoomStore entry + token is the membership proof after GC);
         //   * first create without a client token mints a fresh single-use
         //     shareable invite for the creator to distribute.
-        // Room-id alone is NOT enough Ã¢â‚¬â€ non-creators without a token are not
+        // Room-id alone is NOT enough — non-creators without a token are not
         // admitted on a bare materialize of an already-existing room.
         let mut invite_token: Option<String> = None;
         if is_private {
@@ -2825,7 +2825,7 @@ impl SupernodeHandler {
 
             if !admitted && (is_creator || created_new) {
                 // Creator (or first materializer creating a brand-new room)
-                // self-admits without a token. Local allow only Ã¢â‚¬â€ cold cluster
+                // self-admits without a token. Local allow only — cold cluster
                 // members re-admit via Space proof or rematerialize + token re-seed.
                 let _ = sfu.write().allow_peer(&room_id_out, &msg.sender);
                 if created_new && invite_token.is_none() {
@@ -2871,7 +2871,7 @@ impl SupernodeHandler {
         let room_exists = sfu.read().get_room(room_id).is_some();
         // Re-entry: a peer previously admitted on *this* node is still in its
         // local `allowed` set. The single-use invite token is consumed on first
-        // use, so subsequent re-entry re-sends a spent token â€” admit already-
+        // use, so subsequent re-entry re-sends a spent token — admit already-
         // allowed peers directly (same node only; cold nodes need Space proof
         // or token rematerialize).
         let already_member = sfu
@@ -2883,7 +2883,7 @@ impl SupernodeHandler {
             .try_space_admission(&msg.sender, room_id, &msg.payload);
         // Cold-cluster / post-GC path: RoomRoster materializes room *existence*
         // without the invite-token map. A client-held RoomStore token is the
-        // durable membership credential â€” re-seed it as multi-use before
+        // durable membership credential — re-seed it as multi-use before
         // validate (same contract as SfuRoomCreate rematerialize). Without
         // this, non-creators can only rejoin the node they first admitted on.
         let by_token = if !by_proof && !token.is_empty() {
@@ -2987,7 +2987,7 @@ impl SupernodeHandler {
             }
             sfu::InviteMint::NotAuthorized => {
                 warn!(
-                    "[sfu] Invite generate denied for room {} Ã¢â‚¬â€ {} is not the room creator",
+                    "[sfu] Invite generate denied for room {} — {} is not the room creator",
                     short(room_id),
                     short(&msg.sender),
                 );
@@ -2999,7 +2999,7 @@ impl SupernodeHandler {
             }
             sfu::InviteMint::RoomNotFound => {
                 warn!(
-                    "[sfu] Invite generate failed for room {} Ã¢â‚¬â€ room not found",
+                    "[sfu] Invite generate failed for room {} — room not found",
                     short(room_id),
                 );
                 self.state.send_signed(
@@ -3013,7 +3013,7 @@ impl SupernodeHandler {
 
     /// The owner announces a signed Space root. Verify the owner signature,
     /// store the highest epoch, and cluster-gossip it so any member can later
-    /// admit by proof against it (authenticated room-set sync, Ã‚Â§8).
+    /// admit by proof against it (authenticated room-set sync, §8).
     fn handle_space_root_announce(&self, msg: &SignalingMessage) {
         let Some(root) = msg
             .payload
@@ -3023,7 +3023,7 @@ impl SupernodeHandler {
         else {
             return;
         };
-        // The announcer must be the root's signer (owner) Ã¢â‚¬â€ a peer can't push
+        // The announcer must be the root's signer (owner) — a peer can't push
         // someone else's root here (gossip re-verifies the signature anyway).
         if root.signer.trim_end_matches('=') != msg.sender.trim_end_matches('=') {
             return;
@@ -3101,7 +3101,7 @@ async fn main() -> anyhow::Result<()> {
     let listener_host = config.external_host.as_deref().unwrap_or("0.0.0.0");
     let listener_url = format!("ws://{}:{}", listener_host, config.signaling_port);
     if listener_host == "0.0.0.0" {
-        warn!("Invite listener_url uses 0.0.0.0 Ã¢â‚¬â€ set supernode_host env var for remote clients");
+        warn!("Invite listener_url uses 0.0.0.0 — set supernode_host env var for remote clients");
     }
     let mut handshake =
         HandshakeManager::new(identity.clone(), listener_url, config.invite_ttl_seconds);
@@ -3131,7 +3131,7 @@ async fn main() -> anyhow::Result<()> {
 
     // SFU room manager
     let sfu = if config.sfu_enabled {
-        info!("SFU enabled Ã¢â‚¬â€ rooms are ephemeral (peer-owned definitions, idle GC)");
+        info!("SFU enabled — rooms are ephemeral (peer-owned definitions, idle GC)");
         Some(RwLock::new(SFURoomManager::new()))
     } else {
         None
@@ -3228,7 +3228,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(move |root: space::SignedSpaceRoot| {
                 if let Some(state) = weak.upgrade() {
                     // Gossip is full-mesh: accept (verify + highest-epoch) but do
-                    // not re-forward Ã¢â‚¬â€ the origin already broadcast to all peers.
+                    // not re-forward — the origin already broadcast to all peers.
                     state.space_roots.write().accept(root);
                 }
             })
@@ -3383,7 +3383,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Install the room-audio datagram bridge so `room.audio.sfu` frames a peer
-    // sends over its QUIC relay session (unreliable datagrams Ã¢â‚¬â€ no TCP
+    // sends over its QUIC relay session (unreliable datagrams — no TCP
     // head-of-line blocking) are fanned out to *every* room member by their
     // best transport: relay datagram for relay-connected members, WebSocket
     // for the rest. The frame stays end-to-end signed, so this never
@@ -3411,8 +3411,8 @@ async fn main() -> anyhow::Result<()> {
                     };
                     let fwd = crate::wire::build_forwarded_datagram(sender_index, &inner);
                     // The relay identifies peers by the *un-padded* base64url id
-                    // (`extract_peer_id`), but the SFU room Ã¢â‚¬â€ populated from the
-                    // WebSocket `SfuJoin` Ã¢â‚¬â€ keys participants by the *padded*
+                    // (`extract_peer_id`), but the SFU room — populated from the
+                    // WebSocket `SfuJoin` — keys participants by the *padded*
                     // `public_id`. Re-pad `from_peer` into the SFU's id space so
                     // the active-speaker gate recognizes the sender and the
                     // exclusion below actually fires; otherwise the talker is
@@ -3433,7 +3433,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         match relay.send_room_datagram(&member, &fwd) {
                             // Delivered (or dropped on quota/send error) over the
-                            // relay Ã¢â‚¬â€ do not also send over WS for this member.
+                            // relay — do not also send over WS for this member.
                             Some(_) => {}
                             // Not relay-connected: deliver over WebSocket,
                             // charging the same `room.audio.sfu` outbound quota.
@@ -3477,9 +3477,9 @@ async fn main() -> anyhow::Result<()> {
         }
         let invite = hs.reusable_invite.as_ref().unwrap();
         let uri = invite.to_uri();
-        info!("Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â");
+        info!("═══════════════════════════════════════");
         info!("Invite URL: {}", uri);
-        info!("Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â");
+        info!("═══════════════════════════════════════");
     }
 
     // Ticket renewal timer
@@ -3493,7 +3493,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Idle SFU room GC Ã¢â‚¬â€ peer-materialized rooms are dropped after inactivity.
+    // Idle SFU room GC — peer-materialized rooms are dropped after inactivity.
     // Room-list broadcast coalescer. Sleeping *after* the wake is what does the
     // work: the first change starts the window, and everything arriving during
     // it folds into the same flush.
@@ -3585,7 +3585,7 @@ fn check_ticket_renewals(state: &SupernodeState) {
             "Renewing relay ticket for {}",
             &peer_id[..12.min(peer_id.len())]
         );
-        // Respect the access gate on renewal â€” do not promote a portal-only
+        // Respect the access gate on renewal — do not promote a portal-only
         // guest to full relay just because their ticket is about to expire.
         state.issue_ticket_for_access_state(&peer_id);
     }
@@ -3601,25 +3601,25 @@ fn check_ticket_renewals(state: &SupernodeState) {
 /// ```text
 /// <data_dir>/
 ///   web/
-///     index.html                     Ã¢â€ Â portal dashboard (uses window.conquerd bridge)
+///     index.html                     ← portal dashboard (uses window.conquerd bridge)
 ///   games/
 ///     example/
-///       index.html                   Ã¢â€ Â cursor-relay demo UI
-///       game.js                      Ã¢â€ Â cursor-relay demo logic
+///       index.html                   ← cursor-relay demo UI
+///       game.js                      ← cursor-relay demo logic
 ///     shared-drawing/
-///       index.html                   Ã¢â€ Â collaborative canvas demo
+///       index.html                   ← collaborative canvas demo
 ///       drawing.js
 ///     brick-breaker/
-///       index.html                   Ã¢â€ Â multiplayer breakout demo
+///       index.html                   ← multiplayer breakout demo
 ///       brick-breaker.js
 ///   web-sdk/
-///     conquerd.mjs                   Ã¢â€ Â browser SDK (imported by all game demos)
+///     conquerd.mjs                   ← browser SDK (imported by all game demos)
 /// ```
 ///
 /// The three game demos (`game.relay.v1`) run inside the native in-app portal
 /// over the identity QUIC relay (`window.conquerd` channel APIs).
 fn seed_web_defaults(data_dir: &std::path::Path) {
-    // Embedded assets â€” all paths are relative to this source file and
+    // Embedded assets — all paths are relative to this source file and
     // live inside the crate so the build works regardless of whether the
     // wider project root (games/, web-sdk/) is present (e.g. on Linux CI).
     const PORTAL_HTML: &str = include_str!("../templates/web_index.html");
@@ -3650,13 +3650,13 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
 
     // Always-overwrite: all system-owned files must stay current with the
     // binary.  Content is compared first so unchanged files are not touched.
-    // Operators add their own games under a different slug Ã¢â‚¬â€ they never
+    // Operators add their own games under a different slug — they never
     // customise these first-party files directly.
     let always_update: &[(&[&str], &str)] = &[
         (&["web", "index.html"], PORTAL_HTML),
-        // Standalone access portal (TOS / gate) â€” separate from the full portal.
+        // Standalone access portal (TOS / gate) — separate from the full portal.
         (&["web", "access.html"], ACCESS_HTML),
-        // Served at /web-sdk/conquerd.mjs Ã¢â‚¬â€ must live under web/ so that
+        // Served at /web-sdk/conquerd.mjs — must live under web/ so that
         // the web_app_module route() function finds it via the web_root.
         (&["web", "web-sdk", "conquerd.mjs"], CONQUERD_MJS),
         (&["games", "example", "index.html"], CURSOR_HTML),
@@ -3684,7 +3684,7 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
             let _ = std::fs::create_dir_all(parent);
         }
         match std::fs::read_to_string(&full) {
-            Ok(existing) if existing == *content => {} // unchanged Ã¢â‚¬â€ skip the write
+            Ok(existing) if existing == *content => {} // unchanged — skip the write
             _ => {
                 if let Err(e) = std::fs::write(&full, content.as_bytes()) {
                     warn!("[seed] could not write {}: {e}", full.display());
@@ -3712,7 +3712,7 @@ mod access_invite_tests {
     /// transcript must not stay portal-only forever).
     #[test]
     fn open_mode_grants_legacy_empty_transcript_not_room_guest() {
-        // Direct / non-empty / empty â†’ would be full; room-guest â†’ controller only.
+        // Direct / non-empty / empty → would be full; room-guest → controller only.
         // Pure helper parity with `check_peer_access` open branch.
         let full = |transcript: &str| {
             if transcript == ROOM_GUEST_TRANSCRIPT_MARKER {
@@ -3742,7 +3742,7 @@ mod identity_normalization_tests {
         let no_pad = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let padded = base64::engine::general_purpose::URL_SAFE;
         // Sweep several distinct 32-byte keys; Ed25519 keys are always 32 bytes
-        // Ã¢â€ â€™ 43 unpadded chars Ã¢â€ â€™ 44 padded (one trailing '=').
+        // → 43 unpadded chars → 44 padded (one trailing '=').
         for seed in [0u8, 1, 7, 42, 255] {
             let key = [seed; 32];
             let relay_id = no_pad.encode(key); // what the relay sees
@@ -3973,7 +3973,7 @@ mod room_list_coalesce_tests {
 
     #[tokio::test(start_paused = true)]
     async fn changes_after_the_window_broadcast_again() {
-        // Coalescing must not swallow later changes â€” the sidebar would go
+        // Coalescing must not swallow later changes — the sidebar would go
         // stale, which is worse than the redundancy being removed.
         let c = Coalescer::new();
         c.spawn(std::time::Duration::from_millis(20));
@@ -4198,7 +4198,7 @@ mod space_admission_tests {
 
     #[test]
     fn space_root_store_flags_same_epoch_content_conflict_as_equivocation() {
-        // Same owner key, same space_id, same epoch Ã¢â‚¬â€ but two different node
+        // Same owner key, same space_id, same epoch — but two different node
         // sets produce two different `root_hash`es. A malicious (or buggy)
         // owner signing both is exactly the equivocation a set tree cannot
         // prevent structurally; we can only detect and flag it (lighter
@@ -4217,7 +4217,7 @@ mod space_admission_tests {
             key_commit: String::new(),
         });
         // Same epoch (forced, simulating an attacker/bug re-using an epoch
-        // number) as `root_a`, different node set Ã¢â€ â€™ different root_hash.
+        // number) as `root_a`, different node set → different root_hash.
         sp_fork.epoch = sp.epoch;
         let root_b = sp_fork.signed_root(1000, |b| ed25519_sign(&key.to_bytes(), b).unwrap());
         assert_eq!(root_a.epoch, root_b.epoch);
@@ -4254,10 +4254,10 @@ mod space_admission_tests {
         let proof = sp.prove(&rid).unwrap();
         let peer = "peer-b-pub";
 
-        // No grant Ã¢â€ â€™ refused.
+        // No grant → refused.
         assert!(!space_admission_ok(&root, &proof, None, peer, &rid, 0));
 
-        // Valid grant for this peer Ã¢â€ â€™ admitted.
+        // Valid grant for this peer → admitted.
         let grant = sp.grant(&rid, peer, 0, |b| ed25519_sign(&key.to_bytes(), b).unwrap());
         assert!(space_admission_ok(
             &root,
@@ -4268,7 +4268,7 @@ mod space_admission_tests {
             0
         ));
 
-        // Grant for a *different* peer Ã¢â€ â€™ refused (replay by a third party).
+        // Grant for a *different* peer → refused (replay by a third party).
         assert!(!space_admission_ok(
             &root,
             &proof,
@@ -4278,7 +4278,7 @@ mod space_admission_tests {
             0
         ));
 
-        // Grant signed by a non-owner Ã¢â€ â€™ refused.
+        // Grant signed by a non-owner → refused.
         let attacker = SigningKey::generate(&mut OsRng);
         let forged = sp.grant(&rid, peer, 0, |b| {
             ed25519_sign(&attacker.to_bytes(), b).unwrap()
@@ -4292,7 +4292,7 @@ mod space_admission_tests {
             0
         ));
 
-        // Expired grant Ã¢â€ â€™ refused.
+        // Expired grant → refused.
         let expiring = sp.grant(&rid, peer, 500, |b| {
             ed25519_sign(&key.to_bytes(), b).unwrap()
         });
@@ -4313,7 +4313,7 @@ mod space_admission_tests {
             501
         ));
 
-        // Grant for a different node id Ã¢â€ â€™ refused.
+        // Grant for a different node id → refused.
         let other = sp.grant("other-room", peer, 0, |b| {
             ed25519_sign(&key.to_bytes(), b).unwrap()
         });
@@ -4345,7 +4345,7 @@ mod space_admission_tests {
         ));
 
         // After the Space changes (new epoch), the OLD proof no longer verifies
-        // against the NEW root Ã¢â€ â€™ current-epoch-only admission.
+        // against the NEW root → current-epoch-only admission.
         sp.upsert_node(space::SpaceNode {
             node_id: space::derive_node_id(&sp.space_id, &sp.owner_pub, "Extra"),
             parent_id: sp.space_id.clone(),

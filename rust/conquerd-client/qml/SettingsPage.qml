@@ -1,4 +1,4 @@
-﻿// SettingsPage.qml - token-driven settings content panel.
+// SettingsPage.qml - token-driven settings content panel.
 
 import QtQuick
 import QtQuick.Controls.Material
@@ -930,7 +930,7 @@ Item {
                     title: "Ollama Assistant"
                     subtitle: "Local-only assistant. Enable + Save, then restart once. Auto-reply posts Ollama answers into chat when a peer messages you."
 
-                    // Stable ListModel â€” assigning a JS array to ComboBox.model is
+                    // Stable ListModel — assigning a JS array to ComboBox.model is
                     // unreliable with editable Material combos on some Qt 6 builds.
                     ListModel { id: ollamaModelList }
 
@@ -967,7 +967,7 @@ Item {
                             return
                         }
                         if (!names || names.length === 0) {
-                            ollamaModelStatus.text = "No models found â€” is Ollama running? Try: ollama list"
+                            ollamaModelStatus.text = "No models found — is Ollama running? Try: ollama list"
                             ollamaModelStatus.color = Theme.muted
                             return
                         }
@@ -994,7 +994,7 @@ Item {
                         id: ollamaEnabledSwitch
                         title: "Enable AI assistant"
                         description: backend && backend.ollama_available
-                                     ? "Plugin running â€” chat AI is available."
+                                     ? "Plugin running — chat AI is available."
                                      : "Uses your local Ollama server. Restart ConquerD after enabling so chat AI starts."
                         checked: root.settings ? root.settings.ollama_enabled : false
                         onChanged: {

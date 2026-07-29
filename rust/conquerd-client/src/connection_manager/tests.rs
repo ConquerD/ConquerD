@@ -1493,3 +1493,243 @@ async fn room_join_retry_gives_up_after_max_attempts() {
         "must not resend once retries are exhausted, got {sent:?}"
     );
 }
+
+// ── Transport matrix: {direct P2P, SFU room} x {text, voice, video} ──────────
+//
+// Every cell must ride ConquerD's own transport over QUIC. These tests pin the
+// *routing decision* — which lane a payload leaves by, and with which channel
+// tag — because that is where this feature set has repeatedly broken silently:
+// a path with a live handler but no emitter, or a sender gated on room state it
+// does not have, produces no error anywhere. It simply never sends.
+
+/// Direct 1:1 text goes out on the peer's QUIC reliable stream, not the
+/// supernode, whenever a direct session exists.
+#[tokio::test]
+async fn p2p_text_prefers_direct_quic_over_the_supernode() {
+    use crate::protocol::{MessageType, SignalingMessage};
+    use conquerd_features::channel_frame;
+    use serde_json::Value;
+
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    let mut peer = t.cm.test_add_peer_session("peer-direct");
+
+    let mut chat = SignalingMessage::new(MessageType::ChatMessage, t.identity.public_id());
+    chat.target = Some("peer-direct".to_owned());
+    chat.payload
+        .insert("message_id".to_owned(), Value::String("m1".to_owned()));
+    chat.payload
+        .insert("body".to_owned(), Value::String("hi".to_owned()));
+    t.cm.dispatch_outbound(chat).await;
+
+    let frame = peer.try_recv().expect("direct QUIC must carry the chat");
+    let bytes = match frame {
+        super::internal::PeerOutbound::Reliable(b) => b,
+        other => panic!("chat must use the reliable stream, got {other:?}"),
+    };
+    assert_eq!(
+        bytes[0],
+        channel_frame::CHAT_TAG,
+        "direct chat must ride the chat channel tag"
+    );
+    assert!(
+        harness::drain_ws(&mut sn).is_empty(),
+        "a live direct session must not also relay through the supernode"
+    );
+}
+
+/// Direct voice rides an unreliable QUIC datagram under the audio tag.
+/// Reliability is deliberately not wanted: a retransmitted Opus frame arrives
+/// too late to play and only adds latency behind it.
+#[tokio::test]
+async fn p2p_voice_uses_a_quic_datagram_with_the_audio_tag() {
+    use conquerd_features::channel_frame;
+
+    let mut t = harness::test_cm();
+    let mut peer = t.cm.test_add_peer_session("peer-direct");
+
+    t.cm.test_send_audio_datagram("peer-direct", vec![0xAA; 80])
+        .await;
+
+    let frame = peer.try_recv().expect("audio must reach the peer");
+    match frame {
+        super::internal::PeerOutbound::Datagram(b) => {
+            assert_eq!(b[0], channel_frame::AUDIO_TAG);
+        }
+        other => panic!("audio must be a datagram, got {other:?}"),
+    }
+}
+
+/// Direct video rides QUIC datagrams under the video tag, fragmented — one
+/// encoded frame does not fit a single datagram the way an Opus frame does.
+#[tokio::test]
+async fn p2p_video_fragments_across_quic_datagrams_with_the_video_tag() {
+    use conquerd_features::channel_frame;
+
+    let mut t = harness::test_cm();
+    let mut peer = t.cm.test_add_peer_session("peer-direct");
+
+    // Comfortably larger than one datagram, so fragmentation is exercised.
+    t.cm.test_send_video_datagram("peer-direct", vec![0x5A; 8000], true)
+        .await;
+
+    let mut fragments = 0usize;
+    while let Ok(frame) = peer.try_recv() {
+        match frame {
+            super::internal::PeerOutbound::Datagram(b) => {
+                assert_eq!(
+                    b[0],
+                    channel_frame::VIDEO_TAG,
+                    "direct video must ride the direct video tag, not the room one"
+                );
+                assert!(
+                    b.len() <= crate::video::DEFAULT_MAX_DATAGRAM,
+                    "fragment of {} bytes exceeds the datagram budget",
+                    b.len()
+                );
+                fragments += 1;
+            }
+            other => panic!("video must be datagrams, got {other:?}"),
+        }
+    }
+    assert!(
+        fragments > 1,
+        "an 8000-byte frame must fragment; got {fragments}"
+    );
+}
+
+/// A direct peer that is not connected must not silently swallow video.
+#[tokio::test]
+async fn p2p_video_without_a_session_sends_nothing() {
+    let mut t = harness::test_cm();
+    let mut peer = t.cm.test_add_peer_session("peer-direct");
+    // A different peer id: nothing is connected for this one.
+    t.cm.test_send_video_datagram("peer-absent", vec![0x11; 4000], true)
+        .await;
+    assert!(
+        peer.try_recv().is_err(),
+        "video for an absent peer must not leak onto another peer's session"
+    );
+}
+
+/// Room text is supernode-targeted, so it leaves via the supernode lane rather
+/// than any direct peer session that happens to exist — and only once the room
+/// is keyed.
+#[tokio::test]
+async fn sfu_text_targets_the_supernode_not_a_direct_peer() {
+    use crate::protocol::MessageType;
+
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    let mut peer = t.cm.test_add_peer_session("peer-direct");
+    t.cm.test_set_room("SN-AAAA", "room-1");
+    t.cm.test_mint_group_key("room-1");
+
+    t.cm.test_send_sfu_chat("SN-AAAA", "room-1", "hello room", "me", "msg-1")
+        .await;
+
+    let sent = harness::drain_ws(&mut sn);
+    let chat = sent
+        .iter()
+        .find(|m| m.msg_type == MessageType::SfuChat)
+        .unwrap_or_else(|| panic!("room chat must reach the supernode, got {sent:?}"));
+    // The body on the wire is sealed under the room key, never the plaintext.
+    let body = chat
+        .payload
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !body.contains("hello room"),
+        "room chat body must be sealed, not cleartext: {body}"
+    );
+    assert_eq!(
+        chat.payload.get("e2e").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "room chat must be flagged e2e"
+    );
+    assert!(
+        peer.try_recv().is_err(),
+        "room chat must not be sent down a direct peer session"
+    );
+}
+
+/// Room chat fails **closed** before keying. The deterministic fallback key can
+/// still seal, but it is not confidential against the supernode (which knows
+/// the room id), so sending under it would be worse than not sending — the user
+/// would believe the message was private.
+#[tokio::test]
+async fn sfu_text_is_dropped_until_the_room_is_keyed() {
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    t.cm.test_set_room("SN-AAAA", "room-1");
+    // Deliberately no test_mint_group_key here.
+
+    t.cm.test_send_sfu_chat("SN-AAAA", "room-1", "secret", "me", "msg-1")
+        .await;
+
+    assert!(
+        harness::drain_ws(&mut sn).is_empty(),
+        "unkeyed room chat must be dropped rather than sent"
+    );
+}
+
+/// Room voice and video are relay-datagram only. With no QUIC relay session
+/// they must drop rather than fall back to the WebSocket: the WS lane cannot
+/// carry binary media frames, and silently "succeeding" there would look like
+/// working audio that no one receives.
+#[tokio::test]
+async fn sfu_media_does_not_fall_back_to_websocket() {
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    t.cm.test_set_room("SN-AAAA", "room-1");
+
+    t.cm.test_send_room_audio(vec![0xAA; 80]).await;
+    t.cm.test_send_room_video(vec![0x5A; 4000], true).await;
+
+    let sent = harness::drain_ws(&mut sn);
+    assert!(
+        sent.is_empty(),
+        "room media must not be emitted as WebSocket signaling, got {sent:?}"
+    );
+}
+
+/// Camera-state announcements pick their lane from the session kind. Both are
+/// covered because the direct arm was missing entirely at first: the sender was
+/// gated on being in a room, so a 1:1 call announced nothing and the peer's
+/// indicator never lit.
+#[tokio::test]
+async fn video_state_announces_on_whichever_lane_is_live() {
+    use crate::protocol::MessageType;
+
+    // Room session: announcement goes to the supernode.
+    {
+        let mut t = harness::test_cm();
+        let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+        t.cm.test_set_room("SN-AAAA", "room-1");
+        t.cm.test_send_video_state(true, None).await;
+        let sent = harness::drain_ws(&mut sn);
+        assert!(
+            sent.iter()
+                .any(|m| m.msg_type == MessageType::SfuVideoState),
+            "room camera state must reach the supernode, got {sent:?}"
+        );
+    }
+
+    // Direct call: announcement goes to the peer over QUIC.
+    {
+        let mut t = harness::test_cm();
+        let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+        let mut peer = t.cm.test_add_peer_session("peer-direct");
+        t.cm.test_send_video_state(true, Some("peer-direct".to_owned()))
+            .await;
+        assert!(
+            peer.try_recv().is_ok(),
+            "direct camera state must be sent to the peer"
+        );
+        assert!(
+            harness::drain_ws(&mut sn).is_empty(),
+            "a direct announcement must not also go to the supernode"
+        );
+    }
+}

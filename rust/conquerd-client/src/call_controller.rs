@@ -1,4 +1,4 @@
-﻿//! Call controller â€” audio call lifecycle state machine.
+//! Call controller — audio call lifecycle state machine.
 //!
 //! Coordinates:
 //! - Audio engine (CPAL + Opus via conquerd-opus)
@@ -86,7 +86,7 @@ impl Default for PeerMix {
 }
 
 struct AudioPipeline {
-    /// Keep streams alive â€” dropped here when the call ends.
+    /// Keep streams alive — dropped here when the call ends.
     _capture_stream: Stream,
     _playback_stream: Stream,
     /// Push decoded PCM frames into the CPAL playback ring buffer.
@@ -98,16 +98,16 @@ struct AudioPipeline {
     noise_strength: Arc<AtomicU32>,
     /// Outgoing Opus bitrate in bits per second. Shared with the capture callback.
     outgoing_bitrate_bps: Arc<AtomicU32>,
-    /// Input gain 0â€“200 (100 = unity). Shared with the capture callback.
+    /// Input gain 0–200 (100 = unity). Shared with the capture callback.
     input_gain: Arc<AtomicU32>,
-    /// Output gain 0â€“200 (100 = unity). Applied in push_inbound.
+    /// Output gain 0–200 (100 = unity). Applied in push_inbound.
     output_gain: Arc<AtomicU32>,
     /// Per-peer Opus decoders (lazily created on first inbound frame).
     decoders: HashMap<String, OpusDecoder>,
     /// Listener-local playback preferences per peer ("mute for me", volume).
     ///
     /// A plain field rather than an `Arc<Mutex<_>>` because the pipeline is
-    /// owned exclusively by the CallController task â€” unlike the atomics above,
+    /// owned exclusively by the CallController task — unlike the atomics above,
     /// which exist only because the cpal capture callback runs on a device
     /// thread. Absent entries mean "no preference".
     peer_mix: HashMap<String, PeerMix>,
@@ -119,7 +119,7 @@ struct AudioPipeline {
     /// `set_packet_loss_perc` can be called on each Opus frame when the value
     /// changes without locking the encoder.
     fec_loss_pct: Arc<AtomicU32>,
-    /// V9: Exponential moving average of playback ring fill ratio (0.0â€“1.0).
+    /// V9: Exponential moving average of playback ring fill ratio (0.0–1.0).
     /// Used to detect and correct sustained positive clock drift (timer fires
     /// faster than the device drains).
     ring_fill_ema: f32,
@@ -144,7 +144,7 @@ unsafe impl Send for AudioPipeline {}
 unsafe impl Sync for AudioPipeline {}
 
 /// Look up a CPAL device by name, falling back to the host default when the
-/// name is empty or no device matches.  `kind` is "input" or "output" â€” used
+/// name is empty or no device matches.  `kind` is "input" or "output" — used
 /// only for the diagnostic log line.
 fn resolve_cpal_device(
     host: &cpal::Host,
@@ -168,7 +168,7 @@ fn resolve_cpal_device(
                 }
             }
             warn!(
-                "Audio {kind} device '{}' not found â€” falling back to system default",
+                "Audio {kind} device '{}' not found — falling back to system default",
                 target
             );
         }
@@ -253,7 +253,7 @@ impl AudioPipeline {
 
         // Query device default configs. On Windows (WASAPI shared mode) and
         // most CoreAudio devices, build_*_stream will refuse any config that
-        // doesn't match the device default â€” so we must adopt the device's
+        // doesn't match the device default — so we must adopt the device's
         // native sample-rate and channel-count and resample / mix in software.
         let input_default = input_dev
             .default_input_config()
@@ -310,7 +310,7 @@ impl AudioPipeline {
         encoder
             .set_dtx(true)
             .map_err(|e| anyhow::anyhow!("Set DTX: {e}"))?;
-        // Enable DRED: 10 Ã— 10 ms frames = 100 ms redundancy depth.
+        // Enable DRED: 10 × 10 ms frames = 100 ms redundancy depth.
         // Non-fatal: OPUS_UNIMPLEMENTED is returned if the weights were not
         // loaded (dnn feature disabled) or this libopus build lacks DRED.
         if let Err(e) = encoder.set_dred_duration_ms(100) {
@@ -330,7 +330,7 @@ impl AudioPipeline {
         let mut vad_above_count = 0u32;
         let mut vad_below_count = 0u32;
 
-        // Resampler state for in_sr â†’ 48 kHz mono (linear interpolation).
+        // Resampler state for in_sr → 48 kHz mono (linear interpolation).
         let mut resamp_prev: f32 = 0.0;
         let mut resamp_phase: f64 = 0.0; // fractional source-sample position [0,1)
         let resamp_ratio: f64 = in_sr as f64 / SAMPLE_RATE as f64;
@@ -341,7 +341,7 @@ impl AudioPipeline {
 
         // Echo cancellation (off unless built with the `aec` feature). The
         // far-end reference ring decouples the playback and capture callbacks;
-        // the capture-side canceller models the speakerâ†’mic echo path and
+        // the capture-side canceller models the speaker→mic echo path and
         // subtracts it from each captured frame before encoding.
         let (aec_ref_prod, mut aec_state): (Option<ringbuf::HeapProd<f32>>, Option<AecState>) =
             if cfg!(feature = "aec") {
@@ -525,7 +525,7 @@ impl AudioPipeline {
         let ring: HeapRb<i16> = HeapRb::new(RING_FRAMES * SAMPLES_PER_FRAME);
         let (playback_prod, mut playback_cons) = ring.split();
 
-        // Resampler state for 48 kHz mono â†’ out_sr (linear interpolation).
+        // Resampler state for 48 kHz mono → out_sr (linear interpolation).
         let mut pb_prev: f32 = 0.0;
         let mut pb_next: f32 = 0.0;
         let mut pb_phase: f64 = 1.0; // start by pulling a fresh source sample
@@ -622,10 +622,10 @@ impl AudioPipeline {
 
     /// Decode one inbound Opus frame (or run PLC when `opus_data` is `None`)
     /// for `peer_id`, **without** touching the playback ring. Returns the
-    /// decoded PCM, the sample count, and the normalised RMS level (0.0â€“1.0).
+    /// decoded PCM, the sample count, and the normalised RMS level (0.0–1.0).
     ///
     /// Separating decode from playout lets [`Self::mix_and_play`] sum several
-    /// peers into one frame before a single push â€” pushing each peer's PCM
+    /// peers into one frame before a single push — pushing each peer's PCM
     /// directly would concatenate (not overlay) simultaneous speakers.
     ///
     /// Pass `opus_data = None` to trigger Opus PLC (packet loss concealment)
@@ -654,8 +654,8 @@ impl AudioPipeline {
                 if opus_data.is_none() && n > 0 {
                     let sum_sq: f64 = pcm[..n].iter().map(|&s| (s as f64).powi(2)).sum::<f64>();
                     if sum_sq / (n as f64) < (20.0_f64).powi(2) {
-                        // RMS < 20 â‰ˆ âˆ’64 dBFS: Opus has fully faded to silence.
-                        // Inject noise at â‰ˆâˆ’66 dBFS (Â±16 peak i16).
+                        // RMS < 20 ≈ −64 dBFS: Opus has fully faded to silence.
+                        // Inject noise at ≈−66 dBFS (±16 peak i16).
                         for s in &mut pcm[..n] {
                             self.cng_seed ^= self.cng_seed << 13;
                             self.cng_seed ^= self.cng_seed >> 17;
@@ -665,7 +665,7 @@ impl AudioPipeline {
                     }
                 }
 
-                // Compute RMS from decoded PCM (i16 â†’ normalised float),
+                // Compute RMS from decoded PCM (i16 → normalised float),
                 // then apply the same dB-scale used for the local mic capture
                 // so remote levels have comparable visual weight on the ring.
                 let sum_sq: f64 = pcm[..n].iter().map(|&s| (s as f64 / 32768.0).powi(2)).sum();
@@ -702,7 +702,7 @@ impl AudioPipeline {
                 let _ = self.playback_prod.try_push(gained);
             }
         } else {
-            debug!("Playback ring full â€” dropping frame from {peer_id}");
+            debug!("Playback ring full — dropping frame from {peer_id}");
         }
         level
     }
@@ -712,8 +712,8 @@ impl AudioPipeline {
     /// ring. Returns each peer's normalised level for UI metering.
     ///
     /// This is the multi-party playout path. Pushing each peer's PCM separately
-    /// would concatenate (not overlay) simultaneous speakers â€” the ring would
-    /// fill at NÃ— the drain rate, time-compressing audio and then dropping
+    /// would concatenate (not overlay) simultaneous speakers — the ring would
+    /// fill at N× the drain rate, time-compressing audio and then dropping
     /// frames. Accumulation uses `i32` so summed peaks can't wrap before the
     /// final clamp. (A soft limiter would be gentler than the hard clamp when
     /// many loud speakers overlap; clamp matches the prior single-source
@@ -750,7 +750,7 @@ impl AudioPipeline {
             // drop once the ring overflows completely.
             if self.ring_fill_ema > 0.65 {
                 debug!(
-                    "Playout drift: ring EMA {:.0}% full â€” skipping push",
+                    "Playout drift: ring EMA {:.0}% full — skipping push",
                     self.ring_fill_ema * 100.0
                 );
                 return levels;
@@ -772,7 +772,7 @@ impl AudioPipeline {
                 }
             } else {
                 debug!(
-                    "Playback ring full â€” dropping mixed frame ({} peers)",
+                    "Playback ring full — dropping mixed frame ({} peers)",
                     levels.len()
                 );
             }
@@ -781,7 +781,7 @@ impl AudioPipeline {
     }
 
     /// Free a peer's Opus decoder when they leave the call/room. Without this
-    /// the `decoders` map grows for every distinct peer ever heard â€” an
+    /// the `decoders` map grows for every distinct peer ever heard — an
     /// unbounded leak in long-lived, high-churn public rooms.
     fn drop_decoder(&mut self, peer_id: &str) {
         self.decoders.remove(peer_id);
@@ -790,7 +790,7 @@ impl AudioPipeline {
     /// Playback gain for one peer, from the listener's local preferences.
     ///
     /// Absent means "no preference": full volume, unmuted. Muting yields 0.0
-    /// rather than skipping the decode â€” see [`Self::set_peer_muted`].
+    /// rather than skipping the decode — see [`Self::set_peer_muted`].
     fn peer_gain(&self, peer_id: &str) -> f32 {
         match self.peer_mix.get(peer_id) {
             Some(m) if m.muted => 0.0,
@@ -834,7 +834,7 @@ impl AudioPipeline {
         );
     }
 
-    /// V12: Update the FEC packet-loss hint (0â€“50 %) fed to the Opus encoder.
+    /// V12: Update the FEC packet-loss hint (0–50 %) fed to the Opus encoder.
     fn set_fec_loss_pct(&self, pct: u8) {
         self.fec_loss_pct
             .store(pct.clamp(0, 50) as u32, Ordering::Relaxed);
@@ -923,9 +923,9 @@ pub enum CallCommand {
     SetNoiseSuppression(bool),
     /// Set noise gate strength (0=off, 1=mild, 2=moderate, 3=aggressive, 4=max).
     SetNoiseStrength(u32),
-    /// Set input microphone gain (0â€“200, 100=unity).
+    /// Set input microphone gain (0–200, 100=unity).
     SetInputGain(u32),
-    /// Set output speaker gain (0â€“200, 100=unity).
+    /// Set output speaker gain (0–200, 100=unity).
     SetOutputGain(u32),
     /// Set outgoing Opus bitrate in bits per second. Treated as the *ceiling*:
     /// adaptive control may reduce the live rate below it under packet loss.
@@ -933,18 +933,18 @@ pub enum CallCommand {
     /// Mute one peer **for this listener only**. Purely local: the peer is not
     /// notified and keeps transmitting, unlike self-mute which rides the wire.
     SetPeerMuted { peer_id: String, muted: bool },
-    /// Set one peer's playback volume for this listener (0â€“200, 100 = unity).
+    /// Set one peer's playback volume for this listener (0–200, 100 = unity).
     SetPeerVolume { peer_id: String, pct: u32 },
     /// Network-quality feedback from the transport layer for one peer/path,
-    /// used to drive adaptive outgoing bitrate. `loss_pct` is 0â€“100.
+    /// used to drive adaptive outgoing bitrate. `loss_pct` is 0–100.
     UpdateNetworkQuality { loss_pct: f32, rtt_ms: f32 },
     /// Inbound direct-peer audio frame (Opus bytes from a 1:1 QUIC session).
     DirectAudioInbound { peer_id: String, opus_data: Vec<u8> },
-    /// Switch PTT â†” voice-activation.
+    /// Switch PTT ↔ voice-activation.
     SetVoiceActivation(bool),
     /// Inbound room audio frame (Opus bytes from a room member).
     RoomAudioInbound { peer_id: String, opus_data: Vec<u8> },
-    /// Update the jitter buffer depth (in Opus frames, 1â€“20). Takes effect
+    /// Update the jitter buffer depth (in Opus frames, 1–20). Takes effect
     /// immediately on the next playout cycle.
     SetJitterDepth(usize),
     /// Enter SFU room audio mode: outbound frames are sent via the supernode
@@ -996,7 +996,7 @@ pub enum CallEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Per-peer audio session (stub â€” full impl requires conquerd-audio)
+// Per-peer audio session (stub — full impl requires conquerd-audio)
 // ---------------------------------------------------------------------------
 
 struct PeerAudioSession {
@@ -1046,7 +1046,7 @@ pub struct CallController {
     encoded_rx: Option<mpsc::Receiver<Vec<u8>>>,
     /// Speaking-state events from the inline VAD in the capture callback.
     speaking_rx: Option<tokio::sync::mpsc::UnboundedReceiver<bool>>,
-    /// Normalized audio level events (0.0â€“1.0) emitted each Opus frame.
+    /// Normalized audio level events (0.0–1.0) emitted each Opus frame.
     level_rx: Option<tokio::sync::mpsc::UnboundedReceiver<f32>>,
     /// Cached local speaking state (used to suppress redundant events and for
     /// immediate false-emission on mute).
@@ -1062,7 +1062,7 @@ pub struct CallController {
     room_peer_last_audio: HashMap<String, std::time::Instant>,
 
     /// Timestamp of the last `RemoteLevelChanged` event emitted per peer.
-    /// Throttles level updates to â‰¤10 Hz (100 ms) to keep the model reset
+    /// Throttles level updates to ≤10 Hz (100 ms) to keep the model reset
     /// rate manageable.
     room_peer_last_level: HashMap<String, std::time::Instant>,
 
@@ -1082,27 +1082,27 @@ pub struct CallController {
     /// Playout frames served since the last jitter adaptation tick.
     playout_frames: u64,
     /// Of those, how many were packet-loss-concealment fills for an empty queue
-    /// (i.e. buffer underruns) â€” the signal the adaptive controller reacts to.
+    /// (i.e. buffer underruns) — the signal the adaptive controller reacts to.
     playout_underruns: u64,
     /// Consecutive low-underrun adaptation ticks; gates buffer shrinking so it
     /// only happens after sustained good conditions (avoids oscillation).
     jitter_low_streak: u32,
-    /// Input gain 0â€“200 (100=unity). Sent to AudioPipeline on start.
+    /// Input gain 0–200 (100=unity). Sent to AudioPipeline on start.
     input_vol: u32,
-    /// Output gain 0â€“200 (100=unity). Sent to AudioPipeline on start.
+    /// Output gain 0–200 (100=unity). Sent to AudioPipeline on start.
     output_vol: u32,
     /// Listener-local per-peer mute/volume, kept here rather than only on the
     /// pipeline so preferences survive a pipeline restart between calls. The
     /// pipeline is rebuilt whenever audio starts; this is replayed into it.
     peer_prefs: HashMap<String, PeerMix>,
-    /// Noise gate strength index 0â€“4. Sent to AudioPipeline on start.
+    /// Noise gate strength index 0–4. Sent to AudioPipeline on start.
     noise_strength_idx: u32,
     /// Live outgoing Opus bitrate in bits per second (direct + room audio).
     /// Adaptive control may lower this below [`Self::bitrate_ceiling_bps`].
     outgoing_bitrate_bps: u32,
     /// User-configured bitrate ceiling; adaptive control never exceeds it.
     bitrate_ceiling_bps: u32,
-    /// Exponentially-smoothed packet loss percentage (0â€“100) from transport
+    /// Exponentially-smoothed packet loss percentage (0–100) from transport
     /// stats, the signal driving adaptive bitrate.
     net_loss_ema: f32,
     /// Remaining adaptation ticks to skip after entering room mode.
@@ -1167,7 +1167,7 @@ impl CallController {
 
     fn set_state(&mut self, new_state: CallState) {
         if self.state != new_state {
-            info!("Call state: {:?} â†’ {:?}", self.state, new_state);
+            info!("Call state: {:?} → {:?}", self.state, new_state);
             self.state = new_state.clone();
             let _ = self.event_tx.try_send(CallEvent::StateChanged(new_state));
         }
@@ -1232,7 +1232,7 @@ impl CallController {
             self.emit_peer_state(&pid, PeerAudioState::Closed);
         }
         self.peers.clear();
-        // Drop the pipeline â€” CPAL streams stop when their handle is dropped.
+        // Drop the pipeline — CPAL streams stop when their handle is dropped.
         self.audio = None;
         self.encoded_rx = None;
         self.speaking_rx = None;
@@ -1326,7 +1326,7 @@ impl CallController {
         // playout tick so irregular network arrivals don't cause clicks/pops.
         let queue = self.peer_jitter_queues.entry(peer_id).or_default();
         queue.push_back(opus_data);
-        // Cap queue at 8Ã— depth to bound memory under extreme bursts.
+        // Cap queue at 8× depth to bound memory under extreme bursts.
         let max_depth = (self.jitter_depth * 8).max(16);
         while queue.len() > max_depth {
             queue.pop_front();
@@ -1337,7 +1337,7 @@ impl CallController {
     /// peer.  Called from the 20 ms `playout_tick` in `run()`.
     ///
     /// - If a peer's queue hasn't yet reached `jitter_depth`, we skip it
-    ///   (initial buffering phase â€” introduces target_depth Ã— 20 ms latency).
+    ///   (initial buffering phase — introduces target_depth × 20 ms latency).
     /// - Once playout has started, an empty queue triggers Opus PLC so the
     ///   decoder state stays coherent during brief packet-loss gaps.
     /// - If the peer goes fully silent (last packet > PEER_SILENCE_TIMEOUT ago)
@@ -1390,8 +1390,8 @@ impl CallController {
                 continue;
             }
 
-            // Pop the next queued frame (None â†’ PLC for this slot). A None here
-            // means a started, still-active peer's queue ran dry â€” an underrun,
+            // Pop the next queued frame (None → PLC for this slot). A None here
+            // means a started, still-active peer's queue ran dry — an underrun,
             // which the adaptive controller uses to grow the buffer.
             let frame = self
                 .peer_jitter_queues
@@ -1425,7 +1425,7 @@ impl CallController {
         };
 
         for (peer_id, level) in levels {
-            // Throttle level events to â‰¤10 Hz per peer.
+            // Throttle level events to ≤10 Hz per peer.
             let should_emit = self
                 .room_peer_last_level
                 .get(&peer_id)
@@ -1447,7 +1447,7 @@ impl CallController {
     /// [`MAX_JITTER_DEPTH`]. No-op when adaptation is disabled (user pinned a
     /// depth), audio is idle, or no frames played this window.
     ///
-    /// Does **not** reset the window counters â€” the caller does that once, after
+    /// Does **not** reset the window counters — the caller does that once, after
     /// [`Self::adapt_room_bitrate`] has also consumed them.
     fn adapt_jitter_buffer(&mut self) {
         if !self.jitter_adaptive || self.audio.is_none() || self.playout_frames == 0 {
@@ -1461,7 +1461,7 @@ impl CallController {
         );
         if depth != self.jitter_depth {
             debug!(
-                "Jitter buffer depth â†’ {} frames ({} ms) â€” underruns {}/{}",
+                "Jitter buffer depth → {} frames ({} ms) — underruns {}/{}",
                 depth,
                 depth * 20,
                 self.playout_underruns,
@@ -1488,7 +1488,7 @@ impl CallController {
         if !self.room_mode || self.audio.is_none() || self.playout_frames == 0 {
             return;
         }
-        // Skip ABR during the warmup window â€” underruns while the jitter buffer
+        // Skip ABR during the warmup window — underruns while the jitter buffer
         // is still filling are expected and are not congestion.
         if self.abr_warmup_ticks > 0 {
             self.abr_warmup_ticks -= 1;
@@ -1510,7 +1510,7 @@ impl CallController {
                 p.set_outgoing_bitrate(new_bps);
             }
             debug!(
-                "Room ABR â†’ {} bps (relay loss proxy EMA {:.1}%)",
+                "Room ABR → {} bps (relay loss proxy EMA {:.1}%)",
                 new_bps, self.net_loss_ema
             );
         }
@@ -1572,7 +1572,7 @@ impl CallController {
         info!("CallController started");
         let mut metrics_tick = tokio::time::interval(Duration::from_secs(2));
         let mut speaking_tick = tokio::time::interval(Duration::from_millis(600));
-        // 20 ms playout tick â€” one Opus frame per peer per tick.
+        // 20 ms playout tick — one Opus frame per peer per tick.
         let mut playout_tick = tokio::time::interval(Duration::from_millis(20));
         // Discard the first (immediate) tick so silence-detection only fires
         // after real intervals.
@@ -1777,7 +1777,7 @@ impl CallController {
                                     p.set_outgoing_bitrate(new);
                                 }
                                 debug!(
-                                    "Adaptive bitrate â†’ {} bps (loss EMA {:.1}%)",
+                                    "Adaptive bitrate → {} bps (loss EMA {:.1}%)",
                                     new, self.net_loss_ema
                                 );
                             }
@@ -1926,11 +1926,11 @@ fn next_jitter_depth(depth: usize, low_streak: u32, frames: u64, underruns: u64)
 }
 
 /// Pure adaptive-bitrate decision. Given the live `current` rate, the user's
-/// `ceiling`, and a smoothed `loss_pct` (0â€“100), returns the next bitrate in
+/// `ceiling`, and a smoothed `loss_pct` (0–100), returns the next bitrate in
 /// bps, clamped to [`MIN_OUTGOING_BITRATE_BPS`]..=`ceiling`.
 ///
-/// AIMD-style: multiplicative back-off (âˆ’20%) above ~10% loss, hold in the
-/// 4â€“10% band, gentle additive-ish recovery (+8%) below 4%. Keeps the call
+/// AIMD-style: multiplicative back-off (−20%) above ~10% loss, hold in the
+/// 4–10% band, gentle additive-ish recovery (+8%) below 4%. Keeps the call
 /// audible on a degrading link instead of letting a fixed high bitrate drown
 /// in loss.
 fn next_bitrate(current: u32, ceiling: u32, loss_pct: f32) -> u32 {
@@ -1966,7 +1966,7 @@ fn update_room_loss_ema(current_ema: f32, playout_underruns: u64, playout_frames
 }
 
 /// Room/relay ABR decision. Like [`next_bitrate`] but recovers slowly in the
-/// 4â€“10% mid band instead of holding indefinitely â€” the underrun proxy often
+/// 4–10% mid band instead of holding indefinitely — the underrun proxy often
 /// lingers there after the jitter buffer has already absorbed the spike.
 fn next_room_bitrate(current: u32, ceiling: u32, loss_pct: f32) -> u32 {
     let target = if loss_pct > 10.0 {
@@ -1985,7 +1985,7 @@ fn next_room_bitrate(current: u32, ceiling: u32, loss_pct: f32) -> u32 {
 /// Soft-knee limiter for the mix bus: linear below `KNEE`, then a smooth
 /// tanh-shaped saturation that asymptotes to full scale. Keeps normal
 /// single/few-speaker levels at unity while taming clipping when several loud
-/// speakers overlap â€” gentler than a hard clamp, which produces harsh
+/// speakers overlap — gentler than a hard clamp, which produces harsh
 /// distortion on peaks. The knee sits near full scale (~-2.5 dBFS) so only
 /// near-clipping peaks are touched.
 fn soft_clip_sample(x: f32) -> i16 {
@@ -2009,7 +2009,7 @@ fn soft_clip_sample(x: f32) -> i16 {
 ///
 /// Each input carries its own gain so a listener can mute or attenuate one
 /// participant without affecting the others. Accumulation is `f32` rather than
-/// `i32` because those gains are fractional â€” summing in integers first would
+/// `i32` because those gains are fractional — summing in integers first would
 /// quantise every attenuated peer to whole sample steps. `f32` has ample
 /// headroom for the summed peaks that `i32` was protecting against, and the
 /// soft limiter still handles overflow at the end.
@@ -2036,11 +2036,11 @@ fn mix_pcm_frames(frames: &[(&[i16], f32)], master_gain: f32) -> Vec<i16> {
 /// a smooth gain ramp when signal energy drops below a strength-dependent
 /// multiple of that floor.  Higher `strength_idx` = more aggressive gating.
 ///
-/// * 0 â€” off (no processing)
-/// * 1 â€” mild (4Ã— floor)
-/// * 2 â€” moderate (8Ã— floor)
-/// * 3 â€” aggressive (16Ã— floor)
-/// * 4 â€” max (32Ã— floor)
+/// * 0 — off (no processing)
+/// * 1 — mild (4× floor)
+/// * 2 — moderate (8× floor)
+/// * 3 — aggressive (16× floor)
+/// * 4 — max (32× floor)
 fn apply_noise_gate(frame: &mut [i16], noise_floor: &mut f32, strength_idx: u32) {
     if strength_idx == 0 || frame.is_empty() {
         return;
@@ -2055,7 +2055,7 @@ fn apply_noise_gate(frame: &mut [i16], noise_floor: &mut f32, strength_idx: u32)
     } else {
         *noise_floor = *noise_floor * (1.0 - 0.001) + rms * 0.001;
     }
-    // Clamp floor so it doesnâ€™t collapse to zero in total silence.
+    // Clamp floor so it doesn’t collapse to zero in total silence.
     *noise_floor = noise_floor.max(1.0);
     let multiplier: f32 = match strength_idx {
         1 => 4.0,
@@ -2095,7 +2095,7 @@ fn process_capture_mono_f32(
     input_gain: f32,
     mut aec: Option<&mut AecState>,
 ) {
-    // Linear-interpolation resampler: input rate â†’ 48 kHz.
+    // Linear-interpolation resampler: input rate → 48 kHz.
     for &src in mono_in {
         while *resamp_phase < 1.0 {
             let interp = *resamp_prev * (1.0 - *resamp_phase as f32) + src * (*resamp_phase as f32);
@@ -2126,7 +2126,7 @@ fn process_capture_mono_f32(
         // Noise gate before VAD/encode so the gate doesn't trip on background noise.
         apply_noise_gate(&mut frame, noise_floor, noise_strength_idx);
 
-        // RMS energy â†’ VAD + level meter.
+        // RMS energy → VAD + level meter.
         let rms_sq: f64 =
             frame.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / frame.len() as f64;
         let rms = rms_sq.sqrt() as f32;
@@ -2612,7 +2612,7 @@ mod tests {
         handle.await.unwrap();
     }
 
-    // â”€â”€ Multi-party mixing (mix_pcm_frames) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Multi-party mixing (mix_pcm_frames) ─────────────────────────────────
 
     #[test]
     fn mix_single_frame_is_passthrough_at_unity_gain() {
@@ -2628,7 +2628,7 @@ mod tests {
         let b = [50i16, 50, -50, -50];
         let out = mix_pcm_frames(&[(&a[..], 1.0), (&b[..], 1.0)], 1.0);
         assert_eq!(out, vec![150, -150, 250, -450]);
-        // Crucially, the mixed frame is the same length as the inputs â€” not the
+        // Crucially, the mixed frame is the same length as the inputs — not the
         // sum of their lengths (which is the concatenation bug being fixed).
         assert_eq!(out.len(), a.len());
     }
@@ -2641,7 +2641,7 @@ mod tests {
         let a = [30000i16];
         let out = mix_pcm_frames(&[(&a[..], 1.0), (&a[..], 1.0), (&a[..], 1.0)], 1.0);
         assert_eq!(out.len(), 1);
-        // Summing 3Ã—30000 then saturating must land above a single input (proof
+        // Summing 3×30000 then saturating must land above a single input (proof
         // it didn't wrap to a small/negative value) and near +full scale. The
         // `<= i16::MAX` bound is guaranteed by the output type, so a positive
         // lower bound is the meaningful check.
@@ -2687,7 +2687,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    // ── Per-peer local mute / volume ────────────────────────────────────────
+    // -- Per-peer local mute / volume ----------------------------------------
 
     #[test]
     fn mix_applies_per_peer_gain_independently() {
@@ -2738,11 +2738,11 @@ mod tests {
         assert_eq!(d.volume_pct, 100);
     }
 
-    // â”€â”€ Adaptive jitter buffer (next_jitter_depth) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Adaptive jitter buffer (next_jitter_depth) ──────────────────────────
 
     #[test]
     fn jitter_grows_immediately_on_high_underruns() {
-        // 10% underruns (> grow ratio) â†’ depth +1, streak reset.
+        // 10% underruns (> grow ratio) → depth +1, streak reset.
         let (depth, streak) = next_jitter_depth(3, 4, 1000, 100);
         assert_eq!(depth, 4);
         assert_eq!(streak, 0);
@@ -2756,11 +2756,11 @@ mod tests {
 
     #[test]
     fn jitter_shrinks_only_after_sustained_low_underruns() {
-        // Below shrink ratio but streak not yet met â†’ hold depth, bump streak.
+        // Below shrink ratio but streak not yet met → hold depth, bump streak.
         let (depth, streak) = next_jitter_depth(6, 2, 1000, 0);
         assert_eq!(depth, 6, "must not shrink before the streak threshold");
         assert_eq!(streak, 3);
-        // One more low window brings the streak to the threshold â†’ shrink.
+        // One more low window brings the streak to the threshold → shrink.
         let (depth, streak) = next_jitter_depth(6, JITTER_SHRINK_STREAK - 1, 1000, 0);
         assert_eq!(depth, 5);
         assert_eq!(streak, 0);
@@ -2774,7 +2774,7 @@ mod tests {
 
     #[test]
     fn jitter_steady_in_normal_band_resets_streak() {
-        // Underruns between shrink and grow ratios â†’ no change, streak reset.
+        // Underruns between shrink and grow ratios → no change, streak reset.
         let (depth, streak) = next_jitter_depth(5, 3, 1000, 20); // 2%
         assert_eq!(depth, 5);
         assert_eq!(streak, 0);
@@ -2786,7 +2786,7 @@ mod tests {
         assert_eq!((depth, streak), (7, 2));
     }
 
-    // â”€â”€ Adaptive bitrate (next_bitrate) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Adaptive bitrate (next_bitrate) ─────────────────────────────────────
 
     #[test]
     fn bitrate_backs_off_under_heavy_loss() {
@@ -2819,7 +2819,7 @@ mod tests {
         );
     }
 
-    // â”€â”€ Room ABR (update_room_loss_ema / next_room_bitrate) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Room ABR (update_room_loss_ema / next_room_bitrate) ─────────────────
 
     #[test]
     fn room_loss_ema_decays_fast_on_zero_underruns() {
@@ -2832,7 +2832,7 @@ mod tests {
 
     #[test]
     fn room_loss_ema_ignores_sporadic_underruns() {
-        // 2 PLC fills in a 400-frame window = 0.5% â€” below the 1% signal gate.
+        // 2 PLC fills in a 400-frame window = 0.5% — below the 1% signal gate.
         let ema = update_room_loss_ema(8.0, 2, 400);
         assert!(
             ema < 8.0,

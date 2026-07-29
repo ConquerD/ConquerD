@@ -1,4 +1,4 @@
-﻿// VideoPopoutWindow.qml â€” one peer's video in a detached OS window.
+// VideoPopoutWindow.qml — one peer's video in a detached OS window.
 //
 // The first dynamically-created top-level window in this app, so a few things
 // that MainWindow gets for free have to be done explicitly here:
@@ -6,7 +6,7 @@
 //  * It is not an engine root object, so `qml_startup.cpp` never sees it and
 //    the frameless chrome must be requested by hand (Windows only).
 //  * `ApplicationWindow.onClosing -> Qt.quit()` is not inherited, which is
-//    what we want â€” closing a popout must not quit the app.
+//    what we want — closing a popout must not quit the app.
 //  * Geometry is restored against the *current* screen set, so unplugging a
 //    monitor cannot strand the window off-screen.
 
@@ -30,7 +30,7 @@ Window {
 
     signal closed()
 
-    title: (displayName || peerId) + " â€” ConquerD"
+    title: (displayName || peerId) + " — ConquerD"
     width: 640
     height: 400
     minimumWidth: 240

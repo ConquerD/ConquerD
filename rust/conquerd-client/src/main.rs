@@ -1,9 +1,9 @@
-//! conquerd-client â€” native Rust desktop client entry point.
+//! conquerd-client — native Rust desktop client entry point.
 //!
 //! When built with `--features qt-ui`, starts a Qt/QML window and runs the
 //! tokio runtime on a background thread (AppBridge handles startup).
 //!
-//! Without `qt-/* ui */`, runs headlessly â€” useful for integration testing.
+//! Without `qt-/* ui */`, runs headlessly — useful for integration testing.
 //!
 //! By default the Windows console window is suppressed (`windows_subsystem = "windows"`).
 //! Build with `--features console` to keep the console attached for debugging.
@@ -91,7 +91,7 @@ enum HeadlessAutoTarget {
 /// On HiDPI Windows displays (e.g. 4K at 150%) Qt honours the OS DPI scale
 /// factor, which makes Material's touch-sized controls (48 dp) appear very
 /// large on desktop.  Setting `QT_SCALE_FACTOR=0.75` before `QGuiApplication`
-/// is constructed gives `0.75 Ã— 1.5 = 1.125` effective scale â€” compact and
+/// is constructed gives `0.75 × 1.5 = 1.125` effective scale — compact and
 /// sharp on 4K, no change on non-HiDPI monitors (96 DPI / 100%).
 ///
 /// Only applied when the caller has not already set `QT_SCALE_FACTOR`.
@@ -137,7 +137,7 @@ fn run_qt_ui() {
         conquerd_install_qt_message_handler();
     }
 
-    // Windows taskbar / alt-tab icon â€” set via C++ shim so that
+    // Windows taskbar / alt-tab icon — set via C++ shim so that
     // QGuiApplication::setWindowIcon() is called before exec().
     #[cfg(target_os = "windows")]
     extern "C" {
@@ -154,7 +154,7 @@ fn run_qt_ui() {
     }
 
     // Register the conquerd:// URL scheme BEFORE QGuiApplication is
-    // created â€” this is a QtWebEngine requirement. No-op without webengine.
+    // created — this is a QtWebEngine requirement. No-op without webengine.
     // Portal pages use web.host.app.v1 over the native QUIC session (no
     // browser WebTransport / Chromium QUIC flags required).
     #[cfg(feature = "webengine")]
@@ -197,7 +197,7 @@ fn run_qt_ui() {
             conquerd_qml_post_load_check(engine_ptr);
         }
     } else {
-        error!("QQmlApplicationEngine::new() returned null â€” UI cannot start");
+        error!("QQmlApplicationEngine::new() returned null — UI cannot start");
     }
     if let Some(app) = app.as_mut() {
         app.exec();
@@ -205,7 +205,7 @@ fn run_qt_ui() {
 }
 
 fn main() {
-    // Logging â€” seeded from the persisted `debug_logging` setting, runtime
+    // Logging — seeded from the persisted `debug_logging` setting, runtime
     // reloadable via the Settings toggle; an explicit RUST_LOG always wins.
     logging::init(logging::load_debug_logging_setting());
 
@@ -288,7 +288,7 @@ async fn headless_main() {
     info!("Peer store loaded: {} peers", peer_store.read().len());
     for sn in peer_store.read().supernodes() {
         info!(
-            "  trusted supernode: {}â€¦",
+            "  trusted supernode: {}…",
             &sn.identity_pub[..12.min(sn.identity_pub.len())]
         );
     }
@@ -306,7 +306,7 @@ async fn headless_main() {
     info!("Chat store opened");
 
     // ------------------------------------------------------------------
-    // Room store (client-owned definitions â€” rematerialized on connect)
+    // Room store (client-owned definitions — rematerialized on connect)
     // ------------------------------------------------------------------
     let room_store = match RoomStore::open(&identity, None) {
         Ok(s) => Arc::new(RwLock::new(s)),
@@ -323,7 +323,7 @@ async fn headless_main() {
         );
         for e in rs.list() {
             info!(
-                "  room '{}' ({}) on {}â€¦ type={} hidden={}",
+                "  room '{}' ({}) on {}… type={} hidden={}",
                 e.room_name,
                 e.room_id,
                 &e.supernode_id[..12.min(e.supernode_id.len())],
@@ -436,7 +436,7 @@ fn unlock_identity(key_dir: &std::path::Path) -> error::Result<Identity> {
         if let Ok((id, _)) = Identity::load_with_keyring_or_passphrase(b"", key_dir) {
             return Ok(id);
         }
-        // Keyring unavailable â€” prompt on stdin
+        // Keyring unavailable — prompt on stdin
         let typed = stdin_prompt("Passphrase: ");
         if !typed.is_empty() {
             return Identity::load_with_passphrase(typed.as_bytes(), key_dir);
@@ -446,7 +446,7 @@ fn unlock_identity(key_dir: &std::path::Path) -> error::Result<Identity> {
         ));
     }
 
-    // â”€â”€ First launch: no identity exists yet â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── First launch: no identity exists yet ──────────────────────────────
     first_launch_setup(key_dir)
 }
 
@@ -487,7 +487,7 @@ fn first_launch_setup(key_dir: &std::path::Path) -> error::Result<Identity> {
     Ok(id)
 }
 
-/// Read a line from stdin with a visible prompt (does not echo â€” use for
+/// Read a line from stdin with a visible prompt (does not echo — use for
 /// passphrases in a real terminal; no TTY suppression needed in headless mode).
 fn stdin_prompt(prompt: &str) -> String {
     eprint!("{prompt}");
@@ -655,7 +655,7 @@ async fn run_headless(
                 );
                 if !settings.enabled || !settings.auto_respond_direct {
                     error!(
-                        "[ollama-sim] ollama_enabled={} auto_respond_direct={} â€” enable both in settings.json",
+                        "[ollama-sim] ollama_enabled={} auto_respond_direct={} — enable both in settings.json",
                         settings.enabled, settings.auto_respond_direct
                     );
                     if std::env::var("CONQUERD_SIMULATE_EXIT").unwrap_or_else(|_| "1".into()) == "1"
@@ -687,12 +687,12 @@ async fn run_headless(
 
     tokio::pin!(ctrl_c);
 
-    // Pending auto-reply streams (request_id â†’ target).
+    // Pending auto-reply streams (request_id → target).
     let mut auto_pending: HashMap<String, HeadlessAutoTarget> = HashMap::new();
     let mut auto_buf: HashMap<String, String> = HashMap::new();
     // Hosts (pad-stripped) already rematerialized this session.
     let mut rematerialized_hosts: HashSet<String> = HashSet::new();
-    // Cluster rosters: member_id â†’ sibling public_ids (for multi-home rematerialize).
+    // Cluster rosters: member_id → sibling public_ids (for multi-home rematerialize).
     let mut cluster_siblings: HashMap<String, Vec<String>> = HashMap::new();
     let sim_exit_on_done = std::env::var("CONQUERD_SIMULATE_INBOUND_CHAT").is_ok()
         && std::env::var("CONQUERD_SIMULATE_EXIT").unwrap_or_else(|_| "1".into()) == "1";
@@ -737,7 +737,7 @@ async fn run_headless(
                     identity.public_id().as_str(),
                 ).await;
                 if done && sim_exit_on_done {
-                    info!("[ollama-sim] auto-reply simulation complete â€” exiting");
+                    info!("[ollama-sim] auto-reply simulation complete — exiting");
                     let _ = ollama_cmd_tx.send(ollama_module::OllamaCommand::Shutdown).await;
                     let _ = cmd_tx.send(ConnectionCommand::Shutdown).await;
                     break;
@@ -779,14 +779,14 @@ fn headless_rematerialize_and_subscribe(
 
     let mut subscribed: HashSet<String> = HashSet::new();
 
-    // Built-in public room â€” always present on the supernode; chat-only subscribe.
+    // Built-in public room — always present on the supernode; chat-only subscribe.
     let _ = cmd_tx.try_send(ConnectionCommand::SubscribeRoomChat {
         supernode_id: live_host.to_owned(),
         room_id: "default".to_owned(),
     });
     subscribed.insert("default".to_owned());
     info!(
-        "[headless] subscribed room chat: default on {}â€¦",
+        "[headless] subscribed room chat: default on {}…",
         &live_host[..12.min(live_host.len())]
     );
 
@@ -812,7 +812,7 @@ fn headless_rematerialize_and_subscribe(
             entry.creator_id.clone()
         };
         info!(
-            "[headless] rematerialize room '{}' ({}) type={} onto {}â€¦",
+            "[headless] rematerialize room '{}' ({}) type={} onto {}…",
             entry.room_name,
             entry.room_id,
             entry.room_type,
@@ -972,7 +972,7 @@ async fn handle_event(
         } => {
             let key = supernode_id.trim_end_matches('=').to_owned();
             info!(
-                "[headless] cluster roster from {}â€¦: {} sibling(s)",
+                "[headless] cluster roster from {}…: {} sibling(s)",
                 &key[..12.min(key.len())],
                 members.len()
             );
@@ -1066,7 +1066,7 @@ async fn handle_event(
         ConnectionEvent::CallRequest { peer_id, .. } => {
             info!("Incoming call from {}", peer_id);
             // Ring and ensure session exists. (The headless client ignores the
-            // fallback_* room coordinates â€” room-mode call answering is a Qt
+            // fallback_* room coordinates — room-mode call answering is a Qt
             // bridge flow.)
             platform::play_ringtone();
             let _ = call_cmd_tx.try_send(call_controller::CallCommand::InitiatePeer {

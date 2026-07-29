@@ -451,6 +451,90 @@ impl ConnectionManager {
         send_rx
     }
 
+    /// Test-only: inject a connected direct QUIC peer session.
+    ///
+    /// The counterpart to [`Self::test_add_supernode_session`] for the direct
+    /// lane. Without it the peer-to-peer media paths cannot be exercised at
+    /// all — every one of them requires `peers[id].quic_out_tx` to be live, so
+    /// they silently no-op in tests and only the relay lane gets covered.
+    #[cfg(test)]
+    pub(super) fn test_add_peer_session(&mut self, peer_id: &str) -> mpsc::Receiver<PeerOutbound> {
+        let (out_tx, out_rx) = mpsc::channel::<PeerOutbound>(64);
+        self.peers.insert(
+            peer_id.to_owned(),
+            PeerConnection {
+                peer_id: peer_id.to_owned(),
+                state: PeerConnectionState::Connected,
+                quic_out_tx: Some(out_tx),
+                connected_at: Some(std::time::Instant::now()),
+            },
+        );
+        out_rx
+    }
+
+    /// Test-only: put the manager in SFU room mode for `room_id` on
+    /// `supernode_id`, as a completed `SfuJoin` would.
+    #[cfg(test)]
+    pub(super) fn test_set_room(&mut self, supernode_id: &str, room_id: &str) {
+        self.current_supernode_id = supernode_id.to_owned();
+        self.current_room_id = room_id.to_owned();
+    }
+
+    /// Test-only: mint a real group key for `room_id`, as being elected keyer
+    /// would. Room chat deliberately fails closed without one, so any test
+    /// exercising the room text path has to establish keying first.
+    #[cfg(test)]
+    pub(super) fn test_mint_group_key(&mut self, room_id: &str) {
+        self.group_keys.new_owner_epoch(room_id);
+    }
+
+    /// Test-only forwarders for the media send paths, which live in the
+    /// `peer_session` / `room_session` submodules.
+    #[cfg(test)]
+    pub(super) async fn test_send_audio_datagram(&self, peer_id: &str, opus: Vec<u8>) {
+        self.send_audio_datagram(peer_id, opus).await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn test_send_video_datagram(
+        &mut self,
+        peer_id: &str,
+        encoded: Vec<u8>,
+        keyframe: bool,
+    ) {
+        self.send_video_datagram(peer_id, encoded, keyframe).await;
+    }
+
+    /// Test-only forwarders for the room lane. These live in `room_session`
+    /// as `pub(super)` to `manager`, one level narrower than `tests` needs.
+    #[cfg(test)]
+    pub(super) async fn test_send_room_audio(&mut self, opus_data: Vec<u8>) {
+        self.send_room_audio(opus_data).await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn test_send_room_video(&mut self, encoded: Vec<u8>, keyframe: bool) {
+        self.send_room_video(encoded, keyframe).await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn test_send_video_state(&mut self, active: bool, direct: Option<String>) {
+        self.send_video_state(active, direct).await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn test_send_sfu_chat(
+        &mut self,
+        supernode_id: &str,
+        room_id: &str,
+        body: &str,
+        sender_handle: &str,
+        message_id: &str,
+    ) {
+        self.send_sfu_chat(supernode_id, room_id, body, sender_handle, message_id)
+            .await;
+    }
+
     /// Test-only: arm a `room_absent` retry as if a denied `SfuJoin` had just
     /// been received, so tests can drive [`Self::retry_pending_room_joins`]
     /// without wiring up the full signed-inbound dispatch pipeline.
