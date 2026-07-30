@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::{
     module::{FeatureModule, PeerId},
     registry::FeatureRegistry,
+    video_codec::VideoCodec,
     wellknown, CapabilityDescriptor, FeatureError,
 };
 
@@ -151,18 +152,31 @@ impl FeatureModule for RoomAudioSfuModule {
     // on_message: inherits default no-op — audio is handled in connection_manager.
 }
 
-/// `core.video.vp8` — direct peer video (VP8 over QUIC datagrams).
+/// `core.video.v1` — direct peer video over QUIC datagrams.
 ///
 /// Advertisement-only, for the same reason as [`CoreAudioOpusModule`]: video
 /// fragments ride a dedicated low-tag datagram path rather than the generic
 /// feature-datagram multiplexer. The descriptor exists for capability
 /// negotiation and quota definition; outbound sends are still gated through
 /// `gate_through_feature`.
-pub struct CoreVideoVp8Module;
+///
+/// Carries the codec set this build can run, because that is what the peer
+/// negotiates against — see [`crate::video_codec`].
+pub struct CoreVideoModule {
+    codecs: Vec<VideoCodec>,
+}
 
-impl FeatureModule for CoreVideoVp8Module {
+impl CoreVideoModule {
+    /// Advertise exactly `codecs`. Callers should pass what the local build
+    /// can really encode and decode, not the full known set.
+    pub fn new(codecs: Vec<VideoCodec>) -> Self {
+        Self { codecs }
+    }
+}
+
+impl FeatureModule for CoreVideoModule {
     fn descriptor(&self) -> CapabilityDescriptor {
-        wellknown::core_video_vp8()
+        wellknown::core_video_v1_for(&self.codecs)
     }
 
     // on_message: inherits default no-op — video routes through datagram callback.
@@ -174,11 +188,20 @@ impl FeatureModule for CoreVideoVp8Module {
 /// fragments are reassembled in `connection_manager` and gated through
 /// `FeatureRegistry::dispatch_message` for per-sender quota enforcement;
 /// outbound fragments are gated in `send_room_video`.
-pub struct RoomVideoSfuModule;
+pub struct RoomVideoSfuModule {
+    codecs: Vec<VideoCodec>,
+}
+
+impl RoomVideoSfuModule {
+    /// See [`CoreVideoModule::new`].
+    pub fn new(codecs: Vec<VideoCodec>) -> Self {
+        Self { codecs }
+    }
+}
 
 impl FeatureModule for RoomVideoSfuModule {
     fn descriptor(&self) -> CapabilityDescriptor {
-        wellknown::room_video_sfu()
+        wellknown::room_video_sfu_for(&self.codecs)
     }
 
     // on_message: inherits default no-op — video is handled in connection_manager.
@@ -206,16 +229,36 @@ impl FeatureModule for RoomChatModule {
 /// no-hook (advertisement-only) variant.  Callers that need `on_message`
 /// dispatch should use the `with_hook` constructors directly.
 ///
+/// Video advertises the full known codec set. A real client knows which codecs
+/// its platform and build actually provide and **must** use
+/// [`register_client_modules_with_video_codecs`] instead — advertising a codec
+/// this build cannot run is exactly the dishonesty the codec-neutral capability
+/// id exists to prevent.
+///
 /// Returns `Err` if any registration fails (e.g. duplicate id).
 pub fn register_client_modules(registry: &FeatureRegistry) -> Result<(), FeatureError> {
+    register_client_modules_with_video_codecs(registry, crate::video_codec::PREFERENCE.to_vec())
+}
+
+/// [`register_client_modules`], advertising only the video codecs in
+/// `video_codecs`.
+///
+/// Pass an empty vec on a platform with no encoder or decoder: the video
+/// descriptors are still registered (so quota gates have something to meter
+/// against) but advertise no codecs, and a peer negotiating against them gets
+/// `None` and does not send video.
+pub fn register_client_modules_with_video_codecs(
+    registry: &FeatureRegistry,
+    video_codecs: Vec<VideoCodec>,
+) -> Result<(), FeatureError> {
     let modules: Vec<crate::module::SharedModule> = vec![
         Arc::new(CoreChatModule::new()),
         Arc::new(CoreAudioOpusModule),
         Arc::new(CoreFileModule::new()),
         Arc::new(RoomFileModule),
         Arc::new(RoomAudioSfuModule),
-        Arc::new(CoreVideoVp8Module),
-        Arc::new(RoomVideoSfuModule),
+        Arc::new(CoreVideoModule::new(video_codecs.clone())),
+        Arc::new(RoomVideoSfuModule::new(video_codecs)),
         Arc::new(RoomChatModule),
     ];
     for m in modules {
@@ -237,7 +280,7 @@ mod tests {
         assert!(reg.get("core.file.v1").is_some());
         assert!(reg.get("room.file.v1").is_some());
         assert!(reg.get("room.audio.sfu").is_some());
-        assert!(reg.get("core.video.vp8").is_some());
+        assert!(reg.get("core.video.v1").is_some());
         assert!(reg.get("room.video.sfu").is_some());
         assert!(reg.get("room.chat.v1").is_some());
     }
@@ -308,7 +351,54 @@ mod tests {
         assert_eq!(CoreAudioOpusModule.descriptor().id, "core.audio.opus");
         assert_eq!(CoreFileModule::new().descriptor().id, "core.file.v1");
         assert_eq!(RoomAudioSfuModule.descriptor().id, "room.audio.sfu");
-        assert_eq!(CoreVideoVp8Module.descriptor().id, "core.video.vp8");
-        assert_eq!(RoomVideoSfuModule.descriptor().id, "room.video.sfu");
+        assert_eq!(
+            CoreVideoModule::new(vec![VideoCodec::H264]).descriptor().id,
+            "core.video.v1"
+        );
+        assert_eq!(
+            RoomVideoSfuModule::new(vec![VideoCodec::H264])
+                .descriptor()
+                .id,
+            "room.video.sfu"
+        );
+    }
+
+    /// The whole point of the codec-neutral id: what a build advertises must
+    /// be what it can actually run.
+    #[test]
+    fn video_modules_advertise_only_the_codecs_they_were_given() {
+        let reg = FeatureRegistry::new();
+        register_client_modules_with_video_codecs(&reg, vec![VideoCodec::H264]).unwrap();
+        for id in ["core.video.v1", "room.video.sfu"] {
+            let desc = reg.get(id).expect("registered");
+            assert_eq!(
+                crate::video_codec::codecs_from_params(&desc.params),
+                vec![VideoCodec::H264],
+                "{id} should advertise exactly the codec it was given"
+            );
+        }
+    }
+
+    /// A platform with no video backend still registers the descriptors (the
+    /// quota gates need them) but must advertise an empty codec set, so a peer
+    /// negotiates `None` rather than sending frames nothing can decode.
+    #[test]
+    fn a_platform_with_no_codecs_advertises_none() {
+        let reg = FeatureRegistry::new();
+        register_client_modules_with_video_codecs(&reg, vec![]).unwrap();
+        let desc = reg.get("core.video.v1").expect("still registered");
+        assert!(crate::video_codec::codecs_from_params(&desc.params).is_empty());
+    }
+
+    #[test]
+    fn the_stub_codec_is_never_advertised_even_if_available() {
+        let reg = FeatureRegistry::new();
+        register_client_modules_with_video_codecs(&reg, vec![VideoCodec::H264, VideoCodec::Stub])
+            .unwrap();
+        let desc = reg.get("core.video.v1").unwrap();
+        assert_eq!(
+            crate::video_codec::codecs_from_params(&desc.params),
+            vec![VideoCodec::H264]
+        );
     }
 }

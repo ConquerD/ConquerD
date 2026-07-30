@@ -130,6 +130,30 @@ fn main() {
     // otherwise warn about an unexpected cfg name.
     println!("cargo:rustc-check-cfg=cfg(qt_multimedia)");
 
+    // macOS camera capture. The Objective-C lives in its own file because
+    // AVFoundation delivers frames through a delegate callback; see the header
+    // comment in macos_camera.m for why that is not done from Rust.
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rerun-if-changed=src/video/macos_camera.m");
+        cc::Build::new()
+            .file("src/video/macos_camera.m")
+            // ARC so the Objective-C object graph is not hand-retained; the
+            // shim holds only a handful of long-lived objects.
+            .flag("-fobjc-arc")
+            .flag("-fmodules")
+            .compile("conquerd_macos_camera");
+        for framework in [
+            "AVFoundation",
+            "CoreMedia",
+            "CoreVideo",
+            "Foundation",
+            "CoreFoundation",
+        ] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
+
     // Windows PE version / signing metadata.
     // Keep ProductVersion in sync with conquerd-client/Cargo.toml version.
     #[cfg(windows)]

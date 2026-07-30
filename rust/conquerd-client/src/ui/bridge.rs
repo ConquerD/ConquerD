@@ -12,7 +12,7 @@
 //!    `CxxQtThread::queue`.
 //! 5. QML user actions call invokables which `try_send` on tokio channels.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -1023,6 +1023,12 @@ pub struct AppBridgeRust {
     /// emission is exactly what a join produces. Without this the indicator was
     /// cleared for everyone the moment anyone joined or left.
     peer_video_active: HashSet<String>,
+    /// Video codecs each peer advertised in `CAPABILITY_ANNOUNCE`.
+    ///
+    /// Mirrored here rather than queried from the manager because the codec has
+    /// to be chosen *before* the encoder is built, on the same thread that
+    /// builds it. Cleared with the rest of a peer's state on disconnect.
+    peer_video_codecs: HashMap<String, Vec<conquerd_features::video_codec::VideoCodec>>,
     /// Decode thread for inbound video, created lazily on the first frame so
     /// a client that never receives video never spawns it.
     video_receiver: Option<crate::video::receiver::VideoReceiver>,
@@ -1378,6 +1384,7 @@ impl Default for AppBridgeRust {
             call_cmd_tx: None,
             video_active: false,
             peer_video_active: HashSet::new(),
+            peer_video_codecs: HashMap::new(),
             video_receiver: None,
             video_sender: None,
             video_preview_active: false,
@@ -1775,7 +1782,10 @@ impl ffi::AppBridge {
         // by `PluginRuntime::start` are visible in the manager's
         // CAPABILITY_ANNOUNCE snapshot.
         let feature_registry = std::sync::Arc::new(conquerd_features::FeatureRegistry::new());
-        if let Err(e) = conquerd_features::register_client_modules(&feature_registry) {
+        if let Err(e) = conquerd_features::client_modules::register_client_modules_with_video_codecs(
+            &feature_registry,
+            crate::video::codec::available_codecs(),
+        ) {
             error!("failed to seed feature registry: {e}");
         }
 
@@ -2495,20 +2505,63 @@ impl ffi::AppBridge {
 
         let quality = crate::video::sender::Quality::from_name(&quality.to_string());
 
-        // Capture + H.264 encode are Windows/Media Foundation only for now.
-        // Soft-fail elsewhere so non-Windows builds (CI, mac/linux nightlies)
-        // still compile the rest of the UI; the camera toggle simply reports off.
+        // Pick the codec before anything else: with no mutual codec there is
+        // nothing worth opening the camera for, and failing here keeps the
+        // capture light off rather than streaming into a void.
+        let direct_target = self.rust().direct_video_target();
+        let codec = match &direct_target {
+            Some(peer_id) => {
+                let peer_codecs = self
+                    .rust()
+                    .peer_video_codecs
+                    .get(peer_id)
+                    .cloned()
+                    .unwrap_or_default();
+                match pick_direct_video_codec(&peer_codecs) {
+                    Some(c) => c,
+                    None => {
+                        warn!(
+                            "[video] no mutual video codec with {} (they speak {:?}, we speak {:?}); \
+                             not starting the camera",
+                            &peer_id[..8.min(peer_id.len())],
+                            peer_codecs,
+                            crate::video::codec::available_codecs()
+                        );
+                        return false;
+                    }
+                }
+            }
+            None => match pick_room_video_codec() {
+                Some(c) => c,
+                None => {
+                    warn!("[video] this build has no video encoder; not starting the camera");
+                    return false;
+                }
+            },
+        };
+
+        // Capture is Windows/Media Foundation only for now. Soft-fail
+        // elsewhere so non-Windows builds (CI, mac/linux nightlies) still
+        // compile the rest of the UI; the camera toggle simply reports off.
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (conn_tx, quality, device_id, overlays_json);
+            let _ = (
+                conn_tx,
+                quality,
+                device_id,
+                overlays_json,
+                codec,
+                direct_target,
+            );
             warn!("[video] capture/encode is not implemented on this platform");
             return false;
         }
 
         #[cfg(target_os = "windows")]
         {
-            let encoder = match crate::video::mediafoundation::MfEncoder::new(
-                crate::video::mediafoundation::MfEncoderConfig {
+            let encoder = match crate::video::codec::make_encoder(
+                codec,
+                crate::video::codec::EncoderParams {
                     width: quality.width,
                     height: quality.height,
                     bitrate_bps: quality.bitrate_bps,
@@ -2517,11 +2570,11 @@ impl ffi::AppBridge {
                 },
             ) {
                 Ok(e) => {
-                    info!("[video] encoder ready ({:?})", e.acceleration());
+                    info!("[video] {} encoder ready", codec.as_str());
                     e
                 }
                 Err(e) => {
-                    warn!("[video] no usable H.264 encoder: {e}");
+                    warn!("[video] no usable {} encoder: {e}", codec.as_str());
                     return false;
                 }
             };
@@ -2541,19 +2594,26 @@ impl ffi::AppBridge {
             // or leaves a room calls `stop_local_video` first. A room takes
             // priority when both look set, since a direct call that fell back to
             // a temporary room is genuinely a room session by then.
-            let sink = match self.rust().direct_video_target() {
+            let sink = match direct_target {
                 Some(peer_id) => {
                     crate::video::sender::ChannelSink::new(conn_tx, move |encoded, keyframe| {
                         ConnectionCommand::SendVideoFrame {
                             peer_id: peer_id.clone(),
                             encoded,
                             keyframe,
+                            codec,
                         }
                     })
                 }
-                None => crate::video::sender::ChannelSink::new(conn_tx, |encoded, keyframe| {
-                    ConnectionCommand::SendRoomVideo { encoded, keyframe }
-                }),
+                None => {
+                    crate::video::sender::ChannelSink::new(conn_tx, move |encoded, keyframe| {
+                        ConnectionCommand::SendRoomVideo {
+                            encoded,
+                            keyframe,
+                            codec,
+                        }
+                    })
+                }
             };
 
             // Our own id, so the capture thread can feed the local preview tile.
@@ -6311,6 +6371,56 @@ fn rooms_sidebar_json(store: &crate::peer_store::PeerStore) -> String {
     .unwrap_or_else(|_| "[]".to_owned())
 }
 
+/// Pull the video codec set out of a peer's `CAPABILITY_ANNOUNCE` payload.
+///
+/// Reads `core.video.v1` — the direct-call descriptor. Room video is not
+/// negotiated pairwise (see [`pick_room_video_codec`]), so its advertised set
+/// is not consulted here.
+///
+/// A peer with no video capability, or one advertising no codecs, yields an
+/// empty set, which negotiates to "send no video" rather than to a default.
+fn video_codecs_from_caps_json(caps_json: &str) -> Vec<conquerd_features::video_codec::VideoCodec> {
+    let Ok(parsed) =
+        serde_json::from_str::<Vec<conquerd_features::CapabilityDescriptor>>(caps_json)
+    else {
+        return Vec::new();
+    };
+    parsed
+        .iter()
+        .find(|c| c.id == "core.video.v1")
+        .map(|c| conquerd_features::video_codec::codecs_from_params(&c.params))
+        .unwrap_or_default()
+}
+
+/// Codec for a direct 1:1 call: the best codec both ends can run.
+///
+/// `None` means no mutual codec, and the caller must not start the camera —
+/// sending frames the peer provably cannot decode wastes their bandwidth and
+/// shows them nothing.
+fn pick_direct_video_codec(
+    peer_codecs: &[conquerd_features::video_codec::VideoCodec],
+) -> Option<conquerd_features::video_codec::VideoCodec> {
+    conquerd_features::video_codec::negotiate(&crate::video::codec::available_codecs(), peer_codecs)
+}
+
+/// Codec for room video: our own most-preferred available codec.
+///
+/// Deliberately not a negotiation. A room sender fans one encoded stream out to
+/// every member, so satisfying everyone would mean either encoding once per
+/// codec (N encoders on the sender) or falling to the worst common denominator
+/// — and membership changes mid-call, which would force a re-encode and a
+/// keyframe every time someone joined. Instead the sender picks what it does
+/// best, stamps it on each frame, and a member without that decoder drops the
+/// frames and logs why. Room-wide codec convergence is a later problem, and the
+/// per-frame codec byte is what leaves room to solve it.
+fn pick_room_video_codec() -> Option<conquerd_features::video_codec::VideoCodec> {
+    let available = crate::video::codec::available_codecs();
+    conquerd_features::video_codec::PREFERENCE
+        .iter()
+        .copied()
+        .find(|c| available.contains(c))
+}
+
 fn emit_rooms_sidebar_sync(mut bridge: Pin<&mut ffi::AppBridge>) {
     let json = bridge
         .rust()
@@ -7424,6 +7534,7 @@ fn dispatch_event(
             peer_id,
             encoded,
             keyframe,
+            codec,
         } => {
             // Hand straight to the decode thread. Decoding here would run on
             // the connection-manager task; decoding after the Qt hop would run
@@ -7435,22 +7546,16 @@ fn dispatch_event(
                     // decode thread.
                     let conn_tx = bridge.rust().conn_cmd_tx.clone();
                     let receiver = crate::video::receiver::VideoReceiver::start(
-                        || {
-                            // Decode is Windows/MF only for now; other platforms
-                            // drop inbound frames until a portable decoder lands.
-                            #[cfg(target_os = "windows")]
-                            {
-                                crate::video::mediafoundation::MfDecoder::new()
-                                    .map(|d| {
-                                        Box::new(d) as Box<dyn crate::video::codec::VideoDecoder>
-                                    })
-                                    .map_err(|e| warn!("[video] no H.264 decoder: {e}"))
-                                    .ok()
-                            }
-                            #[cfg(not(target_os = "windows"))]
-                            {
-                                None
-                            }
+                        |codec| {
+                            // Per frame codec, not per session: a room may carry
+                            // several senders using different codecs. A codec
+                            // this build cannot decode returns None, and the
+                            // receiver logs and drops rather than guessing.
+                            crate::video::codec::make_decoder(codec)
+                                .map_err(|e| {
+                                    warn!("[video] no {} decoder: {e}", codec.as_str());
+                                })
+                                .ok()
                         },
                         move |peer_id| {
                             if let Some(tx) = conn_tx.as_ref() {
@@ -7463,7 +7568,7 @@ fn dispatch_event(
                     bridge.as_mut().rust_mut().video_receiver = Some(receiver);
                 }
                 if let Some(rx) = bridge.rust().video_receiver.as_ref() {
-                    rx.submit(&peer_id, encoded, keyframe);
+                    rx.submit(&peer_id, encoded, keyframe, codec);
                 }
             });
         }
@@ -7638,6 +7743,24 @@ fn dispatch_event(
                 &peer_id[..8.min(peer_id.len())],
                 caps_json
             );
+            // Record what video codecs this peer can run, so a later camera
+            // start can negotiate without a round trip to the manager.
+            let codecs = video_codecs_from_caps_json(&caps_json);
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                if codecs.is_empty() {
+                    bridge
+                        .as_mut()
+                        .rust_mut()
+                        .peer_video_codecs
+                        .remove(&peer_id);
+                } else {
+                    bridge
+                        .as_mut()
+                        .rust_mut()
+                        .peer_video_codecs
+                        .insert(peer_id, codecs);
+                }
+            });
         }
         // Endpoint update — re-trigger peer list refresh (presence change).
         ConnectionEvent::EndpointUpdated { peer_id, .. } => {

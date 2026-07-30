@@ -1123,7 +1123,12 @@ impl ConnectionManager {
     ///
     /// Quota is charged once for the whole frame's wire size, including every
     /// fragment header, so it matches what the supernode meters inbound.
-    pub(super) async fn send_room_video(&mut self, encoded: Vec<u8>, keyframe: bool) {
+    pub(super) async fn send_room_video(
+        &mut self,
+        encoded: Vec<u8>,
+        keyframe: bool,
+        codec: conquerd_features::video_codec::VideoCodec,
+    ) {
         if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
             return; // Not in a room
         }
@@ -1153,7 +1158,7 @@ impl ConnectionManager {
         };
 
         let signing_bytes =
-            crate::video::video_frame_signing_bytes(&room_id, &sender, seq, &sealed);
+            crate::video::video_frame_signing_bytes(&room_id, &sender, seq, codec, &sealed);
         let sig_vec = self.identity.sign(&signing_bytes);
         let Ok(signature) = <[u8; crate::video::fragment::SIGNATURE_LEN]>::try_from(&sig_vec[..])
         else {
@@ -1177,6 +1182,7 @@ impl ConnectionManager {
             &sender,
             seq,
             keyframe,
+            codec,
             &signature,
             &sealed,
             relay.max_video_fragment_len(),

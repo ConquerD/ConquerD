@@ -1,14 +1,25 @@
-//! Video codec seam, plus a compression-free stub implementation.
+//! Video codec seam, the codec registry, plus a compression-free stub.
 //!
-//! The stub exists so the transport can be proven end to end before libvpx is
-//! vendored. It deliberately does **no** compression: it packs raw I420 and
+//! [`VideoEncoder`] and [`VideoDecoder`] are the seam; [`make_encoder`] and
+//! [`make_decoder`] pick an implementation for a
+//! [`VideoCodec`](conquerd_features::video_codec::VideoCodec), and
+//! [`available_codecs`] reports what this build can run so the client
+//! advertises that set and nothing more.
+//!
+//! Peers negotiate over these sets rather than assuming a single codec, because
+//! what a build can run is a platform fact: Media Foundation's H.264 exists on
+//! Windows and nowhere else. See [`conquerd_features::video_codec`] for the
+//! negotiation rules and why the capability id names no codec.
+//!
+//! The stub exists so the transport can be proven end to end without a real
+//! codec. It deliberately does **no** compression: it packs raw I420 and
 //! declares every frame a keyframe. At the 160x120 working size that is 28.8 KB
-//! per frame — about 27 fragments — which stresses reassembly *harder* than
-//! real VP8 will, with zero new dependencies. If a frame arrives corrupt while
-//! the stub is in use, the bug is in the transport, not the codec.
-//!
-//! Phase 4 replaces [`StubEncoder`] / [`StubDecoder`] with libvpx behind the
-//! same two traits. Nothing above this module should need to change.
+//! per frame — about 27 fragments — which stresses reassembly *harder* than a
+//! real codec will, with zero new dependencies. If a frame arrives corrupt
+//! while the stub is in use, the bug is in the transport, not the codec. It is
+//! never advertised to a peer.
+
+use conquerd_features::video_codec::VideoCodec;
 
 use super::frame::RawFrame;
 
@@ -48,10 +59,36 @@ pub trait VideoEncoder: Send {
     }
 }
 
+/// Forward the trait through a box, so [`make_encoder`]'s
+/// `Box<dyn VideoEncoder>` satisfies the generic `E: VideoEncoder` bound that
+/// [`VideoSender::start`](super::sender::VideoSender::start) takes. Without
+/// this the registry could only be used by callers willing to name a concrete
+/// encoder type — which is exactly what picking a codec at runtime rules out.
+impl VideoEncoder for Box<dyn VideoEncoder> {
+    fn encode(&mut self, frame: &RawFrame) -> anyhow::Result<(Vec<u8>, bool)> {
+        (**self).encode(frame)
+    }
+
+    fn request_keyframe(&mut self) {
+        (**self).request_keyframe()
+    }
+
+    fn set_bitrate(&mut self, bps: u32) -> anyhow::Result<()> {
+        (**self).set_bitrate(bps)
+    }
+}
+
 /// Decodes what a [`VideoEncoder`] produced.
 pub trait VideoDecoder: Send {
     /// Decode one encoded frame.
     fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<RawFrame>;
+}
+
+/// See the [`VideoEncoder`] box forward above.
+impl VideoDecoder for Box<dyn VideoDecoder> {
+    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<RawFrame> {
+        (**self).decode(encoded)
+    }
 }
 
 /// Compression-free encoder: packs I420 behind a 4-byte dimension header.
@@ -125,6 +162,174 @@ impl VideoDecoder for StubDecoder {
     }
 }
 
+// ── VP8, via vendored libvpx ────────────────────────────────────────────────
+
+/// VP8 encoder adapter.
+///
+/// VP8 is the codec that makes video work off Windows: Media Foundation H.264
+/// and VideoToolbox H.264 rely on a licence the OS holds, and Linux has no
+/// equivalent, so VP8 — royalty-free, and built from vendored source on every
+/// platform — is the one codec a Windows peer and a Linux peer can agree on.
+pub struct Vp8EncoderAdapter(conquerd_vpx::Vp8Encoder);
+
+impl VideoEncoder for Vp8EncoderAdapter {
+    fn encode(&mut self, frame: &RawFrame) -> anyhow::Result<(Vec<u8>, bool)> {
+        if !frame.is_consistent() {
+            anyhow::bail!(
+                "inconsistent frame: {}x{} with planes {}/{}/{}",
+                frame.width,
+                frame.height,
+                frame.y.len(),
+                frame.u.len(),
+                frame.v.len()
+            );
+        }
+        let (ew, eh) = self.0.dimensions();
+        if (frame.width, frame.height) != (ew, eh) {
+            // libvpx encodes at the size it was built for; a mismatched frame
+            // would be read with the wrong stride rather than rescaled.
+            anyhow::bail!(
+                "frame is {}x{} but the encoder was built for {ew}x{eh}",
+                frame.width,
+                frame.height
+            );
+        }
+        self.0.encode(&frame.y, &frame.u, &frame.v)
+    }
+
+    fn request_keyframe(&mut self) {
+        self.0.request_keyframe();
+    }
+
+    fn set_bitrate(&mut self, bps: u32) -> anyhow::Result<()> {
+        self.0.set_bitrate(bps)
+    }
+}
+
+/// VP8 decoder adapter. See [`Vp8EncoderAdapter`].
+pub struct Vp8DecoderAdapter(conquerd_vpx::Vp8Decoder);
+
+impl VideoDecoder for Vp8DecoderAdapter {
+    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<RawFrame> {
+        let f = self.0.decode(encoded)?;
+        Ok(RawFrame {
+            width: f.width,
+            height: f.height,
+            y: f.y,
+            u: f.u,
+            v: f.v,
+        })
+    }
+}
+
+// ── Codec registry ──────────────────────────────────────────────────────────
+
+/// Codec-neutral encoder settings.
+///
+/// Mirrors the fields every encoder needs, so callers configure a codec without
+/// naming one. Codec-specific tuning stays inside the implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderParams {
+    /// Encoded frame width in pixels.
+    pub width: u32,
+    /// Encoded frame height in pixels.
+    pub height: u32,
+    /// Target average bitrate. Encoders that support rate control retarget a
+    /// running encoder via [`VideoEncoder::set_bitrate`] rather than rebuilding.
+    pub bitrate_bps: u32,
+    /// Target frame rate.
+    pub fps: u32,
+    /// Maximum seconds between keyframes.
+    pub keyframe_interval_secs: u32,
+}
+
+/// Codecs this build can encode **and** decode.
+///
+/// Both directions, deliberately: negotiation produces one codec used for the
+/// whole session, so advertising a codec we can only decode would let a peer
+/// pick something we cannot send.
+///
+/// This is a *build* capability, not a live probe. Constructing a Media
+/// Foundation encoder allocates COM objects and can fail on a machine with no
+/// usable MFT, and doing that at startup to answer "what do we advertise" would
+/// cost every launch. A runtime failure still soft-fails the camera toggle —
+/// what this function exists to prevent is the categorically worse case of
+/// advertising a codec this binary has no implementation of at all.
+// `vec_init_then_push` fires on non-Windows, where the `cfg` block below is
+// empty and the first push therefore follows `Vec::new()` directly. Collapsing
+// it into a `vec![]` literal would mean one literal per platform, which is what
+// this shape exists to avoid as macOS and its VideoToolbox entry arrive.
+#[allow(clippy::vec_init_then_push)]
+pub fn available_codecs() -> Vec<VideoCodec> {
+    let mut out = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        // Media Foundation H.264, using the codec licence held by the OS.
+        // First because it is the hardware path where both peers have it.
+        out.push(VideoCodec::H264);
+    }
+    // VP8 is built from vendored libvpx on every platform, so it is always
+    // available. That is deliberate rather than incidental: it is what gives a
+    // Windows peer and a Linux peer a codec in common.
+    out.push(VideoCodec::Vp8);
+    out
+}
+
+/// Build an encoder for `codec`, or `Err` if this build cannot encode it.
+pub fn make_encoder(
+    codec: VideoCodec,
+    params: EncoderParams,
+) -> anyhow::Result<Box<dyn VideoEncoder>> {
+    match codec {
+        #[cfg(target_os = "windows")]
+        VideoCodec::H264 => {
+            let enc =
+                super::mediafoundation::MfEncoder::new(super::mediafoundation::MfEncoderConfig {
+                    width: params.width,
+                    height: params.height,
+                    bitrate_bps: params.bitrate_bps,
+                    fps: params.fps,
+                    keyframe_interval_secs: params.keyframe_interval_secs,
+                })?;
+            Ok(Box::new(enc))
+        }
+        #[cfg(not(target_os = "windows"))]
+        VideoCodec::H264 => anyhow::bail!(
+            "H.264 encode needs Media Foundation, which is Windows-only; \
+             this build has no H.264 encoder"
+        ),
+        VideoCodec::Vp8 => Ok(Box::new(Vp8EncoderAdapter(conquerd_vpx::Vp8Encoder::new(
+            params.width,
+            params.height,
+            params.bitrate_bps,
+            params.fps,
+            params.keyframe_interval_secs,
+        )?))),
+        VideoCodec::Stub => Ok(Box::new(StubEncoder)),
+    }
+}
+
+/// Build a decoder for `codec`, or `Err` if this build cannot decode it.
+///
+/// Called per (sender, codec) rather than once per session: in a room, two
+/// members may legitimately send in different codecs, and each needs its own
+/// decoder instance anyway because inter frames reference that sender's history.
+pub fn make_decoder(codec: VideoCodec) -> anyhow::Result<Box<dyn VideoDecoder>> {
+    match codec {
+        #[cfg(target_os = "windows")]
+        VideoCodec::H264 => Ok(Box::new(super::mediafoundation::MfDecoder::new()?)),
+        #[cfg(not(target_os = "windows"))]
+        VideoCodec::H264 => anyhow::bail!(
+            "H.264 decode needs Media Foundation, which is Windows-only; \
+             this build has no H.264 decoder"
+        ),
+        VideoCodec::Vp8 => Ok(Box::new(
+            Vp8DecoderAdapter(conquerd_vpx::Vp8Decoder::new()?),
+        )),
+        VideoCodec::Stub => Ok(Box::new(StubDecoder)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +357,7 @@ mod tests {
             "sender-id-placeholder-000000000000000000000",
             1,
             true,
+            VideoCodec::Stub,
             &[0u8; super::super::fragment::SIGNATURE_LEN],
             &encoded,
             1198,
@@ -199,5 +405,99 @@ mod tests {
         let mut frame = RawFrame::black(64, 48);
         frame.u.truncate(3);
         assert!(StubEncoder.encode(&frame).is_err());
+    }
+
+    fn test_params() -> EncoderParams {
+        EncoderParams {
+            width: STUB_WIDTH,
+            height: STUB_HEIGHT,
+            bitrate_bps: 600_000,
+            fps: 30,
+            keyframe_interval_secs: 4,
+        }
+    }
+
+    /// The stub must never be advertised, so it must never be in the set the
+    /// client hands to capability registration.
+    #[test]
+    fn available_codecs_never_includes_the_stub() {
+        assert!(!available_codecs().contains(&VideoCodec::Stub));
+    }
+
+    /// Advertising a codec we cannot construct is the exact dishonesty this
+    /// registry exists to prevent, so every advertised codec must build both
+    /// halves on this platform.
+    #[test]
+    fn every_available_codec_can_build_both_halves() {
+        for codec in available_codecs() {
+            assert!(
+                make_encoder(codec, test_params()).is_ok(),
+                "{codec:?} is advertised but has no encoder"
+            );
+            assert!(
+                make_decoder(codec).is_ok(),
+                "{codec:?} is advertised but has no decoder"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stub_is_always_constructible_for_transport_tests() {
+        assert!(make_encoder(VideoCodec::Stub, test_params()).is_ok());
+        assert!(make_decoder(VideoCodec::Stub).is_ok());
+    }
+
+    /// VP8 is what a Linux peer will negotiate, so it has to be present in
+    /// every build regardless of platform — not only where an OS codec is
+    /// missing.
+    #[test]
+    fn vp8_is_available_on_every_platform() {
+        assert!(
+            available_codecs().contains(&VideoCodec::Vp8),
+            "VP8 must be built everywhere or cross-platform calls have no mutual codec"
+        );
+    }
+
+    /// The adapter has to survive a real frame, not just construct: a mismatch
+    /// between `RawFrame`'s packing and what libvpx expects would corrupt the
+    /// picture rather than error.
+    #[test]
+    fn vp8_adapter_round_trips_a_real_frame() {
+        let params = EncoderParams {
+            width: 320,
+            height: 240,
+            ..test_params()
+        };
+        let mut enc = make_encoder(VideoCodec::Vp8, params).expect("vp8 encoder");
+        let mut dec = make_decoder(VideoCodec::Vp8).expect("vp8 decoder");
+
+        let original = RawFrame::test_pattern(320, 240, 5);
+        let (packet, keyframe) = enc.encode(&original).expect("encode");
+        assert!(!packet.is_empty() && keyframe);
+
+        let out = dec.decode(&packet).expect("decode");
+        assert_eq!((out.width, out.height), (320, 240));
+        assert!(out.is_consistent());
+    }
+
+    /// libvpx encodes at the size it was constructed for, so a mismatched
+    /// frame must be refused rather than read with the wrong stride.
+    #[test]
+    fn vp8_adapter_refuses_a_frame_of_the_wrong_size() {
+        let params = EncoderParams {
+            width: 320,
+            height: 240,
+            ..test_params()
+        };
+        let mut enc = make_encoder(VideoCodec::Vp8, params).unwrap();
+        assert!(enc.encode(&RawFrame::black(160, 120)).is_err());
+    }
+
+    /// On Windows the advertised set must contain H.264, since that is what
+    /// the Media Foundation path actually encodes.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_advertises_h264() {
+        assert!(available_codecs().contains(&VideoCodec::H264));
     }
 }

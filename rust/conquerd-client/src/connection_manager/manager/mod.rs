@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 
 use conquerd_features::{
     channel_frame::{self, FrameClass},
-    client_modules::register_client_modules,
     wellknown, CapabilityDescriptor, FeatureRegistry, ReplayGuard,
 };
 use parking_lot::RwLock;
@@ -315,7 +314,10 @@ impl ConnectionManager {
         // higher-level managers (chat, file). Failures here are
         // unrecoverable configuration bugs.
         let feature_registry = Arc::new(FeatureRegistry::new());
-        if let Err(e) = register_client_modules(&feature_registry) {
+        if let Err(e) = conquerd_features::client_modules::register_client_modules_with_video_codecs(
+            &feature_registry,
+            crate::video::codec::available_codecs(),
+        ) {
             error!("failed to seed feature registry: {e}");
         }
         let (cmd_tx, event_rx, fut) =
@@ -431,7 +433,10 @@ impl ConnectionManager {
         peer_store: Arc<RwLock<PeerStore>>,
     ) -> (Self, mpsc::Receiver<ConnectionEvent>) {
         let feature_registry = Arc::new(FeatureRegistry::new());
-        if let Err(e) = register_client_modules(&feature_registry) {
+        if let Err(e) = conquerd_features::client_modules::register_client_modules_with_video_codecs(
+            &feature_registry,
+            crate::video::codec::available_codecs(),
+        ) {
             panic!("failed to seed feature registry for test: {e}");
         }
         let (_cmd_tx, event_rx, mgr) = Self::construct(identity, peer_store, feature_registry);
@@ -511,7 +516,13 @@ impl ConnectionManager {
         encoded: Vec<u8>,
         keyframe: bool,
     ) {
-        self.send_video_datagram(peer_id, encoded, keyframe).await;
+        self.send_video_datagram(
+            peer_id,
+            encoded,
+            keyframe,
+            conquerd_features::video_codec::VideoCodec::Stub,
+        )
+        .await;
     }
 
     /// Test-only forwarders for the room lane. These live in `room_session`
@@ -523,7 +534,12 @@ impl ConnectionManager {
 
     #[cfg(test)]
     pub(super) async fn test_send_room_video(&mut self, encoded: Vec<u8>, keyframe: bool) {
-        self.send_room_video(encoded, keyframe).await;
+        self.send_room_video(
+            encoded,
+            keyframe,
+            conquerd_features::video_codec::VideoCodec::Stub,
+        )
+        .await;
     }
 
     #[cfg(test)]
@@ -815,11 +831,11 @@ impl ConnectionManager {
                         ConnectionCommand::SendRoomAudio { opus_data } => {
                             self.send_room_audio(opus_data).await;
                         }
-                        ConnectionCommand::SendVideoFrame { peer_id, encoded, keyframe } => {
-                            self.send_video_datagram(&peer_id, encoded, keyframe).await;
+                        ConnectionCommand::SendVideoFrame { peer_id, encoded, keyframe, codec } => {
+                            self.send_video_datagram(&peer_id, encoded, keyframe, codec).await;
                         }
-                        ConnectionCommand::SendRoomVideo { encoded, keyframe } => {
-                            self.send_room_video(encoded, keyframe).await;
+                        ConnectionCommand::SendRoomVideo { encoded, keyframe, codec } => {
+                            self.send_room_video(encoded, keyframe, codec).await;
                         }
                         ConnectionCommand::SendVideoState { active, direct_peer } => {
                             self.send_video_state(active, direct_peer).await;
@@ -1380,12 +1396,12 @@ impl ConnectionManager {
                     // flooding peer must be shed before we buffer its bytes.
                     Some(FrameClass::Video(fragment)) => {
                         if !self.check_inbound_feature_quota(
-                            "core.video.vp8",
+                            "core.video.v1",
                             &canonical_peer_id,
                             fragment.len(),
                         ) {
                             debug!(
-                                "[core.video.vp8] inbound quota exceeded for {}; dropping fragment",
+                                "[core.video.v1] inbound quota exceeded for {}; dropping fragment",
                                 &canonical_peer_id[..8.min(canonical_peer_id.len())]
                             );
                         } else {

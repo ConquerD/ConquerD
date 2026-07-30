@@ -1378,7 +1378,7 @@ mod tests {
             conquerd_features::wellknown::core_file_v1(),
             conquerd_features::wellknown::game_relay_v1(),
             conquerd_features::wellknown::room_audio_sfu(),
-            conquerd_features::wellknown::core_video_vp8(),
+            conquerd_features::wellknown::core_video_v1(),
             conquerd_features::wellknown::room_video_sfu(),
         ] {
             let _ = r.upsert(cap);
@@ -1479,7 +1479,7 @@ mod tests {
             conquerd_features::channel_frame::VIDEO_TAG,
             b"fragment",
         ));
-        assert_eq!(fid, "core.video.vp8");
+        assert_eq!(fid, "core.video.v1");
 
         let (fid, _) = relay_datagram_feature(&encode_frame(
             conquerd_features::channel_frame::ROOM_VIDEO_TAG,

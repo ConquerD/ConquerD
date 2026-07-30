@@ -73,6 +73,7 @@ impl ConnectionManager {
             &conv_id,
             &frame.sender,
             frame.frame_seq,
+            frame.codec,
             &frame.sealed,
         );
         if !Identity::verify_with_public_key(&public_key, &frame.signature, &signing_bytes) {
@@ -119,6 +120,7 @@ impl ConnectionManager {
             peer_id,
             encoded,
             keyframe: frame.keyframe,
+            codec: frame.codec,
         });
     }
 }

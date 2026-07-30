@@ -20,7 +20,7 @@
 //! | `0x03` | file transfer          | `core.file.v1`    |
 //! | `0x04` | room (SFU) audio       | `room.audio.sfu`  |
 //! | `0x05` | game relay             | `game.relay.v1`   |
-//! | `0x06` | direct video           | `core.video.vp8`  |
+//! | `0x06` | direct video           | `core.video.v1`  |
 //! | `0x07` | room (SFU) video       | `room.video.sfu`  |
 //!
 //! The room-audio tag (`0x04`) only appears on the *relayed* datagram path
@@ -71,7 +71,7 @@ pub const ROOM_AUDIO_TAG: u8 = 0x04;
 /// session for in-app portal games. Distinct from room audio so quota and
 /// fan-out stay scoped to game sessions (not SFU voice rooms).
 pub const GAME_RELAY_TAG: u8 = 0x05;
-/// Direct peer video (`core.video.vp8`) — unreliable datagrams carrying one
+/// Direct peer video (`core.video.v1`) — unreliable datagrams carrying one
 /// fragment of an encoded frame. Distinct from [`AUDIO_TAG`] so a congested
 /// video stream is quota-accounted (and can be shed) independently of the
 /// call audio it accompanies.
@@ -107,7 +107,7 @@ pub fn fixed_tag_for(feature_id: &str) -> Option<u8> {
         "core.file.v1" => Some(FILE_TAG),
         "room.audio.sfu" => Some(ROOM_AUDIO_TAG),
         "game.relay.v1" => Some(GAME_RELAY_TAG),
-        "core.video.vp8" => Some(VIDEO_TAG),
+        "core.video.v1" => Some(VIDEO_TAG),
         "room.video.sfu" => Some(ROOM_VIDEO_TAG),
         _ => None,
     }
@@ -121,7 +121,7 @@ pub fn feature_for_fixed_tag(tag: u8) -> Option<&'static str> {
         FILE_TAG => Some("core.file.v1"),
         ROOM_AUDIO_TAG => Some("room.audio.sfu"),
         GAME_RELAY_TAG => Some("game.relay.v1"),
-        VIDEO_TAG => Some("core.video.vp8"),
+        VIDEO_TAG => Some("core.video.v1"),
         ROOM_VIDEO_TAG => Some("room.video.sfu"),
         _ => None,
     }
@@ -187,7 +187,7 @@ mod tests {
             ("core.file.v1", FILE_TAG),
             ("room.audio.sfu", ROOM_AUDIO_TAG),
             ("game.relay.v1", GAME_RELAY_TAG),
-            ("core.video.vp8", VIDEO_TAG),
+            ("core.video.v1", VIDEO_TAG),
             ("room.video.sfu", ROOM_VIDEO_TAG),
         ] {
             assert_eq!(fixed_tag_for(fid), Some(tag));

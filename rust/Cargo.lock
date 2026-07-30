@@ -662,6 +662,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "conquerd-vpx"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "cc",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,42 +1,17 @@
 # Backlog — deferred / open work
 
 Open work deferred while the core framework stabilized. The two original drivers — **E2E text
-chat** and **supernode cluster support** — have both landed, as has Space Merkle **Layer 1** and
-room voice/chat E2E (sender keys). What remains is grouped below by theme; ordering within each group
-is rough priority. Durable *shipped* invariants live in `agents.md`, not here.
+chat** and **supernode cluster support** — have both landed, as has Space Merkle **Layer 1**,
+room voice/chat/file E2E (sender keys), and group-key reliability (elected keyer, ack + reseal
+loop, fail-closed room content). Video calling has substantial in-tree scaffolding (transport,
+Windows capture/encode, UI) but is **not product-finished** — see the Video section below. What
+remains is grouped below by theme; ordering within each group is rough priority.
+
+**Durable *shipped* invariants live in `agents.md`, not here** — when an item below lands, move its
+invariant into the relevant `agents.md` section and delete it from this file rather than marking it
+"shipped" in place. This file is not a changelog; git history is.
 
 ---
-
-## Crypto — group key reliability — shipped (2026-07-09)
-
-TreeKEM was considered here and **declined** (see Declined section) — invite-only rooms sized for
-manual invitation don't hit the O(N) rekey cost that would justify it. The real gap — the pairwise
-`SfuGroupKey` distribution silently never being consumed (encryption was pinned to the deterministic
-per-room key regardless of any distributed key material) and having no keyer at all for the
-ownerless built-in `default` room — is now closed:
-
-- `group_key.rs`: `SenderKeysGroup::{current_epoch, epoch_key}` now actually read installed epoch
-  key state instead of hardcoding epoch 0 → deterministic key forever; the deterministic key is now
-  a true emergency fallback used only until real key material exists for a conversation.
-  `has_real_key` distinguishes "holds distributed key material" from the always-available
-  deterministic fallback.
-- `connection_manager/manager.rs`: distribution is no longer gated on "did I create this room" —
-  any member holding real key material can act as a room's "keyer" (bootstrap the first epoch,
-  rotate on departure, reseal to newcomers), chosen deterministically per membership snapshot as the
-  lexicographically smallest `public_id` present (`is_elected_keyer`). This covers the `default`
-  room (no client-side creator exists for it) and reconnect-after-drop (the next-smallest remaining
-  member takes over automatically). A narrow bootstrap race remains possible if two members join
-  before either observes the other (documented in code); it self-heals on the next shared membership
-  snapshot.
-
-**Follow-up hardening — shipped (2026-07-10):** the dual-keyer variant of the bootstrap race (two lone
-joiners each mint a different epoch-0 key) is closed by deferring first-key minting until a second
-member is visible. Installing a received `SfuGroupKey` now requires the sender to be the current
-elected keyer at a plausible epoch (`accept_group_key_from`) — closes the "any room peer can push a
-bogus key" DoS caveat. Delivery is now acked (`SfuGroupKeyAck`) with a 750ms/16-attempt reseal loop so
-a lost `EncryptedSignal` envelope self-heals instead of permanently desyncing a member. Room chat/file/
-audio now fail closed (drop) instead of falling back to cleartext when no real key exists yet. See
-`agents.md` Supernode Opacity section.
 
 ## Post-quantum crypto (ML-KEM / ML-DSA) — assessed 2026-07-11, deferred
 
@@ -130,29 +105,9 @@ treehead signature per Space per epoch.
 
 ## Space Merkle tree — remaining
 
-**Layer 1 (authenticated room tree) is shipped.** Durable invariants, file locations, and tests
-live in `agents.md` (Architecture Notes / room ownership / UX agent / Roadmap). Implementation:
-`space.rs` (byte-identical client + supernode), signed wire structs (`SignedSpaceRoot`,
-`SpaceInclusionProof`, `SpaceGrant`), owner builder, cluster gossip + `SpaceRootStore`,
-proof-based admission (`try_space_admission`) with local invite-token / creator self-admit
-fallbacks, invite envelope fields, client persistence
-(`RoomEntry.{space_id, parent_id, invite_policy}` in `my_rooms.dat`), `"members"` invite-policy
-+ UI toggle, periodic Space-root re-broadcast, root-equivocation flagging (lighter mitigation),
-and arbitrary-depth sub-room nesting via `parent_id`.
-
-Reserved fields `inherit`, `key_commit`, and invite `space_node_key` are present but defaulted
-empty/false so Layer 2 changes leaf *values*, not leaf *shape* — no `v1` label bump when it lands.
-
-**Admission model (post RoomGrant removal):** cluster no longer replicates per-peer private-room
-ACLs. Paths in use:
-
-| Path | Scope |
-|---|---|
-| **Space proof + grant** (`try_space_admission`) | Cluster-portable: materialize + local `allow_peer` on any node |
-| **RoomRoster** gossip | Room *existence* + `creator_id` / `invite_policy` on every member |
-| **Local invite token** + local `allowed` | Same-node rejoin, shareable links, GC rematerialize re-seed |
-| **Creator self-admit** | Owner joins without token/proof |
-| **PeerAuth** | Unrelated: client trust / relay auth (kept) |
+**Layer 1 (authenticated room tree) is shipped** — implementation, admission-path table, reserved
+Layer 2 leaf fields, and the `v1` hash-label freeze rule now live in `agents.md` (Architecture
+Notes → room ownership invariant). Only the open items are tracked here.
 
 ### Still open
 
@@ -212,6 +167,314 @@ treehead signature, not a per-room/per-grant fan-out.
   perceptible.
 - **Stereo / spatial mixdown (V8).** Per-peer pan in `mix_pcm_frames` + stereo ring buffer.
   Low-priority, pure UX enhancement.
+
+## Video calling — remaining
+
+Large in-tree feature, **not product-finished**. README still correctly says “No video calls yet.”
+Transport, capability ads, quotas, room E2E, camera-state signaling, Windows capture/encode, and
+call-UI plumbing are substantially built under `rust/conquerd-client/src/video/` +
+`connection_manager/manager/video_session.rs` + QML `VideoTile` / `VideoRegion` / settings preview.
+What follows is open work to make video a shippable, cross-platform capability.
+
+### Shipped scaffolding (do not re-litigate)
+
+Merged into `agents.md` — channel tags `0x06`/`0x07` and the relay-datagram-only / one-stream-per-peer
+rules (Channel-tag rules), the `core.video.v1` + `room.video.sfu` descriptor rows and the video
+codec invariant (Feature Module
+Reference), room-video opacity and `MediaKind::Video` AAD separation (Supernode Opacity), and the
+`src/video/` module map with the Windows-only capture caveat (Architecture Notes). Also shipped and
+not re-litigated here: quality presets (low / balanced / high), settings device list + local preview,
+and the in-call camera toggle.
+
+### Still open (rough priority)
+
+1. **Screen share off Windows.**
+
+   The codec question is **closed** (Option C, hybrid, 2026-07-30): VP8 ships on every platform
+   via the vendored `conquerd-vpx`, and **camera capture now exists on all three**. Durable
+   invariants live in `agents.md`. What is left is the screen/window surface:
+
+   | Platform | Camera | Screen / window |
+   |---|---|---|
+   | Windows | `MfCamera` ✅ | `Windows.Graphics.Capture` ✅ |
+   | Linux | `V4l2Camera` ✅ | **open** — PipeWire + `xdg-desktop-portal` (Wayland), X11 fallback |
+   | macOS | `AvfCamera` ✅ | **open** — ScreenCaptureKit |
+
+   Notes for whoever picks this up:
+   - **Linux screen capture is the awkward one, and it changes the UX.** Wayland has no
+     screen-scraping API by design; capture goes through `xdg-desktop-portal`'s ScreenCast
+     interface over D-Bus, which returns a PipeWire node id after the *compositor* draws the
+     picker. That dialog is not skippable and cannot be replaced by our own QML source list the
+     way `monitor:` / `window:` ids work on Windows — so `SourceSpec::Screen` needs a
+     portal-shaped variant rather than an id we choose. An X11 fallback (XComposite/XShm) covers
+     older sessions and can keep the current id model.
+   - **macOS needs entitlements, not just code.** ScreenCaptureKit requires Screen Recording
+     permission granted in System Settings, which cannot be prompted for repeatedly, and the app
+     must carry the matching usage strings. Not testable in CI.
+   - VP8 already covers encode everywhere, so a new backend only has to produce `RawFrame`
+     (tightly-packed I420) and the existing pipeline handles the rest.
+
+2. **Verify the platform backends on real hardware — nothing outside Windows has run against a camera.**
+
+   | Backend | Compiles | Logic tested | Run against a camera |
+   |---|---|---|---|
+   | Windows `MfCamera` | ✅ | ✅ | ✅ (dev machine) |
+   | Linux `V4l2Camera` | ✅ (WSL + CI) | ✅ format choice | ❌ WSL has no `/dev/video*` |
+   | macOS `AvfCamera` | ❌ **never compiled** | — | ❌ no Mac on the team |
+
+   The macOS row is the important one: the Objective-C shim and its Rust FFI have **never been
+   through a compiler**. The new `test-macos` CI job is the first thing that will build them, and
+   it should be expected to need a round or two of fixes rather than passing first try.
+
+   Unverified on Linux specifically: format negotiation against a real driver (V4L2 substitutes
+   silently), stride handling in each of the three accepted formats, buffer starvation under
+   load, and unplug-mid-call. On macOS additionally: the TCC camera prompt, and whether the
+   chosen `AVCaptureSessionPreset` yields the requested size.
+
+   The `#[ignore]`d `captures_a_frame_from_the_default_camera` test is the intended harness;
+   give it Linux and macOS siblings and run all three on hardware before calling any platform
+   done.
+
+3. **End-to-end product validation (2-client + room).**
+   Transport unit tests cover tags, fragmentation, absent-peer drop, and `SfuVideoState` replay;
+   that is not a substitute for:
+   - Direct 1:1 camera on both legs with decode to `QVideoSink`.
+   - Room multi-party fan-out (relay path, mid-join keyframe recovery, camera-off placeholders).
+   - Direct-call → temporary SFU fallback still routing video on the room path (`video_route`).
+   - Failure modes: no camera, camera in use, encoder unavailable, quota shed, stall vs
+     intentional camera-off (`SfuVideoState` is the edge signal).
+   Gate “video calls ship” (and drop the README bullet) on a written manual checklist, not compile
+   alone.
+
+4. **Dual audio roles: voice mic vs stream / content audio.**
+   Live video (especially screen share) often needs **application or system audio**, not the call
+   microphone. Today the client has a single `audio_input_device` setting and one CPAL capture
+   stream in `AudioPipeline` (`call_controller` / Settings → input combo). That is correct for
+   pure voice calls; it is **not** enough for “stream what this app is playing.”
+
+   **Product model (recommended):** treat two roles, not one device list:
+   | Role | Purpose | Typical source | Codec mode |
+   |---|---|---|---|
+   | **Voice** | Conversation (existing call path) | Mic / line-in via CPAL | Opus `Application::Voip` (today) |
+   | **Content / stream** | Audio that belongs with the video (game, browser, DAW, movie) | WASAPI loopback, process/app capture, stereo-mix, virtual cable, or a second hardware input | Prefer Opus `Application::Audio` (music-friendly); higher bitrate preset |
+
+   **Why not just “pick a different mic” once:**
+   - Users still need the **mic for commentary** while content audio plays; a single input forces
+     either mute-the-game or no voiceover.
+   - Loopback / process capture is not a normal cpal “input device” on many hosts (Windows needs
+     WASAPI loopback or a virtual cable; Linux Pulse/PipeWire monitor sources; macOS is harder).
+   - Content audio should **not** run the voice DSP stack unchanged (noise gate, VAD-gated send,
+     aggressive VoIP encode) or music/game audio will sound wrong and may be suppressed.
+   - Screen capture today is **pixels only** (`video::screen`); there is no paired audio track.
+
+   **Design choices to settle before coding:**
+   - **Mix vs dual outbound tracks.** v1 can **mix** voice + content into the existing single
+     Opus send path (one `core.audio.opus` / `room.audio.sfu` stream, local ducking/levels). That
+     needs no wire change and keeps receivers simple. Dual tracks (separate content capability or
+     second sequence) only if receivers must mute commentary independently or we need different
+     FEC/bitrate per role — protocol bump, not required for first streaming UX.
+   - **Selection UI:** keep Settings “Call microphone” as today; add a stream-session control
+     (“Share system audio” / “Share audio from: [app | output device | none]”) when video or
+     screen share is active — not a second global default that rewires every voice call.
+   - **Echo / feedback:** if content is system loopback, local playback of remote peers can re-enter
+     the loop; need exclude-ConquerD-output, ducking, or require a virtual cable / per-app capture.
+   - **Platform order:** Windows WASAPI loopback (or WGC-adjacent process audio where available)
+     first, matching Windows-first video; Linux monitor sources next; macOS last.
+
+   **Reuse:** still send on the existing audio capabilities and room E2E path — content is a
+   **capture/mix source**, not a new media type. Do not invent a parallel “video soundtrack”
+   channel unless mix-at-sender proves insufficient.
+
+5. **A/V sync — shared sender timeline + PTS + audio-led playout (implementation plan).**
+
+   Product requirement: “some sync,” not frame-perfect. Audio and video are independent paths
+   today (separate capabilities, tags, sequence counters, playout). There is **no shared media
+   clock** and no presentation timestamp on either media wire:
+   - Direct audio: `[AUDIO_TAG][id_len][peer_id][opus]` — no PTS (`send_audio_datagram`).
+   - Room audio: JSON `SfuAudio` + crypto `seq` + wall-clock `timestamp` (freshness/replay only).
+   - Video fragments: `frame_seq` only (ordering/reassembly); signing/AAD do not carry media time.
+   - Receiver: Opus → per-peer jitter queue + 20 ms tick (`call_controller`); video → reassemble
+     → decode → `QVideoSink` ASAP. No coupling.
+
+   Without this work, mic+camera and especially content-audio+screen (item 4) drift under loss,
+   unequal buffers, and keyframe stalls. **Gate “video + content audio ships” on this plan.**
+
+   #### Goals / non-goals
+
+   | | v1 |
+   |---|---|
+   | Quality | A/V offset roughly **±40–80 ms** under normal loss |
+   | Master | **Audio-led** — never stretch/warp Opus to chase video |
+   | Clock scope | One **sender** timeline per call/room session; peers need not share wall clocks |
+   | Multi-party | Sync is **per sender** — never compare PTS across peers |
+   | Non-goals | NTP between peers, full RTP/RTCP, sample-accurate editorial sync, dual content-audio wire tracks, muxing A/V into one container |
+
+   #### Architecture
+
+   ```text
+   SessionMediaClock (sender, t0 = voice session start)
+           │ stamp at capture/mix (before encode)
+     ┌─────┴──────┐
+     ▼            ▼
+   voice(+content mix) → Opus@pts_a    camera/screen → RawFrame@pts_v → encode
+     │                                  │
+     seal/sign (PTS in AAD/sig)         seal + sign (PTS bound)
+     │                                  │
+     wire with pts                      fragments (pts on frame; ver bump)
+     │                                  │
+     └──────── receiver ────────────────┘
+              audio 20ms tick = master (record playout_anchor per peer)
+              video hold/drop to extrapolated audio PTS (bounded queue)
+   ```
+
+   **Stamp points (discipline):** audio after mix / at the PCM boundary that becomes that Opus
+   packet; video at capture or composite output **before** encode. Post-encode stamps hide encode
+   latency as false skew.
+
+   **Content audio (item 4):** mix voice + content **before** stamping the Opus PTS so one audio
+   stream remains the master. Do not run two audio clocks against one video.
+
+   #### Wire + crypto
+
+   - **Units:** prefer `u64` microseconds since session `t0` (avoid long-session wrap bugs).
+   - **Direct audio v2:** versioned framing after peer id, e.g.
+     `[AUDIO_TAG][id_len][peer_id][fmt:u8][pts:u64 BE][opus]` with a clear format byte so parsers
+     do not guess. Old v1 frames remain `[…][opus]` only.
+   - **Room audio:** add `"pts": <u64>` on `SfuAudio` (JSON is fine for v1; do not block sync on a
+     binary room-audio rewrite). Wall-clock `timestamp` stays for freshness only.
+   - **Video fragments:** bump `FRAGMENT_VERSION` (e.g. `0x02`); carry `pts:u64` on the frame
+     (fragment 0 is enough, or every frag for simpler reassembly). Extend
+     `video_frame_signing_bytes` to bind PTS.
+   - **Auth:** bind PTS into voice/media AAD (`group_key`) and video signatures so a modified PTS
+     fails open/verify. Advisory-only PTS is not “done right.”
+   - **Capability:** advertise `av_sync=1` + `pts_unit=us` on audio/video descriptors (or params).
+     Mutual support → stamp + enforce; otherwise degrade to today’s best-effort (no hard fail of
+     voice-only peers). Room: stamp when local client supports it; old receivers ignore PTS.
+
+   #### Receiver policy (audio master, video slave)
+
+   - Keep existing audio jitter buffer + 20 ms playout tick as master.
+   - On each played Opus frame for peer P, set `playout_anchor[P] = (pts_a, Instant::now())`.
+   - On PLC / silence, **advance expected audio PTS** by ~20 ms so video does not wait forever.
+   - Decoded video `{pts_v, pixels}` → per-peer hold queue; display tick (~30–60 Hz):
+     - `audio_now_pts = extrapolate(playout_anchor[P])`
+     - drop if `pts_v < audio_now_pts - late_tol`
+     - show if `pts_v <= audio_now_pts + early_tol`
+     - else hold last frame
+   - Starting constants (tunable): `late_tol` 40–60 ms; hold window 40–80 ms; max queue ~5–8
+     frames; stall placeholder after ~300–500 ms without a renderable frame.
+   - Light EMA of measured offset; step-correct by skip/hold frames only — **never** resample
+     audio in v1. Reset on camera off/on, long gap, keyframe after stall, session restart.
+   - **Never block the audio tick on video.**
+
+   #### Phased implementation (PR-sized)
+
+   | Phase | Work | Rough effort |
+   |---|---|---|
+   | **A — Clock + types** | New `SessionMediaClock` (e.g. `media_clock.rs`); create on voice active / destroy on end-call or leave voice room; thread-safe `now_pts_us()`; wire lifecycle from `AppBridge` / `CallController`. No wire change yet. | 0.5–1 d |
+   | **B — Wire + crypto + unit tests** | Video fragment v2 + signing/AAD; direct audio framing v2; room `SfuAudio` `pts` + seal AAD; golden vectors (old frames still verify; tampered PTS fails). | 2–4 d |
+   | **C — Sender plumbing** | Stamp audio at PCM/mix boundary in `AudioPipeline`; stamp video in capture/composite before encode; pass PTS through `SendAudio` / `SendVideoFrame` / `SendRoomVideo`. | 1–2 d |
+   | **D — Receiver audio-led** | Plumb PTS on `DirectAudioReceived` / `SfuAudioReceived` / video frame events; store PTS in jitter queue entries; per-peer playout anchor; video hold/drop queue (extend `video::receiver` or small `VideoPlayout`); gate on `av_sync`; debug metrics for measured offset. **Hardest product logic.** | 3–5 d |
+   | **E — Validation + docs** | Lab clap+flash / A/V test pattern under clean net, ~1–2% loss, keyframe burst; multi-peer per-sender check; README / capability notes; privacy unchanged (PTS is media timing). | 2–3 d |
+
+   **Total focused estimate:** ~1.5–2.5 engineer-weeks for sync alone (Windows video path already
+   capturing). Content loopback (item 4) is separate capture work; this plan still applies once
+   content is mixed into the same Opus timeline.
+
+   #### Files (expected touch set)
+
+   | Area | Likely paths |
+   |---|---|
+   | Clock | new `conquerd-client/src/media_clock.rs`; `call_controller.rs`; `ui/bridge.rs` lifecycle |
+   | Video wire | `video/fragment.rs`, `video/mod.rs` (signing), `video/sender.rs`, `connection_manager/manager/video_session.rs` |
+   | Direct audio | `connection_manager/manager/peer_session.rs` (`send_audio_datagram` + inbound parse) |
+   | Room audio | room send path, `manager/inbound.rs` `SfuAudio`, `group_key.rs` AAD |
+   | Features | `conquerd-features` `wellknown.rs` params; channel_frame docs if needed |
+   | Playout | `call_controller.rs` jitter; `video/receiver.rs` + bridge → `QVideoSink` |
+   | Events | `connection_manager/events.rs` |
+   | Tests | fragment / crypto / transport; new sync tests with a fake clock |
+
+   Supernode stays **content-opaque**: forward binary video fragments and existing audio envelopes
+   without parsing PTS. Do not teach the SFU a media timeline.
+
+   #### Decisions to lock before Phase B
+
+   1. `u64` µs PTS (preferred) vs `u32` coarser ticks.
+   2. PTS **authenticated** (required for “done right”).
+   3. Room audio keeps JSON for PTS v1 (no binary rewrite gate).
+   4. Video without active voice: refuse camera, or free-run video with no sync (prefer refuse /
+      voice-session-only video to keep one clock lifecycle).
+   5. Capability name/params: `av_sync=1`, `pts_unit=us`.
+
+   #### Ship checklist
+
+   - [ ] One `SessionMediaClock` per voice session; not reused across calls
+   - [ ] Audio + video stamped at capture/mix, not post-encode
+   - [ ] PTS on direct audio, room audio, and video frames
+   - [ ] PTS bound in signature / AAD
+   - [ ] Receiver: audio jitter master; video hold/drop to PTS
+   - [ ] Per-peer timelines only; PLC advances audio PTS
+   - [ ] Lab offset inside ±40–80 ms (clean / light loss / keyframe burst)
+   - [ ] `av_sync` graceful degrade for old peers
+   - [ ] Supernode still opaque; no SFU PTS logic
+   - [ ] Docs note sync expectations (seq counters alone are not enough)
+
+   #### Validation
+
+   Scripted or manual clap+flash (or known A/V test pattern); measure receiver playout offset
+   under clean net, ~1–2% loss, and during a keyframe burst. Export or log measured A/V offset
+   in debug builds to tune `late_tol` / hold window without guessing.
+
+6. **Video adaptive bitrate (ABR).**
+   Audio has room/direct ABR in `call_controller`. Video encoder exposes `set_bitrate` (MF path
+   retargets a live MFT without full rebuild) but there is no closed-loop controller driving it
+   from loss / underrun / fragment-drop signals. Wire a video ABR loop (or share a media-quality
+   signal) so keyframe bursts and 720p presets do not melt constrained relays. Content-audio
+   bitrate (item 4) should participate in the same congestion story so video + music do not
+   starve each other on the relay quota. ABR must not fight A/V sync (item 5): prefer dropping
+   or downscaling video before lengthening the audio buffer in ways that push lip-sync out of band.
+
+7. **Receiver resilience polish.**
+   Decode thread, per-peer decoder map, queue drop, and keyframe-request-on-decode-failure exist;
+   still open: PLI/FIR cadence tuning, idle decoder GC under many room members, graceful degrade
+   when Qt Multimedia / sink is absent (`cfg(qt_multimedia)` already degrades UI — keep that
+   path honest in docs and settings). Align drop/keyframe policy with the A/V sync hold queue
+   (item 5) so a PLI storm does not empty the video timeline while audio keeps playing.
+
+8. **UX completeness.**
+   Camera toggle + settings preview + tiles exist; remaining polish as the path stabilizes:
+   - Clear “video unavailable on this platform / no encoder” messaging (not a silent toggle fail).
+   - Screen-share picker UX (monitor/window ids are `monitor:` / `window:` in settings today;
+     discovery UI may still be thin) — pair with content-audio toggle from item 4.
+   - Multi-tile layout under several active room cameras (layout stress, not a new wire feature).
+   - Confirm local-preview vs remote tile identity (preview uses local public id).
+   - Separate level meters / mute for voice vs content when both are live (mix-at-sender still
+     benefits from local “content mute” and “mic mute”).
+
+9. **Docs + agent contract.**
+   When video is product-ready (or when capability IDs/codec change): update README (“No video
+   calls yet”, Built-in Capabilities table, privacy surface — content/loopback capture is a new
+   disclosure), `agents.md` Feature Module Reference / channel-tag table, and supernode opacity
+   notes if any control-plane fields grow. Keep supernode opacity: still forward opaque
+   fragments; never log or persist frame payloads. Document A/V sync expectations (item 5)
+   so agents do not treat independent seq counters as “good enough” for shipping video.
+
+### Video non-goals (near-term)
+
+- **Multiple independent outbound streams per peer** (separate camera + screen without composite)
+  — wire identifies a stream by sender only; changing that is a protocol bump, not a toggle.
+- **Separate content-audio wire track in v1** — prefer mix-at-sender onto existing Opus (item 4);
+  dual tracks only if product requires independent remote mute of commentary vs content.
+- **Frame-perfect / broadcast A/V sync** — v1 target is ±40–80 ms audio-led (item 5), not
+  sample-accurate editorial sync, NTP-coupled peers, or full RTP/RTCP.
+- **WebRTC / browser video** — in-app portal stays on identity QUIC; do not reintroduce public
+  WebTransport or page-side SFU video clients.
+- **openh264 (or other in-tree AVC) in our binary** — rejected for MPEG-LA exposure; Windows uses
+  OS MFTs. Any software H.264 path needs an explicit licensing review before packaging.
+- **Simulcast / SVC layers** — single encode ladder + ABR first; layered encode only if room scale
+  demands it after a real multi-party load test.
+- **WS fallback for room video media** — deliberately relay-datagram-only; members on WS-only
+  keep audio, not video (documented on `SendRoomVideo`).
 
 ## Discovery / federation (speculative — only if demand appears)
 

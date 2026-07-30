@@ -11,10 +11,14 @@
 //! build system. Webcams commonly offer NV12 or YUY2, both of which
 //! [`super::nv12`] converts.
 //!
-//! Other platforms currently get [`NullCamera`], which reports no devices
-//! rather than failing to compile. That keeps mac and Linux CI green while
-//! video is Windows-first; an AVFoundation or V4L2 backend slots in behind
-//! [`CameraSource`] without touching callers.
+//! Linux uses Video4Linux2 through the `v4l` crate. Both backends converge on
+//! the same small set of pixel formats and reuse the same converters, because
+//! the format a webcam offers is a property of the camera rather than of the
+//! operating system — a YUY2-only device behaves the same either side.
+//!
+//! Platforms without a backend get [`NullCamera`], which reports no devices
+//! rather than failing to compile, so their builds stay green and the camera
+//! toggle simply reports off.
 
 use super::frame::RawFrame;
 
@@ -58,8 +62,14 @@ impl CameraSource for NullCamera {
 #[cfg(target_os = "windows")]
 pub use windows_impl::{list_devices, MfCamera};
 
+#[cfg(target_os = "linux")]
+pub use linux_impl::{list_devices, V4l2Camera};
+
+#[cfg(target_os = "macos")]
+pub use macos_impl::{list_devices, AvfCamera};
+
 /// Enumerate cameras. Always empty where capture is unimplemented.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub fn list_devices() -> Vec<CameraDevice> {
     Vec::new()
 }
@@ -388,6 +398,426 @@ mod windows_impl {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod linux_impl {
+    use super::{CameraDevice, CameraSource};
+    use crate::video::frame::RawFrame;
+    use crate::video::nv12;
+
+    use v4l::buffer::Type;
+    use v4l::io::traits::CaptureStream;
+    use v4l::video::Capture;
+    use v4l::{Device, FourCC};
+
+    /// Pixel formats accepted from a device, most preferred first.
+    ///
+    /// All three are uncompressed and convert to I420 with plain byte work.
+    /// MJPEG is deliberately absent even though many webcams offer it at
+    /// higher resolutions: decoding it needs a JPEG decoder, which is a new
+    /// dependency and a new attack surface on the capture path, and every
+    /// device that offers MJPEG also offers YUYV at call resolutions.
+    const PREFERRED: [&[u8; 4]; 3] = [
+        b"YU12", // planar I420 — no conversion at all
+        b"NV12", // semi-planar, converts with nv12_to_i420
+        b"YUYV", // packed 4:2:2, the near-universal webcam fallback
+    ];
+
+    /// Pick the best mutually-supported pixel format, or `None` when the
+    /// device offers nothing usable.
+    ///
+    /// Split out from [`V4l2Camera::open`] so it can be tested without a
+    /// camera: this is the decision most likely to be wrong on hardware that
+    /// is not to hand, and getting it wrong means every frame is converted by
+    /// the wrong routine rather than failing outright.
+    pub(super) fn choose_format(offered: &[[u8; 4]]) -> Option<[u8; 4]> {
+        PREFERRED
+            .iter()
+            .find(|p| offered.contains(&***p))
+            .map(|p| **p)
+    }
+
+    /// Enumerate V4L2 capture devices.
+    pub fn list_devices() -> Vec<CameraDevice> {
+        let mut out = Vec::new();
+        for node in v4l::context::enum_devices() {
+            let Some(path) = node.path().to_str() else {
+                continue;
+            };
+            // A node existing does not make it a capture device: V4L2 also
+            // exposes metadata and output nodes, and modern UVC cameras
+            // publish several nodes per physical camera. Opening and asking
+            // is the only reliable filter.
+            let Ok(dev) = Device::with_path(node.path()) else {
+                continue;
+            };
+            if Capture::enum_formats(&dev)
+                .map(|f| f.is_empty())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let name = node.name().unwrap_or_else(|| path.to_owned());
+            out.push(CameraDevice {
+                id: path.to_owned(),
+                name,
+            });
+        }
+        out
+    }
+
+    /// A V4L2 capture device streaming memory-mapped buffers.
+    pub struct V4l2Camera {
+        // Declared before `device`: the stream borrows the device's fd
+        // internally, so it must be torn down first.
+        stream: v4l::io::mmap::Stream<'static>,
+        _device: Box<Device>,
+        fourcc: [u8; 4],
+        width: u32,
+        height: u32,
+        /// Row stride the driver negotiated, which is not always `width`.
+        stride: usize,
+    }
+
+    impl V4l2Camera {
+        /// Open `device_id` (a `/dev/videoN` path) or the first camera found,
+        /// asking for `width`x`height`.
+        pub fn open(device_id: Option<&str>, width: u32, height: u32) -> anyhow::Result<Self> {
+            let devices = list_devices();
+            if devices.is_empty() {
+                anyhow::bail!("no video capture devices found");
+            }
+            let chosen = match device_id {
+                Some(id) => devices
+                    .iter()
+                    .find(|d| d.id == id || d.name == id)
+                    .ok_or_else(|| anyhow::anyhow!("camera '{id}' not found"))?,
+                None => &devices[0],
+            };
+
+            let device = Box::new(Device::with_path(&chosen.id)?);
+
+            // Pick the best format the device actually offers rather than
+            // asking for one and hoping: V4L2 substitutes silently, so a
+            // request for NV12 on a YUYV-only camera comes back as YUYV and
+            // the frames would be converted with the wrong routine.
+            let offered: Vec<[u8; 4]> = Capture::enum_formats(&*device)?
+                .into_iter()
+                .map(|f| f.fourcc.repr)
+                .collect();
+            let wanted = choose_format(&offered).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "camera '{}' offers no supported pixel format (has {:?})",
+                    chosen.name,
+                    offered
+                        .iter()
+                        .map(|f| String::from_utf8_lossy(f).to_string())
+                        .collect::<Vec<_>>()
+                )
+            })?;
+
+            let mut fmt = Capture::format(&*device)?;
+            fmt.width = width;
+            fmt.height = height;
+            fmt.fourcc = FourCC::new(&wanted);
+            // The driver returns what it actually set, which may differ in
+            // both size and format from what was asked.
+            let fmt = Capture::set_format(&*device, &fmt)?;
+
+            let fourcc = fmt.fourcc.repr;
+            if choose_format(&[fourcc]).is_none() {
+                anyhow::bail!(
+                    "camera '{}' substituted unsupported format {}",
+                    chosen.name,
+                    String::from_utf8_lossy(&fourcc)
+                );
+            }
+            if fmt.width == 0 || fmt.height == 0 || fmt.width % 2 != 0 || fmt.height % 2 != 0 {
+                // Odd dimensions have no valid 4:2:0 chroma plane.
+                anyhow::bail!(
+                    "camera negotiated an unusable size {}x{}",
+                    fmt.width,
+                    fmt.height
+                );
+            }
+
+            // SAFETY: a self-referential struct, sound on three counts.
+            //
+            // 1. The `Device` lives behind a `Box`, so its address is stable
+            //    even when `V4l2Camera` itself is moved.
+            // 2. `stream` is declared *before* `_device` in the struct, and
+            //    Rust drops fields in declaration order, so the stream is torn
+            //    down while the device it borrows is still alive.
+            // 3. Neither field is ever handed out, so no caller can separate
+            //    them or move the device out.
+            //
+            // The alternative — reopening the device per frame, or an Rc — is
+            // either a syscall on the hot path or a refcount for a pair that
+            // is created and destroyed together anyway.
+            let device_ref: &'static Device = unsafe { &*(&*device as *const Device) };
+            // Four buffers: enough to absorb a scheduling hiccup without
+            // adding a frame of latency the way a deep queue would.
+            let stream = v4l::io::mmap::Stream::with_buffers(device_ref, Type::VideoCapture, 4)?;
+
+            Ok(Self {
+                stream,
+                _device: device,
+                fourcc,
+                width: fmt.width,
+                height: fmt.height,
+                stride: fmt.stride as usize,
+            })
+        }
+    }
+
+    impl CameraSource for V4l2Camera {
+        fn next_frame(&mut self) -> anyhow::Result<RawFrame> {
+            let (buf, meta) = self.stream.next()?;
+            // A short buffer means a truncated frame; converting it would read
+            // past the end or produce a torn picture.
+            let payload = buf.get(..meta.bytesused as usize).unwrap_or(buf);
+
+            let (w, h) = (self.width, self.height);
+            let (y, u, v) = match &self.fourcc {
+                b"YU12" => {
+                    // Already I420. Still copied per plane, because the
+                    // driver's rows may be padded to `stride`.
+                    let (wu, hu) = (w as usize, h as usize);
+                    let (cw, ch) = (wu / 2, hu / 2);
+                    if payload.len() < self.stride * hu + 2 * (self.stride / 2) * ch {
+                        anyhow::bail!("short I420 buffer: {} bytes", payload.len());
+                    }
+                    let mut y = Vec::with_capacity(wu * hu);
+                    for r in 0..hu {
+                        y.extend_from_slice(&payload[r * self.stride..r * self.stride + wu]);
+                    }
+                    let cstride = self.stride / 2;
+                    let ubase = self.stride * hu;
+                    let vbase = ubase + cstride * ch;
+                    let mut uo = Vec::with_capacity(cw * ch);
+                    let mut vo = Vec::with_capacity(cw * ch);
+                    for r in 0..ch {
+                        uo.extend_from_slice(
+                            &payload[ubase + r * cstride..ubase + r * cstride + cw],
+                        );
+                        vo.extend_from_slice(
+                            &payload[vbase + r * cstride..vbase + r * cstride + cw],
+                        );
+                    }
+                    (y, uo, vo)
+                }
+                b"NV12" => nv12::nv12_to_i420(payload, self.stride, self.stride * h as usize, w, h)
+                    .ok_or_else(|| anyhow::anyhow!("NV12 buffer too small for {w}x{h}"))?,
+                b"YUYV" => nv12::yuy2_to_i420(payload, self.stride, w, h)
+                    .ok_or_else(|| anyhow::anyhow!("YUY2 buffer too small for {w}x{h}"))?,
+                other => anyhow::bail!("unsupported format {}", String::from_utf8_lossy(other)),
+            };
+
+            Ok(RawFrame {
+                width: w,
+                height: h,
+                y,
+                u,
+                v,
+            })
+        }
+
+        fn dimensions(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use super::{CameraDevice, CameraSource};
+    use crate::video::frame::RawFrame;
+
+    use std::os::raw::{c_char, c_int, c_uchar};
+
+    /// Matches the `CQ_CAM_*` codes in `macos_camera.m`.
+    const CQ_CAM_TIMEOUT: c_int = -2;
+    const CQ_CAM_TOO_SMALL: c_int = -3;
+
+    /// How long a single `next_frame` waits before reporting a stall.
+    ///
+    /// Long enough to cover a session still starting up (AVFoundation takes a
+    /// beat to deliver the first frame, and the TCC prompt may be on screen),
+    /// short enough that an unplugged camera surfaces rather than wedging the
+    /// capture thread.
+    const FRAME_TIMEOUT_MS: c_int = 2_000;
+
+    /// The handle is an Objective-C object bridged out as an opaque pointer.
+    /// It is deliberately *not* a C struct: under ARC, Objective-C pointers in
+    /// a malloc'd struct make it non-trivial, and `free` would skip the
+    /// destructors — see `macos_camera.m`.
+    type Handle = std::ffi::c_void;
+
+    extern "C" {
+        fn cq_mac_cam_list(buf: *mut c_char, cap: c_int) -> c_int;
+        fn cq_mac_cam_open(device_id: *const c_char, width: c_int, height: c_int) -> *mut Handle;
+        fn cq_mac_cam_free(handle: *mut Handle);
+        fn cq_mac_cam_next_frame(
+            handle: *mut Handle,
+            out: *mut c_uchar,
+            cap: c_int,
+            width: *mut c_int,
+            height: *mut c_int,
+            timeout_ms: c_int,
+        ) -> c_int;
+    }
+
+    /// Enumerate AVFoundation capture devices.
+    pub fn list_devices() -> Vec<CameraDevice> {
+        // The shim writes NUL-separated id/name pairs and reports the needed
+        // size as a negative when the buffer is short, so one retry with the
+        // exact size always suffices.
+        let mut cap: usize = 4096;
+        for _ in 0..2 {
+            let mut buf = vec![0u8; cap];
+            // SAFETY: `buf` is writable for `cap` bytes; the shim never writes
+            // past the cap it is given.
+            let rc = unsafe { cq_mac_cam_list(buf.as_mut_ptr() as *mut c_char, cap as c_int) };
+            if rc < 0 {
+                cap = rc.unsigned_abs() as usize;
+                continue;
+            }
+            let mut out = Vec::with_capacity(rc as usize);
+            let mut parts = buf.split(|b| *b == 0);
+            for _ in 0..rc {
+                let (Some(id), Some(name)) = (parts.next(), parts.next()) else {
+                    break;
+                };
+                out.push(CameraDevice {
+                    id: String::from_utf8_lossy(id).into_owned(),
+                    name: String::from_utf8_lossy(name).into_owned(),
+                });
+            }
+            return out;
+        }
+        Vec::new()
+    }
+
+    /// AVFoundation camera capture.
+    pub struct AvfCamera {
+        inner: *mut Handle,
+        scratch: Vec<u8>,
+        width: u32,
+        height: u32,
+    }
+
+    // SAFETY: the handle is owned exclusively and every call takes `&mut self`.
+    // The Objective-C side does its own locking around the frame slot.
+    unsafe impl Send for AvfCamera {}
+
+    impl AvfCamera {
+        /// Open `device_id` (an AVFoundation unique id) or the first camera.
+        pub fn open(device_id: Option<&str>, width: u32, height: u32) -> anyhow::Result<Self> {
+            let devices = list_devices();
+            if devices.is_empty() {
+                // Also the symptom of a denied camera permission: macOS hides
+                // devices from an app without TCC consent rather than failing
+                // the open, so say so instead of only "no camera".
+                anyhow::bail!(
+                    "no video capture devices found — if a camera is attached, \
+                     check Privacy & Security > Camera"
+                );
+            }
+            let chosen = match device_id {
+                Some(id) => devices
+                    .iter()
+                    .find(|d| d.id == id || d.name == id)
+                    .ok_or_else(|| anyhow::anyhow!("camera '{id}' not found"))?,
+                None => &devices[0],
+            };
+
+            let c_id = std::ffi::CString::new(chosen.id.as_str())?;
+            // SAFETY: `c_id` is a valid NUL-terminated string that outlives the
+            // call; the shim returns null on failure.
+            let inner = unsafe { cq_mac_cam_open(c_id.as_ptr(), width as c_int, height as c_int) };
+            if inner.is_null() {
+                anyhow::bail!("could not start capture on camera '{}'", chosen.name);
+            }
+
+            let mut cam = Self {
+                inner,
+                // Sized for the request; grows if the session delivers larger.
+                scratch: vec![0u8; RawFrame::packed_len(width.max(2), height.max(2))],
+                width: 0,
+                height: 0,
+            };
+
+            // Pull one frame to learn the size the session actually produces —
+            // AVFoundation presets are coarse and the delegate reports what
+            // arrives, so this is the only way to know.
+            let first = cam.next_frame()?;
+            cam.width = first.width;
+            cam.height = first.height;
+            Ok(cam)
+        }
+    }
+
+    impl CameraSource for AvfCamera {
+        fn next_frame(&mut self) -> anyhow::Result<RawFrame> {
+            let mut w: c_int = 0;
+            let mut h: c_int = 0;
+            for _ in 0..2 {
+                // SAFETY: `scratch` is writable for its length; both out-params
+                // are live ints; `inner` is non-null for the lifetime of self.
+                let rc = unsafe {
+                    cq_mac_cam_next_frame(
+                        self.inner,
+                        self.scratch.as_mut_ptr() as *mut c_uchar,
+                        self.scratch.len() as c_int,
+                        &mut w,
+                        &mut h,
+                        FRAME_TIMEOUT_MS,
+                    )
+                };
+                match rc {
+                    CQ_CAM_TOO_SMALL => {
+                        // The session is producing a larger frame than the
+                        // requested preset; resize once and retry.
+                        let (nw, nh) = (w.max(2) as u32, h.max(2) as u32);
+                        self.scratch = vec![0u8; RawFrame::packed_len(nw, nh)];
+                    }
+                    CQ_CAM_TIMEOUT => {
+                        anyhow::bail!("camera delivered no frame within {FRAME_TIMEOUT_MS}ms")
+                    }
+                    n if n < 0 => anyhow::bail!("camera capture stopped"),
+                    n => {
+                        let (uw, uh) = (w as u32, h as u32);
+                        let (cw, ch) = ((uw as usize + 1) / 2, (uh as usize + 1) / 2);
+                        let y_len = uw as usize * uh as usize;
+                        let c_len = cw * ch;
+                        if n as usize != y_len + 2 * c_len {
+                            anyhow::bail!("camera returned {n} bytes, expected I420 for {uw}x{uh}");
+                        }
+                        return Ok(RawFrame {
+                            width: uw,
+                            height: uh,
+                            y: self.scratch[..y_len].to_vec(),
+                            u: self.scratch[y_len..y_len + c_len].to_vec(),
+                            v: self.scratch[y_len + c_len..y_len + 2 * c_len].to_vec(),
+                        });
+                    }
+                }
+            }
+            anyhow::bail!("camera frame did not fit after a resize")
+        }
+
+        fn dimensions(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+    }
+
+    impl Drop for AvfCamera {
+        fn drop(&mut self) {
+            // SAFETY: `inner` came from `cq_mac_cam_open` and is freed once.
+            unsafe { cq_mac_cam_free(self.inner) }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +836,50 @@ mod tests {
         let devices = list_devices();
         for d in &devices {
             assert!(!d.id.is_empty(), "device id must be usable for reopening");
+        }
+    }
+
+    /// Format preference on Linux. Tested without a camera because the
+    /// consequence of getting it wrong is not a failure but a picture
+    /// converted by the wrong routine.
+    #[cfg(target_os = "linux")]
+    mod v4l2_format_choice {
+        use crate::video::camera::linux_impl::choose_format;
+
+        #[test]
+        fn planar_i420_wins_when_offered() {
+            // YU12 needs no conversion at all, so it beats both others.
+            assert_eq!(
+                choose_format(&[*b"YUYV", *b"NV12", *b"YU12"]),
+                Some(*b"YU12")
+            );
+        }
+
+        #[test]
+        fn nv12_beats_yuyv() {
+            // NV12 is a plane copy; YUY2 needs vertical chroma averaging.
+            assert_eq!(choose_format(&[*b"YUYV", *b"NV12"]), Some(*b"NV12"));
+        }
+
+        #[test]
+        fn yuyv_is_the_fallback_every_webcam_has() {
+            assert_eq!(choose_format(&[*b"YUYV"]), Some(*b"YUYV"));
+        }
+
+        /// MJPEG-only devices must be refused rather than accepted and then
+        /// fed to a converter that would read compressed bytes as luma.
+        #[test]
+        fn compressed_only_devices_are_refused() {
+            assert_eq!(choose_format(&[*b"MJPG"]), None);
+            assert_eq!(choose_format(&[*b"H264", *b"MJPG"]), None);
+            assert_eq!(choose_format(&[]), None);
+        }
+
+        /// A device offering both compressed and raw formats must land on the
+        /// raw one rather than the first entry it advertises.
+        #[test]
+        fn a_raw_format_is_chosen_past_compressed_ones() {
+            assert_eq!(choose_format(&[*b"MJPG", *b"YUYV"]), Some(*b"YUYV"));
         }
     }
 

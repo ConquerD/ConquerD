@@ -2,3 +2,7 @@
 	path = rust/conquerd-opus/opus
 	url = https://github.com/xiph/opus
 	ignore = untracked
+[submodule "rust/conquerd-vpx/libvpx"]
+	path = rust/conquerd-vpx/libvpx
+	url = https://github.com/webmproject/libvpx
+	branch = main

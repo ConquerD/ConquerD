@@ -28,6 +28,7 @@ pub mod quota;
 pub mod registry;
 pub mod replay;
 pub mod signing;
+pub mod video_codec;
 pub mod web_app;
 pub mod wellknown;
 
@@ -50,4 +51,8 @@ pub use replay::{ReplayGuard, DEFAULT_REPLAY_WINDOW_SECS};
 pub use signing::{
     sign_manifest, ManifestCapability, ModuleManifest, SigningError, TrustedKeyStore,
     MANIFEST_SCHEMA_VERSION,
+};
+pub use video_codec::{
+    advertised_codecs, codec_names, codecs_from_params, negotiate as negotiate_video_codec,
+    VideoCodec,
 };

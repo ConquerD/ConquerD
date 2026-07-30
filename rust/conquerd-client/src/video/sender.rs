@@ -123,7 +123,33 @@ impl SourceSpec {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    pub(super) fn open(&self, width: u32, height: u32) -> anyhow::Result<Box<dyn CameraSource>> {
+        match self {
+            Self::Camera { device_id } => {
+                let cam = super::camera::V4l2Camera::open(device_id.as_deref(), width, height)?;
+                Ok(Box::new(cam))
+            }
+            Self::Screen { .. } => {
+                anyhow::bail!("screen capture is not implemented on Linux yet")
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn open(&self, width: u32, height: u32) -> anyhow::Result<Box<dyn CameraSource>> {
+        match self {
+            Self::Camera { device_id } => {
+                let cam = super::camera::AvfCamera::open(device_id.as_deref(), width, height)?;
+                Ok(Box::new(cam))
+            }
+            Self::Screen { .. } => {
+                anyhow::bail!("screen capture is not implemented on macOS yet")
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     pub(super) fn open(&self, _width: u32, _height: u32) -> anyhow::Result<Box<dyn CameraSource>> {
         anyhow::bail!("video capture is not implemented on this platform")
     }

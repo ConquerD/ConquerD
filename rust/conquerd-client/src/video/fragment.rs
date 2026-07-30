@@ -2,10 +2,10 @@
 //!
 //! Audio never needed this: one 20 ms Opus frame always fits inside a single
 //! 1200-byte datagram, so `send_audio_datagram` can put a whole frame on the
-//! wire untouched. A VP8 frame does not — an inter frame runs a few KB and a
-//! keyframe tens of KB — and the relay silently *drops* any datagram over
-//! `MAX_DATAGRAM_SIZE`. So the sender splits each encoded frame into fragments
-//! and the receiver puts them back together.
+//! wire untouched. A video frame does not — an inter frame runs a few KB and a
+//! keyframe tens of KB, in every codec we support — and the relay silently
+//! *drops* any datagram over `MAX_DATAGRAM_SIZE`. So the sender splits each
+//! encoded frame into fragments and the receiver puts them back together.
 //!
 //! # Wire format
 //!
@@ -15,8 +15,9 @@
 //! as `encode_frame` does for the other channels.
 //!
 //! ```text
-//! [ver:u8]                  0x01
+//! [ver:u8]                  0x02
 //! [flags:u8]                bit0 keyframe · bit1 has_signature · bits2-7 reserved
+//! [codec:u8]                VideoCodec wire byte
 //! [sender_len:u8][sender]   base64url peer id (43 or 44 bytes in practice)
 //! [frame_seq:u32 BE]
 //! [frag_idx:u16 BE]
@@ -25,6 +26,22 @@
 //! [chunk bytes]
 //! ```
 //!
+//! # Why the codec is on every frame
+//!
+//! Peers negotiate a codec from their advertised sets (see
+//! [`conquerd_features::video_codec`]), but negotiation alone is not enough to
+//! decode by. A room sender fans out to every member at once and there may be
+//! no single codec all of them run, so "what did we agree on" is not a
+//! well-defined question room-side — only "what is *this* frame" is. Carrying
+//! the codec makes the receiver's decoder choice a fact rather than an
+//! inference, and lets a member that cannot decode this codec drop the frame
+//! and say so instead of feeding a decoder bytes it will choke on.
+//!
+//! The byte is bound into the frame signature (see
+//! [`video_frame_signing_bytes`](super::video_frame_signing_bytes)), so a relay
+//! flipping it fails verification rather than silently redirecting a frame to
+//! the wrong decoder.
+//!
 //! # Why not the signed-JSON envelope room audio uses
 //!
 //! Room audio wraps every frame in a base64'd, Ed25519-signed `SfuAudio` JSON
@@ -32,7 +49,7 @@
 //! leaving roughly 644 usable bytes per datagram, and forces the supernode to
 //! run a full `serde_json` parse per datagram. At 30 fps with ~4 fragments per
 //! frame that is over 120 parses and signature verifications per second per
-//! sender. The binary header above is 55 bytes, leaving ~1143 usable bytes —
+//! sender. The binary header above is 56 bytes, leaving ~1142 usable bytes —
 //! about 77% more goods per datagram — and the relay forwards it opaquely.
 //!
 //! # Authenticity
@@ -50,11 +67,18 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use conquerd_features::video_codec::VideoCodec;
+
 /// Wire format version. Bump only for an incompatible header change.
-pub const FRAGMENT_VERSION: u8 = 0x01;
+///
+/// `0x02` added the codec byte. There is no `0x01` compatibility path: video
+/// has never shipped, so there is no fleet to interoperate with, and a parser
+/// that accepted both would have to guess the codec of a v1 frame — exactly the
+/// guess this version exists to remove.
+pub const FRAGMENT_VERSION: u8 = 0x02;
 
 /// Bytes of fixed header before the variable-length sender id.
-const FIXED_PREFIX_LEN: usize = 3; // ver + flags + sender_len
+const FIXED_PREFIX_LEN: usize = 4; // ver + flags + codec + sender_len
 /// Bytes of fixed header after the sender id, excluding the signature.
 const FIXED_SUFFIX_LEN: usize = 8; // frame_seq(4) + frag_idx(2) + frag_count(2)
 /// Length of the Ed25519 signature carried on fragment 0.
@@ -107,6 +131,8 @@ const MONOTONIC_LAG: u32 = 2;
 pub struct FragmentHeader {
     /// Whether the frame this fragment belongs to is a keyframe.
     pub keyframe: bool,
+    /// Codec the frame's bytes are in.
+    pub codec: VideoCodec,
     /// Base64url peer id of the sender, as carried on the wire.
     pub sender: String,
     /// Sender-assigned frame counter.
@@ -128,10 +154,13 @@ pub struct ReassembledFrame {
     pub frame_seq: u32,
     /// Whether this is a keyframe.
     pub keyframe: bool,
+    /// Codec the sealed bytes decode as, once opened.
+    pub codec: VideoCodec,
     /// Ed25519 signature over the frame, from fragment 0. The caller must
     /// verify this **before** opening `sealed`.
     pub signature: [u8; SIGNATURE_LEN],
-    /// The sealed frame bytes: `[epoch:u8][nonce:12][aesgcm(vp8)]`.
+    /// The sealed frame bytes: `[epoch:u8][nonce:12][aesgcm(encoded frame)]`,
+    /// where the inner frame is in [`Self::codec`].
     pub sealed: Vec<u8>,
 }
 
@@ -146,6 +175,7 @@ pub fn fragment_frame(
     sender: &str,
     frame_seq: u32,
     keyframe: bool,
+    codec: VideoCodec,
     signature: &[u8; SIGNATURE_LEN],
     sealed: &[u8],
     max_payload: usize,
@@ -188,6 +218,7 @@ pub fn fragment_frame(
             Vec::with_capacity(base + if is_first { SIGNATURE_LEN } else { 0 } + chunk.len());
         buf.push(FRAGMENT_VERSION);
         buf.push(flags);
+        buf.push(codec.as_wire());
         buf.push(sender.len() as u8);
         buf.extend_from_slice(sender.as_bytes());
         buf.extend_from_slice(&frame_seq.to_be_bytes());
@@ -214,7 +245,11 @@ pub fn parse_fragment(buf: &[u8]) -> Option<(FragmentHeader, &[u8])> {
         return None;
     }
     let flags = buf[1];
-    let sender_len = buf[2] as usize;
+    // An unknown codec is rejected here rather than carried up as "unknown":
+    // nothing downstream can decode it, and letting it through would put an
+    // undecodable frame through reassembly and signature verification first.
+    let codec = VideoCodec::from_wire(buf[2])?;
+    let sender_len = buf[3] as usize;
     if sender_len == 0 || sender_len > MAX_SENDER_LEN {
         return None;
     }
@@ -261,6 +296,7 @@ pub fn parse_fragment(buf: &[u8]) -> Option<(FragmentHeader, &[u8])> {
     Some((
         FragmentHeader {
             keyframe: flags & FLAG_KEYFRAME != 0,
+            codec,
             sender: sender.to_string(),
             frame_seq,
             frag_idx,
@@ -281,6 +317,7 @@ fn seq_newer(a: u32, b: u32) -> bool {
 
 struct PartialFrame {
     keyframe: bool,
+    codec: VideoCodec,
     signature: Option<[u8; SIGNATURE_LEN]>,
     chunks: Vec<Option<Vec<u8>>>,
     received: u16,
@@ -397,6 +434,7 @@ impl Reassembler {
             .entry(hdr.frame_seq)
             .or_insert_with(|| PartialFrame {
                 keyframe: hdr.keyframe,
+                codec: hdr.codec,
                 signature: None,
                 // Safe: `parse_fragment` already bounded frag_count by
                 // MAX_FRAGS_PER_FRAME, so this allocates at most 64 slots.
@@ -409,6 +447,13 @@ impl Reassembler {
         // A fragment claiming a different total than its siblings is either a
         // spoof or a desync; trust the first arrival and drop the odd one out.
         if entry.chunks.len() != hdr.frag_count as usize {
+            return None;
+        }
+
+        // Likewise for the codec: one frame is in one codec, so a fragment
+        // disagreeing with its siblings cannot be part of this frame. Splicing
+        // it in would corrupt the frame the signature is computed over.
+        if entry.codec != hdr.codec {
             return None;
         }
 
@@ -452,6 +497,7 @@ impl Reassembler {
         // up unverified.
         let signature = entry.signature?;
         let keyframe = entry.keyframe;
+        let codec = entry.codec;
         let mut sealed = Vec::with_capacity(entry.bytes);
         for slot in entry.chunks.iter() {
             sealed.extend_from_slice(slot.as_deref()?);
@@ -479,6 +525,7 @@ impl Reassembler {
             sender: hdr.sender,
             frame_seq: hdr.frame_seq,
             keyframe,
+            codec,
             signature,
             sealed,
         })
@@ -491,12 +538,13 @@ mod tests {
 
     const SENDER: &str = "alice-public-id-base64url-xxxxxxxxxxxxxxxxxxx";
     const SIG: [u8; SIGNATURE_LEN] = [7u8; SIGNATURE_LEN];
+    const CODEC: VideoCodec = VideoCodec::H264;
     /// Mirrors the real budget: 1200-byte datagram minus the relay's index and
     /// channel tag bytes.
     const MAX_PAYLOAD: usize = 1198;
 
     fn frags(sealed: &[u8], seq: u32, keyframe: bool) -> Vec<Vec<u8>> {
-        fragment_frame(SENDER, seq, keyframe, &SIG, sealed, MAX_PAYLOAD).unwrap()
+        fragment_frame(SENDER, seq, keyframe, CODEC, &SIG, sealed, MAX_PAYLOAD).unwrap()
     }
 
     #[test]
@@ -512,6 +560,115 @@ mod tests {
         assert!(out.keyframe);
         assert_eq!(out.signature, SIG);
         assert_eq!(out.sealed, sealed);
+        assert_eq!(out.codec, CODEC);
+    }
+
+    // ── Codec on the wire ───────────────────────────────────────────────────
+
+    /// GOLDEN: the header layout. A silent shift here desynchronises every
+    /// field after it, and the symptom would be undecodable video rather than
+    /// a parse error.
+    #[test]
+    fn codec_byte_sits_at_offset_two() {
+        let f = frags(b"x", 1, true);
+        assert_eq!(f[0][0], FRAGMENT_VERSION);
+        assert_eq!(f[0][2], CODEC.as_wire());
+        assert_eq!(f[0][3], SENDER.len() as u8);
+    }
+
+    #[test]
+    fn codec_survives_a_multi_fragment_round_trip() {
+        for codec in [VideoCodec::H264, VideoCodec::Vp8, VideoCodec::Stub] {
+            let sealed: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+            let f = fragment_frame(SENDER, 7, false, codec, &SIG, &sealed, MAX_PAYLOAD).unwrap();
+            assert!(f.len() > 1);
+
+            let mut r = Reassembler::new();
+            let mut out = None;
+            for part in &f {
+                if let Some(frame) = r.push(part, Instant::now()) {
+                    out = Some(frame);
+                }
+            }
+            assert_eq!(out.expect("reassembled").codec, codec);
+        }
+    }
+
+    /// A codec byte this build does not know must be refused outright. Parsing
+    /// it as "some codec" would carry an undecodable frame through reassembly
+    /// and signature verification before anything noticed.
+    #[test]
+    fn an_unknown_codec_byte_is_rejected() {
+        let mut f = frags(b"payload", 1, true).remove(0);
+        f[2] = 0x7E; // not a VideoCodec
+        assert!(parse_fragment(&f).is_none());
+
+        let mut r = Reassembler::new();
+        assert!(r.push(&f, Instant::now()).is_none());
+    }
+
+    /// Fragments of one frame that disagree about the codec cannot all belong
+    /// to that frame. Splicing them would corrupt the bytes the signature is
+    /// computed over.
+    #[test]
+    fn fragments_disagreeing_on_codec_do_not_combine() {
+        let sealed: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+        let a = fragment_frame(
+            SENDER,
+            3,
+            false,
+            VideoCodec::H264,
+            &SIG,
+            &sealed,
+            MAX_PAYLOAD,
+        )
+        .unwrap();
+        let b = fragment_frame(
+            SENDER,
+            3,
+            false,
+            VideoCodec::Vp8,
+            &SIG,
+            &sealed,
+            MAX_PAYLOAD,
+        )
+        .unwrap();
+        assert!(a.len() > 2, "need a multi-fragment frame for this test");
+
+        let mut r = Reassembler::new();
+        let now = Instant::now();
+        // First fragment establishes H.264 for frame 3.
+        assert!(r.push(&a[0], now).is_none());
+        // The VP8-tagged siblings must not be accepted into it...
+        for part in b.iter().skip(1) {
+            assert!(r.push(part, now).is_none());
+        }
+        // ...so the frame is still incomplete, and only the matching
+        // fragments finish it.
+        let mut out = None;
+        for part in a.iter().skip(1) {
+            if let Some(frame) = r.push(part, now) {
+                out = Some(frame);
+            }
+        }
+        let done = out.expect("matching fragments complete the frame");
+        assert_eq!(done.codec, VideoCodec::H264);
+        assert_eq!(done.sealed, sealed);
+    }
+
+    /// The header grew by one byte, so the usable chunk budget shrank by one.
+    /// Stated as a test because getting this wrong produces datagrams one byte
+    /// over the relay ceiling, which the relay drops silently.
+    #[test]
+    fn fragments_never_exceed_the_payload_budget() {
+        let sealed: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        for part in frags(&sealed, 1, true) {
+            assert!(
+                part.len() <= MAX_PAYLOAD,
+                "fragment of {} bytes exceeds the {MAX_PAYLOAD}-byte budget",
+                part.len()
+            );
+        }
     }
 
     #[test]
@@ -717,7 +874,7 @@ mod tests {
 
         for i in 0..MAX_SENDERS + 5 {
             let who = format!("sender-{i:03}");
-            let f = fragment_frame(&who, 1, false, &SIG, &sealed, MAX_PAYLOAD).unwrap();
+            let f = fragment_frame(&who, 1, false, CODEC, &SIG, &sealed, MAX_PAYLOAD).unwrap();
             let _ = r.push(&f[0], now);
         }
         assert_eq!(r.tracked_senders(), MAX_SENDERS);
@@ -839,12 +996,12 @@ mod tests {
         // Beyond MAX_FRAGS_PER_FRAME fragments the sender must refuse rather
         // than emit a frame the receiver is guaranteed to reject.
         let huge = vec![0u8; MAX_FRAGS_PER_FRAME as usize * MAX_PAYLOAD];
-        assert!(fragment_frame(SENDER, 1, true, &SIG, &huge, MAX_PAYLOAD).is_none());
+        assert!(fragment_frame(SENDER, 1, true, CODEC, &SIG, &huge, MAX_PAYLOAD).is_none());
     }
 
     #[test]
     fn refuses_payload_budget_that_leaves_no_room() {
-        assert!(fragment_frame(SENDER, 1, true, &SIG, b"x", 10).is_none());
+        assert!(fragment_frame(SENDER, 1, true, CODEC, &SIG, b"x", 10).is_none());
     }
 
     #[test]
@@ -853,8 +1010,8 @@ mod tests {
         let now = Instant::now();
         let sealed: Vec<u8> = (0..6_000u32).map(|i| (i % 249) as u8).collect();
 
-        let a = fragment_frame("alice", 1, true, &SIG, &sealed, MAX_PAYLOAD).unwrap();
-        let b = fragment_frame("bob", 1, true, &SIG, &sealed, MAX_PAYLOAD).unwrap();
+        let a = fragment_frame("alice", 1, true, CODEC, &SIG, &sealed, MAX_PAYLOAD).unwrap();
+        let b = fragment_frame("bob", 1, true, CODEC, &SIG, &sealed, MAX_PAYLOAD).unwrap();
 
         // Interleave the two streams.
         let mut done = 0;

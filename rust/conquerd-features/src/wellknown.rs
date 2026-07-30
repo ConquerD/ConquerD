@@ -8,6 +8,7 @@
 use serde_json::json;
 
 use crate::descriptor::{AuthTier, CapabilityDescriptor, ChannelKind};
+use crate::video_codec::{self, VideoCodec};
 
 // ── Reserved namespace prefixes (documented for tooling/lints). ──────────────
 pub const NS_CORE: &str = "core";
@@ -228,7 +229,7 @@ pub fn room_audio_sfu() -> CapabilityDescriptor {
         .with_auth(AuthTier::RoomMember)
 }
 
-/// `core.video.vp8` — direct peer video (VP8 over QUIC datagrams).
+/// `core.video.v1` — direct peer video over QUIC datagrams.
 ///
 /// Unlike audio, one encoded frame spans many datagrams: the sender fragments
 /// each frame to fit the 1200-byte relay ceiling. At the 640x360 / 30 fps /
@@ -236,10 +237,25 @@ pub fn room_audio_sfu() -> CapabilityDescriptor {
 /// spiking to ~25 for a keyframe. Quotas are sized ~3x that ceiling so ABR
 /// overshoot and keyframe bursts do not trip supernode shedding — the same
 /// headroom rationale as [`room_audio_sfu`].
-pub fn core_video_vp8() -> CapabilityDescriptor {
-    CapabilityDescriptor::new("core.video.vp8", "1.0", ChannelKind::Datagram)
+///
+/// The id names no codec: which codecs this build can actually run is a
+/// platform and build-time fact, advertised in `params.codecs` and resolved by
+/// [`negotiate`](crate::video_codec::negotiate). See [`crate::video_codec`] for
+/// why the codec cannot live in the id.
+///
+/// This constructor advertises the full known codec set and is what the
+/// supernode registers for quota classification (it forwards video opaquely and
+/// encodes nothing). A client **must** advertise only what it can really run —
+/// use [`core_video_v1_for`].
+pub fn core_video_v1() -> CapabilityDescriptor {
+    core_video_v1_for(&video_codec::PREFERENCE)
+}
+
+/// [`core_video_v1`] restricted to the codecs this build can actually run.
+pub fn core_video_v1_for(codecs: &[VideoCodec]) -> CapabilityDescriptor {
+    CapabilityDescriptor::new("core.video.v1", "1.0", ChannelKind::Datagram)
         .with_params(json!({
-            "codec": "vp8",
+            "codecs": video_codec::codec_names(&video_codec::advertised_codecs(codecs)),
             "quota_bytes_per_sec": 512 * 1024,
             "quota_datagrams_per_sec": 1200,
         }))
@@ -256,10 +272,21 @@ pub fn core_video_vp8() -> CapabilityDescriptor {
 /// instead carries a fixed 56-byte binary header, and authenticity comes from
 /// one Ed25519 signature per *frame* (carried in fragment 0) rather than one
 /// per datagram.
+///
+/// Codec selection works as for [`core_video_v1`], with one difference that
+/// matters: a room sender fans out to every member at once, so there may be no
+/// single codec all of them decode. The sender stamps the codec on each frame
+/// and a member that cannot decode it drops the frame — video degrades for that
+/// member only, rather than the room failing to negotiate.
 pub fn room_video_sfu() -> CapabilityDescriptor {
+    room_video_sfu_for(&video_codec::PREFERENCE)
+}
+
+/// [`room_video_sfu`] restricted to the codecs this build can actually run.
+pub fn room_video_sfu_for(codecs: &[VideoCodec]) -> CapabilityDescriptor {
     CapabilityDescriptor::new("room.video.sfu", "1.0", ChannelKind::Datagram)
         .with_params(json!({
-            "codec": "vp8",
+            "codecs": video_codec::codec_names(&video_codec::advertised_codecs(codecs)),
             "quota_bytes_per_sec": 512 * 1024,
             "quota_datagrams_per_sec": 1200,
             "allow_public_rooms": false,
@@ -356,7 +383,7 @@ pub fn local_capabilities() -> Vec<CapabilityDescriptor> {
         core_file_v1(),
         core_audio_opus(),
         room_audio_sfu(),
-        core_video_vp8(),
+        core_video_v1(),
         room_video_sfu(),
         room_chat_v1(),
         room_file_v1(),
@@ -405,7 +432,7 @@ mod tests {
             // Added for video calling. Purely additive: peers that predate
             // these simply won't advertise them, and negotiation degrades to
             // audio-only, so no migration window is needed.
-            "core.video.vp8",
+            "core.video.v1",
             "room.video.sfu",
             "room.chat.v1",
             "room.file.v1",

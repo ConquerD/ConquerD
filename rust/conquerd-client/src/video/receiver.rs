@@ -7,6 +7,12 @@
 //!
 //! Decoders are per-sender and stateful — inter frames reference the sender's
 //! own previous frames — so they can never be shared between peers.
+//!
+//! They are also per-*codec*. A room fans out frames from several senders who
+//! need not agree on one codec, so which decoder a frame needs is a property of
+//! the frame, not of the session: each frame carries its codec and the decoder
+//! is built to match. A sender that changes codec gets a fresh decoder, since
+//! the old one's reference frames are meaningless to the new format.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +20,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
+use conquerd_features::video_codec::VideoCodec;
 use tracing::{debug, info, warn};
 
 use super::codec::VideoDecoder;
@@ -24,6 +31,15 @@ pub struct InboundFrame {
     pub peer_id: String,
     pub encoded: Vec<u8>,
     pub keyframe: bool,
+    /// Codec these bytes are in, from the frame's signed header.
+    pub codec: VideoCodec,
+}
+
+/// A peer's decoder together with the codec it was built for, so a codec change
+/// is detectable rather than silently feeding bytes to the wrong decoder.
+struct PeerDecoder {
+    codec: VideoCodec,
+    decoder: Box<dyn VideoDecoder>,
 }
 
 /// How many undecoded frames to queue before shedding.
@@ -90,7 +106,7 @@ impl VideoReceiver {
     /// request. It is rate-limited by the caller, not here.
     pub fn start<F, D>(mut make_decoder: F, mut request_keyframe: D) -> Self
     where
-        F: FnMut() -> Option<Box<dyn VideoDecoder>> + Send + 'static,
+        F: FnMut(VideoCodec) -> Option<Box<dyn VideoDecoder>> + Send + 'static,
         D: FnMut(&str) + Send + 'static,
     {
         let (tx, rx) = mpsc::sync_channel::<InboundFrame>(QUEUE_DEPTH);
@@ -101,7 +117,7 @@ impl VideoReceiver {
         let handle = std::thread::Builder::new()
             .name("conquerd-video-decode".into())
             .spawn(move || {
-                let mut decoders: HashMap<String, Box<dyn VideoDecoder>> = HashMap::new();
+                let mut decoders: HashMap<String, PeerDecoder> = HashMap::new();
                 let mut failures: HashMap<String, u32> = HashMap::new();
                 // When each decoded peer last delivered a frame, for the cap.
                 let mut last_frame: HashMap<String, std::time::Instant> = HashMap::new();
@@ -144,22 +160,50 @@ impl VideoReceiver {
                     }
                     last_frame.insert(item.peer_id.clone(), now);
 
-                    let decoder = match decoders.entry(item.peer_id.clone()) {
+                    // A decoder built for a different codec cannot be reused:
+                    // drop it so the entry below rebuilds. This is the path a
+                    // mid-session renegotiation takes.
+                    if decoders
+                        .get(&item.peer_id)
+                        .is_some_and(|d| d.codec != item.codec)
+                    {
+                        debug!(
+                            "[video] {} switched codec to {}; rebuilding decoder",
+                            &item.peer_id[..8.min(item.peer_id.len())],
+                            item.codec.as_str()
+                        );
+                        decoders.remove(&item.peer_id);
+                        failures.remove(&item.peer_id);
+                    }
+
+                    let entry = match decoders.entry(item.peer_id.clone()) {
                         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                         std::collections::hash_map::Entry::Vacant(e) => {
-                            let Some(d) = make_decoder() else {
-                                warn!("[video] no decoder available; dropping frame");
+                            let Some(d) = make_decoder(item.codec) else {
+                                // Not a transient failure: this build has no
+                                // decoder for this codec, so every frame from
+                                // this sender will land here until they change
+                                // codec. Warn with the codec named so the cause
+                                // is diagnosable from a log alone.
+                                warn!(
+                                    "[video] no {} decoder in this build; dropping frame from {}",
+                                    item.codec.as_str(),
+                                    &item.peer_id[..8.min(item.peer_id.len())]
+                                );
                                 // Release the slot claimed above. Leaving it
                                 // held would let peers we cannot decode crowd
                                 // out peers we can.
                                 last_frame.remove(&item.peer_id);
                                 continue;
                             };
-                            e.insert(d)
+                            e.insert(PeerDecoder {
+                                codec: item.codec,
+                                decoder: d,
+                            })
                         }
                     };
 
-                    match decoder.decode(&item.encoded) {
+                    match entry.decoder.decode(&item.encoded) {
                         Ok(frame) => {
                             failures.remove(&item.peer_id);
                             sink::push_frame(&item.peer_id, &frame);
@@ -202,11 +246,12 @@ impl VideoReceiver {
     ///
     /// Never blocks: a full queue means the decoder is behind, and the newest
     /// frame is worth less than the latency that waiting would add.
-    pub fn submit(&self, peer_id: &str, encoded: Vec<u8>, keyframe: bool) {
+    pub fn submit(&self, peer_id: &str, encoded: Vec<u8>, keyframe: bool, codec: VideoCodec) {
         let item = InboundFrame {
             peer_id: peer_id.to_owned(),
             encoded,
             keyframe,
+            codec,
         };
         match self.tx.try_send(item) {
             Ok(()) => {}
@@ -282,7 +327,7 @@ fn admit(
 
 fn drain_control(
     control_rx: &mpsc::Receiver<Control>,
-    decoders: &mut HashMap<String, Box<dyn VideoDecoder>>,
+    decoders: &mut HashMap<String, PeerDecoder>,
     failures: &mut HashMap<String, u32>,
     last_frame: &mut HashMap<String, std::time::Instant>,
 ) {
@@ -350,13 +395,13 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let c = Arc::clone(&calls);
         let rx = VideoReceiver::start(
-            move || Some(Box::new(CountingDecoder(Arc::clone(&c)))),
+            move |_codec| Some(Box::new(CountingDecoder(Arc::clone(&c)))),
             |_| {},
         );
 
         let started = std::time::Instant::now();
         for _ in 0..(QUEUE_DEPTH * 4) {
-            rx.submit("peer", vec![1, 2, 3], false);
+            rx.submit("peer", vec![1, 2, 3], false, VideoCodec::Stub);
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
@@ -369,14 +414,14 @@ mod tests {
         // Drop must not hang: the thread parks on recv_timeout, so Drop has to
         // close the channel and set stop before joining.
         let rx = VideoReceiver::start(
-            || {
+            |_codec| {
                 Some(Box::new(CountingDecoder(Arc::new(
                     std::sync::atomic::AtomicU32::new(0),
                 ))))
             },
             |_| {},
         );
-        rx.submit("peer", vec![1], false);
+        rx.submit("peer", vec![1], false, VideoCodec::Stub);
         let started = std::time::Instant::now();
         drop(rx);
         assert!(
@@ -484,7 +529,7 @@ mod tests {
     #[test]
     fn forget_does_not_block_on_full_frame_queue() {
         let rx = VideoReceiver::start(
-            || {
+            |_codec| {
                 Some(Box::new(CountingDecoder(Arc::new(
                     std::sync::atomic::AtomicU32::new(0),
                 ))))
@@ -493,7 +538,7 @@ mod tests {
         );
         // Fill the frame queue so a coupled control path would block.
         for _ in 0..(QUEUE_DEPTH * 2) {
-            rx.submit("peer-a", vec![1], false);
+            rx.submit("peer-a", vec![1], false, VideoCodec::Stub);
         }
         let started = std::time::Instant::now();
         rx.forget("peer-a");

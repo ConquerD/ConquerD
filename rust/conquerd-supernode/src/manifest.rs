@@ -375,7 +375,7 @@ fn wellknown_for(id: &str) -> Option<CapabilityDescriptor> {
         "core.file.v1" => Some(wellknown::core_file_v1()),
         "core.audio.opus" => Some(wellknown::core_audio_opus()),
         "room.audio.sfu" => Some(wellknown::room_audio_sfu()),
-        "core.video.vp8" => Some(wellknown::core_video_vp8()),
+        "core.video.v1" => Some(wellknown::core_video_v1()),
         "room.video.sfu" => Some(wellknown::room_video_sfu()),
         "room.chat.v1" => Some(wellknown::room_chat_v1()),
         "room.file.v1" => Some(wellknown::room_file_v1()),

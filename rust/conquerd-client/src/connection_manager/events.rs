@@ -3,6 +3,8 @@
 use serde_json::Value;
 use std::sync::mpsc as std_mpsc;
 
+use conquerd_features::video_codec::VideoCodec;
+
 use crate::protocol::SignalingMessage;
 use crate::session_state::PeerSessionState;
 use crate::web_app_client::WebAppResponse;
@@ -239,10 +241,16 @@ pub enum ConnectionEvent {
     /// reaches here its fragments have been reassembled, its per-frame
     /// signature verified, and (for room video) its GCM seal opened. The
     /// payload is codec bytes still awaiting decode.
+    ///
+    /// `codec` comes from the (signature-bound) fragment header, so the
+    /// receiver selects a decoder from what the frame *is* rather than from
+    /// what was negotiated — the two can differ legitimately in a room, where
+    /// members may not share one codec.
     VideoFrameReceived {
         peer_id: String,
         encoded: Vec<u8>,
         keyframe: bool,
+        codec: VideoCodec,
     },
     /// An invite handshake completed and the peer was added to the store.
     InviteAccepted { peer_id: String, handle: String },
@@ -354,10 +362,15 @@ pub enum ConnectionCommand {
     /// frame does not fit one datagram the way an Opus frame does. `keyframe`
     /// rides the fragment header so a receiver can tell whether it may start
     /// decoding here.
+    ///
+    /// `codec` travels with the bytes it describes, from the encoder that
+    /// produced them, rather than being looked up again at send time — the
+    /// negotiated codec and the running encoder must never be able to disagree.
     SendVideoFrame {
         peer_id: String,
         encoded: Vec<u8>,
         keyframe: bool,
+        codec: VideoCodec,
     },
     /// Send a typing indicator to a peer.
     SendTyping {
@@ -499,6 +512,7 @@ pub enum ConnectionCommand {
     SendRoomVideo {
         encoded: Vec<u8>,
         keyframe: bool,
+        codec: VideoCodec,
     },
     /// Ask `peer_id` for a keyframe because we cannot decode their stream.
     ///

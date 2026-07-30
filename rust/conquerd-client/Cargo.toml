@@ -66,6 +66,11 @@ cpal = "0.15"
 conquerd-opus = { path = "../conquerd-opus" }
 ringbuf = "0.4"
 
+# VP8 video codec (vendored libvpx). Present on every platform, because it is
+# the only codec a Windows peer and a Linux peer can both run — Windows and
+# macOS have OS-licensed H.264, Linux has nothing equivalent.
+conquerd-vpx = { path = "../conquerd-vpx" }
+
 # Ringtone playback (OGG/Vorbis via rodio)
 rodio = { version = "0.19", default-features = false, features = ["vorbis"] }
 
@@ -81,6 +86,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Clipboard access (invite link copy)
 arboard = { version = "3", default-features = false }
+
+# Linux camera capture (Video4Linux2).
+#
+# The crate rather than raw ioctls: V4L2's structs are large, contain unions,
+# and differ in layout between x86_64 and aarch64 — both of which are release
+# targets, and only one of which can be tested here. Getting a layout wrong
+# yields corrupt frames rather than a compile error.
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = "0.14"
 
 # Windows taskbar overlay badge (unread count)
 [target.'cfg(target_os = "windows")'.dependencies]

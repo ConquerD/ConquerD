@@ -61,15 +61,22 @@ const VIDEO_SIG_DOMAIN: &[u8] = b"conquerd.video.frame.v1";
 /// sender bound into a signature only that member can produce, any room member
 /// could seal a frame claiming to be someone else. `sequence` is bound so a
 /// captured frame cannot be replayed at a later position in the stream.
+///
+/// `codec` is bound because it travels in the cleartext fragment header, where
+/// a relay could otherwise flip it. On its own that is only a nuisance — the
+/// receiver would hand the bytes to the wrong decoder, which errors and asks
+/// for a keyframe — but an advisory codec is not worth having when binding it
+/// costs one byte in the hash.
 pub fn video_frame_signing_bytes(
     conv_id: &str,
     sender: &str,
     sequence: u32,
+    codec: conquerd_features::video_codec::VideoCodec,
     sealed: &[u8],
 ) -> Vec<u8> {
     let digest = Sha256::digest(sealed);
     let mut out = Vec::with_capacity(
-        VIDEO_SIG_DOMAIN.len() + 4 + conv_id.len() + 4 + sender.len() + 4 + digest.len(),
+        VIDEO_SIG_DOMAIN.len() + 4 + conv_id.len() + 4 + sender.len() + 4 + 1 + digest.len(),
     );
     out.extend_from_slice(VIDEO_SIG_DOMAIN);
     // Length-prefixed like `group_key::voice_aad`, so the variable-length
@@ -79,6 +86,7 @@ pub fn video_frame_signing_bytes(
     out.extend_from_slice(&(sender.len() as u32).to_be_bytes());
     out.extend_from_slice(sender.as_bytes());
     out.extend_from_slice(&sequence.to_be_bytes());
+    out.push(codec.as_wire());
     out.extend_from_slice(&digest);
     out
 }
@@ -120,6 +128,10 @@ pub fn video_route(voice_room_id: &str, direct_call_peer_id: &str) -> Option<Str
 mod tests {
     use super::*;
 
+    use conquerd_features::video_codec::VideoCodec;
+
+    const CODEC: VideoCodec = VideoCodec::Stub;
+
     #[test]
     fn a_joined_room_routes_video_to_the_room() {
         assert_eq!(video_route("room-1", ""), None);
@@ -160,30 +172,86 @@ mod tests {
 
     #[test]
     fn signing_bytes_bind_every_field() {
-        let base = video_frame_signing_bytes("room", "alice", 1, b"sealed");
+        let base = video_frame_signing_bytes("room", "alice", 1, CODEC, b"sealed");
         for other in [
-            video_frame_signing_bytes("ROOM", "alice", 1, b"sealed"),
-            video_frame_signing_bytes("room", "mallory", 1, b"sealed"),
-            video_frame_signing_bytes("room", "alice", 2, b"sealed"),
-            video_frame_signing_bytes("room", "alice", 1, b"tampered"),
+            video_frame_signing_bytes("ROOM", "alice", 1, CODEC, b"sealed"),
+            video_frame_signing_bytes("room", "mallory", 1, CODEC, b"sealed"),
+            video_frame_signing_bytes("room", "alice", 2, CODEC, b"sealed"),
+            video_frame_signing_bytes("room", "alice", 1, CODEC, b"tampered"),
         ] {
             assert_ne!(base, other);
         }
+    }
+
+    /// The codec travels in cleartext in the fragment header, so it must be
+    /// bound into the signature — otherwise a relay could redirect a frame to
+    /// the wrong decoder without invalidating anything.
+    #[test]
+    fn signing_bytes_bind_the_codec() {
+        let h264 = video_frame_signing_bytes("room", "alice", 1, VideoCodec::H264, b"sealed");
+        let vp8 = video_frame_signing_bytes("room", "alice", 1, VideoCodec::Vp8, b"sealed");
+        assert_ne!(h264, vp8);
+    }
+
+    /// End to end: flipping the codec byte on the wire must make the frame fail
+    /// verification, not merely decode oddly.
+    #[test]
+    fn tampering_with_the_codec_byte_fails_verification() {
+        const ROOM: &str = "room-codec-tamper";
+        let identity = Identity::generate();
+        let sender = identity.public_id();
+        let seq = 5u32;
+        let sealed = b"sealed-frame-bytes".to_vec();
+
+        let sig_bytes = video_frame_signing_bytes(ROOM, &sender, seq, VideoCodec::H264, &sealed);
+        let signature = <[u8; SIGNATURE_LEN]>::try_from(&identity.sign(&sig_bytes)[..]).unwrap();
+        let mut parts = fragment::fragment_frame(
+            &sender,
+            seq,
+            true,
+            VideoCodec::H264,
+            &signature,
+            &sealed,
+            1198,
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 1, "small frame should be a single fragment");
+
+        // A relay flips H.264 to VP8 in the cleartext header.
+        parts[0][2] = VideoCodec::Vp8.as_wire();
+
+        let mut rx = Reassembler::new();
+        let got = rx
+            .push(&parts[0], std::time::Instant::now())
+            .expect("the tampered fragment still parses");
+        assert_eq!(got.codec, VideoCodec::Vp8, "the lie is carried up as-is");
+
+        // ...and dies here, because the receiver verifies against the codec
+        // the frame claims.
+        let public_key =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, &got.sender)
+                .unwrap();
+        let check =
+            video_frame_signing_bytes(ROOM, &got.sender, got.frame_seq, got.codec, &got.sealed);
+        assert!(
+            !Identity::verify_with_public_key(&public_key, &got.signature, &check),
+            "a flipped codec byte must fail signature verification"
+        );
     }
 
     #[test]
     fn signing_bytes_are_length_prefixed_not_concatenated() {
         // "ab" + "c" must not collide with "a" + "bc".
         assert_ne!(
-            video_frame_signing_bytes("ab", "c", 1, b"x"),
-            video_frame_signing_bytes("a", "bc", 1, b"x")
+            video_frame_signing_bytes("ab", "c", 1, CODEC, b"x"),
+            video_frame_signing_bytes("a", "bc", 1, CODEC, b"x")
         );
     }
 
     #[test]
     fn signing_bytes_are_fixed_size_regardless_of_frame_size() {
-        let small = video_frame_signing_bytes("room", "alice", 1, b"x");
-        let large = video_frame_signing_bytes("room", "alice", 1, &vec![0u8; 100_000]);
+        let small = video_frame_signing_bytes("room", "alice", 1, CODEC, b"x");
+        let large = video_frame_signing_bytes("room", "alice", 1, CODEC, &vec![0u8; 100_000]);
         assert_eq!(small.len(), large.len());
     }
 
@@ -218,11 +286,12 @@ mod tests {
             &encoded,
         )
         .unwrap();
-        let sig_bytes = video_frame_signing_bytes(ROOM, &sender, seq, &sealed);
+        let sig_bytes = video_frame_signing_bytes(ROOM, &sender, seq, CODEC, &sealed);
         let signature = <[u8; SIGNATURE_LEN]>::try_from(&identity.sign(&sig_bytes)[..]).unwrap();
 
         let fragments =
-            fragment::fragment_frame(&sender, seq, keyframe, &signature, &sealed, 1198).unwrap();
+            fragment::fragment_frame(&sender, seq, keyframe, CODEC, &signature, &sealed, 1198)
+                .unwrap();
         assert!(
             fragments.len() > 20,
             "the stub frame should genuinely exercise fragmentation"
@@ -247,7 +316,8 @@ mod tests {
         let public_key =
             base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, &got.sender)
                 .unwrap();
-        let check = video_frame_signing_bytes(ROOM, &got.sender, got.frame_seq, &got.sealed);
+        let check =
+            video_frame_signing_bytes(ROOM, &got.sender, got.frame_seq, got.codec, &got.sealed);
         assert!(Identity::verify_with_public_key(
             &public_key,
             &got.signature,
@@ -303,7 +373,7 @@ mod tests {
         .is_some());
 
         // But the attacker can only sign with their own key.
-        let sig_bytes = video_frame_signing_bytes(ROOM, &victim_id, seq, &forged);
+        let sig_bytes = video_frame_signing_bytes(ROOM, &victim_id, seq, CODEC, &forged);
         let signature = attacker.sign(&sig_bytes);
         let victim_key =
             base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, &victim_id).unwrap();

@@ -598,7 +598,7 @@ impl ConnectionManager {
     #[inline]
     pub(super) fn check_video_quota(&self, target: &str, byte_count: usize) -> bool {
         self.feature_registry
-            .gate_through_feature("core.video.vp8", target, byte_count)
+            .gate_through_feature("core.video.v1", target, byte_count)
     }
 
     /// Send one encoded video frame to a directly-connected peer.
@@ -626,6 +626,7 @@ impl ConnectionManager {
         peer_id: &str,
         encoded: Vec<u8>,
         keyframe: bool,
+        codec: conquerd_features::video_codec::VideoCodec,
     ) {
         // Clone the sender handle so the `self.peers` borrow ends before the
         // per-peer sequence counter is advanced below.
@@ -637,7 +638,7 @@ impl ConnectionManager {
         let seq = self.direct_video_seq.get(peer_id).copied().unwrap_or(0);
         let conv_id = crate::video::direct_conv_id(&sender, peer_id);
         let signing_bytes =
-            crate::video::video_frame_signing_bytes(&conv_id, &sender, seq, &encoded);
+            crate::video::video_frame_signing_bytes(&conv_id, &sender, seq, codec, &encoded);
         let sig_vec = self.identity.sign(&signing_bytes);
         let Ok(signature) = <[u8; crate::video::fragment::SIGNATURE_LEN]>::try_from(&sig_vec[..])
         else {
@@ -647,10 +648,10 @@ impl ConnectionManager {
         // One byte of channel tag rides ahead of each fragment.
         let budget = crate::video::DEFAULT_MAX_DATAGRAM.saturating_sub(1);
         let Some(fragments) = crate::video::fragment::fragment_frame(
-            &sender, seq, keyframe, &signature, &encoded, budget,
+            &sender, seq, keyframe, codec, &signature, &encoded, budget,
         ) else {
             warn!(
-                "[core.video.vp8] frame of {}B does not fit the fragment budget; dropping",
+                "[core.video.v1] frame of {}B does not fit the fragment budget; dropping",
                 encoded.len()
             );
             return;
@@ -661,7 +662,7 @@ impl ConnectionManager {
         let wire_bytes: usize = fragments.iter().map(|f| f.len() + 1).sum();
         if !self.check_video_quota(peer_id, wire_bytes) {
             debug!(
-                "[core.video.vp8] outbound quota exceeded for {}; dropping frame",
+                "[core.video.v1] outbound quota exceeded for {}; dropping frame",
                 &peer_id[..8.min(peer_id.len())]
             );
             return;
