@@ -641,6 +641,11 @@ impl ConnectionManager {
                         supernode_id: msg.sender.clone(),
                         room_id: room_id.clone(),
                     });
+                    // Our camera-on went to the node that was lost, so the room
+                    // as it exists on this sibling has never heard it. Nobody
+                    // else will prompt us either — the members already here see
+                    // no join from us worth replaying to.
+                    self.reannounce_video_state(&room_id).await;
                 }
                 // Reconcile the room group key against the authoritative key
                 // group (participants + subscribers) so text-only members are
@@ -682,6 +687,9 @@ impl ConnectionManager {
                 let members: Vec<String> = set.into_iter().collect();
                 self.sync_room_membership(&msg.sender, &room_id, &members)
                     .await;
+                // The newcomer never saw our camera-on edge; replay it so their
+                // indicator (and ours on their side) reflects who is streaming.
+                self.reannounce_video_state(&room_id).await;
                 self.emit_event(ConnectionEvent::RoomPeerJoined {
                     supernode_id: msg.sender.clone(),
                     room_id,

@@ -111,13 +111,16 @@ Item {
         return cfg.hasOwnProperty(key) ? cfg[key] : fallback
     }
 
+    // Nothing on this page writes the file itself; every control changes the
+    // property and lets the Save button say so. Applying live is separate — a
+    // slider that only took effect after Save would be unusable — so this still
+    // updates the avatar everywhere it is shown.
     function setAvatarValue(key, value) {
         if (!settings) return
         var cfg = avatarConfig()
         cfg[key] = value
         var json = JSON.stringify(cfg)
         settings.avatar_config_json = json
-        settings.save()
         if (backend) {
             backend.setAvatarConfigJson(json)
             backend.broadcastAvatarConfigToAll(json)
@@ -478,17 +481,53 @@ Item {
                     // combo's display model. Storing the name would break the
                     // moment two identical webcams are attached.
                     property var cameraIds: []
+                    /// Display names, index-aligned with `cameraIds`.
+                    property var cameraNames: []
+                    /// Id the empty "Default camera" selection actually resolves
+                    /// to, so the overlay picker can avoid offering the very
+                    /// device the main source is about to open.
+                    property string firstCameraId: ""
+
+                    /// Whether anything is currently feeding the preview surface.
+                    ///
+                    /// Either capture will: a call sends the same pre-encode
+                    /// frames it shows locally, and the preview below is that
+                    /// same surface. So while sharing is on the preview simply
+                    /// shows the outgoing stream rather than opening the device
+                    /// a second time — which would fail anyway.
+                    readonly property bool previewLive: backend
+                        ? (backend.video_active || backend.video_preview_active)
+                        : false
+
+                    function startPreview() {
+                        if (!backend || !root.settings) return
+                        backend.setVideoPreviewEnabled(
+                            true,
+                            root.settings.video_input_device,
+                            root.settings.video_quality,
+                            root.settings.video_overlays_json)
+                    }
+
+                    function stopPreview() {
+                        // Only ever stops the preview capture — a call's camera
+                        // is not this button's to turn off.
+                        if (backend) backend.setVideoPreviewEnabled(false, "", "", "")
+                    }
 
                     function applyCameraSettings() {
                         if (!root.settings || !backend) return
-                        // Restart capture when it is already running so a device
-                        // or quality change takes effect immediately rather than
-                        // at the next call.
+                        // Restart whichever capture is running so a device,
+                        // quality, or layout change takes effect immediately
+                        // rather than at the next call: the running thread still
+                        // holds the old devices, so nothing else can open them.
                         if (backend.video_active) {
                             backend.setVideoEnabled(
                                 true,
                                 root.settings.video_input_device,
-                                root.settings.video_quality)
+                                root.settings.video_quality,
+                                root.settings.video_overlays_json)
+                        } else if (backend.video_preview_active) {
+                            cameraCard.startPreview()
                         }
                     }
 
@@ -509,7 +548,6 @@ Item {
                                 // "first available camera".
                                 root.settings.video_input_device =
                                     currentIndex === 0 ? "" : (cameraCard.cameraIds[currentIndex - 1] || "")
-                                root.settings.save()
                                 cameraCard.applyCameraSettings()
                             }
                         }
@@ -525,8 +563,64 @@ Item {
                             onActivated: {
                                 if (!root.settings) return
                                 root.settings.video_quality = keys[currentIndex] || "balanced"
-                                root.settings.save()
                                 cameraCard.applyCameraSettings()
+                            }
+                        }
+                    }
+
+                    // Preview of the selected source.
+                    //
+                    // Loaded rather than declared inline: a build without Qt
+                    // Multimedia has no VideoTile in the qrc at all (see
+                    // build.rs), and this page carries every other setting, so
+                    // it must still parse there. VideoTile is reused as-is
+                    // because the sink registration it does is the whole job —
+                    // a second component would be a second lifecycle to leak.
+                    Item {
+                        Layout.preferredWidth: 320
+                        Layout.preferredHeight: 180
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: Theme.radiusSm
+                            color: Theme.bg1
+                            border.color: Theme.bg3
+                            border.width: 1
+                            clip: true
+
+                            Loader {
+                                id: previewLoader
+                                anchors.fill: parent
+                                anchors.margins: 1
+                                // Bound only while this page is on screen: the
+                                // tile registers a video sink, and a registered
+                                // sink is what tells a capture thread somebody
+                                // is watching.
+                                active: root.visible && root.currentTab === root.tabVideo
+                                source: "qrc:/qt/qml/ConquerD/Client/qml/VideoTile.qml"
+
+                                onLoaded: {
+                                    // Our own id: captured frames are shown
+                                    // locally under it, by the call path and
+                                    // the preview path alike.
+                                    item.peerId = Qt.binding(() => backend ? backend.public_id : "")
+                                    item.streaming = Qt.binding(() => cameraCard.previewLive)
+                                    item.showChrome = false
+                                }
+                                // Navigating away must not leave the camera on.
+                                onActiveChanged: if (!active) cameraCard.stopPreview()
+                            }
+
+                            Label {
+                                anchors.centerIn: parent
+                                anchors.margins: Theme.spacingMd
+                                width: parent.width - Theme.spacingLg
+                                visible: previewLoader.status === Loader.Error
+                                text: "Video preview is unavailable in this build."
+                                horizontalAlignment: Text.AlignHCenter
+                                wrapMode: Text.WordWrap
+                                color: Theme.muted
+                                font.pixelSize: Theme.fontSizeCaption
                             }
                         }
                     }
@@ -540,9 +634,23 @@ Item {
                                 ? "No capture sources detected."
                                 : (backend && backend.video_active
                                     ? "Sharing is on."
-                                    : "Sharing is off.")
+                                    : (backend && backend.video_preview_active
+                                        ? "Previewing — nobody else can see this."
+                                        : "Sharing is off."))
                             color: cameraCombo.count <= 1 ? Theme.warn : Theme.muted
                             font.pixelSize: Theme.fontSizeCaption
+                        }
+
+                        StyledButton {
+                            // Hidden while a call is sending: the preview is
+                            // that stream, so stopping it here would mean
+                            // stopping the call's camera from the settings page.
+                            visible: !(backend && backend.video_active)
+                            enabled: previewLoader.status !== Loader.Error
+                            text: cameraCard.previewLive ? "Stop preview" : "Preview"
+                            onClicked: cameraCard.previewLive
+                                ? cameraCard.stopPreview()
+                                : cameraCard.startPreview()
                         }
 
                         StyledButton {
@@ -556,15 +664,14 @@ Item {
                         Item { Layout.fillWidth: true }
                     }
 
-                    // Cameras, displays, and windows share one list because only
-                    // one can be live: a video frame identifies its stream by
-                    // sender alone, so a peer cannot send camera and screen at
-                    // once. Presenting them as one choice matches what the
-                    // transport can actually carry.
+                    // Cameras, displays, and windows share one list because any
+                    // of them can play either role: the main source that fills
+                    // the frame, or an inset drawn over it.
                     function reloadCameras() {
                         if (!backend) return
                         var names = []
                         var ids = []
+                        var firstCam = ""
                         try {
                             var res = JSON.parse(backend.listVideoDevices())
                             var groups = [
@@ -572,6 +679,8 @@ Item {
                                 { items: res.screens || [], prefix: "" },
                                 { items: res.windows || [], prefix: "Window — " }
                             ]
+                            firstCam = (res.cameras && res.cameras.length > 0)
+                                ? (res.cameras[0].id || "") : ""
                             for (var g = 0; g < groups.length; g++) {
                                 var items = groups[g].items
                                 for (var i = 0; i < items.length; i++) {
@@ -581,25 +690,327 @@ Item {
                             }
                         } catch (e) {}
                         cameraCard.cameraIds = ids
+                        // Kept alongside the ids so the overlay rows can offer
+                        // the same sources without the "Default camera" entry,
+                        // which has no meaning for an inset.
+                        cameraCard.cameraNames = names
+                        cameraCard.firstCameraId = firstCam
                         cameraCombo.model = ["Default camera"].concat(names)
+                        cameraCard.syncFromSettings()
+                        // The overlay rows pick their source out of this same
+                        // list, so rebuild them against the new one rather than
+                        // leaving each row's combo pointing at a stale index.
+                        pipCard.reload()
+                    }
 
-                        // Reselect the saved source by id. A camera can be
-                        // unplugged and a window closed between sessions, so
-                        // falling back to Default is expected, not an error.
+                    /// Point the combos at what is actually stored.
+                    ///
+                    /// Reselects the source by id: a camera can be unplugged and
+                    /// a window closed between sessions, so falling back to
+                    /// Default is expected, not an error.
+                    function syncFromSettings() {
+                        if (!root.settings) return
                         var idx = 0
-                        if (root.settings && root.settings.video_input_device !== "") {
-                            var at = ids.indexOf(root.settings.video_input_device)
+                        if (root.settings.video_input_device !== "") {
+                            var at = cameraCard.cameraIds.indexOf(root.settings.video_input_device)
                             idx = at >= 0 ? at + 1 : 0
                         }
                         cameraCombo.currentIndex = idx
+                        var q = qualityCombo.keys.indexOf(root.settings.video_quality)
+                        qualityCombo.currentIndex = q >= 0 ? q : 1
                     }
 
-                    Component.onCompleted: {
-                        cameraCard.reloadCameras()
-                        if (root.settings) {
-                            var q = qualityCombo.keys.indexOf(root.settings.video_quality)
-                            qualityCombo.currentIndex = q >= 0 ? q : 1
+                    // Settings are loaded from disk in MainWindow's own
+                    // Component.onCompleted, which runs *after* its children —
+                    // this page included. The stored selection therefore arrives
+                    // as a property change, not as an initial value, and reading
+                    // it once at completion would only ever see the defaults.
+                    Connections {
+                        target: root.settings
+                        function onVideo_input_deviceChanged() { cameraCard.syncFromSettings() }
+                        function onVideo_qualityChanged() { cameraCard.syncFromSettings() }
+                    }
+
+                    Component.onCompleted: cameraCard.reloadCameras()
+                }
+
+                // Picture-in-picture.
+                //
+                // Only one video stream ever leaves this client — a frame names
+                // its stream by sender alone — so "camera over game" cannot mean
+                // two streams. The sources are merged into one frame before the
+                // encoder instead, which is why this costs no extra bandwidth
+                // and needs nothing from the receiving end.
+                SettingsCard {
+                    id: pipCard
+                    title: "Picture-in-picture"
+                    subtitle: "Overlay more sources on the main one — a webcam over a game, "
+                        + "or a second app. They are combined into a single stream, so peers "
+                        + "see one picture and the bandwidth is unchanged."
+
+                    // Each overlay costs a capture device, a thread, and a scale
+                    // per frame. Kept in step with `composite::MAX_OVERLAYS`.
+                    readonly property int maxOverlays: 3
+                    readonly property var corners: ["top-left", "top-right", "bottom-left", "bottom-right"]
+                    readonly property var cornerLabels: ["Top left", "Top right", "Bottom left", "Bottom right"]
+                    readonly property var sizes: [10, 15, 20, 25, 30, 40, 50]
+
+                    /// Id the main source will actually open, resolving the
+                    /// empty "Default camera" selection to the device it means.
+                    readonly property string baseId: root.settings
+                        ? (root.settings.video_input_device !== ""
+                            ? root.settings.video_input_device
+                            : cameraCard.firstCameraId)
+                        : ""
+
+                    ListModel { id: overlayModel }
+
+                    /// Bumped whenever the layout changes, so bindings that call
+                    /// the helper functions below re-evaluate. A binding cannot
+                    /// see inside a function call, and `overlayModel.count`
+                    /// alone misses an edit that only changed a row's source.
+                    property int revision: 0
+
+                    /// True while `persist` is writing, so the settings-change
+                    /// handler does not rebuild the model out from under the
+                    /// delegate whose click is still being handled.
+                    property bool writing: false
+
+                    /// Snap a stored width to the nearest offered one, so a
+                    /// hand-edited value is shown honestly rather than silently
+                    /// displaying something else.
+                    function nearestSize(value) {
+                        var best = 25
+                        var bestGap = 1e9
+                        for (var i = 0; i < pipCard.sizes.length; i++) {
+                            var gap = Math.abs(pipCard.sizes[i] - value)
+                            if (gap < bestGap) { bestGap = gap; best = pipCard.sizes[i] }
                         }
+                        return best
+                    }
+
+                    function reload() {
+                        overlayModel.clear()
+                        if (!root.settings) return
+                        var list = []
+                        try {
+                            list = JSON.parse(root.settings.video_overlays_json || "[]")
+                        } catch (e) { list = [] }
+                        if (!Array.isArray(list)) list = []
+                        for (var i = 0; i < list.length && overlayModel.count < pipCard.maxOverlays; i++) {
+                            var o = list[i] || {}
+                            if (!o.id) continue
+                            overlayModel.append({
+                                sourceId: String(o.id),
+                                corner: pipCard.corners.indexOf(o.corner) >= 0
+                                    ? String(o.corner) : "bottom-right",
+                                size: pipCard.nearestSize(Number(o.size) || 25)
+                            })
+                        }
+                        pipCard.revision++
+                    }
+
+                    function persist() {
+                        if (!root.settings) return
+                        var out = []
+                        for (var i = 0; i < overlayModel.count; i++) {
+                            var r = overlayModel.get(i)
+                            if (!r.sourceId) continue
+                            out.push({ id: r.sourceId, corner: r.corner, size: r.size })
+                        }
+                        pipCard.writing = true
+                        root.settings.video_overlays_json = JSON.stringify(out)
+                        pipCard.writing = false
+                        pipCard.revision++
+                        // A running capture holds its devices open, so the new
+                        // layout only takes effect on a restart.
+                        cameraCard.applyCameraSettings()
+                    }
+
+                    // Same reason as the camera card's: the stored layout
+                    // arrives as a property change after this page is built.
+                    Connections {
+                        target: root.settings
+                        function onVideo_overlays_jsonChanged() {
+                            if (!pipCard.writing) pipCard.reload()
+                        }
+                    }
+
+                    Component.onCompleted: pipCard.reload()
+
+                    /// Whether any stored overlay names `base` — passed in
+                    /// rather than read off `pipCard` so the binding tracks it.
+                    ///
+                    /// Stored layouts can hold one even though `firstFreeSource`
+                    /// never offers one: changing the main source afterwards
+                    /// makes a previously fine overlay a duplicate of it, and
+                    /// nothing rewrites the list behind the user's back.
+                    function clashesWithBase(base) {
+                        if (!base) return false
+                        for (var i = 0; i < overlayModel.count; i++)
+                            if (overlayModel.get(i).sourceId === base) return true
+                        return false
+                    }
+
+                    /// First source not already spoken for.
+                    ///
+                    /// A device cannot be opened twice, so offering one that is
+                    /// already the main source (or another overlay) would just
+                    /// produce an inset that fails to open.
+                    function firstFreeSource() {
+                        var used = [pipCard.baseId]
+                        for (var i = 0; i < overlayModel.count; i++)
+                            used.push(overlayModel.get(i).sourceId)
+                        for (var j = 0; j < cameraCard.cameraIds.length; j++) {
+                            if (used.indexOf(cameraCard.cameraIds[j]) < 0)
+                                return cameraCard.cameraIds[j]
+                        }
+                        return ""
+                    }
+
+                    Label {
+                        visible: overlayModel.count === 0
+                        Layout.fillWidth: true
+                        text: "No overlays — the main source fills the frame."
+                        color: Theme.muted
+                        font.pixelSize: Theme.fontSizeCaption
+                    }
+
+                    Repeater {
+                        model: overlayModel
+
+                        RowLayout {
+                            id: overlayRow
+                            required property int index
+                            required property string sourceId
+                            required property string corner
+                            required property int size
+
+                            Layout.fillWidth: true
+                            spacing: Theme.spacingSm
+
+                            Label {
+                                text: (overlayRow.index + 1) + "."
+                                color: Theme.muted
+                                font.pixelSize: Theme.fontSizeCaption
+                            }
+
+                            ComboBox {
+                                Layout.fillWidth: true
+                                Layout.minimumWidth: 140
+                                model: cameraCard.cameraNames
+                                // -1 when the saved device is gone: unplugged
+                                // cameras and closed windows are routine between
+                                // sessions, so the row stays and says so rather
+                                // than silently rebinding to some other source.
+                                currentIndex: cameraCard.cameraIds.indexOf(overlayRow.sourceId)
+                                // Says which row the capture will leave out, and
+                                // why. Named here rather than only in the card's
+                                // warning because with three rows "an overlay"
+                                // is not enough to act on.
+                                displayText: overlayRow.sourceId === pipCard.baseId
+                                    ? "Same as main source"
+                                    : (currentIndex >= 0 ? currentText : "Source unavailable")
+                                onActivated: {
+                                    overlayModel.setProperty(
+                                        overlayRow.index, "sourceId",
+                                        cameraCard.cameraIds[currentIndex] || "")
+                                    pipCard.persist()
+                                }
+                            }
+
+                            ComboBox {
+                                Layout.preferredWidth: 130
+                                model: pipCard.cornerLabels
+                                currentIndex: Math.max(0, pipCard.corners.indexOf(overlayRow.corner))
+                                onActivated: {
+                                    overlayModel.setProperty(
+                                        overlayRow.index, "corner",
+                                        pipCard.corners[currentIndex] || "bottom-right")
+                                    pipCard.persist()
+                                }
+                            }
+
+                            ComboBox {
+                                Layout.preferredWidth: 110
+                                // Width only: the height follows the source's own
+                                // aspect ratio, so a 4:3 webcam is not stretched
+                                // into a 16:9 box.
+                                model: pipCard.sizes.map(function (s) { return s + "% wide" })
+                                currentIndex: Math.max(0, pipCard.sizes.indexOf(overlayRow.size))
+                                onActivated: {
+                                    overlayModel.setProperty(
+                                        overlayRow.index, "size",
+                                        pipCard.sizes[currentIndex] || 25)
+                                    pipCard.persist()
+                                }
+                            }
+
+                            StyledButton {
+                                text: "Remove"
+                                onClicked: {
+                                    overlayModel.remove(overlayRow.index)
+                                    pipCard.persist()
+                                }
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.spacingMd
+
+                        StyledButton {
+                            text: "Add overlay"
+                            // `revision` is what makes this re-evaluate — a
+                            // binding cannot see the model reads inside the
+                            // function call.
+                            enabled: pipCard.revision >= 0
+                                && overlayModel.count < pipCard.maxOverlays
+                                && pipCard.firstFreeSource() !== ""
+                            onClicked: {
+                                var id = pipCard.firstFreeSource()
+                                if (id === "") return
+                                overlayModel.append({
+                                    sourceId: id,
+                                    corner: "bottom-right",
+                                    size: 25
+                                })
+                                pipCard.persist()
+                            }
+                        }
+
+                        Label {
+                            Layout.fillWidth: true
+                            text: pipCard.revision >= 0
+                                && overlayModel.count >= pipCard.maxOverlays
+                                ? "Maximum of " + pipCard.maxOverlays + " overlays."
+                                : (pipCard.firstFreeSource() === ""
+                                    ? "Every available source is already in the layout."
+                                    : "Changing the layout restarts capture, so it may "
+                                        + "flicker for a moment.")
+                            color: Theme.muted
+                            font.pixelSize: Theme.fontSizeCaption
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+
+                    // The one way the list and the outgoing picture can disagree
+                    // without the user being told: a device cannot be opened
+                    // twice, so an overlay that is also the main source is left
+                    // out of the composite. `baseId` is read in the binding so
+                    // this re-evaluates when the main source changes, which is
+                    // how the layout usually ends up in this state.
+                    Label {
+                        Layout.fillWidth: true
+                        visible: pipCard.revision >= 0
+                            && pipCard.clashesWithBase(pipCard.baseId)
+                        text: "One overlay is the same device as the main source. A device "
+                            + "cannot be captured twice, so it is left out of the picture — "
+                            + "remove that row, or pick a different main source."
+                        color: Theme.warn
+                        font.pixelSize: Theme.fontSizeCaption
+                        wrapMode: Text.WordWrap
                     }
                 }
             }
@@ -647,7 +1058,6 @@ Item {
                                 onEditingFinished: {
                                     if (!root.settings) return
                                     root.settings.local_handle = text
-                                    root.settings.save()
                                     // Push the new name to already-connected peers.
                                     if (backend)
                                         backend.broadcastHandleToAll(text.trim())
@@ -701,7 +1111,6 @@ Item {
                                     var defaultJson = JSON.stringify(root.defaultAvatarConfig())
                                     backend.setAvatarConfigJson("")
                                     root.settings.avatar_config_json = ""
-                                    root.settings.save()
                                     // Local empty JSON = factory defaults; peers need the
                                     // explicit payload because send_avatar_config skips "".
                                     backend.broadcastAvatarConfigToAll(defaultJson)
@@ -934,11 +1343,6 @@ Item {
                     // unreliable with editable Material combos on some Qt 6 builds.
                     ListModel { id: ollamaModelList }
 
-                    function persistOllamaSettings() {
-                        if (root.settings)
-                            root.settings.save()
-                    }
-
                     function refreshOllamaModels() {
                         if (typeof backend === "undefined" || !backend) {
                             ollamaModelStatus.text = "Backend not ready"
@@ -1000,7 +1404,6 @@ Item {
                         onChanged: {
                             if (!root.settings) return
                             root.settings.ollama_enabled = checked
-                            persistOllamaSettings()
                             if (checked)
                                 refreshOllamaModels()
                         }
@@ -1024,7 +1427,6 @@ Item {
                             background: Rectangle { color: Theme.bg3; radius: Theme.radiusMd; border.color: activeFocus ? Theme.accent : Theme.bg3; border.width: 1 }
                             onEditingFinished: {
                                 if (root.settings) root.settings.ollama_base_url = text
-                                persistOllamaSettings()
                                 refreshOllamaModels()
                             }
                         }
@@ -1048,16 +1450,13 @@ Item {
                                 onActivated: {
                                     if (!root.settings) return
                                     var name = ollamaModelList.get(currentIndex).name
-                                    if (root.settings.ollama_model !== name) {
+                                    if (root.settings.ollama_model !== name)
                                         root.settings.ollama_model = name
-                                        persistOllamaSettings()
-                                    }
                                 }
                                 onEditTextChanged: {
                                     if (!root.settings) return
                                     if (root.settings.ollama_model === editText) return
                                     root.settings.ollama_model = editText
-                                    persistOllamaSettings()
                                 }
                             }
                             ToolButton {
@@ -1097,10 +1496,8 @@ Item {
                             placeholderTextColor: Theme.muted
                             background: Rectangle { color: Theme.bg3; radius: Theme.radiusMd; border.color: activeFocus ? Theme.accent : Theme.bg3; border.width: 1 }
                             onActiveFocusChanged: {
-                                if (!activeFocus && root.settings) {
+                                if (!activeFocus && root.settings)
                                     root.settings.ollama_system_prompt = text
-                                    persistOllamaSettings()
-                                }
                             }
                         }
 
@@ -1113,7 +1510,6 @@ Item {
                                 onChanged: {
                                     if (!root.settings) return
                                     root.settings.ollama_auto_respond_direct = checked
-                                    persistOllamaSettings()
                                 }
                             }
                             SettingSwitch {
@@ -1122,7 +1518,6 @@ Item {
                                 onChanged: {
                                     if (!root.settings) return
                                     root.settings.ollama_auto_respond_room = checked
-                                    persistOllamaSettings()
                                 }
                             }
                         }
@@ -1180,7 +1575,6 @@ Item {
                         onChanged: {
                             if (!root.settings) return
                             root.settings.direct_p2p_enabled = checked
-                            root.settings.save()
                             if (backend)
                                 backend.configureDirectP2p(checked, root.settings.direct_p2p_port)
                         }
@@ -1205,7 +1599,6 @@ Item {
                                 var port = parseInt(text, 10)
                                 if (isNaN(port) || port < 1 || port > 65535) port = 61045
                                 root.settings.direct_p2p_port = port
-                                root.settings.save()
                                 if (backend)
                                     backend.configureDirectP2p(root.settings.direct_p2p_enabled, port)
                             }

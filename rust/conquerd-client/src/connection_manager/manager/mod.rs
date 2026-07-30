@@ -246,6 +246,14 @@ pub struct ConnectionManager {
     /// Last keyframe request sent per peer, for the rate limit in
     /// [`Self::send_video_keyframe_request`].
     video_keyframe_last: HashMap<String, std::time::Instant>,
+    /// Whether our camera is on, as last announced by
+    /// [`Self::send_video_state`].
+    ///
+    /// `SfuVideoState` is an edge — one message per toggle — so a member who
+    /// joins afterwards never saw it and shows us as not streaming forever.
+    /// Remembering the level here is what lets
+    /// [`Self::reannounce_video_state`] replay it to newcomers.
+    local_video_active: bool,
     /// Space proof-based admission creds carried by a pasted room invite, keyed
     /// by `room_id`, attached to the next `SfuJoin` for that room. JSON text
     /// `(space_root, space_proof, space_grant)`; `""` for any absent field.
@@ -402,6 +410,7 @@ impl ConnectionManager {
             direct_video_seq: HashMap::new(),
             video_reassembler: crate::video::fragment::Reassembler::new(),
             video_keyframe_last: HashMap::new(),
+            local_video_active: false,
             pending_join_space_creds: HashMap::new(),
             pending_group_key_acks: HashMap::new(),
             pending_peer_reconnects: HashMap::new(),
@@ -520,6 +529,13 @@ impl ConnectionManager {
     #[cfg(test)]
     pub(super) async fn test_send_video_state(&mut self, active: bool, direct: Option<String>) {
         self.send_video_state(active, direct).await;
+    }
+
+    /// Test-only: drive the join-time replay directly, as an inbound
+    /// `SfuPeerJoined` for `room_id` would.
+    #[cfg(test)]
+    pub(super) async fn test_reannounce_video_state(&mut self, room_id: &str) {
+        self.reannounce_video_state(room_id).await;
     }
 
     #[cfg(test)]

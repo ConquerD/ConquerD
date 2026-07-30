@@ -44,6 +44,10 @@ pub mod ffi {
         #[qproperty(QString, audio_input_device)]
         #[qproperty(QString, audio_output_device)]
         #[qproperty(QString, video_input_device)]
+        /// Picture-in-picture overlays drawn over `video_input_device`, as a
+        /// JSON array of `{"id":..,"corner":..,"size":..}`. Empty means the
+        /// single-source capture that predates PIP.
+        #[qproperty(QString, video_overlays_json)]
         #[qproperty(bool, video_enabled)]
         #[qproperty(QString, video_quality)]
         #[qproperty(QString, peer_audio_prefs_json)]
@@ -87,6 +91,13 @@ pub mod ffi {
         /// Verbose (debug-level) logging for troubleshooting. Applied live and
         /// seeded at next startup; an explicit RUST_LOG env var overrides it.
         #[qproperty(bool, debug_logging)]
+        /// Whether the live settings differ from what is on disk.
+        ///
+        /// Read-only in practice: [`refresh_dirty`](SettingsModel::refresh_dirty)
+        /// recomputes it, and save/load clear it. Drives the Save button, which
+        /// otherwise looks identically clickable whether or not there is
+        /// anything to save.
+        #[qproperty(bool, dirty)]
         type SettingsModel = super::SettingsModelRust;
 
         /// Persist settings to disk (JSON).
@@ -96,6 +107,19 @@ pub mod ffi {
         /// Load settings from disk, updating properties.
         #[qinvokable]
         fn load(self: Pin<&mut Self>);
+
+        /// Recompute [`dirty`](SettingsModel::dirty) by comparing the live
+        /// properties with the last state written to (or read from) disk.
+        ///
+        /// Polled by the settings UI rather than maintained per edit. There are
+        /// around a hundred places that write a setting, most of which save
+        /// immediately and some of which do not; a flag each one had to set
+        /// would be wrong the first time someone added the hundred-and-first.
+        /// Comparing against the saved state cannot drift — the answer is
+        /// derived from the same snapshot `save` writes.
+        #[qinvokable]
+        #[rust_name = "refresh_dirty"]
+        fn refreshDirty(self: Pin<&mut Self>);
     }
 }
 
@@ -141,6 +165,10 @@ struct SettingsSnapshot {
     audio_output_device: String,
     #[serde(default)]
     video_input_device: String,
+    /// Overlay layout for picture-in-picture, as a JSON array. One blob rather
+    /// than a field per overlay, which would fix the maximum in the schema.
+    #[serde(default = "default_overlays_blob")]
+    video_overlays_json: String,
     #[serde(default)]
     video_enabled: bool,
     #[serde(default = "default_video_quality")]
@@ -251,6 +279,11 @@ fn default_prefs_blob() -> String {
     "{}".to_string()
 }
 
+/// Empty JSON array — no picture-in-picture overlays.
+fn default_overlays_blob() -> String {
+    "[]".to_string()
+}
+
 fn default_voice_bitrate() -> String {
     "ultra".to_string()
 }
@@ -281,6 +314,7 @@ impl Default for SettingsSnapshot {
             audio_input_device: String::new(),
             audio_output_device: String::new(),
             video_input_device: String::new(),
+            video_overlays_json: default_overlays_blob(),
             video_enabled: false,
             video_quality: default_video_quality(),
             peer_audio_prefs_json: default_prefs_blob(),
@@ -334,6 +368,7 @@ pub struct SettingsModelRust {
     audio_input_device: QString,
     audio_output_device: QString,
     video_input_device: QString,
+    video_overlays_json: QString,
     video_enabled: bool,
     video_quality: QString,
     peer_audio_prefs_json: QString,
@@ -361,6 +396,14 @@ pub struct SettingsModelRust {
     window_height: i32,
     avatar_config_json: QString,
     debug_logging: bool,
+    dirty: bool,
+    /// The last state written to (or read from) disk, serialized compactly.
+    ///
+    /// Held as text rather than a `SettingsSnapshot` so the comparison is one
+    /// string equality over every field at once — a field added to the snapshot
+    /// is covered without touching this, which a hand-written `PartialEq` would
+    /// not be.
+    saved_json: String,
 }
 
 impl Default for SettingsModelRust {
@@ -384,6 +427,7 @@ impl Default for SettingsModelRust {
             audio_input_device: QString::default(),
             audio_output_device: QString::default(),
             video_input_device: QString::default(),
+            video_overlays_json: QString::from(s.video_overlays_json.as_str()),
             video_enabled: s.video_enabled,
             video_quality: QString::from(s.video_quality.as_str()),
             peer_audio_prefs_json: QString::from(s.peer_audio_prefs_json.as_str()),
@@ -411,6 +455,13 @@ impl Default for SettingsModelRust {
             window_height: s.window_height,
             avatar_config_json: QString::default(),
             debug_logging: s.debug_logging,
+            dirty: false,
+            // Deliberately not the serialized defaults: nothing has been read
+            // from disk yet, so the first `load` is what establishes the
+            // baseline. Leaving it empty means a model that is never loaded
+            // reports dirty, which is the truthful answer — those values have
+            // never been persisted.
+            saved_json: String::new(),
         }
     }
 }
@@ -428,9 +479,15 @@ pub fn settings_file() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 impl ffi::SettingsModel {
-    fn save(self: Pin<&mut Self>) {
+    /// The live properties as the struct that gets serialized.
+    ///
+    /// Shared by `save` and the dirty check so the two can never disagree about
+    /// what "the current settings" are — a second, separately-maintained
+    /// copy of this mapping is exactly how a Save button ends up claiming
+    /// there is nothing to save.
+    fn snapshot(&self) -> SettingsSnapshot {
         let r = self.rust();
-        let snap = SettingsSnapshot {
+        SettingsSnapshot {
             notifications_enabled: r.notifications_enabled,
             auto_connect: r.auto_connect,
             direct_p2p_enabled: r.direct_p2p_enabled,
@@ -448,6 +505,7 @@ impl ffi::SettingsModel {
             audio_input_device: r.audio_input_device.to_string(),
             audio_output_device: r.audio_output_device.to_string(),
             video_input_device: r.video_input_device.to_string(),
+            video_overlays_json: r.video_overlays_json.to_string(),
             video_enabled: r.video_enabled,
             video_quality: r.video_quality.to_string(),
             peer_audio_prefs_json: r.peer_audio_prefs_json.to_string(),
@@ -475,7 +533,11 @@ impl ffi::SettingsModel {
             window_height: r.window_height,
             avatar_config_json: r.avatar_config_json.to_string(),
             debug_logging: r.debug_logging,
-        };
+        }
+    }
+
+    fn save(mut self: Pin<&mut Self>) {
+        let snap = self.snapshot();
         // Apply the log-verbosity choice live so it takes effect without a restart.
         crate::logging::set_debug_logging(snap.debug_logging);
         let path = settings_file();
@@ -486,11 +548,34 @@ impl ffi::SettingsModel {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, json) {
                     warn!("SettingsModel::save failed: {e}");
-                } else {
-                    debug!("Settings saved to {}", path.display());
+                    // Deliberately not marking clean: the file still holds the
+                    // old settings, so there is genuinely something to save and
+                    // the button must keep saying so.
+                    return;
                 }
+                debug!("Settings saved to {}", path.display());
+                self.as_mut().mark_saved(&snap);
             }
             Err(e) => warn!("SettingsModel::save serialize error: {e}"),
+        }
+    }
+
+    /// Record `snap` as the state on disk and clear [`dirty`].
+    fn mark_saved(mut self: Pin<&mut Self>, snap: &SettingsSnapshot) {
+        // Compact, not pretty: this is only ever compared with itself, and the
+        // comparison must not depend on how the file happens to be formatted.
+        if let Ok(compact) = serde_json::to_string(snap) {
+            self.as_mut().rust_mut().saved_json = compact;
+        }
+        self.as_mut().set_dirty(false);
+    }
+
+    fn refresh_dirty(mut self: Pin<&mut Self>) {
+        let live = serde_json::to_string(&self.snapshot()).unwrap_or_default();
+        let changed = live != self.rust().saved_json;
+        // Only write through a change: `set_dirty` emits, and this is polled.
+        if changed != self.rust().dirty {
+            self.as_mut().set_dirty(changed);
         }
     }
 
@@ -537,6 +622,8 @@ impl ffi::SettingsModel {
             .set_audio_output_device(QString::from(snap.audio_output_device.as_str()));
         self.as_mut()
             .set_video_input_device(QString::from(snap.video_input_device.as_str()));
+        self.as_mut()
+            .set_video_overlays_json(QString::from(snap.video_overlays_json.as_str()));
         self.as_mut().set_video_enabled(snap.video_enabled);
         self.as_mut()
             .set_video_quality(QString::from(snap.video_quality.as_str()));
@@ -581,6 +668,12 @@ impl ffi::SettingsModel {
             .set_avatar_config_json(QString::from(snap.avatar_config_json.as_str()));
         self.as_mut().set_debug_logging(snap.debug_logging);
         crate::logging::set_debug_logging(snap.debug_logging);
+        // The baseline is taken from the *applied* properties, not from `snap`:
+        // a few are clamped or derived on the way in (the port, and noise
+        // suppression from its strength), so recording `snap` would leave the
+        // model looking unsaved the moment it finished loading.
+        let applied = self.snapshot();
+        self.as_mut().mark_saved(&applied);
         debug!("Settings loaded from {}", path.display());
     }
 }

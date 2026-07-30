@@ -2289,12 +2289,29 @@ ApplicationWindow {
             // ── Settings section navigation ──────────────────────────────────
             // Replaces the peer/rooms area when Settings is the active nav.
             SettingsSidebar {
+                id: settingsSidebar
                 visible: navIndex === 2
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 currentIndex: settingsTab
+                dirty: settingsModel ? settingsModel.dirty : false
                 onSectionActivated: (index) => settingsTab = index
                 onSaveRequested: if (settingsModel) settingsModel.save()
+
+                // Polled rather than pushed: settings are written from around a
+                // hundred places, most of which save immediately and some of
+                // which do not, so a flag each writer had to set would be wrong
+                // the first time one was added. The model compares itself with
+                // what is on disk instead, which cannot drift.
+                //
+                // Only while Settings is on screen — this is for the button.
+                Timer {
+                    interval: 300
+                    repeat: true
+                    running: settingsSidebar.visible && settingsModel !== null
+                    triggeredOnStart: true
+                    onTriggered: settingsModel.refreshDirty()
+                }
             }
 
             Rectangle {
@@ -2610,7 +2627,8 @@ ApplicationWindow {
                 var got = backend.setVideoEnabled(
                     on,
                     settingsModel.video_input_device,
-                    settingsModel.video_quality)
+                    settingsModel.video_quality,
+                    settingsModel.video_overlays_json)
                 if (on && !got)
                     console.warn("[video] could not start the camera")
                 // Reflect our own state on our own tile straight away; remote

@@ -1733,3 +1733,64 @@ async fn video_state_announces_on_whichever_lane_is_live() {
         );
     }
 }
+
+/// The join-time replay. `SfuVideoState` is one message per toggle, so without
+/// this a member who joined while we were already streaming would show us as
+/// camera-off for the rest of the session.
+#[tokio::test]
+async fn a_peer_joining_mid_stream_is_told_the_camera_is_on() {
+    use crate::protocol::MessageType;
+
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    t.cm.test_set_room("SN-AAAA", "room-1");
+    t.cm.test_send_video_state(true, None).await;
+    let _ = harness::drain_ws(&mut sn); // The original toggle.
+
+    t.cm.test_reannounce_video_state("room-1").await;
+
+    let sent = harness::drain_ws(&mut sn);
+    let replay = sent
+        .iter()
+        .find(|m| m.msg_type == MessageType::SfuVideoState)
+        .expect("a join must replay the camera state");
+    assert_eq!(
+        replay.payload.get("active").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+/// Only "on" is replayed, and only for the room we are actually in. A member
+/// who never heard from us already assumes camera-off, so announcing it on
+/// every join would be a signed message per join conveying nothing.
+#[tokio::test]
+async fn a_join_replays_nothing_when_the_camera_is_off_or_the_room_differs() {
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    t.cm.test_set_room("SN-AAAA", "room-1");
+
+    // Never streamed.
+    t.cm.test_reannounce_video_state("room-1").await;
+    assert!(
+        harness::drain_ws(&mut sn).is_empty(),
+        "camera-off must not be replayed on join"
+    );
+
+    // Streaming, but the join is in some other room we also subscribe to.
+    t.cm.test_send_video_state(true, None).await;
+    let _ = harness::drain_ws(&mut sn);
+    t.cm.test_reannounce_video_state("room-2").await;
+    assert!(
+        harness::drain_ws(&mut sn).is_empty(),
+        "a join in another room must not announce our camera"
+    );
+
+    // Turned off again: a later join learns nothing.
+    t.cm.test_send_video_state(false, None).await;
+    let _ = harness::drain_ws(&mut sn);
+    t.cm.test_reannounce_video_state("room-1").await;
+    assert!(
+        harness::drain_ws(&mut sn).is_empty(),
+        "a stopped camera must not be replayed as on"
+    );
+}

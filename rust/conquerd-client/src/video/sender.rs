@@ -18,6 +18,7 @@ use super::camera::CameraSource;
 #[cfg(target_os = "windows")]
 use super::camera::MfCamera;
 use super::codec::VideoEncoder;
+use super::composite::Placement;
 use super::frame::RawFrame;
 
 /// Quality preset, mapped from the `video_quality` setting.
@@ -73,16 +74,40 @@ pub enum SourceSpec {
 }
 
 impl SourceSpec {
-    /// Open the backing capture device.
+    /// Interpret a settings `video_input_device` string.
+    ///
+    /// One settings field doubles as the source selector: a `monitor:` or
+    /// `window:` prefix means screen capture, anything else is a camera device
+    /// id, and an empty string is the system default camera. One field rather
+    /// than two because exactly one source is ever live.
+    pub fn from_device_id(raw: &str) -> Self {
+        if raw.starts_with("monitor:") || raw.starts_with("window:") {
+            Self::Screen {
+                target_id: raw.to_owned(),
+            }
+        } else {
+            Self::Camera {
+                device_id: (!raw.is_empty()).then(|| raw.to_owned()),
+            }
+        }
+    }
+
+    /// Open the backing capture device at (at most) `width` x `height`.
     ///
     /// Runs on the capture thread because both backends are blocking to open —
     /// a camera can take a second or more to spin up — and both have COM thread
-    /// affinity, so they must be created where they will be used.
+    /// affinity, so they must be created where they will be used. That is also
+    /// why this takes a size rather than a [`Quality`]: an overlay opens at its
+    /// own inset size, not the stream's.
+    ///
+    /// The size is a *request*. Screen capture honours it exactly (letterboxing
+    /// into it), but a camera substitutes its nearest supported mode, so callers
+    /// must read [`CameraSource::dimensions`] back rather than assume.
     #[cfg(target_os = "windows")]
-    fn open(&self, quality: Quality) -> anyhow::Result<Box<dyn CameraSource>> {
+    pub(super) fn open(&self, width: u32, height: u32) -> anyhow::Result<Box<dyn CameraSource>> {
         match self {
             Self::Camera { device_id } => {
-                let cam = MfCamera::open(device_id.as_deref(), quality.width, quality.height)?;
+                let cam = MfCamera::open(device_id.as_deref(), width, height)?;
                 Ok(Box::new(cam))
             }
             Self::Screen { target_id } => {
@@ -92,15 +117,14 @@ impl SourceSpec {
                     // session may now name nothing, or something else.
                     anyhow::anyhow!("capture source '{target_id}' is no longer available")
                 })?;
-                let cap =
-                    super::screen::ScreenCapture::open(&target, quality.width, quality.height)?;
+                let cap = super::screen::ScreenCapture::open(&target, width, height)?;
                 Ok(Box::new(cap))
             }
         }
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn open(&self, _quality: Quality) -> anyhow::Result<Box<dyn CameraSource>> {
+    pub(super) fn open(&self, _width: u32, _height: u32) -> anyhow::Result<Box<dyn CameraSource>> {
         anyhow::bail!("video capture is not implemented on this platform")
     }
 
@@ -109,6 +133,157 @@ impl SourceSpec {
         match self {
             Self::Camera { .. } => "camera",
             Self::Screen { .. } => "screen",
+        }
+    }
+}
+
+/// Everything that goes into the one outgoing video stream.
+///
+/// A peer can only *send* one stream — a fragment names its stream by sender
+/// alone — so "camera and game at once" has to mean one frame containing both.
+/// This is that description: a base source that fills the frame, plus insets
+/// drawn on top of it. With no overlays it is exactly the single-source capture
+/// that came before, and costs exactly as much.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CaptureLayout {
+    /// The source that fills the frame.
+    pub base: SourceSpec,
+    /// Insets drawn over the base, in stacking order.
+    pub overlays: Vec<(SourceSpec, Placement)>,
+}
+
+impl Default for SourceSpec {
+    /// The default camera — what an empty `video_input_device` means.
+    fn default() -> Self {
+        Self::Camera { device_id: None }
+    }
+}
+
+impl CaptureLayout {
+    /// Build a layout from the two settings that describe it.
+    ///
+    /// `device_id` is `video_input_device` (the base) and `overlays_json` is
+    /// `video_overlays_json`. Both are user-editable, so this is total: anything
+    /// unusable is dropped and the capture still starts.
+    ///
+    /// Resolves what the empty "default camera" selection actually opens before
+    /// deduplicating, since that is the case the raw ids cannot catch — see
+    /// [`from_settings_with_default`](Self::from_settings_with_default). The
+    /// enumeration is skipped unless it can change the answer.
+    pub fn from_settings(device_id: &str, overlays_json: &str) -> Self {
+        let overlays = super::composite::parse_overlays(overlays_json);
+        let default_id = if device_id.trim().is_empty() && !overlays.is_empty() {
+            super::camera::default_device_id()
+        } else {
+            String::new()
+        };
+        Self::build(device_id, overlays, &default_id)
+    }
+
+    /// [`from_settings`](Self::from_settings) with the default camera supplied
+    /// rather than enumerated, so the rule can be tested without a device.
+    ///
+    /// Ids are deduplicated, and an overlay naming the base is discarded. That
+    /// is not tidiness — a camera cannot be opened twice, so the duplicate would
+    /// fail to open, log, and leave a hole in the picture for no reason.
+    ///
+    /// `default_camera_id` is what an empty `device_id` resolves to. Comparing
+    /// raw ids alone misses exactly the layout users end up with: base left on
+    /// "Default camera" and the same webcam added by id as an overlay. The
+    /// duplicate then reached Media Foundation, which cannot open one device
+    /// twice and reports it as a *format* failure ("offers neither NV12 nor
+    /// YUY2") — an error that reads like a broken webcam rather than a layout
+    /// that was never openable.
+    pub fn from_settings_with_default(
+        device_id: &str,
+        overlays_json: &str,
+        default_camera_id: &str,
+    ) -> Self {
+        Self::build(
+            device_id,
+            super::composite::parse_overlays(overlays_json),
+            default_camera_id,
+        )
+    }
+
+    fn build(
+        device_id: &str,
+        configs: Vec<super::composite::OverlayConfig>,
+        default_camera_id: &str,
+    ) -> Self {
+        let base_id = device_id.trim();
+        let base = SourceSpec::from_device_id(base_id);
+
+        let mut seen = vec![base_id.to_owned()];
+        // Both spellings of the base are claimed: the stored one and the device
+        // it resolves to. Either can be what an overlay names.
+        if base_id.is_empty() {
+            let resolved = default_camera_id.trim();
+            if !resolved.is_empty() {
+                seen.push(resolved.to_owned());
+            }
+        }
+
+        let overlays = configs
+            .into_iter()
+            .filter_map(|cfg| {
+                let id = cfg.id.trim().to_owned();
+                if seen.contains(&id) {
+                    debug!("[video] skipping overlay '{id}': already in the layout");
+                    return None;
+                }
+                seen.push(id.clone());
+                Some((SourceSpec::from_device_id(&id), cfg.placement()))
+            })
+            .collect();
+
+        Self { base, overlays }
+    }
+
+    /// A single-source layout, for callers that have no overlays to add.
+    pub fn single(base: SourceSpec) -> Self {
+        Self {
+            base,
+            overlays: Vec::new(),
+        }
+    }
+
+    /// Whether more than one source is involved.
+    pub fn is_composite(&self) -> bool {
+        !self.overlays.is_empty()
+    }
+
+    /// Open every source and return one capture that produces frames of exactly
+    /// `quality.width` x `quality.height`.
+    ///
+    /// The size guarantee is the point of doing this here: the encoder is
+    /// configured once and rejects every frame that does not match, and a camera
+    /// is free to hand back its nearest supported mode instead of the one that
+    /// was asked for.
+    fn open(&self, quality: Quality) -> anyhow::Result<Box<dyn CameraSource>> {
+        let base = self.base.open(quality.width, quality.height)?;
+        if !self.is_composite() {
+            return Ok(super::composite::NormalizedSource::wrap(
+                base,
+                quality.width,
+                quality.height,
+            ));
+        }
+        Ok(Box::new(super::composite::CompositeSource::new(
+            base,
+            self.overlays.clone(),
+            quality.width,
+            quality.height,
+            quality.fps,
+        )))
+    }
+
+    /// Label for logs, without leaking a full window title.
+    fn kind(&self) -> String {
+        if self.is_composite() {
+            format!("{} + {} overlay(s)", self.base.kind(), self.overlays.len())
+        } else {
+            self.base.kind().to_owned()
         }
     }
 }
@@ -162,15 +337,14 @@ pub struct VideoSender {
 }
 
 impl VideoSender {
-    /// Start capturing from `device_id` (or the default camera) and feeding
-    /// `sink`.
+    /// Start capturing `layout` and feeding `sink`.
     ///
-    /// Returns immediately; the camera is opened on the new thread because
+    /// Returns immediately; the sources are opened on the new thread because
     /// opening is itself blocking and can take a second or more.
     /// `preview_peer_id` is our own peer id, so the captured frame can be shown
     /// locally. `None` disables self-preview.
     pub fn start<S, E>(
-        source: SourceSpec,
+        layout: CaptureLayout,
         quality: Quality,
         mut encoder: E,
         mut sink: S,
@@ -194,8 +368,8 @@ impl VideoSender {
         let handle = std::thread::Builder::new()
             .name("conquerd-video-capture".into())
             .spawn(move || {
-                let kind = source.kind();
-                let mut camera = match source.open(quality) {
+                let kind = layout.kind();
+                let mut camera = match layout.open(quality) {
                     Ok(c) => c,
                     Err(e) => {
                         warn!("[video] could not open {kind} source: {e}");
@@ -301,6 +475,27 @@ impl VideoSender {
         }
     }
 
+    /// Start a capture whose frames are only ever shown locally — the settings
+    /// preview of the selected source.
+    ///
+    /// Nothing is encoded or transmitted: the preview draws the same raw
+    /// pre-encode frame self-preview already uses, so no encoder is built and
+    /// no session needs to exist. The capture loop itself is shared with
+    /// [`start`](Self::start) rather than copied, because the fiddly parts —
+    /// opening the source, tolerating the burst of read errors every device
+    /// emits while spinning up, pacing to the preset, and releasing the device
+    /// on stop — are exactly the parts a second copy would get wrong. Getting
+    /// the last one wrong leaves the hardware capture light on.
+    pub fn start_preview(layout: CaptureLayout, quality: Quality, preview_peer_id: String) -> Self {
+        Self::start(
+            layout,
+            quality,
+            DiscardEncoder,
+            DiscardSink,
+            Some(preview_peer_id),
+        )
+    }
+
     /// Feed a transport loss measurement into adaptive bitrate control.
     ///
     /// Called on the same connection-stats tick that drives audio ABR, so both
@@ -401,6 +596,33 @@ fn next_video_bitrate(current: u32, ceiling: u32, loss_pct: f32) -> u32 {
     target.clamp(floor, ceiling.max(floor))
 }
 
+/// Encoder for a preview-only capture.
+///
+/// Returns no bytes, which the capture loop already handles as "nothing ready
+/// this tick" (the normal state of a pipelined encoder that is still filling),
+/// so no frame ever reaches the sink. Skipping the encode outright is the point:
+/// a preview costs one camera and nothing else, and can therefore run without a
+/// hardware encoder — which is also what keeps it available on machines where
+/// [`MfEncoder`](super::mediafoundation::MfEncoder) creation fails.
+struct DiscardEncoder;
+
+impl VideoEncoder for DiscardEncoder {
+    fn encode(&mut self, _frame: &RawFrame) -> anyhow::Result<(Vec<u8>, bool)> {
+        Ok((Vec::new(), false))
+    }
+
+    fn request_keyframe(&mut self) {}
+}
+
+/// Sink for a preview-only capture. Unreachable in practice — [`DiscardEncoder`]
+/// never produces a frame to hand over — but the loop is generic over a sink, so
+/// it needs one.
+struct DiscardSink;
+
+impl FrameSink for DiscardSink {
+    fn send(&mut self, _encoded: Vec<u8>, _keyframe: bool) {}
+}
+
 /// A [`FrameSink`] that forwards to a channel, for wiring into the connection
 /// manager without this module depending on it.
 pub struct ChannelSink<T> {
@@ -497,6 +719,183 @@ mod tests {
         fn request_keyframe(&mut self) {
             self.keyframe_next = true;
         }
+    }
+
+    #[test]
+    fn a_device_id_selects_the_matching_source_kind() {
+        assert_eq!(
+            SourceSpec::from_device_id("monitor:0"),
+            SourceSpec::Screen {
+                target_id: "monitor:0".into()
+            }
+        );
+        assert_eq!(
+            SourceSpec::from_device_id("window:1234"),
+            SourceSpec::Screen {
+                target_id: "window:1234".into()
+            }
+        );
+        assert_eq!(
+            SourceSpec::from_device_id(r"\\?\usb#vid_046d"),
+            SourceSpec::Camera {
+                device_id: Some(r"\\?\usb#vid_046d".into())
+            }
+        );
+    }
+
+    /// The settings UI stores "" for "first available camera", so an empty id
+    /// must reach the backend as the default rather than as a device named "".
+    #[test]
+    fn an_empty_device_id_means_the_default_camera() {
+        assert_eq!(
+            SourceSpec::from_device_id(""),
+            SourceSpec::Camera { device_id: None }
+        );
+    }
+
+    // ── Layouts ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_layout_with_no_overlay_blob_is_single_source() {
+        for blob in ["", "[]", "garbage"] {
+            let layout = CaptureLayout::from_settings("monitor:1", blob);
+            assert!(!layout.is_composite(), "{blob:?} should stay single-source");
+            assert_eq!(
+                layout.base,
+                SourceSpec::Screen {
+                    target_id: "monitor:1".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_layout_pairs_each_overlay_with_its_placement() {
+        let layout = CaptureLayout::from_settings(
+            "monitor:1",
+            r#"[{"id":"cam-a","corner":"top-left","size":30}]"#,
+        );
+        assert!(layout.is_composite());
+        assert_eq!(
+            layout.overlays,
+            vec![(
+                SourceSpec::Camera {
+                    device_id: Some("cam-a".into())
+                },
+                Placement {
+                    corner: crate::video::composite::Corner::TopLeft,
+                    size_pct: 30
+                }
+            )]
+        );
+    }
+
+    /// A device cannot be opened twice, so an overlay naming the base — or
+    /// naming another overlay — would fail to open and leave a hole in the
+    /// picture. Dropping it up front is the difference between a clean layout
+    /// and a warning every session.
+    #[test]
+    fn a_layout_never_opens_the_same_source_twice() {
+        let layout = CaptureLayout::from_settings(
+            "cam-a",
+            r#"[{"id":"cam-a"},{"id":"cam-b"},{"id":"cam-b"}]"#,
+        );
+        assert_eq!(layout.overlays.len(), 1);
+        assert_eq!(
+            layout.overlays[0].0,
+            SourceSpec::Camera {
+                device_id: Some("cam-b".into())
+            }
+        );
+    }
+
+    /// The default camera is the empty id, so an overlay with a blank id would
+    /// silently become "the default camera" — which is very often the base.
+    #[test]
+    fn a_blank_overlay_id_does_not_become_the_default_camera() {
+        let layout = CaptureLayout::from_settings("", r#"[{"id":""},{"id":"   "}]"#);
+        assert!(!layout.is_composite());
+    }
+
+    /// The collision raw ids cannot see: the base is left on "Default camera"
+    /// (stored as `""`) and the same webcam is added by id as an overlay. This
+    /// reached the capture thread as a second open of one device, which Media
+    /// Foundation reports as a format failure — so the overlay vanished from the
+    /// stream while the settings page still listed it.
+    #[test]
+    fn an_overlay_naming_the_default_camera_is_not_opened_twice() {
+        let layout = CaptureLayout::from_settings_with_default(
+            "",
+            r#"[{"id":"usb#vid_046d"},{"id":"window:42"}]"#,
+            "usb#vid_046d",
+        );
+        assert_eq!(
+            layout.overlays.len(),
+            1,
+            "the overlay naming the resolved base must be dropped"
+        );
+        assert_eq!(
+            layout.overlays[0].0,
+            SourceSpec::Screen {
+                target_id: "window:42".into()
+            }
+        );
+    }
+
+    /// The same device named explicitly on both sides is already caught, and
+    /// must stay caught now that the empty case is resolved separately.
+    #[test]
+    fn an_overlay_naming_an_explicit_base_is_still_dropped() {
+        let layout = CaptureLayout::from_settings_with_default(
+            "usb#vid_046d",
+            r#"[{"id":"usb#vid_046d"}]"#,
+            // A different default, which must not be consulted at all when the
+            // base is explicit — resolving it there would drop a legitimate
+            // overlay of the first camera.
+            "usb#other",
+        );
+        assert!(!layout.is_composite());
+
+        let kept = CaptureLayout::from_settings_with_default(
+            "usb#vid_046d",
+            r#"[{"id":"usb#other"}]"#,
+            "usb#other",
+        );
+        assert!(
+            kept.is_composite(),
+            "the first camera is a valid overlay when the base is some other device"
+        );
+    }
+
+    /// With no camera attached there is nothing for the empty base to resolve
+    /// to, and an empty id must not then match every overlay.
+    #[test]
+    fn an_unresolvable_default_camera_drops_nothing() {
+        let layout =
+            CaptureLayout::from_settings_with_default("", r#"[{"id":"window:42"}]"#, "   ");
+        assert!(layout.is_composite());
+    }
+
+    #[test]
+    fn layout_labels_say_how_many_sources_are_involved() {
+        assert_eq!(CaptureLayout::from_settings("", "").kind(), "camera");
+        assert_eq!(
+            CaptureLayout::from_settings("monitor:1", r#"[{"id":"cam-a"}]"#).kind(),
+            "screen + 1 overlay(s)"
+        );
+    }
+
+    /// The preview path leans on this: an encoder that yields nothing must look
+    /// like a pipelined encoder still filling, not like an error, so the loop
+    /// keeps capturing (and keeps feeding the preview surface) indefinitely.
+    #[test]
+    fn the_preview_encoder_produces_nothing_to_send() {
+        let (data, keyframe) = DiscardEncoder.encode(&RawFrame::black(64, 48)).unwrap();
+        assert!(
+            data.is_empty(),
+            "a preview must never queue a frame to send"
+        );
+        assert!(!keyframe);
     }
 
     #[test]

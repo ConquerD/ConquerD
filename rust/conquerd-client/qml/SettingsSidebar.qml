@@ -7,6 +7,9 @@ Rectangle {
     id: root
 
     property int currentIndex: 0
+    /// Whether the live settings differ from the file. Drives the Save button's
+    /// colour and whether it is clickable at all.
+    property bool dirty: false
     signal sectionActivated(int index)
     signal saveRequested()
 
@@ -127,15 +130,28 @@ Rectangle {
 
         Rectangle {
             Layout.fillWidth: true
-            height: 52
+            height: 72
             color: Theme.bg0
 
             StyledButton {
-                anchors.centerIn: parent
-                text: "Save Settings"
-                primary: true
+                anchors.fill: parent
+                anchors.margins: Theme.spacingMd
+                // Red only while there is something to save, and unclickable
+                // once there is not — the state is the point of the button, so
+                // it says which of the two it is rather than looking the same
+                // either way.
+                danger: root.dirty
+                enabled: root.dirty
+                compact: false
+                font.pixelSize: Theme.fontSizeTitle
+                font.bold: root.dirty
+                text: root.dirty ? "Save Settings" : "Settings Saved"
                 icon.source: "qrc:/qt/qml/ConquerD/Client/icons/save.svg"
                 onClicked: root.saveRequested()
+
+                Accessible.description: root.dirty
+                    ? "There are unsaved settings"
+                    : "All settings are saved"
             }
         }
     }

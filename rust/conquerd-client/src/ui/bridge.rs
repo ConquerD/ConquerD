@@ -71,6 +71,12 @@ pub mod ffi {
         #[qproperty(bool, mic_test_active)]
         /// True while the local camera is capturing and sending.
         #[qproperty(bool, video_active)]
+        /// True while the settings preview owns the camera.
+        ///
+        /// Never true at the same time as `video_active`: one capture holds the
+        /// device, and a call takes it over. The settings surface is fed by
+        /// whichever is running, so it should watch both.
+        #[qproperty(bool, video_preview_active)]
         type AppBridge = super::AppBridgeRust;
 
         // ── Signals ───────────────────────────────────────────────────────
@@ -751,6 +757,11 @@ pub mod ffi {
         /// the change to the room so other members' indicators update. Returns
         /// the resulting state, which may be `false` even when `on` was `true`
         /// if no camera could be opened.
+        ///
+        /// `overlays_json` is the `video_overlays_json` setting: a JSON array of
+        /// picture-in-picture insets drawn over `device_id`. Empty or `[]` gives
+        /// plain single-source capture. Only one stream ever leaves this client,
+        /// composited or not — see [`CaptureLayout`](crate::video::sender::CaptureLayout).
         #[qinvokable]
         #[rust_name = "set_video_enabled"]
         fn setVideoEnabled(
@@ -758,6 +769,31 @@ pub mod ffi {
             on: bool,
             device_id: &QString,
             quality: &QString,
+            overlays_json: &QString,
+        ) -> bool;
+
+        /// Show or hide the settings preview of `device_id` plus `overlays_json`.
+        ///
+        /// Captures without encoding or transmitting anything, so it works with
+        /// no call and no room. Frames land on the sinks bound to our own
+        /// `public_id` — the same surface self-preview uses — so the caller
+        /// renders it exactly like any other tile. The layout is built the same
+        /// way the call path builds it, so the preview shows the composite
+        /// exactly as peers would receive it.
+        ///
+        /// Returns whether that surface will now receive frames. Starting a
+        /// preview while a call is already sending is a no-op that returns
+        /// `true`: the call's capture already feeds the same surface, and
+        /// opening the device a second time would simply fail. `false` means
+        /// nothing could be opened.
+        #[qinvokable]
+        #[rust_name = "set_video_preview_enabled"]
+        fn setVideoPreviewEnabled(
+            self: Pin<&mut AppBridge>,
+            on: bool,
+            device_id: &QString,
+            quality: &QString,
+            overlays_json: &QString,
         ) -> bool;
 
         /// Set this listener's local mute / volume for one peer.
@@ -980,6 +1016,13 @@ pub struct AppBridgeRust {
     call_cmd_tx: Option<mpsc::Sender<CallCommand>>,
     /// Backing field for the `video_active` Q_PROPERTY.
     video_active: bool,
+    /// Room members whose camera is on, as last announced by each.
+    ///
+    /// `RoomModel::setParticipants` resets the model, so the streaming flag it
+    /// carries has to be re-supplied on every roster emission — and a roster
+    /// emission is exactly what a join produces. Without this the indicator was
+    /// cleared for everyone the moment anyone joined or left.
+    peer_video_active: HashSet<String>,
     /// Decode thread for inbound video, created lazily on the first frame so
     /// a client that never receives video never spawns it.
     video_receiver: Option<crate::video::receiver::VideoReceiver>,
@@ -988,6 +1031,14 @@ pub struct AppBridgeRust {
     /// Dropping this stops the thread and releases the device, which is what
     /// turns the hardware capture light off — so it must not be leaked.
     video_sender: Option<crate::video::sender::VideoSender>,
+    /// Backing field for the `video_preview_active` Q_PROPERTY.
+    video_preview_active: bool,
+    /// Capture thread behind the settings preview, `None` when it is off.
+    ///
+    /// Separate from `video_sender` so a preview can never be mistaken for a
+    /// call that is sending: this one encodes nothing and reaches no peer. Only
+    /// one of the two is ever `Some` — the device cannot be opened twice.
+    video_preview: Option<crate::video::sender::VideoSender>,
     sfu_cmd_tx: Option<mpsc::Sender<SfuCommand>>,
     updater_cmd_tx: Option<mpsc::Sender<crate::github_updater::UpdaterCommand>>,
 
@@ -1326,8 +1377,11 @@ impl Default for AppBridgeRust {
             conn_cmd_tx: None,
             call_cmd_tx: None,
             video_active: false,
+            peer_video_active: HashSet::new(),
             video_receiver: None,
             video_sender: None,
+            video_preview_active: false,
+            video_preview: None,
             sfu_cmd_tx: None,
             updater_cmd_tx: None,
             my_peer_id: String::new(),
@@ -2416,13 +2470,17 @@ impl ffi::AppBridge {
         on: bool,
         device_id: &QString,
         quality: &QString,
+        overlays_json: &QString,
     ) -> bool {
         // Stopping first also covers the restart case (device or quality
         // changed while running): the old thread must release the camera
-        // before a new one can open it.
+        // before a new one can open it. The settings preview holds the same
+        // device, so it has to go too — a call always wins over a preview of
+        // one.
         if let Some(sender) = self.as_mut().rust_mut().video_sender.take() {
             sender.stop();
         }
+        self.as_mut().stop_video_preview();
 
         if !on {
             self.as_mut().set_video_active(false);
@@ -2442,7 +2500,7 @@ impl ffi::AppBridge {
         // still compile the rest of the UI; the camera toggle simply reports off.
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (conn_tx, quality, device_id);
+            let _ = (conn_tx, quality, device_id, overlays_json);
             warn!("[video] capture/encode is not implemented on this platform");
             return false;
         }
@@ -2468,21 +2526,13 @@ impl ffi::AppBridge {
                 }
             };
 
-            // `device_id` doubles as the source selector: a `monitor:` / `window:`
-            // prefix means screen capture, anything else is a camera device id.
-            // One field rather than two because exactly one source is ever live —
-            // the wire format allows a peer only one video stream.
-            let raw_source = device_id.to_string();
-            let source = if raw_source.starts_with("monitor:") || raw_source.starts_with("window:")
-            {
-                crate::video::sender::SourceSpec::Screen {
-                    target_id: raw_source,
-                }
-            } else {
-                crate::video::sender::SourceSpec::Camera {
-                    device_id: (!raw_source.is_empty()).then_some(raw_source),
-                }
-            };
+            // The wire format allows a peer only one video stream, so several
+            // selected sources become one composited frame rather than several
+            // streams. With no overlays this is the plain single-source capture.
+            let layout = crate::video::sender::CaptureLayout::from_settings(
+                &device_id.to_string(),
+                &overlays_json.to_string(),
+            );
 
             // Route frames to the room, or to the one peer of a direct 1:1 call.
             //
@@ -2512,13 +2562,91 @@ impl ffi::AppBridge {
                 (!id.is_empty()).then_some(id)
             };
             let sender = crate::video::sender::VideoSender::start(
-                source, quality, encoder, sink, preview_id,
+                layout, quality, encoder, sink, preview_id,
             );
             self.as_mut().rust_mut().video_sender = Some(sender);
             self.as_mut().set_video_active(true);
             self.as_mut().announce_video_state(true);
             true
         }
+    }
+
+    fn set_video_preview_enabled(
+        mut self: Pin<&mut Self>,
+        on: bool,
+        device_id: &QString,
+        quality: &QString,
+        overlays_json: &QString,
+    ) -> bool {
+        // Unconditional stop first, which is also the restart path: the running
+        // thread must release the device before another can open it.
+        self.as_mut().stop_video_preview();
+
+        if !on {
+            return false;
+        }
+
+        // A call already owns the device and is already feeding this surface
+        // with the frames it is sending. Re-opening it would fail, and stopping
+        // the call to preview it would be absurd.
+        if self.rust().video_active {
+            return true;
+        }
+
+        // The surface is keyed by our own id, so there is nowhere to draw until
+        // the identity is unlocked.
+        let preview_id = self.rust().my_public_id.clone();
+        if preview_id.is_empty() {
+            warn!("[video] cannot preview before the identity is unlocked");
+            return false;
+        }
+
+        // Capture-only, so unlike `set_video_enabled` this needs no encoder and
+        // no connection — but it does need a capture backend.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (device_id, quality, overlays_json);
+            warn!("[video] capture is not implemented on this platform");
+            return false;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let quality = crate::video::sender::Quality::from_name(&quality.to_string());
+            // The same layout the call path would build, so what the user sees
+            // here is what peers would receive — including every overlay.
+            let layout = crate::video::sender::CaptureLayout::from_settings(
+                &device_id.to_string(),
+                &overlays_json.to_string(),
+            );
+            let preview =
+                crate::video::sender::VideoSender::start_preview(layout, quality, preview_id);
+            self.as_mut().rust_mut().video_preview = Some(preview);
+            self.as_mut().set_video_preview_active(true);
+            true
+        }
+    }
+
+    /// Stop the settings preview capture if it is running, and blank what it
+    /// was drawing to.
+    ///
+    /// Idempotent. The blank matters as much as the stop: without it the last
+    /// captured frame stays on the surface, which reads as a camera that is
+    /// still on — the one impression a preview must never leave behind.
+    fn stop_video_preview(mut self: Pin<&mut Self>) {
+        let Some(preview) = self.as_mut().rust_mut().video_preview.take() else {
+            // Nothing of ours is running. Deliberately no clear here: a call's
+            // capture may be feeding the same surface, and blanking that would
+            // wipe live video.
+            self.as_mut().set_video_preview_active(false);
+            return;
+        };
+        preview.stop();
+        let id = self.rust().my_public_id.clone();
+        if !id.is_empty() {
+            crate::video::sink::clear_peer(&id);
+        }
+        self.as_mut().set_video_preview_active(false);
     }
 
     /// Stop the local camera if running and announce camera-off to the room.
@@ -2547,6 +2675,15 @@ impl ffi::AppBridge {
     /// Called when the local voice/video session ends so a subsequent join
     /// cannot reuse stale decoder state (or paint a previous peer's last frame).
     fn reset_inbound_video(mut self: Pin<&mut Self>) {
+        // Announce each one off rather than only dropping the record: the UI
+        // keeps its own streaming map (the video region cannot read model
+        // roles), and nothing else would ever tell it these peers stopped.
+        let streaming: Vec<String> = self.rust().peer_video_active.iter().cloned().collect();
+        self.as_mut().rust_mut().peer_video_active.clear();
+        for id in streaming {
+            self.as_mut()
+                .peer_video_state_changed(QString::from(id.as_str()), false);
+        }
         if let Some(rx) = self.rust().video_receiver.as_ref() {
             rx.forget_all();
         }
@@ -2563,9 +2700,17 @@ impl ffi::AppBridge {
     /// Drop one peer's decoder and blank their tile(s).
     ///
     /// Used when a remote peer leaves the room or turns their camera off.
-    fn forget_peer_video(self: Pin<&mut Self>, peer_id: &str) {
+    fn forget_peer_video(mut self: Pin<&mut Self>, peer_id: &str) {
         if peer_id.is_empty() {
             return;
+        }
+        // Someone who leaves mid-stream sends no camera-off, so the departure
+        // is the only signal the UI will ever get that they stopped. Skipped
+        // when the record is already gone, which is the camera-off path — it
+        // emitted this itself before calling here.
+        if self.as_mut().rust_mut().peer_video_active.remove(peer_id) {
+            self.as_mut()
+                .peer_video_state_changed(QString::from(peer_id), false);
         }
         if let Some(rx) = self.rust().video_receiver.as_ref() {
             rx.forget(peer_id);
@@ -5327,6 +5472,19 @@ fn emit_member_list_json(
     let my_public_id = bridge.rust().my_public_id.clone();
     let my_peer_id = bridge.rust().my_peer_id.clone();
     let display_handles = bridge.rust().room_display_handles.clone();
+    // Camera state is not part of the roster the supernode sends, so it has to
+    // be re-applied here: the model is reset wholesale on every emission, and
+    // anything omitted reads as "camera off".
+    let streaming = {
+        let r = bridge.rust();
+        let mut set = r.peer_video_active.clone();
+        // Our own tile too — the local flag is authoritative for us, and the
+        // announcement we send never comes back to teach us about ourselves.
+        if r.video_active && !my_public_id.is_empty() {
+            set.insert(my_public_id.clone());
+        }
+        set
+    };
     let json = if let Some(ps) = bridge.rust().peer_store.as_ref() {
         room_participants_json(
             Some(&ps.read()),
@@ -5334,6 +5492,7 @@ fn emit_member_list_json(
             members,
             &my_peer_id,
             &my_public_id,
+            &streaming,
         )
     } else {
         room_participants_json(
@@ -5342,6 +5501,7 @@ fn emit_member_list_json(
             members,
             &my_peer_id,
             &my_public_id,
+            &streaming,
         )
     };
     if as_voice {
@@ -6093,6 +6253,7 @@ fn room_participants_json(
     ids: &[String],
     my_peer_id: &str,
     my_public_id: &str,
+    streaming: &HashSet<String>,
 ) -> String {
     serde_json::to_string(
         &ids.iter()
@@ -6120,7 +6281,10 @@ fn room_participants_json(
                     // layer. Naming them keeps that failure impossible.
                     "local_muted": false,
                     "local_volume": 100,
-                    "video_active": false,
+                    // Not roster state — carried across the reset from the last
+                    // `SfuVideoState` each member announced, since a roster
+                    // refresh must not read as everyone turning their camera off.
+                    "video_active": streaming.contains(id),
                 })
             })
             .collect::<Vec<_>>(),
@@ -7305,6 +7469,16 @@ fn dispatch_event(
         }
         ConnectionEvent::PeerVideoStateChanged { peer_id, active } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                // Remembered as well as signalled: the signal only reaches rows
+                // that exist right now, and the next roster reset would drop it.
+                {
+                    let mut r = bridge.as_mut().rust_mut();
+                    if active {
+                        r.peer_video_active.insert(peer_id.clone());
+                    } else {
+                        r.peer_video_active.remove(&peer_id);
+                    }
+                }
                 bridge
                     .as_mut()
                     .peer_video_state_changed(QString::from(peer_id.as_str()), active);

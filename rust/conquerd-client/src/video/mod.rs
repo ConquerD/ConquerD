@@ -10,6 +10,11 @@
 //! datagrams -> reassemble -> verify signature -> open seal -> decode -> QVideoSink
 //! ```
 //!
+//! "Camera" there may be several devices at once: a fragment names its stream by
+//! sender alone, so a peer gets exactly one video stream, and picture-in-picture
+//! is therefore done by merging sources into one frame before the encoder. See
+//! [`composite`].
+//!
 //! Sealing happens once per frame rather than per fragment: a partial frame
 //! cannot be decoded, so per-fragment sealing would cost 28 bytes and a GCM
 //! operation each for no gain. Authenticity likewise rides one Ed25519
@@ -18,6 +23,7 @@
 
 pub mod camera;
 pub mod codec;
+pub mod composite;
 pub mod fragment;
 pub mod frame;
 #[cfg(target_os = "windows")]

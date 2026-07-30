@@ -1049,6 +1049,10 @@ impl ConnectionManager {
     /// reads only `active` and the signed `sender`; a separate direct-only
     /// message type would be a second wire format conveying identical facts.
     pub(super) async fn send_video_state(&mut self, active: bool, direct_peer: Option<String>) {
+        // Remembered before the routing checks below, which can return without
+        // sending: this records what our camera *is*, not what we managed to
+        // announce, and that is what a later joiner has to be told.
+        self.local_video_active = active;
         let sender = self.identity.public_id();
         let mut msg = SignalingMessage::new(MessageType::SfuVideoState, sender);
 
@@ -1071,6 +1075,28 @@ impl ConnectionManager {
 
         // dispatch_outbound signs and routes (relay stream or WS fallback).
         self.dispatch_outbound(msg).await;
+    }
+
+    /// Replay our camera state to a room that just gained a member.
+    ///
+    /// `SfuVideoState` is broadcast once per toggle, so a peer who joins while
+    /// we are already streaming missed it and would show us as camera-off until
+    /// we toggled again. Announcing on join is what closes that window, and it
+    /// closes it symmetrically: the joiner learns about every member already
+    /// streaming, because each of them replays on seeing the same join.
+    ///
+    /// Only "on" is replayed. Camera-off is the state a member who never heard
+    /// from us already assumes, so re-broadcasting it would be one signed
+    /// message per join conveying nothing.
+    ///
+    /// The room is re-fanned rather than targeted at the newcomer because the
+    /// supernode relays this type to the whole room; members who already knew
+    /// simply re-apply the same value, which their UI dedupes.
+    pub(super) async fn reannounce_video_state(&mut self, room_id: &str) {
+        if !self.local_video_active || room_id != self.current_room_id {
+            return;
+        }
+        self.send_video_state(true, None).await;
     }
 
     pub(super) fn check_room_video_outbound_quota(&self, target: &str, byte_count: usize) -> bool {

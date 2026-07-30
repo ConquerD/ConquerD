@@ -64,6 +64,20 @@ pub fn list_devices() -> Vec<CameraDevice> {
     Vec::new()
 }
 
+/// Id of the device an empty `video_input_device` setting opens.
+///
+/// The empty selection means "first available camera", which
+/// [`MfCamera::open(None, ..)`](MfCamera::open) resolves to `list_devices()[0]`
+/// — so this must stay the *same* choice, not merely a plausible one. Callers
+/// use it to tell whether some other id names that same device; an empty string
+/// means there is nothing to compare against.
+pub fn default_device_id() -> String {
+    list_devices()
+        .first()
+        .map(|d| d.id.clone())
+        .unwrap_or_default()
+}
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::{CameraDevice, CameraSource};
