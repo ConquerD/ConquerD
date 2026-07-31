@@ -109,6 +109,14 @@ jobs:
         run: cargo clippy -p conquerd-client --no-default-features -- -D warnings
         working-directory: rust/conquerd-client
 
+      # Lints the macOS-only capture module from Linux. Clippy type-checks
+      # without linking, so the Rust half needs no Mac; this catches lints
+      # that fire solely under cfg(target_os = "macos") without waiting on
+      # the macOS runner. Only the Objective-C half genuinely needs macOS.
+      - name: Clippy (macOS capture module, cross-linted)
+        run: cargo clippy -p conquerd-client --no-default-features --features lint-macos -- -D warnings
+        working-directory: rust/conquerd-client
+
       # --- Security ---------------------------------------------------------
       # Lockfiles live under rust/ (two separate Cargo workspaces, not repo root).
       # The RUSTSEC-2024-0436 ignore (macOS-only wgpu-hal→metal `paste`) lives

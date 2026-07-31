@@ -174,6 +174,20 @@ webengine = ["qt-ui"]
 console = []
 # Manual developer diagnostics (live profile dump). Not compiled in CI/default test runs.
 manual-diagnostics = []
+# Type-check and lint the macOS-only capture code from a non-macOS host.
+#
+# Nobody on the team develops on a Mac, so without this the macOS backend's
+# only feedback is a CI run — and a lint that fires solely under
+# `cfg(target_os = "macos")` is invisible until then. The module is pure Rust
+# over an `extern "C"` block, and `cargo clippy` type-checks without linking, so
+# any host can compile it; only the Objective-C half genuinely needs a Mac.
+#
+#   cargo clippy -p conquerd-client --no-default-features \
+#       --features lint-macos -- -D warnings
+#
+# Never enable this for a real build: the module's `extern` symbols only exist
+# when `macos_camera.m` is compiled, so linking would fail.
+lint-macos = []
 # Experimental acoustic echo cancellation on the capture path (pure-Rust NLMS,
 # no extra dependencies). Off by default; the canceller compiles either way (so
 # its DSP unit tests always run) but is only activated at runtime when enabled.

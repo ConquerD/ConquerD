@@ -134,6 +134,16 @@ Invoke-Step 'cargo clippy (client workspace, headless, -D warnings)' {
     )
 }
 
+# The macOS capture module is cfg-gated, so a lint inside it is invisible to
+# every other platform's clippy run. This compiles it here (clippy type-checks
+# without linking, so no Mac is needed) to catch those before CI does.
+Invoke-Step 'cargo clippy (macOS capture module, cross-linted, -D warnings)' {
+    Invoke-Cargo $ClientDir @(
+        'clippy', '-p', 'conquerd-client', '--no-default-features',
+        '--features', 'lint-macos', '--', '-D', 'warnings'
+    )
+}
+
 if (-not $SkipAudit) {
     if (-not (Get-Command cargo-audit -ErrorAction SilentlyContinue)) {
         Write-Step 'Installing cargo-audit (not on PATH)'

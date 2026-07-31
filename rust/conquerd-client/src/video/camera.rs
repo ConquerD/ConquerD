@@ -627,7 +627,11 @@ mod linux_impl {
     }
 }
 
-#[cfg(target_os = "macos")]
+// Also compiled under `lint-macos` so a non-macOS host can type-check and lint
+// this module; see that feature's comment in Cargo.toml. Dead there, because
+// the re-export above stays macOS-only.
+#[cfg(any(target_os = "macos", feature = "lint-macos"))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod macos_impl {
     use super::{CameraDevice, CameraSource};
     use crate::video::frame::RawFrame;
@@ -786,7 +790,7 @@ mod macos_impl {
                     n if n < 0 => anyhow::bail!("camera capture stopped"),
                     n => {
                         let (uw, uh) = (w as u32, h as u32);
-                        let (cw, ch) = ((uw as usize + 1) / 2, (uh as usize + 1) / 2);
+                        let (cw, ch) = ((uw as usize).div_ceil(2), (uh as usize).div_ceil(2));
                         let y_len = uw as usize * uh as usize;
                         let c_len = cw * ch;
                         if n as usize != y_len + 2 * c_len {
