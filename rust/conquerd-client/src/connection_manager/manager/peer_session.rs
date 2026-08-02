@@ -36,8 +36,8 @@ use super::super::ws::supernode_ws_task;
 use super::ConnectionManager;
 
 use super::{
-    unix_now_f64, AUDIO_CHANNEL_TAG, DEFAULT_QUIC_LISTENER_PORT, PEER_RECONNECT_MAX_BACKOFF_S,
-    QUIC_PORT_FILE, QUIC_PORT_SEARCH_LIMIT, VIDEO_CHANNEL_TAG,
+    unix_now_f64, AUDIO_CHANNEL_TAG, CONTENT_AUDIO_CHANNEL_TAG, DEFAULT_QUIC_LISTENER_PORT,
+    PEER_RECONNECT_MAX_BACKOFF_S, QUIC_PORT_FILE, QUIC_PORT_SEARCH_LIMIT, VIDEO_CHANNEL_TAG,
 };
 
 pub fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
@@ -601,6 +601,78 @@ impl ConnectionManager {
             .gate_through_feature("core.video.v1", target, byte_count)
     }
 
+    #[inline]
+    pub(super) fn check_content_audio_quota(&self, target: &str, byte_count: usize) -> bool {
+        self.feature_registry
+            .gate_through_feature("core.audio.content.v1", target, byte_count)
+    }
+
+    /// Send one content-audio frame to a directly-connected peer.
+    ///
+    /// Same documented low-tag bypass as
+    /// [`send_video_datagram`](Self::send_video_datagram) / voice: real-time
+    /// datagram under `CONTENT_AUDIO_TAG`, capability + outbound quota still
+    /// honoured. **Not app-layer sealed** — direct sessions already have QUIC
+    /// mTLS confidentiality and no untrusted relay on path (room content audio
+    /// is sealed; see `send_room_content_audio`).
+    ///
+    /// The per-frame signature still runs so the receiver has one verification
+    /// path for both transports, and so a `pts_us` shift cannot pass as a
+    /// legitimate frame.
+    pub(super) async fn send_content_audio_datagram(
+        &mut self,
+        peer_id: &str,
+        opus: Vec<u8>,
+        pts_us: u64,
+    ) {
+        let Some(qtx) = self.peers.get(peer_id).and_then(|c| c.quic_out_tx.clone()) else {
+            return; // No QUIC (or no peer): drop. Content audio never falls back to WS.
+        };
+
+        let sender = self.identity.public_id();
+        let seq = self
+            .direct_content_audio_seq
+            .get(peer_id)
+            .copied()
+            .unwrap_or(0);
+        let conv_id = crate::video::direct_conv_id(&sender, peer_id);
+        let signing_bytes = crate::content_audio::content_audio_signing_bytes(
+            &conv_id, &sender, seq, pts_us, &opus,
+        );
+        let sig_vec = self.identity.sign(&signing_bytes);
+        let Ok(signature) = <[u8; crate::content_audio::SIGNATURE_LEN]>::try_from(&sig_vec[..])
+        else {
+            return;
+        };
+
+        let Some(frame) =
+            crate::content_audio::encode_frame(&sender, seq, pts_us, &signature, &opus)
+        else {
+            warn!("[core.audio.content.v1] could not encode frame; dropping");
+            return;
+        };
+
+        // +1 for the channel tag that rides ahead of the frame.
+        if !self.check_content_audio_quota(peer_id, frame.len() + 1) {
+            debug!(
+                "[core.audio.content.v1] outbound quota exceeded for {}; dropping frame",
+                &peer_id[..8.min(peer_id.len())]
+            );
+            return;
+        }
+
+        self.direct_content_audio_seq
+            .insert(peer_id.to_owned(), seq.wrapping_add(1));
+
+        let mut framed = Vec::with_capacity(1 + frame.len());
+        framed.push(CONTENT_AUDIO_CHANNEL_TAG);
+        framed.extend_from_slice(&frame);
+        if qtx.try_send(PeerOutbound::Datagram(framed)).is_err() {
+            use super::super::internal::drop_metrics;
+            drop_metrics::note(&drop_metrics::PEER_OUTBOUND);
+        }
+    }
+
     /// Send one encoded video frame to a directly-connected peer.
     ///
     /// Extends the same documented bypass as
@@ -627,6 +699,7 @@ impl ConnectionManager {
         encoded: Vec<u8>,
         keyframe: bool,
         codec: conquerd_features::video_codec::VideoCodec,
+        pts_us: u64,
     ) {
         // Clone the sender handle so the `self.peers` borrow ends before the
         // per-peer sequence counter is advanced below.
@@ -637,8 +710,9 @@ impl ConnectionManager {
         let sender = self.identity.public_id();
         let seq = self.direct_video_seq.get(peer_id).copied().unwrap_or(0);
         let conv_id = crate::video::direct_conv_id(&sender, peer_id);
-        let signing_bytes =
-            crate::video::video_frame_signing_bytes(&conv_id, &sender, seq, codec, &encoded);
+        let signing_bytes = crate::video::video_frame_signing_bytes(
+            &conv_id, &sender, seq, codec, pts_us, &encoded,
+        );
         let sig_vec = self.identity.sign(&signing_bytes);
         let Ok(signature) = <[u8; crate::video::fragment::SIGNATURE_LEN]>::try_from(&sig_vec[..])
         else {
@@ -648,7 +722,7 @@ impl ConnectionManager {
         // One byte of channel tag rides ahead of each fragment.
         let budget = crate::video::DEFAULT_MAX_DATAGRAM.saturating_sub(1);
         let Some(fragments) = crate::video::fragment::fragment_frame(
-            &sender, seq, keyframe, codec, &signature, &encoded, budget,
+            &sender, seq, keyframe, codec, pts_us, &signature, &encoded, budget,
         ) else {
             warn!(
                 "[core.video.v1] frame of {}B does not fit the fragment budget; dropping",

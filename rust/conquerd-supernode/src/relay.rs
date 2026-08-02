@@ -1497,6 +1497,34 @@ mod tests {
     /// This test exists because that behaviour is load-bearing but invisible:
     /// adding an arm above the generic broadcast, or making the audio bridge
     /// match more broadly, would silently break room video.
+    /// Content audio is the newest media tag and must inherit the same
+    /// opacity: the supernode routes it and meters its bytes, but never parses
+    /// the frame — which would mean reading a presentation timestamp it has no
+    /// business knowing, on content it cannot decrypt anyway.
+    #[test]
+    fn room_content_audio_is_forwarded_opaquely_without_a_dedicated_arm() {
+        use conquerd_features::channel_frame::{encode_frame, ROOM_CONTENT_AUDIO_TAG};
+
+        // A sealed frame: not valid UTF-8, let alone JSON, so any path that
+        // tried to parse it would fail here.
+        let frame = [0x01u8, 0x00, 0xFF, 0x80, 0xFE, 0x7F];
+        let payload = encode_frame(ROOM_CONTENT_AUDIO_TAG, &frame);
+
+        let (fid, bytes) = relay_datagram_feature(&payload);
+        assert_eq!(fid, "room.audio.content.sfu");
+        assert_eq!(bytes, payload.len());
+
+        // It must not be mistaken for the voice stream — that would put it
+        // through the active-speaker gate and the voice quota bucket.
+        assert_ne!(fid, "room.audio.sfu");
+        assert_ne!(fid, "room.video.sfu");
+        assert_ne!(fid, "game.relay.v1");
+
+        // The JSON room-id extractor is only reached for room *voice*; it must
+        // decline rather than panic on these bytes.
+        assert_eq!(room_id_from_room_audio_payload(&payload), None);
+    }
+
     #[test]
     fn room_video_is_forwarded_opaquely_without_a_dedicated_arm() {
         use conquerd_features::channel_frame::{encode_frame, ROOM_VIDEO_TAG};

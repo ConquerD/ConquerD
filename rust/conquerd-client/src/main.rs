@@ -25,6 +25,10 @@ mod chat_store;
 mod cluster;
 mod connection_fallback;
 mod connection_manager;
+mod content_audio;
+mod content_capture;
+mod content_playout;
+mod content_sender;
 mod crypto;
 mod error;
 mod feature_trust;
@@ -33,6 +37,8 @@ mod github_updater;
 mod group_key;
 mod identity;
 mod logging;
+mod media_clock;
+mod media_sync;
 #[cfg(feature = "qt-ui")]
 mod metrics;
 mod network_monitor;
@@ -1259,6 +1265,7 @@ async fn handle_event(
         // Headless has no display, so video has nowhere to go and no camera to
         // send from — the indicator and keyframe events are equally moot.
         | ConnectionEvent::VideoFrameReceived { .. }
+        | ConnectionEvent::ContentAudioReceived { .. }
         | ConnectionEvent::PeerVideoStateChanged { .. }
         | ConnectionEvent::VideoKeyframeRequested { .. }
         | ConnectionEvent::AvatarConfigUpdated { .. }

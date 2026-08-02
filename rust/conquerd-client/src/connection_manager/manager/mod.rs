@@ -35,7 +35,8 @@ use crate::identity::Identity;
 use crate::peer_store::PeerStore;
 use crate::protocol::{MessageType, SignalingMessage};
 use crate::quic_relay_client::{
-    QuicRelayClient, RelayGameInbound, RelaySignalingInbound, RelayVideoInbound,
+    QuicRelayClient, RelayContentAudioInbound, RelayGameInbound, RelaySignalingInbound,
+    RelayVideoInbound,
 };
 use crate::quic_tls;
 use crate::web_app_client::{self, WebAppResponse};
@@ -79,6 +80,7 @@ pub(super) const ROOM_JOIN_MAX_ATTEMPTS: u8 = 8;
 pub(super) const DIRECT_CALL_FALLBACK_GRACE_S: u64 = 5;
 pub(super) const AUDIO_CHANNEL_TAG: u8 = channel_frame::AUDIO_TAG;
 pub(super) const VIDEO_CHANNEL_TAG: u8 = channel_frame::VIDEO_TAG;
+pub(super) const CONTENT_AUDIO_CHANNEL_TAG: u8 = channel_frame::CONTENT_AUDIO_TAG;
 /// Minimum gap between keyframe requests to the same peer.
 ///
 /// One second is the standard choice: long enough that a burst of undecodable
@@ -217,6 +219,10 @@ pub struct ConnectionManager {
     relay_video_tx: mpsc::UnboundedSender<RelayVideoInbound>,
     /// Receiver side of [`Self::relay_video_tx`], polled in the run loop.
     relay_video_rx: mpsc::UnboundedReceiver<RelayVideoInbound>,
+    /// Sender for inbound `room.audio.content.sfu` frames from the relay.
+    relay_content_audio_tx: mpsc::UnboundedSender<RelayContentAudioInbound>,
+    /// Receiver side of [`Self::relay_content_audio_tx`].
+    relay_content_audio_rx: mpsc::UnboundedReceiver<RelayContentAudioInbound>,
     /// Sender-keys group keying for E2E room audio + room chat. The room's
     /// elected keyer (see [`Self::sync_room_membership`]) generates/rotates
     /// epoch keys and seals them to members over `SfuGroupKey`; every member
@@ -234,10 +240,19 @@ pub struct ConnectionManager {
     /// `MediaKind` domain separator in `group_key` is what stops the two
     /// counters colliding in the AEAD's associated data.
     room_video_seq: u32,
+    /// Per-stream counter for outbound room content audio. Separate from the
+    /// voice counter: they are different streams, and sharing a sequence space
+    /// would let a captured frame of one be replayed as the other.
+    room_content_audio_seq: u32,
     /// Per-frame counter for outbound direct video, keyed by peer id. Direct
     /// calls are 1:1 but several can be live at once, and each needs its own
     /// monotonic sequence for the receiver's reassembly ordering.
     direct_video_seq: HashMap<String, u32>,
+    /// Per-stream counter for outbound direct content audio, keyed by peer id.
+    /// Separate from `direct_video_seq`: the two streams are independent, and
+    /// sharing a sequence space would let a captured frame of one be replayed
+    /// as the other under a mismatched media kind.
+    direct_content_audio_seq: HashMap<String, u32>,
     /// Reassembles inbound video fragments from every sender, direct and room
     /// alike. One instance covers both paths because the fragment format is
     /// identical and its own per-sender caps bound the memory.
@@ -364,6 +379,8 @@ impl ConnectionManager {
             mpsc::unbounded_channel::<RelaySignalingInbound>();
         let (relay_game_tx, relay_game_rx) = mpsc::unbounded_channel::<RelayGameInbound>();
         let (relay_video_tx, relay_video_rx) = mpsc::unbounded_channel::<RelayVideoInbound>();
+        let (relay_content_audio_tx, relay_content_audio_rx) =
+            mpsc::unbounded_channel::<RelayContentAudioInbound>();
 
         let mgr = Self {
             identity,
@@ -403,12 +420,16 @@ impl ConnectionManager {
             relay_game_rx,
             relay_video_tx,
             relay_video_rx,
+            relay_content_audio_tx,
+            relay_content_audio_rx,
             room_relay_fail_streak: 0,
             room_relay_cooldown_frames: 0,
             group_keys: SenderKeysGroup::new(),
             room_group_members: HashMap::new(),
             room_audio_seq: 0,
             room_video_seq: 0,
+            room_content_audio_seq: 0,
+            direct_content_audio_seq: HashMap::new(),
             direct_video_seq: HashMap::new(),
             video_reassembler: crate::video::fragment::Reassembler::new(),
             video_keyframe_last: HashMap::new(),
@@ -521,6 +542,7 @@ impl ConnectionManager {
             encoded,
             keyframe,
             conquerd_features::video_codec::VideoCodec::Stub,
+            0,
         )
         .await;
     }
@@ -533,11 +555,28 @@ impl ConnectionManager {
     }
 
     #[cfg(test)]
+    pub(super) async fn test_send_room_content_audio(&mut self, opus: Vec<u8>, pts_us: u64) {
+        self.send_room_content_audio(opus, pts_us).await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn test_send_content_audio_datagram(
+        &mut self,
+        peer_id: &str,
+        opus: Vec<u8>,
+        pts_us: u64,
+    ) {
+        self.send_content_audio_datagram(peer_id, opus, pts_us)
+            .await;
+    }
+
+    #[cfg(test)]
     pub(super) async fn test_send_room_video(&mut self, encoded: Vec<u8>, keyframe: bool) {
         self.send_room_video(
             encoded,
             keyframe,
             conquerd_features::video_codec::VideoCodec::Stub,
+            0,
         )
         .await;
     }
@@ -831,11 +870,22 @@ impl ConnectionManager {
                         ConnectionCommand::SendRoomAudio { opus_data } => {
                             self.send_room_audio(opus_data).await;
                         }
-                        ConnectionCommand::SendVideoFrame { peer_id, encoded, keyframe, codec } => {
-                            self.send_video_datagram(&peer_id, encoded, keyframe, codec).await;
+                        ConnectionCommand::SendVideoFrame { peer_id, encoded, keyframe, codec, pts_us } => {
+                            self.send_video_datagram(&peer_id, encoded, keyframe, codec, pts_us).await;
                         }
-                        ConnectionCommand::SendRoomVideo { encoded, keyframe, codec } => {
-                            self.send_room_video(encoded, keyframe, codec).await;
+                        ConnectionCommand::SendRoomVideo { encoded, keyframe, codec, pts_us } => {
+                            self.send_room_video(encoded, keyframe, codec, pts_us).await;
+                        }
+                        ConnectionCommand::SendContentAudio {
+                            peer_id,
+                            opus,
+                            pts_us,
+                        } => {
+                            self.send_content_audio_datagram(&peer_id, opus, pts_us)
+                                .await;
+                        }
+                        ConnectionCommand::SendRoomContentAudio { opus, pts_us } => {
+                            self.send_room_content_audio(opus, pts_us).await;
                         }
                         ConnectionCommand::SendVideoState { active, direct_peer } => {
                             self.send_video_state(active, direct_peer).await;
@@ -1093,6 +1143,25 @@ impl ConnectionManager {
                         );
                     } else {
                         self.accept_video_fragment(&sn, &video.fragment, true).await;
+                    }
+                }
+                Some(item) = self.relay_content_audio_rx.recv() => {
+                    // Charged against the relaying supernode for the same
+                    // reason video is: the real sender is not known until the
+                    // frame parses, and metering a self-declared id would let
+                    // one peer spend another's budget.
+                    let sn = item.supernode_id.clone();
+                    if !self.check_inbound_feature_quota(
+                        "room.audio.content.sfu",
+                        &sn,
+                        item.frame.len(),
+                    ) {
+                        debug!(
+                            "[room.audio.content.sfu] inbound quota exceeded via {}; dropping",
+                            &sn[..8.min(sn.len())]
+                        );
+                    } else {
+                        self.accept_content_audio_frame(&sn, &item.frame, true).await;
                     }
                 }
                 // Accept incoming QUIC connections
@@ -1409,6 +1478,24 @@ impl ConnectionManager {
                                 .await;
                         }
                     }
+                    // Direct peer content audio: one timestamped Opus frame
+                    // under CONTENT_AUDIO_TAG. Same per-arrival quota posture
+                    // as video — shed a flood before decoding or buffering.
+                    Some(FrameClass::ContentAudio(frame)) => {
+                        if !self.check_inbound_feature_quota(
+                            "core.audio.content.v1",
+                            &canonical_peer_id,
+                            frame.len(),
+                        ) {
+                            debug!(
+                                "[core.audio.content.v1] inbound quota exceeded for {}; dropping",
+                                &canonical_peer_id[..8.min(canonical_peer_id.len())]
+                            );
+                        } else {
+                            self.accept_content_audio_frame(&canonical_peer_id, frame, false)
+                                .await;
+                        }
+                    }
                     // Chat / file / control all carry signed JSON; route
                     // through the common inbound path (signature + replay +
                     // freshness checks, then feature dispatch). The channel
@@ -1605,6 +1692,7 @@ impl ConnectionManager {
         let relay_signaling_tx = self.relay_signaling_tx.clone();
         let relay_game_tx = self.relay_game_tx.clone();
         let relay_video_tx = self.relay_video_tx.clone();
+        let relay_content_audio_tx = self.relay_content_audio_tx.clone();
         let sn_id_for_task = supernode_id.clone();
         tokio::spawn(async move {
             let client = match QuicRelayClient::connect(
@@ -1616,6 +1704,7 @@ impl ConnectionManager {
                     signaling: relay_signaling_tx,
                     game: Some(relay_game_tx),
                     video: Some(relay_video_tx),
+                    content_audio: Some(relay_content_audio_tx),
                 },
                 portal_only,
             )

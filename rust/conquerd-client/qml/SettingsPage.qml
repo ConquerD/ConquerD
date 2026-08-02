@@ -566,6 +566,54 @@ Item {
                                 cameraCard.applyCameraSettings()
                             }
                         }
+
+                        Label { text: "Audio"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        // The share button asks about audio each time it starts
+                        // a share, and writes the answer back here — so this is
+                        // the pre-selected default rather than a separate
+                        // setting that could disagree with what was chosen.
+                        ComboBox {
+                            id: contentAudioCombo
+                            Layout.fillWidth: true
+                            // "Follow" is first because it is right almost
+                            // always: sharing an app sends that app's sound,
+                            // sharing a screen sends the machine's, and a camera
+                            // sends none — your microphone already carries you.
+                            model: [
+                                "Follow the shared source",
+                                "This computer's audio",
+                                "No audio"
+                            ]
+                            property var keys: ["auto", "system", "off"]
+                            onActivated: {
+                                if (!root.settings) return
+                                root.settings.content_audio_mode = keys[currentIndex] || "auto"
+                            }
+                        }
+
+                        // Empty cell keeps the two-column grid aligned.
+                        Item {}
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            color: Theme.muted
+                            font.pixelSize: Theme.fontTiny
+                            text: {
+                                var dev = root.settings ? root.settings.video_input_device : ""
+                                var isScreen = dev.indexOf("window:") === 0
+                                var isMonitor = dev.indexOf("monitor:") === 0
+                                var mode = root.settings ? root.settings.content_audio_mode : "auto"
+                                if (mode === "off")
+                                    return qsTr("Shared video will be silent.")
+                                if (mode === "system")
+                                    return qsTr("Everything this computer plays is shared, whatever the source.")
+                                if (isScreen)
+                                    return qsTr("Only the shared application's audio is sent.")
+                                if (isMonitor)
+                                    return qsTr("Everything this computer plays is sent.")
+                                return qsTr("A camera shares no extra audio — your microphone already carries you.")
+                            }
+                        }
                     }
 
                     // Preview of the selected source.
@@ -718,6 +766,8 @@ Item {
                         cameraCombo.currentIndex = idx
                         var q = qualityCombo.keys.indexOf(root.settings.video_quality)
                         qualityCombo.currentIndex = q >= 0 ? q : 1
+                        var a = contentAudioCombo.keys.indexOf(root.settings.content_audio_mode)
+                        contentAudioCombo.currentIndex = a >= 0 ? a : 0
                     }
 
                     // Settings are loaded from disk in MainWindow's own
@@ -729,6 +779,7 @@ Item {
                         target: root.settings
                         function onVideo_input_deviceChanged() { cameraCard.syncFromSettings() }
                         function onVideo_qualityChanged() { cameraCard.syncFromSettings() }
+                        function onContent_audio_modeChanged() { cameraCard.syncFromSettings() }
                     }
 
                     Component.onCompleted: cameraCard.reloadCameras()

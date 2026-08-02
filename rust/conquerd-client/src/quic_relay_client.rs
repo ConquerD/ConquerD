@@ -86,6 +86,20 @@ pub struct RelayInboundSinks {
     pub game: Option<UnboundedSender<RelayGameInbound>>,
     /// `room.video.sfu` fragments, pre-reassembly.
     pub video: Option<UnboundedSender<RelayVideoInbound>>,
+    /// `room.audio.content.sfu` frames — system/application audio that
+    /// accompanies video, kept separate from the voice lane.
+    pub content_audio: Option<UnboundedSender<RelayContentAudioInbound>>,
+}
+
+/// One `room.audio.content.sfu` frame received over a QUIC relay.
+///
+/// Whole frames rather than fragments: one Opus frame always fits a datagram,
+/// so unlike video there is nothing to reassemble. Verification and unsealing
+/// happen in the connection manager, which owns the keys.
+#[derive(Debug, Clone)]
+pub struct RelayContentAudioInbound {
+    pub supernode_id: String,
+    pub frame: Vec<u8>,
 }
 
 /// One `room.video.sfu` fragment received over a QUIC relay.
@@ -171,6 +185,7 @@ impl QuicRelayClient {
             signaling: reinject_tx,
             game: game_tx,
             video: video_tx,
+            content_audio: content_audio_tx,
         } = sinks;
         let supernode_id = supernode_id.into();
         let addr: SocketAddr = format!("{host}:{port}")
@@ -217,14 +232,21 @@ impl QuicRelayClient {
         let shutdown_dgram = shutdown.clone();
         let sn_id_dgram = supernode_id.clone();
         let sn_short_dgram = supernode_id[..12.min(supernode_id.len())].to_owned();
-        let reinject_dgram = reinject_tx.clone();
+        // Reassembled rather than passed field-by-field: these four channels
+        // are exactly what the datagram loop fans to, and naming them once
+        // keeps that list from growing into a positional argument soup as
+        // media types are added.
+        let dgram_sinks = RelayInboundSinks {
+            signaling: reinject_tx.clone(),
+            game: game_tx,
+            video: video_tx,
+            content_audio: content_audio_tx,
+        };
         tokio::spawn(async move {
             recv_room_datagrams(
                 conn_dgram,
                 shutdown_dgram,
-                reinject_dgram,
-                game_tx,
-                video_tx,
+                dgram_sinks,
                 sn_id_dgram,
                 sn_short_dgram,
             )
@@ -350,6 +372,19 @@ impl QuicRelayClient {
     /// worth less than the head-of-line blocking a reliable retry would cost.
     pub fn send_room_video(&self, fragment: &[u8]) -> bool {
         self.send_broadcast_tagged(ROOM_VIDEO_TAG, fragment)
+    }
+
+    /// Send one room content-audio frame for opaque SFU fan-out.
+    ///
+    /// Like room video and unlike room *voice*, there is no WebSocket
+    /// fallback: this stream exists to be synchronised with video, and a frame
+    /// that arrives late through a reliable retry is worse than one that never
+    /// arrives — it would drag the whole timeline with it.
+    pub fn send_room_content_audio(&self, frame: &[u8]) -> bool {
+        self.send_broadcast_tagged(
+            conquerd_features::channel_frame::ROOM_CONTENT_AUDIO_TAG,
+            frame,
+        )
     }
 
     /// Usable fragment payload for this connection, after the relay's index and
@@ -482,12 +517,16 @@ async fn drain_relay_commands(conn: Connection, shutdown: Arc<Notify>, sn_short:
 async fn recv_room_datagrams(
     conn: Connection,
     shutdown: Arc<Notify>,
-    reinject_tx: UnboundedSender<RelaySignalingInbound>,
-    game_tx: Option<UnboundedSender<RelayGameInbound>>,
-    video_tx: Option<UnboundedSender<RelayVideoInbound>>,
+    sinks: RelayInboundSinks,
     supernode_id: String,
     sn_short: String,
 ) {
+    let RelayInboundSinks {
+        signaling: reinject_tx,
+        game: game_tx,
+        video: video_tx,
+        content_audio: content_audio_tx,
+    } = sinks;
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
@@ -536,6 +575,21 @@ async fn recv_room_datagrams(
                                 {
                                     // Video queue dropped — keep reading for audio.
                                     // Losing video must never cost the call.
+                                }
+                            }
+                        } else if tag
+                            == conquerd_features::channel_frame::ROOM_CONTENT_AUDIO_TAG
+                        {
+                            if let Some(ref ctx) = content_audio_tx {
+                                if ctx
+                                    .send(RelayContentAudioInbound {
+                                        supernode_id: supernode_id.clone(),
+                                        frame: body.to_vec(),
+                                    })
+                                    .is_err()
+                                {
+                                    // Same rule as video: losing the content
+                                    // stream must never cost the voice call.
                                 }
                             }
                         }

@@ -11,6 +11,7 @@
 
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Layouts
 import QtMultimedia
 import ConquerD.Native 1.0
 import ConquerD.Client 1.0
@@ -26,9 +27,26 @@ Item {
     property bool streaming: false
     /// Show the name label and hover controls.
     property bool showChrome: true
+    /// Show the shared-audio control.
+    ///
+    /// Defaults to `showChrome` but is separable: a popout wants the audio
+    /// control without the popout/collapse buttons, and the settings preview
+    /// wants neither (it shows your own camera, which has no incoming audio).
+    property bool showAudioControl: showChrome
+    /// Level (0–200) and mute for this peer's shared application audio.
+    /// Held here so the slider survives the popup being reopened.
+    property int contentVolume: 100
+    property bool contentMuted: false
 
     signal closeRequested()
     signal popoutRequested()
+    /// Requested change to this peer's shared-audio level and mute.
+    ///
+    /// A signal rather than a direct backend call: `AppBridge` is instantiated
+    /// in MainWindow as `AppBridge { id: backend }`, and a QML `id` is scoped
+    /// to the file that declares it — `backend` is simply not in scope here.
+    /// Calling it directly silently did nothing.
+    signal contentAudioChanged(bool muted, int volume)
 
     // Tracks what we actually registered, which is not always `peerId`: when
     // peerId changes we must unregister the *previous* value, and by then the
@@ -143,7 +161,7 @@ Item {
         // hover-only popout button is present, instead of sliding out from
         // under the cursor as you reach for it.
         Row {
-            visible: root.showChrome
+            visible: root.showChrome || root.showAudioControl
             anchors {
                 right: parent.right
                 top: parent.top
@@ -170,6 +188,82 @@ Item {
                 }
                 ToolTip.text: qsTr("Pop out to its own window")
                 ToolTip.visible: popoutHover.hovered
+            }
+
+            // Volume for the audio shared *with* this video, not the peer's
+            // voice — muting a loud game must not mute the person narrating it,
+            // and muting the person must not silence what they are sharing.
+            // The two are independent; see `resolve_mix_gain`.
+            Rectangle {
+                id: audioButton
+                visible: root.showAudioControl
+                width: 26; height: 26; radius: Theme.radiusSm
+                color: root.contentMuted
+                    ? Theme.danger
+                    : (audioHover.hovered ? Theme.bg3 : Qt.rgba(0, 0, 0, 0.6))
+                Behavior on color { ColorAnimation { duration: Theme.animMicro } }
+
+                Image {
+                    anchors.centerIn: parent
+                    source: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg"
+                    sourceSize.width: 14; sourceSize.height: 14
+                    width: 14; height: 14
+                    opacity: root.contentMuted ? 0.5 : 1.0
+                }
+                HoverHandler { id: audioHover }
+                MouseArea {
+                    anchors.fill: parent
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                    cursorShape: Qt.PointingHandCursor
+                    // Left click toggles mute — the action wanted in a hurry;
+                    // right click opens the level slider.
+                    onClicked: (mouse) => {
+                        if (mouse.button === Qt.RightButton) {
+                            contentVolumePopup.open()
+                        } else {
+                            root.contentMuted = !root.contentMuted
+                            root.applyContentAudio()
+                        }
+                    }
+                }
+                ToolTip.text: root.contentMuted
+                    ? qsTr("Unmute shared audio (right-click for level)")
+                    : qsTr("Mute shared audio (right-click for level)")
+                ToolTip.visible: audioHover.hovered
+
+                Popup {
+                    id: contentVolumePopup
+                    y: parent.height + 4
+                    width: 180
+                    padding: Theme.spacingSm
+                    background: Rectangle {
+                        color: Theme.bg2
+                        border.color: Theme.border
+                        radius: Theme.radiusSm
+                    }
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 2
+                        Label {
+                            text: qsTr("Shared audio: %1%").arg(root.contentVolume)
+                            color: Theme.muted
+                            font.pixelSize: Theme.fontTiny
+                        }
+                        Slider {
+                            Layout.fillWidth: true
+                            from: 0; to: 200; stepSize: 5
+                            value: root.contentVolume
+                            onMoved: {
+                                root.contentVolume = Math.round(value)
+                                // Moving off zero is an implicit unmute: the
+                                // slider would otherwise appear to do nothing.
+                                if (root.contentVolume > 0)
+                                    root.contentMuted = false
+                                root.applyContentAudio()
+                            }
+                        }
+                    }
+                }
             }
 
             // Always visible: closing a tile must not depend on discovering a
@@ -199,5 +293,11 @@ Item {
         }
 
         HoverHandler { id: tileHover }
+
+        /// Ask the parent to push the current level and mute to the mixer.
+        function applyContentAudio() {
+            if (root.peerId)
+                root.contentAudioChanged(root.contentMuted, root.contentVolume)
+        }
     }
 }

@@ -207,6 +207,29 @@ impl FeatureModule for RoomVideoSfuModule {
     // on_message: inherits default no-op — video is handled in connection_manager.
 }
 
+/// `core.audio.content.v1` — direct peer content audio.
+///
+/// Advertisement-only, like the other media descriptors: the datagram path is
+/// dedicated rather than routed through the generic multiplexer. Registering it
+/// is what makes the client advertise `av_sync`, which is how a peer learns it
+/// can synchronise video against this stream.
+pub struct CoreContentAudioModule;
+
+impl FeatureModule for CoreContentAudioModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::core_audio_content_v1()
+    }
+}
+
+/// `room.audio.content.sfu` — content audio relayed via supernode.
+pub struct RoomContentAudioModule;
+
+impl FeatureModule for RoomContentAudioModule {
+    fn descriptor(&self) -> CapabilityDescriptor {
+        wellknown::room_audio_content_sfu()
+    }
+}
+
 /// `room.chat.v1` — advertisement-only descriptor for SFU room text chat.
 ///
 /// Advertisement-only on the desktop client: inbound `SfuChat` messages are
@@ -260,6 +283,8 @@ pub fn register_client_modules_with_video_codecs(
         Arc::new(CoreVideoModule::new(video_codecs.clone())),
         Arc::new(RoomVideoSfuModule::new(video_codecs)),
         Arc::new(RoomChatModule),
+        Arc::new(CoreContentAudioModule),
+        Arc::new(RoomContentAudioModule),
     ];
     for m in modules {
         registry.register_module(m)?;
@@ -283,6 +308,25 @@ mod tests {
         assert!(reg.get("core.video.v1").is_some());
         assert!(reg.get("room.video.sfu").is_some());
         assert!(reg.get("room.chat.v1").is_some());
+        assert!(reg.get("core.audio.content.v1").is_some());
+        assert!(reg.get("room.audio.content.sfu").is_some());
+    }
+
+    /// Content audio must advertise `av_sync`: it is the signal a peer uses to
+    /// decide whether it can slave video to this stream, and without it the
+    /// receiver correctly falls back to free-running video.
+    #[test]
+    fn content_audio_advertises_av_sync() {
+        let reg = FeatureRegistry::new();
+        register_client_modules(&reg).unwrap();
+        for id in ["core.audio.content.v1", "room.audio.content.sfu"] {
+            let desc = reg.get(id).expect("registered");
+            assert_eq!(desc.params.get("av_sync").and_then(|v| v.as_u64()), Some(1));
+            assert_eq!(
+                desc.params.get("pts_unit").and_then(|v| v.as_str()),
+                Some("us")
+            );
+        }
     }
 
     #[test]

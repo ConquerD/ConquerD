@@ -283,7 +283,17 @@ fn build_qt_ui() {
     // lib directory cxx-qt-build will link against, so the answer here matches
     // what the linker would actually find.
     fn qt_multimedia_available() -> bool {
+        // Every negative path below warns. Without that this probe produces a
+        // client that builds and runs but silently cannot show video at all —
+        // `sink::has_sink` returns false, so the decode loop skips every frame
+        // and the settings preview reports the feature missing. That has cost
+        // real debugging time, because nothing in the build output said so.
         let Some(lib_dir) = qt_lib_dir() else {
+            println!(
+                "cargo:warning=Qt lib directory not found — VIDEO WILL BE DISABLED in this \
+                 build. Set QMAKE to your qmake6 executable (or QT_DIR / CMAKE_PREFIX_PATH \
+                 to the Qt prefix) and rebuild."
+            );
             return false;
         };
         let has_lib = [
@@ -295,6 +305,12 @@ fn build_qt_ui() {
         .any(|name| lib_dir.join(name).exists())
             || lib_dir.join("QtMultimedia.framework").exists();
         if !has_lib {
+            println!(
+                "cargo:warning=Qt Multimedia not found in {} — VIDEO WILL BE DISABLED in this \
+                 build. Install the Qt Multimedia component with the Qt Maintenance Tool, or \
+                 point QMAKE at a Qt installation that has it.",
+                lib_dir.display()
+            );
             return false;
         }
         // The C++ shim needs moc, so its absence means the whole video surface

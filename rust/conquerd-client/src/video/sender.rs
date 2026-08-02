@@ -163,6 +163,41 @@ impl SourceSpec {
     }
 }
 
+/// Whether a settings `video_input_device` names a screen or window rather
+/// than a camera.
+///
+/// Split out so the audio side can ask the same question without duplicating
+/// the prefix convention that [`SourceSpec::from_device_id`] owns.
+pub fn source_is_screen(device_id: &str) -> bool {
+    matches!(
+        SourceSpec::from_device_id(device_id),
+        SourceSpec::Screen { .. }
+    )
+}
+
+/// Process behind a shared *window*, when it can be determined.
+///
+/// `None` for cameras, for monitors (no single owning process), and for a
+/// window whose handle no longer resolves — a saved id from a previous session
+/// is the common case there.
+pub fn source_process_id(device_id: &str) -> Option<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        let SourceSpec::Screen { target_id } = SourceSpec::from_device_id(device_id) else {
+            return None;
+        };
+        super::screen::list_sources()
+            .into_iter()
+            .find(|s| s.id == target_id)
+            .and_then(|s| s.pid)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = device_id;
+        None
+    }
+}
+
 /// Everything that goes into the one outgoing video stream.
 ///
 /// A peer can only *send* one stream — a fragment names its stream by sender
@@ -319,8 +354,12 @@ impl CaptureLayout {
 /// A trait rather than a channel type so the loop can be exercised in tests
 /// without a live connection manager.
 pub trait FrameSink: Send {
-    /// Hand off one encoded frame. `keyframe` rides the fragment header.
-    fn send(&mut self, encoded: Vec<u8>, keyframe: bool);
+    /// Hand off one encoded frame.
+    ///
+    /// `keyframe` and `pts_us` both ride the fragment header. `pts_us` is the
+    /// time the frame was **captured**, not the time it finished encoding —
+    /// see the stamping note on the capture loop.
+    fn send(&mut self, encoded: Vec<u8>, keyframe: bool, pts_us: u64);
 }
 
 /// Floor for adaptive bitrate control.
@@ -369,12 +408,19 @@ impl VideoSender {
     /// opening is itself blocking and can take a second or more.
     /// `preview_peer_id` is our own peer id, so the captured frame can be shown
     /// locally. `None` disables self-preview.
+    ///
+    /// `clock` is the session timeline each frame is stamped against. Pass the
+    /// *same* handle that content audio stamps from — two separately started
+    /// clocks would each look self-consistent while being mutually meaningless.
+    /// `None` means this capture is not part of a synchronised session (the
+    /// settings preview, which reaches no peer).
     pub fn start<S, E>(
         layout: CaptureLayout,
         quality: Quality,
         mut encoder: E,
         mut sink: S,
         preview_peer_id: Option<String>,
+        clock: Option<crate::media_clock::SessionMediaClock>,
     ) -> Self
     where
         S: FrameSink + 'static,
@@ -448,6 +494,18 @@ impl VideoSender {
                         }
                     };
 
+                    // Stamp *here*, on the captured frame, before preview or
+                    // encode. Stamping after the encoder would fold encode
+                    // latency into the timestamp, and since audio and video
+                    // encoders have very different latencies that shows up as a
+                    // fixed A/V skew no receiver can correct.
+                    //
+                    // No clock means no synchronised session (the settings
+                    // preview, or a build predating the media layer): zero is
+                    // then a placeholder no receiver consults, because sync is
+                    // gated on the capability being mutually advertised.
+                    let pts_us = clock.as_ref().map_or(0, |c| c.now_pts_us());
+
                     // Local self-preview, from the raw frame before encoding.
                     //
                     // Our own frames are sent to the network and never come
@@ -472,7 +530,7 @@ impl VideoSender {
                     match encoder.encode(&frame) {
                         Ok((data, keyframe)) if !data.is_empty() => {
                             count_t.fetch_add(1, Ordering::Relaxed);
-                            sink.send(data, keyframe);
+                            sink.send(data, keyframe, pts_us);
                         }
                         // Empty output is normal while a pipelined encoder
                         // fills; it is not an error and must not be logged per
@@ -519,6 +577,9 @@ impl VideoSender {
             DiscardEncoder,
             DiscardSink,
             Some(preview_peer_id),
+            // The settings preview reaches no peer, so it is not part of a
+            // synchronised session and needs no clock.
+            None,
         )
     }
 
@@ -646,14 +707,14 @@ impl VideoEncoder for DiscardEncoder {
 struct DiscardSink;
 
 impl FrameSink for DiscardSink {
-    fn send(&mut self, _encoded: Vec<u8>, _keyframe: bool) {}
+    fn send(&mut self, _encoded: Vec<u8>, _keyframe: bool, _pts_us: u64) {}
 }
 
 /// A [`FrameSink`] that forwards to a channel, for wiring into the connection
 /// manager without this module depending on it.
 pub struct ChannelSink<T> {
     tx: tokio::sync::mpsc::Sender<T>,
-    make: Box<dyn Fn(Vec<u8>, bool) -> T + Send>,
+    make: Box<dyn Fn(Vec<u8>, bool, u64) -> T + Send>,
     dropped: u32,
 }
 
@@ -661,7 +722,7 @@ impl<T: Send> ChannelSink<T> {
     /// Wrap `tx`, using `make` to build the message for each frame.
     pub fn new(
         tx: tokio::sync::mpsc::Sender<T>,
-        make: impl Fn(Vec<u8>, bool) -> T + Send + 'static,
+        make: impl Fn(Vec<u8>, bool, u64) -> T + Send + 'static,
     ) -> Self {
         Self {
             tx,
@@ -672,11 +733,15 @@ impl<T: Send> ChannelSink<T> {
 }
 
 impl<T: Send> FrameSink for ChannelSink<T> {
-    fn send(&mut self, encoded: Vec<u8>, keyframe: bool) {
+    fn send(&mut self, encoded: Vec<u8>, keyframe: bool, pts_us: u64) {
         // try_send, never blocking: stalling the capture thread on a full
         // channel would back pressure into the camera and stutter the frame
         // clock. Dropping the newest frame is the correct real-time choice.
-        if self.tx.try_send((self.make)(encoded, keyframe)).is_err() {
+        if self
+            .tx
+            .try_send((self.make)(encoded, keyframe, pts_us))
+            .is_err()
+        {
             self.dropped = self.dropped.saturating_add(1);
             // Log sparsely — at 30 fps a per-frame warning would flood.
             if self.dropped % 60 == 1 {
@@ -724,7 +789,7 @@ mod tests {
     struct RecordingSink(Arc<std::sync::Mutex<Vec<(usize, bool)>>>);
 
     impl FrameSink for RecordingSink {
-        fn send(&mut self, encoded: Vec<u8>, keyframe: bool) {
+        fn send(&mut self, encoded: Vec<u8>, keyframe: bool, _pts_us: u64) {
             self.0.lock().unwrap().push((encoded.len(), keyframe));
         }
     }
@@ -928,10 +993,10 @@ mod tests {
     fn channel_sink_drops_rather_than_blocking_when_full() {
         // Capacity 1, then push 5 frames. A blocking sink would deadlock the
         // capture thread; this must drop instead.
-        let (tx, _rx) = tokio::sync::mpsc::channel::<(Vec<u8>, bool)>(1);
-        let mut sink = ChannelSink::new(tx, |d, k| (d, k));
+        let (tx, _rx) = tokio::sync::mpsc::channel::<(Vec<u8>, bool, u64)>(1);
+        let mut sink = ChannelSink::new(tx, |d, k, p| (d, k, p));
         for _ in 0..5 {
-            sink.send(vec![0u8; 8], false);
+            sink.send(vec![0u8; 8], false, 0);
         }
         assert!(sink.dropped >= 3, "expected drops, saw {}", sink.dropped);
     }
@@ -1059,7 +1124,7 @@ mod tests {
         let frame = RawFrame::black(64, 48);
 
         let (data, kf) = enc.encode(&frame).unwrap();
-        sink.send(data, kf);
+        sink.send(data, kf, 0);
         assert_eq!(log.lock().unwrap().as_slice(), &[(3, true)]);
     }
 }

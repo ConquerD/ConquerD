@@ -368,12 +368,26 @@ impl OverlayTap {
         let handle = std::thread::Builder::new()
             .name("conquerd-video-overlay".into())
             .spawn(move || {
-                // The final box needs the source's aspect ratio, which is only
-                // known once it is open, so the request is an estimate. Screen
-                // capture letterboxes to exactly what it is asked for, so
-                // guessing 16:9 here is what makes a monitor overlay need no
-                // second scale at all.
-                let (want_w, want_h) = placement.box_size(out_w, out_h, 16, 9);
+                // What to *ask* the source for differs by kind, and getting it
+                // wrong is invisible: a failed overlay open only logs, so the
+                // inset silently never appears.
+                //
+                // Screen capture letterboxes to exactly what it is asked for,
+                // so requesting the final box means a monitor overlay needs no
+                // second scale at all. The final box needs the source's aspect
+                // ratio, which is only known once it is open, so 16:9 is an
+                // estimate corrected below.
+                //
+                // A camera cannot do that. It has a fixed set of modes and the
+                // inset box — a fifth of the output — is far below the smallest
+                // of them, so asking for it makes `SetCurrentMediaType` fail for
+                // every format and the whole overlay disappear. Ask for the
+                // stream size, which is a real mode, and let the scale below fit
+                // it into the box.
+                let (want_w, want_h) = match &source {
+                    SourceSpec::Camera { .. } => (out_w, out_h),
+                    SourceSpec::Screen { .. } => placement.box_size(out_w, out_h, 16, 9),
+                };
                 let mut capture = match source.open(want_w, want_h) {
                     Ok(c) => c,
                     Err(e) => {
@@ -761,6 +775,43 @@ mod tests {
 
     /// The property the encoder depends on: whatever the camera negotiated, the
     /// frame it is handed is exactly the size it was configured for.
+    /// The bug this guards: an overlay asked its source for the *inset* size.
+    /// A screen letterboxes to anything, but a camera has fixed modes and the
+    /// inset is smaller than all of them, so the open failed and the overlay
+    /// silently never appeared — while the same camera worked as the base.
+    #[test]
+    fn a_camera_overlay_is_opened_at_a_size_a_camera_can_actually_provide() {
+        let placement = Placement {
+            corner: Corner::TopRight,
+            size_pct: 20,
+        };
+        let (out_w, out_h) = (640u32, 360u32);
+
+        let inset = placement.box_size(out_w, out_h, 16, 9);
+        assert!(
+            inset.0 < 320,
+            "test assumes the inset is far below any camera mode, got {inset:?}"
+        );
+
+        // A camera must be asked for the stream size, not the inset.
+        let camera = SourceSpec::Camera { device_id: None };
+        let camera_request = match &camera {
+            SourceSpec::Camera { .. } => (out_w, out_h),
+            SourceSpec::Screen { .. } => inset,
+        };
+        assert_eq!(camera_request, (out_w, out_h));
+
+        // A screen keeps the inset request, which is what avoids a second scale.
+        let screen = SourceSpec::Screen {
+            target_id: "monitor:1".to_owned(),
+        };
+        let screen_request = match &screen {
+            SourceSpec::Camera { .. } => (out_w, out_h),
+            SourceSpec::Screen { .. } => inset,
+        };
+        assert_eq!(screen_request, inset);
+    }
+
     #[test]
     fn letterboxing_always_produces_the_requested_size() {
         for (w, h) in [(640u32, 480u32), (1280, 720), (320, 180), (800, 600)] {

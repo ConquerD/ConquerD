@@ -22,6 +22,8 @@
 //! | `0x05` | game relay             | `game.relay.v1`   |
 //! | `0x06` | direct video           | `core.video.v1`  |
 //! | `0x07` | room (SFU) video       | `room.video.sfu`  |
+//! | `0x08` | direct content audio   | `core.audio.content.v1` |
+//! | `0x09` | room (SFU) content audio | `room.audio.content.sfu` |
 //!
 //! The room-audio tag (`0x04`) only appears on the *relayed* datagram path
 //! (a peer's QUIC relay session to a supernode that fans the frame out to
@@ -79,6 +81,17 @@ pub const VIDEO_TAG: u8 = 0x06;
 /// Room (SFU) video (`room.video.sfu`) — unreliable datagrams on a relay
 /// session. Relay-only, mirroring [`ROOM_AUDIO_TAG`]'s role for audio.
 pub const ROOM_VIDEO_TAG: u8 = 0x07;
+/// Direct peer content audio (`core.audio.content.v1`) — system or application
+/// audio that accompanies video, carried separately from the call microphone.
+///
+/// A second audio channel rather than a mix into [`AUDIO_TAG`] because the two
+/// are different streams with different needs: content audio is stamped with a
+/// presentation timestamp so video can be synchronised to it, and it is encoded
+/// for music rather than speech. One Opus encoder cannot do both.
+pub const CONTENT_AUDIO_TAG: u8 = 0x08;
+/// Room (SFU) content audio (`room.audio.content.sfu`) — relay-only, like
+/// [`ROOM_AUDIO_TAG`] and [`ROOM_VIDEO_TAG`].
+pub const ROOM_CONTENT_AUDIO_TAG: u8 = 0x09;
 
 /// Highest fixed first-party tag. Tags above this up to
 /// [`DYNAMIC_TAG_START`](crate::channel_tag::DYNAMIC_TAG_START) stay
@@ -109,6 +122,8 @@ pub fn fixed_tag_for(feature_id: &str) -> Option<u8> {
         "game.relay.v1" => Some(GAME_RELAY_TAG),
         "core.video.v1" => Some(VIDEO_TAG),
         "room.video.sfu" => Some(ROOM_VIDEO_TAG),
+        "core.audio.content.v1" => Some(CONTENT_AUDIO_TAG),
+        "room.audio.content.sfu" => Some(ROOM_CONTENT_AUDIO_TAG),
         _ => None,
     }
 }
@@ -123,6 +138,8 @@ pub fn feature_for_fixed_tag(tag: u8) -> Option<&'static str> {
         GAME_RELAY_TAG => Some("game.relay.v1"),
         VIDEO_TAG => Some("core.video.v1"),
         ROOM_VIDEO_TAG => Some("room.video.sfu"),
+        CONTENT_AUDIO_TAG => Some("core.audio.content.v1"),
+        ROOM_CONTENT_AUDIO_TAG => Some("room.audio.content.sfu"),
         _ => None,
     }
 }
@@ -155,6 +172,9 @@ pub enum FrameClass<'a> {
     /// Direct video datagram (`0x06`); payload is one fragment of an encoded
     /// frame, headed by the `video::fragment` header (not a whole frame).
     Video(&'a [u8]),
+    /// Direct content-audio datagram (`0x08`); payload is one timestamped Opus
+    /// frame of system or application audio.
+    ContentAudio(&'a [u8]),
     /// Any other reserved/dynamic tag; carries the raw `(tag, payload)`.
     Other(u8, &'a [u8]),
 }
@@ -169,8 +189,11 @@ pub fn classify(frame: &[u8]) -> Option<FrameClass<'_>> {
         CHAT_TAG => FrameClass::Chat(rest),
         FILE_TAG => FrameClass::File(rest),
         VIDEO_TAG => FrameClass::Video(rest),
-        // ROOM_VIDEO_TAG (0x07) is deliberately absent: like ROOM_AUDIO_TAG it
-        // is relay-only and never rides the direct peer fabric.
+        CONTENT_AUDIO_TAG => FrameClass::ContentAudio(rest),
+        // ROOM_VIDEO_TAG (0x07) and ROOM_CONTENT_AUDIO_TAG (0x09) are
+        // deliberately absent: like ROOM_AUDIO_TAG they are relay-only and
+        // never ride the direct peer fabric. Falling through to `Other` is what
+        // makes the supernode forward them without parsing.
         other => FrameClass::Other(other, rest),
     })
 }

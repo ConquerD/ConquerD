@@ -71,6 +71,13 @@ pub mod ffi {
         #[qproperty(bool, mic_test_active)]
         /// True while the local camera is capturing and sending.
         #[qproperty(bool, video_active)]
+        /// True while system/application audio is being captured and sent.
+        ///
+        /// Independent of `video_active` in both directions: sharing a screen
+        /// silently is legitimate, and so is sharing audio while the camera is
+        /// off. It does require a media session, since the stream is
+        /// timestamped against that session's clock.
+        #[qproperty(bool, content_audio_active)]
         /// True while the settings preview owns the camera.
         ///
         /// Never true at the same time as `video_active`: one capture holds the
@@ -762,6 +769,29 @@ pub mod ffi {
         /// picture-in-picture insets drawn over `device_id`. Empty or `[]` gives
         /// plain single-source capture. Only one stream ever leaves this client,
         /// composited or not — see [`CaptureLayout`](crate::video::sender::CaptureLayout).
+        /// Start or stop sharing the machine's audio output.
+        ///
+        /// This is the audio the computer is *playing* — a game, a video, a
+        /// browser tab — not the call microphone, which is unaffected and keeps
+        /// its own path. Returns false when the platform has no loopback
+        /// backend or the device could not be opened.
+        ///
+        /// Requires an active media session: the stream carries timestamps on
+        /// that session's clock, which is what lets a receiver line it up with
+        /// video.
+        ///
+        /// `device_id` is the current `video_input_device` and `mode` the
+        /// `content_audio_mode` setting — the audio source is derived from the
+        /// video source unless the mode overrides it.
+        #[qinvokable]
+        #[rust_name = "set_content_audio_enabled"]
+        fn setContentAudioEnabled(
+            self: Pin<&mut AppBridge>,
+            on: bool,
+            device_id: &QString,
+            mode: &QString,
+        ) -> bool;
+
         #[qinvokable]
         #[rust_name = "set_video_enabled"]
         fn setVideoEnabled(
@@ -804,6 +834,17 @@ pub mod ffi {
         #[qinvokable]
         #[rust_name = "set_peer_audio_pref"]
         fn setPeerAudioPref(
+            self: Pin<&mut AppBridge>,
+            peer_id: &QString,
+            muted: bool,
+            volume_pct: i32,
+        );
+
+        /// Level and mute for one peer's *shared application* audio, separate
+        /// from their voice. Muting the peer themselves still silences both.
+        #[qinvokable]
+        #[rust_name = "set_content_audio_pref"]
+        fn setContentAudioPref(
             self: Pin<&mut AppBridge>,
             peer_id: &QString,
             muted: bool,
@@ -1029,6 +1070,19 @@ pub struct AppBridgeRust {
     /// to be chosen *before* the encoder is built, on the same thread that
     /// builds it. Cleared with the rest of a peer's state on disconnect.
     peer_video_codecs: HashMap<String, Vec<conquerd_features::video_codec::VideoCodec>>,
+    /// Timeline that synchronised media is stamped against, for the life of one
+    /// video session.
+    ///
+    /// `Some` exactly while a local video session is running. Content audio and
+    /// video must both stamp from *this* handle — two separately started clocks
+    /// would each look self-consistent while being mutually meaningless, which
+    /// presents as a fixed A/V offset rather than an error. See
+    /// [`crate::media_clock`] and the media-layer item in `backlog.md`.
+    ///
+    /// Video capture stamps `pts_us` from this clock on every frame; content
+    /// audio stamps from the same handle. Device/quality restarts **reuse**
+    /// the existing clock so a share already in progress does not desync.
+    media_clock: Option<crate::media_clock::SessionMediaClock>,
     /// Decode thread for inbound video, created lazily on the first frame so
     /// a client that never receives video never spawns it.
     video_receiver: Option<crate::video::receiver::VideoReceiver>,
@@ -1039,6 +1093,14 @@ pub struct AppBridgeRust {
     video_sender: Option<crate::video::sender::VideoSender>,
     /// Backing field for the `video_preview_active` Q_PROPERTY.
     video_preview_active: bool,
+    /// Backing field for the `content_audio_active` Q_PROPERTY.
+    content_audio_active: bool,
+    /// Running system-audio capture thread, `None` when not sharing.
+    ///
+    /// Dropping this stops the thread and releases the loopback endpoint, which
+    /// must happen: leaving it open holds a WASAPI client against the render
+    /// device for the life of the process.
+    content_audio_sender: Option<crate::content_sender::ContentAudioSender>,
     /// Capture thread behind the settings preview, `None` when it is off.
     ///
     /// Separate from `video_sender` so a preview can never be mistaken for a
@@ -1385,6 +1447,9 @@ impl Default for AppBridgeRust {
             video_active: false,
             peer_video_active: HashSet::new(),
             peer_video_codecs: HashMap::new(),
+            media_clock: None,
+            content_audio_active: false,
+            content_audio_sender: None,
             video_receiver: None,
             video_sender: None,
             video_preview_active: false,
@@ -2475,6 +2540,84 @@ impl ffi::AppBridge {
         QString::from(json.to_string().as_str())
     }
 
+    /// Start or stop sharing system audio. See the bridge declaration.
+    fn set_content_audio_enabled(
+        mut self: Pin<&mut Self>,
+        on: bool,
+        device_id: &QString,
+        mode: &QString,
+    ) -> bool {
+        // Stop first, which also covers the restart case.
+        if let Some(sender) = self.as_mut().rust_mut().content_audio_sender.take() {
+            sender.stop();
+        }
+        if !on {
+            self.as_mut().set_content_audio_active(false);
+            return true;
+        }
+
+        // The stream is timestamped against the media session's clock, so
+        // without a session there is nothing to synchronise it to and the
+        // timestamps would be meaningless.
+        let Some(clock) = self.rust().media_clock.clone() else {
+            warn!("[content-audio] cannot share system audio without an active media session");
+            return false;
+        };
+        let Some(conn_tx) = self.rust().conn_cmd_tx.clone() else {
+            warn!("[content-audio] backend is not initialised");
+            return false;
+        };
+
+        // Derive what to capture from the *video* source, so sharing an app
+        // shares that app's audio rather than the whole desktop. The user's
+        // mode setting can override the derivation entirely.
+        let device_id = device_id.to_string();
+        let mode = crate::content_capture::ContentAudioMode::from_setting(&mode.to_string());
+        let spec = crate::content_capture::resolve_audio_spec(
+            mode,
+            crate::video::sender::source_is_screen(&device_id),
+            crate::video::sender::source_process_id(&device_id),
+        );
+        if spec == crate::content_capture::ContentAudioSpec::None {
+            warn!(
+                "[content-audio] the current video source shares no audio \
+                 (a camera shares none by design). Set Settings > Video > Audio \
+                 to \"This computer's audio\" to share it anyway."
+            );
+            return false;
+        }
+
+        let source = match crate::content_capture::open_for(spec) {
+            Ok(s) => s,
+            Err(e) => {
+                // Expected on Linux and macOS today, so it is a warning rather
+                // than an error: the message names what the platform needs.
+                warn!("[content-audio] {e}");
+                return false;
+            }
+        };
+
+        // Same routing rule as video: room when voice is in a room (including
+        // a direct-call fallback room), otherwise the active 1:1 peer.
+        let direct_target = self.rust().direct_video_target();
+        let sender =
+            crate::content_sender::ContentAudioSender::start(source, clock, move |opus, pts_us| {
+                let cmd = match &direct_target {
+                    Some(peer_id) => ConnectionCommand::SendContentAudio {
+                        peer_id: peer_id.clone(),
+                        opus,
+                        pts_us,
+                    },
+                    None => ConnectionCommand::SendRoomContentAudio { opus, pts_us },
+                };
+                conn_tx.try_send(cmd).is_ok()
+            });
+        self.as_mut().rust_mut().content_audio_sender = Some(sender);
+        self.as_mut().set_content_audio_active(true);
+        info!("[content-audio] sharing system audio");
+        true
+    }
+
     fn set_video_enabled(
         mut self: Pin<&mut Self>,
         on: bool,
@@ -2487,14 +2630,21 @@ impl ffi::AppBridge {
         // before a new one can open it. The settings preview holds the same
         // device, so it has to go too — a call always wins over a preview of
         // one.
+        //
+        // Content audio is deliberately left running across a restart: it
+        // stamps against `media_clock`, which is reused below so A/V stays
+        // aligned. A full stop goes through the `!on` branch (or
+        // `stop_local_video`) and tears both down together.
         if let Some(sender) = self.as_mut().rust_mut().video_sender.take() {
             sender.stop();
         }
         self.as_mut().stop_video_preview();
 
         if !on {
-            self.as_mut().set_video_active(false);
-            self.as_mut().announce_video_state(false);
+            // Share the full cleanup with leave-room / end-call: content audio
+            // cannot outlive the session clock, and a half-stop that leaves
+            // capture running after the camera is off is a lifecycle leak.
+            self.as_mut().stop_local_video();
             return false;
         }
 
@@ -2595,25 +2745,25 @@ impl ffi::AppBridge {
             // priority when both look set, since a direct call that fell back to
             // a temporary room is genuinely a room session by then.
             let sink = match direct_target {
-                Some(peer_id) => {
-                    crate::video::sender::ChannelSink::new(conn_tx, move |encoded, keyframe| {
-                        ConnectionCommand::SendVideoFrame {
-                            peer_id: peer_id.clone(),
-                            encoded,
-                            keyframe,
-                            codec,
-                        }
-                    })
-                }
-                None => {
-                    crate::video::sender::ChannelSink::new(conn_tx, move |encoded, keyframe| {
-                        ConnectionCommand::SendRoomVideo {
-                            encoded,
-                            keyframe,
-                            codec,
-                        }
-                    })
-                }
+                Some(peer_id) => crate::video::sender::ChannelSink::new(
+                    conn_tx,
+                    move |encoded, keyframe, pts_us| ConnectionCommand::SendVideoFrame {
+                        peer_id: peer_id.clone(),
+                        encoded,
+                        keyframe,
+                        codec,
+                        pts_us,
+                    },
+                ),
+                None => crate::video::sender::ChannelSink::new(
+                    conn_tx,
+                    move |encoded, keyframe, pts_us| ConnectionCommand::SendRoomVideo {
+                        encoded,
+                        keyframe,
+                        codec,
+                        pts_us,
+                    },
+                ),
             };
 
             // Our own id, so the capture thread can feed the local preview tile.
@@ -2621,8 +2771,26 @@ impl ffi::AppBridge {
                 let id = self.rust().my_public_id.clone();
                 (!id.is_empty()).then_some(id)
             };
+            // One clock for the whole media session. Reuse across device/quality
+            // restarts so content audio that is already stamping against it does
+            // not get a permanently offset twin; only mint a new one when none
+            // exists (fresh share). Dropped in `stop_local_video` so the next
+            // session starts from zero.
+            let clock = if let Some(existing) = self.rust().media_clock.clone() {
+                existing
+            } else {
+                let clock = crate::media_clock::SessionMediaClock::start();
+                self.as_mut().rust_mut().media_clock = Some(clock.clone());
+                clock
+            };
+
             let sender = crate::video::sender::VideoSender::start(
-                layout, quality, encoder, sink, preview_id,
+                layout,
+                quality,
+                encoder,
+                sink,
+                preview_id,
+                Some(clock),
             );
             self.as_mut().rust_mut().video_sender = Some(sender);
             self.as_mut().set_video_active(true);
@@ -2724,6 +2892,18 @@ impl ffi::AppBridge {
         if let Some(sender) = self.as_mut().rust_mut().video_sender.take() {
             sender.stop();
         }
+        // Content audio is stamped against this session's clock, so it cannot
+        // outlive it — its timestamps would be relative to a clock nobody
+        // holds. Stopped before the clock is dropped, not after.
+        if let Some(sender) = self.as_mut().rust_mut().content_audio_sender.take() {
+            sender.stop();
+        }
+        self.as_mut().set_content_audio_active(false);
+
+        // Drop the media clock with the session that owned it. A clock must
+        // never outlive its session: the next one has to start from zero, or
+        // the receiver would see a timeline that jumps.
+        self.as_mut().rust_mut().media_clock = None;
         if had_sender || was_active {
             self.as_mut().set_video_active(false);
             self.as_mut().announce_video_state(false);
@@ -2831,6 +3011,34 @@ impl ffi::AppBridge {
             .to_string()
             .as_str(),
         )
+    }
+
+    /// Set the level and mute for one peer's *shared application* audio.
+    ///
+    /// Separate from [`set_peer_audio_pref`](Self::set_peer_audio_pref) so a
+    /// listener can turn a loud game down without losing the person talking
+    /// over it. Muting the *peer* still silences both — see `resolve_mix_gain`.
+    fn set_content_audio_pref(
+        self: Pin<&mut Self>,
+        peer_id: &QString,
+        muted: bool,
+        volume_pct: i32,
+    ) {
+        let id = peer_id.to_string();
+        if id.is_empty() {
+            return;
+        }
+        let volume = volume_pct.clamp(0, 200);
+        if let Some(tx) = self.rust().call_cmd_tx.clone() {
+            let _ = tx.try_send(CallCommand::SetContentMuted {
+                peer_id: id.clone(),
+                muted,
+            });
+            let _ = tx.try_send(CallCommand::SetContentVolume {
+                peer_id: id,
+                pct: volume as u32,
+            });
+        }
     }
 
     fn set_peer_audio_pref(self: Pin<&mut Self>, peer_id: &QString, muted: bool, volume_pct: i32) {
@@ -6400,6 +6608,18 @@ fn video_codecs_from_caps_json(caps_json: &str) -> Vec<conquerd_features::video_
 fn pick_direct_video_codec(
     peer_codecs: &[conquerd_features::video_codec::VideoCodec],
 ) -> Option<conquerd_features::video_codec::VideoCodec> {
+    // An *empty* list means "we have not heard what this peer speaks", which is
+    // not the same as "this peer speaks nothing we do". Treating the two alike
+    // silently refused to start the camera whenever the capability announce had
+    // not arrived yet, or came from a build using the previous capability id —
+    // the caller sees only that video stopped working.
+    //
+    // Unknown therefore falls back to our own preferred codec and sends. A
+    // receiver that cannot decode it drops the frames and says so in its log,
+    // which is a far better failure than a camera that never turns on.
+    if peer_codecs.is_empty() {
+        return pick_room_video_codec();
+    }
     conquerd_features::video_codec::negotiate(&crate::video::codec::available_codecs(), peer_codecs)
 }
 
@@ -7530,11 +7750,31 @@ fn dispatch_event(
                 emit_peers_updated(bridge.as_mut());
             });
         }
+        ConnectionEvent::ContentAudioReceived {
+            peer_id,
+            opus,
+            pts_us,
+            seq,
+        } => {
+            // Straight to the call controller: it owns the 20 ms playout tick
+            // that both mixes this to the speaker and anchors the A/V timeline.
+            let _ = qt_thread.queue(move |bridge: Pin<&mut ffi::AppBridge>| {
+                if let Some(ref tx) = bridge.rust().call_cmd_tx {
+                    let _ = tx.try_send(crate::call_controller::CallCommand::ContentAudioInbound {
+                        peer_id,
+                        seq,
+                        pts_us,
+                        opus,
+                    });
+                }
+            });
+        }
         ConnectionEvent::VideoFrameReceived {
             peer_id,
             encoded,
             keyframe,
             codec,
+            pts_us,
         } => {
             // Hand straight to the decode thread. Decoding here would run on
             // the connection-manager task; decoding after the Qt hop would run
@@ -7565,10 +7805,18 @@ fn dispatch_event(
                             }
                         },
                     );
+                    // The call controller anchors the sync timeline from its
+                    // own playout tick, so it needs the same state this
+                    // receiver holds video against.
+                    if let Some(ref tx) = bridge.rust().call_cmd_tx {
+                        let _ = tx.try_send(crate::call_controller::CallCommand::SetVideoPlayout(
+                            receiver.playout(),
+                        ));
+                    }
                     bridge.as_mut().rust_mut().video_receiver = Some(receiver);
                 }
                 if let Some(rx) = bridge.rust().video_receiver.as_ref() {
-                    rx.submit(&peer_id, encoded, keyframe, codec);
+                    rx.submit(&peer_id, encoded, keyframe, codec, pts_us);
                 }
             });
         }

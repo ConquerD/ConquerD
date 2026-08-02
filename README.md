@@ -107,6 +107,12 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Qt 6.x (e.g. `C:\Qt\6.8.3\msvc2022_64`); set `QMAKE` or `CMAKE_PREFIX_PATH`. Qt WebEngine is optional but required for the in-app supernode portal.
 - A working audio input/output device
 - No server, no account, no sign-up required
+- **Git submodules** — two C libraries are vendored (libopus and libvpx), so a plain `git clone` is not enough:
+  ```bash
+  git submodule update --init --recursive
+  ```
+- **CMake** (builds libopus) and **perl** (generates libvpx's runtime-dispatch headers). Perl ships with Git for Windows and is in the base install on Linux and macOS; the build finds it automatically.
+- **Linux only:** `libasound2-dev libdbus-1-dev libclang-dev` (the last is for the V4L2 camera bindings).
 - **Opus DNN model data** (for DRED + OSCE neural features, enabled by default): run once before building —
   ```powershell
   powershell -ExecutionPolicy Bypass -File scripts/fetch_opus_weights.ps1
@@ -913,7 +919,7 @@ cargo build --release -p conquerd-supernode
 cargo build --release -p conquerd-installer
 ```
 
-`conquerd-client` lives in its own Cargo workspace (`rust/conquerd-client/Cargo.toml`) so Qt/CXX-Qt dependencies stay isolated from server-side builds. The outer workspace (`rust/Cargo.toml`) contains `conquerd-features`, `conquerd-supernode`, `conquerd-installer`, and `conquerd-opus`. The cluster-operations tool is a third workspace at `rust/conquerd-supernode-manager/`.
+`conquerd-client` lives in its own Cargo workspace (`rust/conquerd-client/Cargo.toml`) so Qt/CXX-Qt dependencies stay isolated from server-side builds. The outer workspace (`rust/Cargo.toml`) contains `conquerd-features`, `conquerd-supernode`, `conquerd-installer`, `conquerd-opus`, and `conquerd-vpx`. The cluster-operations tool is a third workspace at `rust/conquerd-supernode-manager/`.
 
 ### Run Tests
 ```powershell
@@ -1082,6 +1088,7 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 │   ├── conquerd-supernode/        # Standalone binary: QUIC relay, ephemeral SFU, WS signaling, in-app portal
 │   ├── conquerd-installer/        # Standalone binary: signed-release download + apply
 │   ├── conquerd-opus/             # First-party libopus wrapper (DRED + OSCE)
+│   ├── conquerd-vpx/              # First-party VP8 wrapper over vendored libvpx (cross-platform video)
 │   └── conquerd-supernode-manager/ # Separate workspace: provisioning, cluster sync, deploy, remote exec
 ├── web-sdk/conquerd.mjs           # In-app portal game SDK (identity QUIC channel; no WebTransport)
 ├── games/                         # Example portal games (conquerd:// only)
@@ -1230,7 +1237,7 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 ### Known limitations
 
 - Desktop only (no mobile clients) for 1.0.
-- No video calls yet.
+- **No video calls yet.** The pieces exist — VP8 on every platform (vendored libvpx), H.264 via Media Foundation on Windows, camera capture on Windows/Linux/macOS, negotiated codecs, and an end-to-end encrypted transport — but video is not shipped: there is no audio/video synchronisation, no adaptive bitrate for video, and screen sharing is Windows-only. Progress is tracked in `backlog.md`.
 - Supernode discovery is manual (invite-link based).
 
 ## License

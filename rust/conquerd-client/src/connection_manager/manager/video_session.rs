@@ -74,6 +74,7 @@ impl ConnectionManager {
             &frame.sender,
             frame.frame_seq,
             frame.codec,
+            frame.pts_us,
             &frame.sealed,
         );
         if !Identity::verify_with_public_key(&public_key, &frame.signature, &signing_bytes) {
@@ -121,6 +122,108 @@ impl ConnectionManager {
             encoded,
             keyframe: frame.keyframe,
             codec: frame.codec,
+            pts_us: frame.pts_us,
+        });
+    }
+}
+
+impl ConnectionManager {
+    /// Accept one inbound content-audio frame (room or direct).
+    ///
+    /// Same order of operations as video, and for the same reason on the room
+    /// path: the room group key is *shared*, so the per-frame signature is what
+    /// binds identity and must be checked **before** anything is decrypted.
+    ///
+    /// 1. Parse (bounded, hostile-input-safe — see [`crate::content_audio`]).
+    /// 2. Verify the signature, which covers the timestamp.
+    /// 3. Open the seal (room only — direct rides mTLS, raw Opus on the wire).
+    /// 4. Emit for decode and playout.
+    ///
+    /// `session_peer_id` is the transport-verified identity on the direct path
+    /// (or the relaying supernode id on the room path, unused after parse).
+    /// `is_room` selects seal expectations and which conversation id the
+    /// signature binds.
+    pub(super) async fn accept_content_audio_frame(
+        &mut self,
+        session_peer_id: &str,
+        buf: &[u8],
+        is_room: bool,
+    ) {
+        let label = if is_room {
+            "room.audio.content.sfu"
+        } else {
+            "core.audio.content.v1"
+        };
+
+        let Some(frame) = crate::content_audio::parse_frame(buf) else {
+            debug!("[{label}] malformed frame; dropping");
+            return;
+        };
+
+        let Some(public_key) = public_key_from_public_id(&frame.sender) else {
+            debug!("[{label}] unparseable sender id; dropping");
+            return;
+        };
+
+        let conv_id = if is_room {
+            self.current_room_id.clone()
+        } else {
+            crate::video::direct_conv_id(&self.identity.public_id(), &frame.sender)
+        };
+        if conv_id.is_empty() {
+            return;
+        }
+
+        let signing_bytes = crate::content_audio::content_audio_signing_bytes(
+            &conv_id,
+            &frame.sender,
+            frame.seq,
+            frame.pts_us,
+            &frame.payload,
+        );
+        if !Identity::verify_with_public_key(&public_key, &frame.signature, &signing_bytes) {
+            // As with video, a well-formed frame failing here is an
+            // impersonation attempt rather than corruption: only the named
+            // sender's key can produce this signature.
+            warn!(
+                "[{label}] signature rejected for sender {}",
+                &frame.sender[..8.min(frame.sender.len())]
+            );
+            return;
+        }
+
+        let opus = if is_room {
+            let Some(plain) = crate::group_key::open_media_frame(
+                &self.group_keys,
+                crate::group_key::MediaKind::ContentAudio,
+                &conv_id,
+                &frame.sender,
+                u64::from(frame.seq),
+                &frame.payload,
+            ) else {
+                debug!("[{label}] could not open sealed frame; dropping");
+                return;
+            };
+            plain
+        } else {
+            // Direct content audio is not app-layer encrypted — same posture as
+            // direct video/voice: the QUIC mTLS session provides confidentiality.
+            frame.payload
+        };
+
+        // Trust the transport-verified identity over the self-declared one for
+        // the direct path; on the relay path the signature above binds identity.
+        let peer_id = if is_room {
+            frame.sender
+        } else {
+            session_peer_id.to_owned()
+        };
+
+        self.emit_event(ConnectionEvent::ContentAudioReceived {
+            peer_id,
+            opus,
+            pts_us: frame.pts_us,
+            seq: frame.seq,
         });
     }
 }

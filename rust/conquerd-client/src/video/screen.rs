@@ -287,6 +287,13 @@ pub struct CaptureSource {
     pub name: String,
     /// Whether this is a display rather than a window.
     pub is_monitor: bool,
+    /// Process that owns this window, when known.
+    ///
+    /// Present so sharing an application can capture *that application's*
+    /// audio rather than everything the machine is playing. `None` for
+    /// monitors, which have no single owning process — whole-system audio is
+    /// the only sensible answer there.
+    pub pid: Option<u32>,
 }
 
 /// Parse an id produced by [`list_sources`] back into a target.
@@ -325,6 +332,19 @@ pub fn parse_target(id: &str) -> Option<CaptureTarget> {
 }
 
 /// Enumerate capturable monitors and top-level windows.
+/// Process id owning `hwnd`, or `None` if the window has gone.
+fn window_pid(hwnd: windows::Win32::Foundation::HWND) -> Option<u32> {
+    let mut pid: u32 = 0;
+    // SAFETY: `pid` is a live out-param; the call does not retain the pointer.
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+            hwnd,
+            Some(std::ptr::from_mut(&mut pid)),
+        );
+    }
+    (pid != 0).then_some(pid)
+}
+
 pub fn list_sources() -> Vec<CaptureSource> {
     let mut out = list_monitors();
     out.extend(list_windows());
@@ -375,6 +395,7 @@ fn list_monitors() -> Vec<CaptureSource> {
                 id: format!("monitor:{}", monitor.0 as isize),
                 name: label,
                 is_monitor: true,
+                pid: None,
             });
         }
         windows::Win32::Foundation::TRUE
@@ -442,6 +463,7 @@ fn list_windows() -> Vec<CaptureSource> {
             id: format!("window:{}", hwnd.0 as isize),
             name: title,
             is_monitor: false,
+            pid: window_pid(hwnd),
         });
         windows::Win32::Foundation::TRUE
     }

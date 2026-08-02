@@ -269,9 +269,10 @@ pub fn core_video_v1_for(codecs: &[VideoCodec]) -> CapabilityDescriptor {
 /// that room audio uses. At video frame rates the base64 + envelope + per
 /// datagram signature overhead consumes more than half of each datagram and
 /// forces a full JSON parse per datagram on the supernode. Each fragment
-/// instead carries a fixed 56-byte binary header, and authenticity comes from
-/// one Ed25519 signature per *frame* (carried in fragment 0) rather than one
-/// per datagram.
+/// instead carries a compact binary header (`FRAGMENT_VERSION` `0x03`: codec +
+/// `pts_us`, ~64 bytes before the signature for a typical sender id), and
+/// authenticity comes from one Ed25519 signature per *frame* (carried in
+/// fragment 0) rather than one per datagram.
 ///
 /// Codec selection works as for [`core_video_v1`], with one difference that
 /// matters: a room sender fans out to every member at once, so there may be no
@@ -289,6 +290,55 @@ pub fn room_video_sfu_for(codecs: &[VideoCodec]) -> CapabilityDescriptor {
             "codecs": video_codec::codec_names(&video_codec::advertised_codecs(codecs)),
             "quota_bytes_per_sec": 512 * 1024,
             "quota_datagrams_per_sec": 1200,
+            "allow_public_rooms": false,
+            "allow_private_rooms": true,
+        }))
+        .with_auth(AuthTier::RoomMember)
+}
+
+/// `core.audio.content.v1` — direct peer content audio.
+///
+/// System or application audio that belongs *with* the video — a game, a
+/// browser tab, a track — carried separately from the call microphone rather
+/// than mixed into it. Two reasons it is its own stream:
+///
+/// * **It is synchronised.** Every frame carries a presentation timestamp on
+///   the sender's session clock, and video is slaved to it. The mic path has no
+///   timestamp and is deliberately left alone.
+/// * **It is encoded differently.** Speech settings — `Application::Voip`, a
+///   noise gate, voice-activity gating — mangle or suppress music and game
+///   audio. This stream uses `Application::Audio` at a higher rate, and one
+///   Opus encoder cannot be in both modes at once.
+///
+/// Quota sits above voice because the bitrate is higher and frames are not
+/// gated by voice activity, so the stream is continuous rather than bursty.
+pub fn core_audio_content_v1() -> CapabilityDescriptor {
+    CapabilityDescriptor::new("core.audio.content.v1", "1.0", ChannelKind::Datagram)
+        .with_params(json!({
+            "codec": "opus",
+            "opus_application": "audio",
+            "av_sync": 1,
+            "pts_unit": "us",
+            "quota_bytes_per_sec": 64 * 1024,
+            "quota_datagrams_per_sec": 200,
+        }))
+        .with_auth(AuthTier::TrustedPeer)
+}
+
+/// `room.audio.content.sfu` — content audio relayed through a supernode.
+///
+/// See [`core_audio_content_v1`]. The supernode forwards these frames opaquely
+/// and never parses the timestamp: teaching the SFU a media timeline would give
+/// it a reason to inspect content it is not trusted with.
+pub fn room_audio_content_sfu() -> CapabilityDescriptor {
+    CapabilityDescriptor::new("room.audio.content.sfu", "1.0", ChannelKind::Datagram)
+        .with_params(json!({
+            "codec": "opus",
+            "opus_application": "audio",
+            "av_sync": 1,
+            "pts_unit": "us",
+            "quota_bytes_per_sec": 64 * 1024,
+            "quota_datagrams_per_sec": 200,
             "allow_public_rooms": false,
             "allow_private_rooms": true,
         }))
@@ -384,6 +434,8 @@ pub fn local_capabilities() -> Vec<CapabilityDescriptor> {
         core_audio_opus(),
         room_audio_sfu(),
         core_video_v1(),
+        core_audio_content_v1(),
+        room_audio_content_sfu(),
         room_video_sfu(),
         room_chat_v1(),
         room_file_v1(),
@@ -433,6 +485,8 @@ mod tests {
             // these simply won't advertise them, and negotiation degrades to
             // audio-only, so no migration window is needed.
             "core.video.v1",
+            "core.audio.content.v1",
+            "room.audio.content.sfu",
             "room.video.sfu",
             "room.chat.v1",
             "room.file.v1",

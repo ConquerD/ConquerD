@@ -111,6 +111,11 @@ struct AudioPipeline {
     /// which exist only because the cpal capture callback runs on a device
     /// thread. Absent entries mean "no preference".
     peer_mix: HashMap<String, PeerMix>,
+    /// Per-peer level and mute for *content* audio, separate from voice.
+    ///
+    /// Separate because that is the point of the split: a listener needs to be
+    /// able to turn down a loud game without losing the person talking over it.
+    content_mix: HashMap<String, PeerMix>,
     /// Far-end (played) 48 kHz mono reference fed to the capture-side echo
     /// canceller. `None` unless the `aec` feature is active. The mixed playback
     /// frame is tee'd here in `mix_and_play`; the capture closure pops it.
@@ -609,6 +614,7 @@ impl AudioPipeline {
                 output_gain: output_gain_arc,
                 decoders: HashMap::new(),
                 peer_mix: HashMap::new(),
+                content_mix: HashMap::new(),
                 aec_ref_prod,
                 fec_loss_pct: fec_loss_arc,
                 ring_fill_ema: 0.0,
@@ -792,11 +798,23 @@ impl AudioPipeline {
     /// Absent means "no preference": full volume, unmuted. Muting yields 0.0
     /// rather than skipping the decode — see [`Self::set_peer_muted`].
     fn peer_gain(&self, peer_id: &str) -> f32 {
-        match self.peer_mix.get(peer_id) {
-            Some(m) if m.muted => 0.0,
-            Some(m) => m.volume_pct as f32 / 100.0,
-            None => 1.0,
-        }
+        resolve_mix_gain(peer_id, &self.peer_mix, &self.content_mix)
+    }
+
+    /// Mute or unmute one peer's *content* audio, leaving their voice alone.
+    fn set_content_muted(&mut self, peer_id: &str, muted: bool) {
+        self.content_mix
+            .entry(peer_id.to_owned())
+            .or_default()
+            .muted = muted;
+    }
+
+    /// Set one peer's content-audio level (0–200, 100 = unity).
+    fn set_content_volume(&mut self, peer_id: &str, pct: u32) {
+        self.content_mix
+            .entry(peer_id.to_owned())
+            .or_default()
+            .volume_pct = pct.min(200);
     }
 
     /// Mute or unmute one peer **for this listener only**.
@@ -902,6 +920,49 @@ impl PeerAudioState {
 // Commands / Events
 // ---------------------------------------------------------------------------
 
+/// Gain for one mixer slot, resolving voice and content slots alike.
+///
+/// Content slots carry a namespaced key, so a naive lookup finds nothing and
+/// returns unity — which is the bug this exists to prevent: the tile's control
+/// had no effect at all because it wrote to a map nothing read.
+///
+/// **The two streams are independent.** Muting a peer silences their *voice*
+/// and leaves what they are sharing audible; muting a tile's shared audio
+/// silences the stream and leaves the person talking over it audible. That is
+/// the whole reason they are separate streams: someone narrating a game must
+/// stay mutable apart from the game.
+fn resolve_mix_gain(
+    slot: &str,
+    peer_mix: &std::collections::HashMap<String, PeerMix>,
+    content_mix: &std::collections::HashMap<String, PeerMix>,
+) -> f32 {
+    let level = |m: Option<&PeerMix>| match m {
+        Some(m) if m.muted => 0.0,
+        Some(m) => m.volume_pct as f32 / 100.0,
+        None => 1.0,
+    };
+    match slot.strip_prefix(CONTENT_DECODER_PREFIX) {
+        Some(peer) => level(content_mix.get(peer)),
+        None => level(peer_mix.get(slot)),
+    }
+}
+
+/// Prefix marking a decoder slot as content audio rather than voice.
+///
+/// A control character, so it cannot appear in a base64url peer id and the two
+/// namespaces can never collide however peer ids change.
+const CONTENT_DECODER_PREFIX: &str = "\u{1}content:";
+
+/// Decoder-map key for a peer's content-audio stream.
+fn content_decoder_key(peer_id: &str) -> String {
+    format!("{CONTENT_DECODER_PREFIX}{peer_id}")
+}
+
+/// Whether a decoder-map key names a content stream rather than a peer.
+fn is_content_decoder_key(key: &str) -> bool {
+    key.starts_with(CONTENT_DECODER_PREFIX)
+}
+
 /// Commands sent from the application layer into the call controller.
 #[derive(Debug)]
 pub enum CallCommand {
@@ -935,6 +996,10 @@ pub enum CallCommand {
     SetPeerMuted { peer_id: String, muted: bool },
     /// Set one peer's playback volume for this listener (0–200, 100 = unity).
     SetPeerVolume { peer_id: String, pct: u32 },
+    /// Mute one peer's shared application audio, leaving their voice audible.
+    SetContentMuted { peer_id: String, muted: bool },
+    /// Set one peer's shared application audio level (0–200, 100 = unity).
+    SetContentVolume { peer_id: String, pct: u32 },
     /// Network-quality feedback from the transport layer for one peer/path,
     /// used to drive adaptive outgoing bitrate. `loss_pct` is 0–100.
     UpdateNetworkQuality { loss_pct: f32, rtt_ms: f32 },
@@ -944,6 +1009,23 @@ pub enum CallCommand {
     SetVoiceActivation(bool),
     /// Inbound room audio frame (Opus bytes from a room member).
     RoomAudioInbound { peer_id: String, opus_data: Vec<u8> },
+    /// A verified, unsealed content-audio frame: system or application audio
+    /// that accompanies a peer's video.
+    ///
+    /// Mixed into the same output as voice but decoded separately and never
+    /// through the voice jitter queues — the two are different streams with
+    /// independent sequence spaces, and sharing decoder state would corrupt
+    /// both.
+    ContentAudioInbound {
+        peer_id: String,
+        seq: u32,
+        pts_us: u64,
+        opus: Vec<u8>,
+    },
+    /// Hand over the shared hold/drop state the video receiver reads, so each
+    /// played content frame can anchor the timeline video is synchronised
+    /// against. Sent once, when the video receiver is created.
+    SetVideoPlayout(crate::video::receiver::SharedPlayout),
     /// Update the jitter buffer depth (in Opus frames, 1–20). Takes effect
     /// immediately on the next playout cycle.
     SetJitterDepth(usize),
@@ -1076,6 +1158,12 @@ pub struct CallController {
     /// conditions (see [`Self::adapt_jitter_buffer`]) unless overridden by
     /// `CallCommand::SetJitterDepth`.
     jitter_depth: usize,
+    /// Reorder buffers for content audio, ticked from the same playout loop as
+    /// voice so the two cannot drift apart.
+    content_playout: crate::content_playout::ContentPlayout,
+    /// Shared hold/drop state the video receiver reads. Each played content
+    /// frame anchors the timeline video is synchronised against.
+    video_playout: Option<crate::video::receiver::SharedPlayout>,
     /// When true, [`Self::adapt_jitter_buffer`] tunes `jitter_depth` from
     /// observed underruns. Set false once the user pins a depth manually.
     jitter_adaptive: bool,
@@ -1147,6 +1235,8 @@ impl CallController {
             peer_jitter_queues: HashMap::new(),
             peer_playout_started: HashMap::new(),
             jitter_depth: 3,
+            content_playout: crate::content_playout::ContentPlayout::new(),
+            video_playout: None,
             jitter_adaptive: true,
             playout_frames: 0,
             playout_underruns: 0,
@@ -1415,6 +1505,31 @@ impl CallController {
             }
         }
 
+        // Content audio rides this same tick. Two independent 20 ms loops would
+        // drift against each other, and that drift would surface as A/V sync
+        // error that no arithmetic elsewhere could explain.
+        let now = std::time::Instant::now();
+        for (peer_id, action) in self.content_playout.tick() {
+            let (played_pts, opus) = match action {
+                crate::content_playout::TickAction::Play(frame) => (frame.pts_us, Some(frame.opus)),
+                // Concealed: nothing to decode, but still anchor. A timeline
+                // that stopped on loss would strand held video frames.
+                crate::content_playout::TickAction::Conceal { pts_us } => (pts_us, None),
+                crate::content_playout::TickAction::Idle => continue,
+            };
+
+            // Anchor whether or not there is audio to play: this is the
+            // timeline video is held against, and it must keep advancing.
+            if let Some(ref playout) = self.video_playout {
+                playout.lock().note_audio_played(&peer_id, played_pts, now);
+            }
+            if let Some(opus) = opus {
+                // Namespaced key: content and voice are different streams from
+                // the same peer, and sharing decoder state would corrupt both.
+                to_decode.push((content_decoder_key(&peer_id), Some(opus)));
+            }
+        }
+
         // Decode + mix every active peer's frame into a single playback frame.
         // Summing (not concatenating) is what lets simultaneous speakers be
         // heard overlaid without overrunning the ring.
@@ -1423,6 +1538,13 @@ impl CallController {
         } else {
             return;
         };
+
+        // Content entries are an internal mixing detail; surfacing them would
+        // put a phantom participant in the UI's level display.
+        let levels: Vec<(String, f32)> = levels
+            .into_iter()
+            .filter(|(id, _)| !is_content_decoder_key(id))
+            .collect();
 
         for (peer_id, level) in levels {
             // Throttle level events to ≤10 Hz per peer.
@@ -1745,6 +1867,17 @@ impl CallController {
                                 p.set_peer_volume(&peer_id, pct);
                             }
                         }
+                        CallCommand::SetContentMuted { peer_id, muted } => {
+                            if let Some(p) = &mut self.audio {
+                                p.set_content_muted(&peer_id, muted);
+                            }
+                        }
+                        CallCommand::SetContentVolume { peer_id, pct } => {
+                            let pct = pct.min(MAX_PEER_VOLUME_PCT);
+                            if let Some(p) = &mut self.audio {
+                                p.set_content_volume(&peer_id, pct);
+                            }
+                        }
                         CallCommand::SetOutgoingBitrate(bps) => {
                             // User setting is the ceiling; reset the live rate to
                             // it and let adaptation back off from there.
@@ -1806,6 +1939,22 @@ impl CallController {
                         }
                         CallCommand::RoomAudioInbound { peer_id, opus_data } => {
                             self.handle_room_audio(peer_id, opus_data);
+                        }
+                        CallCommand::SetVideoPlayout(playout) => {
+                            self.video_playout = Some(playout);
+                        }
+                        CallCommand::ContentAudioInbound {
+                            peer_id,
+                            seq,
+                            pts_us,
+                            opus,
+                        } => {
+                            // Straight into its own reorder buffer. Never the
+                            // voice jitter queues: separate sequence spaces.
+                            self.content_playout.accept(
+                                &peer_id,
+                                crate::content_playout::PendingFrame { seq, pts_us, opus },
+                            );
                         }
                         CallCommand::SetJitterDepth(depth) => {
                             // Explicit user setting pins the depth and disables
@@ -2559,6 +2708,82 @@ fn play_speaker_test_beep() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mix(muted: bool, pct: u32) -> PeerMix {
+        PeerMix {
+            muted,
+            volume_pct: pct,
+        }
+    }
+
+    /// The two controls are independent: "mute for me" on the voice rail is
+    /// about the *person*, not about what they are sharing. Muting someone
+    /// narrating a game must not also silence the game.
+    #[test]
+    fn muting_a_peers_voice_leaves_their_shared_audio_playing() {
+        let mut peers = std::collections::HashMap::new();
+        peers.insert("alice".to_owned(), mix(true, 100));
+        let content = std::collections::HashMap::new();
+
+        assert_eq!(resolve_mix_gain("alice", &peers, &content), 0.0);
+        assert_eq!(
+            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content),
+            1.0,
+            "muting a peer's voice must not silence what they are sharing"
+        );
+    }
+
+    /// And the converse: silencing a shared stream leaves the person audible.
+    #[test]
+    fn muting_shared_audio_leaves_the_peers_voice_audible() {
+        let peers = std::collections::HashMap::new();
+        let mut content = std::collections::HashMap::new();
+        content.insert("alice".to_owned(), mix(true, 100));
+
+        assert_eq!(resolve_mix_gain("alice", &peers, &content), 1.0);
+        assert_eq!(
+            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content),
+            0.0
+        );
+    }
+
+    /// The reason the two streams are split at all: turn the game down without
+    /// losing the person talking over it.
+    #[test]
+    fn content_can_be_ducked_while_voice_stays_up() {
+        let peers = std::collections::HashMap::new();
+        let mut content = std::collections::HashMap::new();
+        content.insert("alice".to_owned(), mix(false, 20));
+
+        assert_eq!(resolve_mix_gain("alice", &peers, &content), 1.0);
+        assert!(
+            (resolve_mix_gain(&content_decoder_key("alice"), &peers, &content) - 0.2).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn content_can_be_muted_alone() {
+        let peers = std::collections::HashMap::new();
+        let mut content = std::collections::HashMap::new();
+        content.insert("alice".to_owned(), mix(true, 100));
+
+        assert_eq!(resolve_mix_gain("alice", &peers, &content), 1.0);
+        assert_eq!(
+            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content),
+            0.0
+        );
+    }
+
+    #[test]
+    fn unknown_slots_play_at_unity() {
+        let peers = std::collections::HashMap::new();
+        let content = std::collections::HashMap::new();
+        assert_eq!(resolve_mix_gain("nobody", &peers, &content), 1.0);
+        assert_eq!(
+            resolve_mix_gain(&content_decoder_key("nobody"), &peers, &content),
+            1.0
+        );
+    }
 
     /// Drain the event channel until a `StateChanged` event arrives.
     /// Skips advisory events (e.g. `CaptureError` when no audio device is available in tests).

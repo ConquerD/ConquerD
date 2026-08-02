@@ -358,6 +358,7 @@ mod tests {
             1,
             true,
             VideoCodec::Stub,
+            0,
             &[0u8; super::super::fragment::SIGNATURE_LEN],
             &encoded,
             1198,

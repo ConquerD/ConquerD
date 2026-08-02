@@ -253,9 +253,22 @@ mod windows_impl {
         ) -> anyhow::Result<(u32, u32, usize, CaptureFormat)> {
             let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
-            for (subtype, format) in [
-                (MFVideoFormat_NV12, CaptureFormat::Nv12),
-                (MFVideoFormat_YUY2, CaptureFormat::Yuy2),
+            // Each format is tried at the requested size first, then with no
+            // size constraint at all. The second pass matters: a camera exposes
+            // a fixed set of modes, and `SetCurrentMediaType` fails outright
+            // for a size none of them match rather than picking the nearest.
+            // Without the fallback, any caller asking for an unusual size — an
+            // overlay inset, say — gets "offers neither NV12 nor YUY2", which
+            // reads like a broken webcam rather than an unavailable mode.
+            //
+            // The negotiated size is read back below either way, so accepting
+            // the device's own choice is safe: nothing downstream assumes the
+            // request was honoured.
+            for (subtype, format, constrain_size) in [
+                (MFVideoFormat_NV12, CaptureFormat::Nv12, true),
+                (MFVideoFormat_YUY2, CaptureFormat::Yuy2, true),
+                (MFVideoFormat_NV12, CaptureFormat::Nv12, false),
+                (MFVideoFormat_YUY2, CaptureFormat::Yuy2, false),
             ] {
                 // SAFETY: building a media type and applying it to the reader.
                 let applied = unsafe {
@@ -264,7 +277,11 @@ mod windows_impl {
                     };
                     if mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).is_err()
                         || mt.SetGUID(&MF_MT_SUBTYPE, &subtype).is_err()
-                        || mt
+                    {
+                        continue;
+                    }
+                    if constrain_size
+                        && mt
                             .SetUINT64(&MF_MT_FRAME_SIZE, ((want_w as u64) << 32) | want_h as u64)
                             .is_err()
                     {

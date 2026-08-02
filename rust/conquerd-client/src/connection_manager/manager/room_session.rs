@@ -1128,6 +1128,7 @@ impl ConnectionManager {
         encoded: Vec<u8>,
         keyframe: bool,
         codec: conquerd_features::video_codec::VideoCodec,
+        pts_us: u64,
     ) {
         if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
             return; // Not in a room
@@ -1158,7 +1159,7 @@ impl ConnectionManager {
         };
 
         let signing_bytes =
-            crate::video::video_frame_signing_bytes(&room_id, &sender, seq, codec, &sealed);
+            crate::video::video_frame_signing_bytes(&room_id, &sender, seq, codec, pts_us, &sealed);
         let sig_vec = self.identity.sign(&signing_bytes);
         let Ok(signature) = <[u8; crate::video::fragment::SIGNATURE_LEN]>::try_from(&sig_vec[..])
         else {
@@ -1183,6 +1184,7 @@ impl ConnectionManager {
             seq,
             keyframe,
             codec,
+            pts_us,
             &signature,
             &sealed,
             relay.max_video_fragment_len(),
@@ -1219,6 +1221,90 @@ impl ConnectionManager {
             // reassembly timeout collects the remains. Logged at debug because
             // at 30 fps this must never become a per-frame warning.
             debug!("[room.video.sfu] sent {sent}/{total} fragments for seq {seq}");
+        }
+    }
+
+    #[inline]
+    pub(super) fn check_room_content_audio_quota(&self, target: &str, byte_count: usize) -> bool {
+        self.feature_registry
+            .gate_through_feature("room.audio.content.sfu", target, byte_count)
+    }
+
+    /// Send one content-audio frame to the supernode for SFU fan-out.
+    ///
+    /// Content audio is the system/application audio that accompanies video —
+    /// distinct from the call microphone, which keeps its own untouched path.
+    /// `pts_us` comes from the same session clock the video capture stamps
+    /// from, which is what lets a receiver line the two up.
+    pub(super) async fn send_room_content_audio(&mut self, opus: Vec<u8>, pts_us: u64) {
+        if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
+            return; // Not in a room
+        }
+        let sender = self.identity.public_id();
+        let room_id = self.current_room_id.clone();
+        let supernode_id = self.live_room_route(&self.current_supernode_id.clone());
+
+        // Same fail-closed rule as every other room content type: never emit
+        // something the relay could derive. The deterministic fallback key is a
+        // function of room_id, so it is not supernode-opaque.
+        if !may_send_room_e2e_content(self.group_keys.has_real_key(&room_id)) {
+            warn!("[room.audio.content.sfu] no real group key yet; dropping frame");
+            return;
+        }
+
+        let seq = self.room_content_audio_seq;
+        let Some(sealed) = crate::group_key::seal_media_frame(
+            &self.group_keys,
+            crate::group_key::MediaKind::ContentAudio,
+            &room_id,
+            &sender,
+            u64::from(seq),
+            &opus,
+        ) else {
+            warn!("[room.audio.content.sfu] seal failed; dropping frame");
+            return;
+        };
+
+        let signing_bytes = crate::content_audio::content_audio_signing_bytes(
+            &room_id, &sender, seq, pts_us, &sealed,
+        );
+        let sig_vec = self.identity.sign(&signing_bytes);
+        let Ok(signature) = <[u8; crate::content_audio::SIGNATURE_LEN]>::try_from(&sig_vec[..])
+        else {
+            warn!("[room.audio.content.sfu] unexpected signature length; dropping frame");
+            return;
+        };
+
+        let Some(relay) = self
+            .quic_relays
+            .get(&supernode_id)
+            .filter(|r| r.is_alive())
+            .cloned()
+        else {
+            debug!("[room.audio.content.sfu] no live relay session; dropping frame");
+            return;
+        };
+
+        let Some(frame) =
+            crate::content_audio::encode_frame(&sender, seq, pts_us, &signature, &sealed)
+        else {
+            warn!("[room.audio.content.sfu] could not encode frame; dropping");
+            return;
+        };
+
+        // +2 for the relay's broadcast index and channel tag, matching how the
+        // supernode meters it inbound.
+        if !self.check_room_content_audio_quota(&supernode_id, frame.len() + 2) {
+            debug!(
+                "[room.audio.content.sfu] outbound quota exceeded for {}; dropping frame",
+                &supernode_id[..8.min(supernode_id.len())]
+            );
+            return;
+        }
+
+        self.room_content_audio_seq = self.room_content_audio_seq.wrapping_add(1);
+        if !relay.send_room_content_audio(&frame) {
+            debug!("[room.audio.content.sfu] relay refused frame seq {seq}");
         }
     }
 

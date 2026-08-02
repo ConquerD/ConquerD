@@ -110,6 +110,10 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
+    # WASAPI loopback: capturing what the machine is playing, to send with
+    # video. Not a normal capture device — see src/content_capture.rs.
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
     "Win32_System_Threading",
     "Win32_Security",
     # Media Foundation: hardware-accelerated H.264 encode/decode. The hardware

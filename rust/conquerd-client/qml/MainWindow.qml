@@ -870,6 +870,9 @@ ApplicationWindow {
         map[peerId] = win
         root.videoPopouts = map
         win.closed.connect(function() { root.forgetVideoPopout(peerId) })
+        win.contentAudioChanged.connect(function(pid, muted, volume) {
+            backend.setContentAudioPref(pid, muted, volume)
+        })
         // Leaving it in the region too would decode the same stream into two
         // sinks for no benefit; popping out is a move, not a copy.
         root.collapseVideo(peerId)
@@ -2419,6 +2422,11 @@ ApplicationWindow {
                     item.heightRatio = Qt.binding(() => root.videoRegionRatio)
                     item.collapseRequested.connect(root.collapseVideo)
                     item.popoutRequested.connect(root.popoutVideo)
+                    // `backend` is only in scope here, so the tile's request
+                    // arrives as a signal and is applied at this level.
+                    item.contentAudioChanged.connect(function(peerId, muted, volume) {
+                        backend.setContentAudioPref(peerId, muted, volume)
+                    })
                     item.ratioChanged.connect(function(r) {
                         root.videoRegionRatio = r
                         videoRegionRatioSaveTimer.restart()
@@ -2619,26 +2627,72 @@ ApplicationWindow {
             onMuteToggled: (m) => backend.setMuted(m)
 
             videoOn: backend.video_active
+            shareAudioOn: backend.content_audio_active
 
-            onVideoToggled: (on) => {
-                // The backend reports what actually happened — asking for the
-                // camera can fail (no device, in use elsewhere), so the button
-                // must follow the real state rather than the requested one.
+            /// Start sharing video, and the audio that belongs with it.
+            ///
+            /// Order matters: video creates the session clock, and the content
+            /// audio is timestamped against it. Starting audio first would
+            /// stamp it against a clock that does not exist yet.
+            onShareRequested: (audioMode) => {
+                settingsModel.content_audio_mode = audioMode
+
                 var got = backend.setVideoEnabled(
-                    on,
+                    true,
                     settingsModel.video_input_device,
                     settingsModel.video_quality,
                     settingsModel.video_overlays_json)
-                if (on && !got)
-                    console.warn("[video] could not start the camera")
+                if (!got) {
+                    console.warn("[video] could not start sharing")
+                    return
+                }
                 // Reflect our own state on our own tile straight away; remote
                 // members learn about it from the SfuVideoState announcement.
                 // `public_id` is the exposed Q_PROPERTY — `my_public_id` is the
-                // internal Rust field name and reads as undefined from QML,
-                // which silently skipped this whole branch.
+                // internal Rust field name and reads as undefined from QML.
                 if (roomModel && roomModel.setVideoActive && backend.public_id)
-                    roomModel.setVideoActive(backend.public_id, got)
-                root.setPeerVideoActive(backend.public_id, got)
+                    roomModel.setVideoActive(backend.public_id, true)
+                root.setPeerVideoActive(backend.public_id, true)
+
+                if (audioMode === "off")
+                    return
+                // Audio failing is not a reason to abandon the video that is
+                // already running — the platform may simply have no loopback.
+                var audioOk = backend.setContentAudioEnabled(
+                    true,
+                    settingsModel.video_input_device,
+                    audioMode)
+                if (audioOk)
+                    return
+                // "auto" on a camera resolves to no audio by design — your
+                // microphone already carries you — so it is not a failure and
+                // must not be logged as one, or the real failures below stop
+                // being worth reading.
+                var dev = settingsModel.video_input_device
+                var isScreen = dev.indexOf("window:") === 0
+                    || dev.indexOf("monitor:") === 0
+                if (audioMode === "auto" && !isScreen)
+                    return
+                console.warn("[content-audio] sharing video without audio: "
+                    + "no capture endpoint for mode '" + audioMode + "'")
+            }
+
+            /// Stop both. Content audio cannot outlive the clock it is stamped
+            /// against, so it is stopped first and explicitly.
+            onStopShareRequested: {
+                if (backend.content_audio_active)
+                    backend.setContentAudioEnabled(
+                        false,
+                        settingsModel.video_input_device,
+                        settingsModel.content_audio_mode)
+                backend.setVideoEnabled(
+                    false,
+                    settingsModel.video_input_device,
+                    settingsModel.video_quality,
+                    settingsModel.video_overlays_json)
+                if (roomModel && roomModel.setVideoActive && backend.public_id)
+                    roomModel.setVideoActive(backend.public_id, false)
+                root.setPeerVideoActive(backend.public_id, false)
             }
 
             expandedPeers: root.expandedVideoPeers

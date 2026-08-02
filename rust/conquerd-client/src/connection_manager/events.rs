@@ -251,6 +251,19 @@ pub enum ConnectionEvent {
         encoded: Vec<u8>,
         keyframe: bool,
         codec: VideoCodec,
+        /// Sender's capture time, microseconds on *their* session clock. Only
+        /// comparable against other media from the same sender.
+        pts_us: u64,
+    },
+    /// A verified, unsealed content-audio frame from a room peer.
+    ///
+    /// `pts_us` is on the *sender's* session clock, so it is comparable only
+    /// against other media from that same sender — never across peers.
+    ContentAudioReceived {
+        peer_id: String,
+        opus: Vec<u8>,
+        pts_us: u64,
+        seq: u32,
     },
     /// An invite handshake completed and the peer was added to the store.
     InviteAccepted { peer_id: String, handle: String },
@@ -371,6 +384,8 @@ pub enum ConnectionCommand {
         encoded: Vec<u8>,
         keyframe: bool,
         codec: VideoCodec,
+        /// Capture time on the sender's session clock, microseconds.
+        pts_us: u64,
     },
     /// Send a typing indicator to a peer.
     SendTyping {
@@ -513,6 +528,29 @@ pub enum ConnectionCommand {
         encoded: Vec<u8>,
         keyframe: bool,
         codec: VideoCodec,
+        /// Capture time on the sender's session clock, microseconds.
+        pts_us: u64,
+    },
+    /// Send one content-audio frame to a directly-connected peer.
+    ///
+    /// Direct path counterpart of [`SendRoomContentAudio`]: raw Opus under
+    /// `CONTENT_AUDIO_TAG`, signed but not app-layer sealed (QUIC mTLS provides
+    /// confidentiality, same posture as direct video). `pts_us` is on the same
+    /// session clock the video capture stamps from.
+    SendContentAudio {
+        peer_id: String,
+        opus: Vec<u8>,
+        pts_us: u64,
+    },
+    /// Send one content-audio frame to the room for SFU fan-out.
+    ///
+    /// Content audio is system or application audio that accompanies video —
+    /// not the call microphone, which has its own untouched path. `pts_us` is
+    /// on the same session clock the video capture stamps from, which is what
+    /// lets a receiver synchronise the two.
+    SendRoomContentAudio {
+        opus: Vec<u8>,
+        pts_us: u64,
     },
     /// Ask `peer_id` for a keyframe because we cannot decode their stream.
     ///

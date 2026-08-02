@@ -1674,6 +1674,97 @@ async fn sfu_text_is_dropped_until_the_room_is_keyed() {
     );
 }
 
+/// Direct content audio rides QUIC datagrams under `CONTENT_AUDIO_TAG` as a
+/// single (unfragmented) frame — one Opus packet always fits a datagram. The
+/// tag must be the direct one, not the room tag, or a peer session would never
+/// classify the frame.
+#[tokio::test]
+async fn p2p_content_audio_rides_the_content_audio_tag() {
+    use conquerd_features::channel_frame;
+
+    let mut t = harness::test_cm();
+    let mut peer = t.cm.test_add_peer_session("peer-direct");
+
+    t.cm.test_send_content_audio_datagram("peer-direct", vec![0xAA; 80], 1_234)
+        .await;
+
+    let frame = peer
+        .try_recv()
+        .expect("direct content audio must leave on the peer session");
+    match frame {
+        super::internal::PeerOutbound::Datagram(b) => {
+            assert_eq!(
+                b[0],
+                channel_frame::CONTENT_AUDIO_TAG,
+                "direct content audio must ride CONTENT_AUDIO_TAG, not the room tag"
+            );
+            assert!(b.len() > 1, "frame must carry a body after the channel tag");
+            let parsed = crate::content_audio::parse_frame(&b[1..])
+                .expect("payload after the tag must be a valid content-audio frame");
+            assert_eq!(parsed.pts_us, 1_234);
+            assert_eq!(parsed.payload, vec![0xAA; 80]);
+        }
+        other => panic!("content audio must be a datagram, got {other:?}"),
+    }
+    assert!(
+        peer.try_recv().is_err(),
+        "one Opus frame is one datagram; nothing else should have been sent"
+    );
+}
+
+/// A direct peer that is not connected must not leak content audio onto another
+/// peer's session (same isolation rule as direct video).
+#[tokio::test]
+async fn p2p_content_audio_without_a_session_sends_nothing() {
+    let mut t = harness::test_cm();
+    let mut peer = t.cm.test_add_peer_session("peer-direct");
+    t.cm.test_send_content_audio_datagram("peer-absent", vec![0x11; 40], 500)
+        .await;
+    assert!(
+        peer.try_recv().is_err(),
+        "content audio for an absent peer must not leak onto another peer's session"
+    );
+}
+
+/// Content audio must fail closed exactly as room chat, voice, file and video
+/// do. It is the newest room content type and the easiest to forget: the
+/// deterministic fallback key is derived from the room id, so a supernode could
+/// re-derive it, and emitting under it would hand the relay content it is not
+/// trusted with.
+#[tokio::test]
+async fn unkeyed_room_content_audio_is_dropped_not_sent() {
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    t.cm.test_set_room("SN-AAAA", "room-1");
+
+    t.cm.test_send_room_content_audio(vec![0xAA; 80], 1_000)
+        .await;
+
+    assert!(
+        harness::drain_ws(&mut sn).is_empty(),
+        "unkeyed room content audio must be dropped rather than sent"
+    );
+}
+
+/// Content audio joins room voice and video on the relay-datagram-only rule.
+/// It exists to be synchronised with video, so a frame delivered late by a
+/// reliable retry is worse than one never delivered — it drags the timeline.
+#[tokio::test]
+async fn content_audio_does_not_fall_back_to_websocket() {
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    t.cm.test_set_room("SN-AAAA", "room-1");
+
+    t.cm.test_send_room_content_audio(vec![0xAA; 80], 2_000)
+        .await;
+
+    let sent = harness::drain_ws(&mut sn);
+    assert!(
+        sent.is_empty(),
+        "content audio must not be emitted as WebSocket signaling, got {sent:?}"
+    );
+}
+
 /// Room voice and video are relay-datagram only. With no QUIC relay session
 /// they must drop rather than fall back to the WebSocket: the WS lane cannot
 /// carry binary media frames, and silently "succeeding" there would look like

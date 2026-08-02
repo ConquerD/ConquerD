@@ -104,6 +104,12 @@ pub const PREFERENCE: [VideoCodec; 3] = [VideoCodec::H264, VideoCodec::Vp8, Vide
 
 /// Pick the best codec both sides support.
 ///
+/// **An empty `remote` means "no mutual codec", not "unknown".** Callers that
+/// may not have heard a peer's capability announce yet must distinguish the two
+/// themselves — conflating them turns a missing announce into a camera that
+/// silently never starts, which is much harder to diagnose than a frame the
+/// receiver drops.
+///
 /// Preference is **ours**, not the remote's, and the order is fixed rather than
 /// negotiated: two peers running this function against the same pair of lists
 /// must reach the same answer without exchanging another message. Returns
@@ -206,6 +212,16 @@ mod tests {
         let a = [VideoCodec::H264, VideoCodec::Vp8];
         let b = [VideoCodec::Vp8];
         assert_eq!(negotiate(&a, &b), negotiate(&b, &a));
+    }
+
+    /// Documents the trap deliberately: an empty remote list is *not* the same
+    /// question as "which codec do we share", and callers must not treat a peer
+    /// they have not heard from as one they cannot talk to.
+    #[test]
+    fn an_unheard_peer_is_indistinguishable_from_an_incompatible_one_here() {
+        let local = [VideoCodec::H264, VideoCodec::Vp8];
+        assert_eq!(negotiate(&local, &[]), None);
+        assert_eq!(negotiate(&local, &[VideoCodec::Stub]), None);
     }
 
     #[test]

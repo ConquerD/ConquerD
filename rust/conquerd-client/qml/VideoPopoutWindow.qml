@@ -29,6 +29,8 @@ Window {
     property bool streaming: false
 
     signal closed()
+    /// Shared-audio level/mute changed for this popout's peer.
+    signal contentAudioChanged(string peerId, bool muted, int volume)
 
     title: (displayName || peerId) + " — ConquerD"
     width: 640
@@ -76,7 +78,13 @@ Window {
             item.peerId = Qt.binding(() => popWin.peerId)
             item.displayName = ""      // the title bar already names the peer
             item.showChrome = false    // no popout/collapse buttons in a popout
+            // ...but the shared-audio control is still wanted: a popped-out
+            // video is exactly where someone turns a loud stream down.
+            item.showAudioControl = true
             item.streaming = Qt.binding(() => popWin.streaming)
+            item.contentAudioChanged.connect(function(muted, volume) {
+                popWin.contentAudioChanged(popWin.peerId, muted, volume)
+            })
         }
     }
 

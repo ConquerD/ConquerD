@@ -31,6 +31,9 @@ Item {
     readonly property real maxRatio: 0.7
 
     signal collapseRequested(string peerId)
+    /// One tile's shared-audio level/mute changed. Forwarded up because the
+    /// backend object is only in scope in MainWindow.
+    signal contentAudioChanged(string peerId, bool muted, int volume)
     signal popoutRequested(string peerId)
     signal ratioChanged(real ratio)
 
@@ -98,6 +101,8 @@ Item {
 
                     onCloseRequested: root.collapseRequested(modelData)
                     onPopoutRequested: root.popoutRequested(modelData)
+                    onContentAudioChanged: (muted, volume) =>
+                        root.contentAudioChanged(modelData, muted, volume)
                 }
             }
         }

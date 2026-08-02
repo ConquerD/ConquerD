@@ -246,184 +246,152 @@ and the in-call camera toggle.
    Gate “video calls ship” (and drop the README bullet) on a written manual checklist, not compile
    alone.
 
-4. **Dual audio roles: voice mic vs stream / content audio.**
-   Live video (especially screen share) often needs **application or system audio**, not the call
-   microphone. Today the client has a single `audio_input_device` setting and one CPAL capture
-   stream in `AudioPipeline` (`call_controller` / Settings → input combo). That is correct for
-   pure voice calls; it is **not** enough for “stream what this app is playing.”
+4. **Media layer: content audio + video on one clock (A/V sync).**
 
-   **Product model (recommended):** treat two roles, not one device list:
-   | Role | Purpose | Typical source | Codec mode |
-   |---|---|---|---|
-   | **Voice** | Conversation (existing call path) | Mic / line-in via CPAL | Opus `Application::Voip` (today) |
-   | **Content / stream** | Audio that belongs with the video (game, browser, DAW, movie) | WASAPI loopback, process/app capture, stereo-mix, virtual cable, or a second hardware input | Prefer Opus `Application::Audio` (music-friendly); higher bitrate preset |
+   **Design decided 2026-07-30: add a media layer beside the voice path, do not modify it.**
 
-   **Why not just “pick a different mic” once:**
-   - Users still need the **mic for commentary** while content audio plays; a single input forces
-     either mute-the-game or no voiceover.
-   - Loopback / process capture is not a normal cpal “input device” on many hosts (Windows needs
-     WASAPI loopback or a virtual cable; Linux Pulse/PipeWire monitor sources; macOS is harder).
-   - Content audio should **not** run the voice DSP stack unchanged (noise gate, VAD-gated send,
-     aggressive VoIP encode) or music/game audio will sound wrong and may be suppressed.
-   - Screen capture today is **pixels only** (`video::screen`); there is no paired audio track.
+   The earlier plan put a presentation timestamp on the *existing* audio wires. That is now
+   rejected. Two facts drove the change:
 
-   **Design choices to settle before coding:**
-   - **Mix vs dual outbound tracks.** v1 can **mix** voice + content into the existing single
-     Opus send path (one `core.audio.opus` / `room.audio.sfu` stream, local ducking/levels). That
-     needs no wire change and keeps receivers simple. Dual tracks (separate content capability or
-     second sequence) only if receivers must mute commentary independently or we need different
-     FEC/bitrate per role — protocol bump, not required for first streaming UX.
-   - **Selection UI:** keep Settings “Call microphone” as today; add a stream-session control
-     (“Share system audio” / “Share audio from: [app | output device | none]”) when video or
-     screen share is active — not a second global default that rewires every voice call.
-   - **Echo / feedback:** if content is system loopback, local playback of remote peers can re-enter
-     the loop; need exclude-ConquerD-output, ducking, or require a virtual cable / per-app capture.
-   - **Platform order:** Windows WASAPI loopback (or WGC-adjacent process audio where available)
-     first, matching Windows-first video; Linux monitor sources next; macOS last.
+   - **Direct audio has no sequence number.** The wire is
+     `[AUDIO_TAG][id_len][peer_id][opus]` — raw Opus with nothing to hang a timestamp off, so it
+     is a full reframing of a live format, not a field addition.
+   - **Room audio's `seq` is bound into the crypto AAD**, so adding a field there touches sealing
+     and needs golden vectors proving old frames still verify.
 
-   **Reuse:** still send on the existing audio capabilities and room E2E path — content is a
-   **capture/mix source**, not a new media type. Do not invent a parallel “video soundtrack”
-   channel unless mix-at-sender proves insufficient.
+   Against that: the voice path is the most battle-tested code in the product (jitter buffer, ABR,
+   DRED/OSCE, VAD, noise gate, PLC, cross-cluster replication, WS fallback) and **it ships today,
+   while video does not**. Changing a working wire for a feature that does not exist yet is the
+   wrong risk trade. A separate layer is purely additive: if it breaks, video breaks, and video is
+   already not shipping.
 
-5. **A/V sync — shared sender timeline + PTS + audio-led playout (implementation plan).**
+   ### Shape
 
-   Product requirement: “some sync,” not frame-perfect. Audio and video are independent paths
-   today (separate capabilities, tags, sequence counters, playout). There is **no shared media
-   clock** and no presentation timestamp on either media wire:
-   - Direct audio: `[AUDIO_TAG][id_len][peer_id][opus]` — no PTS (`send_audio_datagram`).
-   - Room audio: JSON `SfuAudio` + crypto `seq` + wall-clock `timestamp` (freshness/replay only).
-   - Video fragments: `frame_seq` only (ordering/reassembly); signing/AAD do not carry media time.
-   - Receiver: Opus → per-peer jitter queue + 20 ms tick (`call_controller`); video → reassemble
-     → decode → `QVideoSink` ASAP. No coupling.
+   | Stream | Sync need | Path |
+   |---|---|---|
+   | **Mic / voice** | Loose — lip sync on a 640x360 tile is forgiving | **Unchanged.** `core.audio.opus` / `room.audio.sfu`, no PTS, no clock |
+   | **Content audio** (game, browser, screen share, music) | **Tight** — a gunshot before the muzzle flash is glaring | **New**, stamped from the same clock as video |
+   | **Video** | — | Existing path, gains a PTS field |
 
-   Without this work, mic+camera and especially content-audio+screen (item 4) drift under loss,
-   unequal buffers, and keyframe stalls. **Gate “video + content audio ships” on this plan.**
+   Content audio and video are both captured locally and stamped from one `SessionMediaClock`, so
+   they share a timeline by construction — which is most of the sync problem gone. The receiver
+   runs content audio as the master and slaves video to it, exactly as the audio-led design below
+   describes; the mic stream plays on its own existing path, independently.
 
-   #### Goals / non-goals
+   **This merges the old items 4 and 5.** They were sequential (sync gating content audio); under
+   this design they are one piece of work, and likely less of it.
 
-   | | v1 |
-   |---|---|
-   | Quality | A/V offset roughly **±40–80 ms** under normal loss |
-   | Master | **Audio-led** — never stretch/warp Opus to chase video |
-   | Clock scope | One **sender** timeline per call/room session; peers need not share wall clocks |
-   | Multi-party | Sync is **per sender** — never compare PTS across peers |
-   | Non-goals | NTP between peers, full RTP/RTCP, sample-accurate editorial sync, dual content-audio wire tracks, muxing A/V into one container |
+   ### What this deliberately does not solve
 
-   #### Architecture
+   **Lip sync for a talking-head call.** The mic is not on the synced timeline, so a face and its
+   voice can drift by whatever the two paths' buffering differs by. Accepted for v1: the target
+   was always "some sync, not frame-perfect", and a small webcam tile is forgiving. If it proves
+   inadequate, the mic can be *additionally* carried on the media layer during video calls — an
+   optional follow-on, not a prerequisite, and one that would need a clean handoff at camera
+   toggle.
 
-   ```text
-   SessionMediaClock (sender, t0 = voice session start)
-           │ stamp at capture/mix (before encode)
-     ┌─────┴──────┐
-     ▼            ▼
-   voice(+content mix) → Opus@pts_a    camera/screen → RawFrame@pts_v → encode
-     │                                  │
-     seal/sign (PTS in AAD/sig)         seal + sign (PTS bound)
-     │                                  │
-     wire with pts                      fragments (pts on frame; ver bump)
-     │                                  │
-     └──────── receiver ────────────────┘
-              audio 20ms tick = master (record playout_anchor per peer)
-              video hold/drop to extrapolated audio PTS (bounded queue)
-   ```
+   ### Wire
 
-   **Stamp points (discipline):** audio after mix / at the PCM boundary that becomes that Opus
-   packet; video at capture or composite output **before** encode. Post-encode stamps hide encode
-   latency as false skew.
+   Tags `0x08`–`0x0F` are free in the first-party range, and `classify` falls through to
+   `FrameClass::Other`, so the supernode forwards a new tag opaquely with **no media logic** —
+   the same property `ROOM_VIDEO_TAG` relies on. The SFU active-speaker gate reads `SfuAudio`
+   only and never sees this stream.
 
-   **Content audio (item 4):** mix voice + content **before** stamping the Opus PTS so one audio
-   stream remains the master. Do not run two audio clocks against one video.
+   - `core.audio.content.v1` (direct) and `room.audio.content.sfu` (relay), sitting beside
+     `core.audio.opus` / `room.audio.sfu`.
+   - One Opus frame fits one datagram, so no fragmentation: `[ver][flags][pts:u64 BE]
+     [sender_len][sender][sig:64][payload]`, payload sealed under the room sender key on the relay
+     path and raw on the direct path (matching how direct video is unsealed — mTLS, no relay).
+   - PTS is `u64` microseconds since session `t0`, **bound into the signature and AAD** so a relay
+     cannot shift a stream's timing. Advisory timing is not worth having.
+   - Video fragments gain the same `pts` field (`FRAGMENT_VERSION` -> `0x03`), bound into
+     `video_frame_signing_bytes` as the codec byte already is.
+   - Capability params advertise `av_sync=1`, `pts_unit=us`. No mutual support -> no content audio,
+     and video free-runs as it does today.
 
-   #### Wire + crypto
+   ### Encoding
 
-   - **Units:** prefer `u64` microseconds since session `t0` (avoid long-session wrap bugs).
-   - **Direct audio v2:** versioned framing after peer id, e.g.
-     `[AUDIO_TAG][id_len][peer_id][fmt:u8][pts:u64 BE][opus]` with a clear format byte so parsers
-     do not guess. Old v1 frames remain `[…][opus]` only.
-   - **Room audio:** add `"pts": <u64>` on `SfuAudio` (JSON is fine for v1; do not block sync on a
-     binary room-audio rewrite). Wall-clock `timestamp` stays for freshness only.
-   - **Video fragments:** bump `FRAGMENT_VERSION` (e.g. `0x02`); carry `pts:u64` on the frame
-     (fragment 0 is enough, or every frag for simpler reassembly). Extend
-     `video_frame_signing_bytes` to bind PTS.
-   - **Auth:** bind PTS into voice/media AAD (`group_key`) and video signatures so a modified PTS
-     fails open/verify. Advisory-only PTS is not “done right.”
-   - **Capability:** advertise `av_sync=1` + `pts_unit=us` on audio/video descriptors (or params).
-     Mutual support → stamp + enforce; otherwise degrade to today’s best-effort (no hard fail of
-     voice-only peers). Room: stamp when local client supports it; old receivers ignore PTS.
+   Content audio must **not** run the voice DSP stack: noise gate, VAD-gated send, and
+   `Application::Voip` will suppress or mangle music and game audio. It wants
+   `Application::Audio`, a higher bitrate, and no gating. This is precisely why mix-at-sender onto
+   the voice stream was rejected — one encoder cannot have two application modes.
 
-   #### Receiver policy (audio master, video slave)
+   ### Capture (per platform, the unbuilt half)
 
-   - Keep existing audio jitter buffer + 20 ms playout tick as master.
-   - On each played Opus frame for peer P, set `playout_anchor[P] = (pts_a, Instant::now())`.
+   | Platform | Source | State |
+   |---|---|---|
+   | Windows | WASAPI endpoint loopback (whole machine) and `VAD\Process_Loopback` via `ActivateAudioInterfaceAsync` (one app's process tree) | Built |
+   | Linux | PipeWire / PulseAudio monitor source | Unbuilt |
+   | macOS | Hardest — needs a virtual device or ScreenCaptureKit audio | Unbuilt |
+
+   Whichever backend a platform gets, it must report **device capture offsets** per frame rather
+   than counting frames out: a loopback device emits nothing at all while its source is quiet, and
+   a counter silently converts every silence into permanent audio-behind-video lag. See
+   `CaptureTimeline`.
+
+   Pairs naturally with screen capture (item 1), which needs the same permissions on Linux/macOS.
+   **Echo hazard:** if content is system loopback, remote peers' audio played locally re-enters
+   the loop. Needs exclude-our-own-output, ducking, or a virtual cable.
+
+   ### Receiver policy (content audio master, video slave)
+
+   - Content audio keeps a jitter buffer and a 20 ms playout tick, as voice does.
+   - On each played content frame for peer P, set `playout_anchor[P] = (pts_a, Instant::now())`.
    - On PLC / silence, **advance expected audio PTS** by ~20 ms so video does not wait forever.
-   - Decoded video `{pts_v, pixels}` → per-peer hold queue; display tick (~30–60 Hz):
+   - Decoded video `{pts_v, pixels}` -> per-peer hold queue; display tick (~30-60 Hz):
      - `audio_now_pts = extrapolate(playout_anchor[P])`
      - drop if `pts_v < audio_now_pts - late_tol`
      - show if `pts_v <= audio_now_pts + early_tol`
      - else hold last frame
-   - Starting constants (tunable): `late_tol` 40–60 ms; hold window 40–80 ms; max queue ~5–8
-     frames; stall placeholder after ~300–500 ms without a renderable frame.
+   - Starting constants (tunable): `late_tol` 40-60 ms; hold window 40-80 ms; max queue ~5-8
+     frames; stall placeholder after ~300-500 ms without a renderable frame.
    - Light EMA of measured offset; step-correct by skip/hold frames only — **never** resample
      audio in v1. Reset on camera off/on, long gap, keyframe after stall, session restart.
-   - **Never block the audio tick on video.**
+   - **When no content audio is present** (camera-only call), video free-runs exactly as today.
+     There is no fallback to slaving video against the mic stream — that is the lip-sync
+     follow-on, not v1.
+   - **Never block a playout tick on video.**
 
-   #### Phased implementation (PR-sized)
+   ### Phases
 
    | Phase | Work | Rough effort |
    |---|---|---|
-   | **A — Clock + types** | New `SessionMediaClock` (e.g. `media_clock.rs`); create on voice active / destroy on end-call or leave voice room; thread-safe `now_pts_us()`; wire lifecycle from `AppBridge` / `CallController`. No wire change yet. | 0.5–1 d |
-   | **B — Wire + crypto + unit tests** | Video fragment v2 + signing/AAD; direct audio framing v2; room `SfuAudio` `pts` + seal AAD; golden vectors (old frames still verify; tampered PTS fails). | 2–4 d |
-   | **C — Sender plumbing** | Stamp audio at PCM/mix boundary in `AudioPipeline`; stamp video in capture/composite before encode; pass PTS through `SendAudio` / `SendVideoFrame` / `SendRoomVideo`. | 1–2 d |
-   | **D — Receiver audio-led** | Plumb PTS on `DirectAudioReceived` / `SfuAudioReceived` / video frame events; store PTS in jitter queue entries; per-peer playout anchor; video hold/drop queue (extend `video::receiver` or small `VideoPlayout`); gate on `av_sync`; debug metrics for measured offset. **Hardest product logic.** | 3–5 d |
-   | **E — Validation + docs** | Lab clap+flash / A/V test pattern under clean net, ~1–2% loss, keyframe burst; multi-peer per-sender check; README / capability notes; privacy unchanged (PTS is media timing). | 2–3 d |
+   | **A — Clock** | `SessionMediaClock` (`media_clock.rs`); created on video session start, destroyed on end; thread-safe `now_pts_us()`. No wire change. | 0.5-1 d |
+   | **B — Video PTS** | Fragment `0x03` + PTS bound into signing bytes; golden vectors. Isolated from audio entirely. | 1-2 d |
+   | **C — Content audio transport** | Tags, capability descriptors, quotas, seal/sign, send + receive, supernode opaque fan-out test. | 2-4 d |
+   | **D — Content capture** | WASAPI loopback first (matching Windows-first video), then PipeWire monitor. macOS last. | 2-4 d |
+   | **E — Receiver sync** | Playout anchor, video hold/drop queue, debug offset metrics. **Hardest product logic.** | 3-5 d |
+   | **F — Validation** | Clap+flash under clean net, ~1-2% loss, keyframe burst; multi-peer per-sender. | 2-3 d |
 
-   **Total focused estimate:** ~1.5–2.5 engineer-weeks for sync alone (Windows video path already
-   capturing). Content loopback (item 4) is separate capture work; this plan still applies once
-   content is mixed into the same Opus timeline.
+   Phases A and B are useful on their own and touch nothing that ships.
 
-   #### Files (expected touch set)
+   ### Ship checklist
+
+   - [ ] Voice path byte-identical to before — diff it and confirm
+   - [ ] One `SessionMediaClock` per video session; not reused across calls
+   - [ ] Content audio and video stamped at capture/mix, never post-encode
+   - [ ] PTS bound in signature / AAD on both streams
+   - [ ] Receiver: content audio master, video hold/drop to PTS
+   - [ ] Per-peer timelines only; PLC advances audio PTS
+   - [ ] Camera-only call still free-runs video with no regression
+   - [ ] Lab offset inside +/-40-80 ms (clean / light loss / keyframe burst)
+   - [ ] `av_sync` graceful degrade for peers without it
+   - [ ] Supernode still opaque; no PTS logic in the SFU
+   - [ ] Content audio never routed through the voice DSP stack
+
+   ### Files (expected touch set)
 
    | Area | Likely paths |
    |---|---|
-   | Clock | new `conquerd-client/src/media_clock.rs`; `call_controller.rs`; `ui/bridge.rs` lifecycle |
-   | Video wire | `video/fragment.rs`, `video/mod.rs` (signing), `video/sender.rs`, `connection_manager/manager/video_session.rs` |
-   | Direct audio | `connection_manager/manager/peer_session.rs` (`send_audio_datagram` + inbound parse) |
-   | Room audio | room send path, `manager/inbound.rs` `SfuAudio`, `group_key.rs` AAD |
-   | Features | `conquerd-features` `wellknown.rs` params; channel_frame docs if needed |
-   | Playout | `call_controller.rs` jitter; `video/receiver.rs` + bridge → `QVideoSink` |
-   | Events | `connection_manager/events.rs` |
-   | Tests | fragment / crypto / transport; new sync tests with a fake clock |
+   | Clock | new `conquerd-client/src/media_clock.rs`; `ui/bridge.rs` lifecycle |
+   | Video wire | `video/fragment.rs`, `video/mod.rs` (signing), `manager/video_session.rs` |
+   | Content audio | new module; `conquerd-features` `channel_frame.rs` + `wellknown.rs` |
+   | Capture | new per-platform loopback backends |
+   | Playout | `call_controller.rs` (new stream, existing voice untouched); `video/receiver.rs` |
+   | Tests | fragment/crypto/transport; sync tests with a fake clock |
 
-   Supernode stays **content-opaque**: forward binary video fragments and existing audio envelopes
-   without parsing PTS. Do not teach the SFU a media timeline.
-
-   #### Decisions to lock before Phase B
-
-   1. `u64` µs PTS (preferred) vs `u32` coarser ticks.
-   2. PTS **authenticated** (required for “done right”).
-   3. Room audio keeps JSON for PTS v1 (no binary rewrite gate).
-   4. Video without active voice: refuse camera, or free-run video with no sync (prefer refuse /
-      voice-session-only video to keep one clock lifecycle).
-   5. Capability name/params: `av_sync=1`, `pts_unit=us`.
-
-   #### Ship checklist
-
-   - [ ] One `SessionMediaClock` per voice session; not reused across calls
-   - [ ] Audio + video stamped at capture/mix, not post-encode
-   - [ ] PTS on direct audio, room audio, and video frames
-   - [ ] PTS bound in signature / AAD
-   - [ ] Receiver: audio jitter master; video hold/drop to PTS
-   - [ ] Per-peer timelines only; PLC advances audio PTS
-   - [ ] Lab offset inside ±40–80 ms (clean / light loss / keyframe burst)
-   - [ ] `av_sync` graceful degrade for old peers
-   - [ ] Supernode still opaque; no SFU PTS logic
-   - [ ] Docs note sync expectations (seq counters alone are not enough)
-
-   #### Validation
-
-   Scripted or manual clap+flash (or known A/V test pattern); measure receiver playout offset
-   under clean net, ~1–2% loss, and during a keyframe burst. Export or log measured A/V offset
-   in debug builds to tune `late_tol` / hold window without guessing.
+   Supernode stays **content-opaque**: forward the new tag verbatim, never parse PTS. Do not
+   teach the SFU a media timeline.
 
 6. **Video adaptive bitrate (ABR).**
    Audio has room/direct ABR in `call_controller`. Video encoder exposes `set_bitrate` (MF path
@@ -463,8 +431,11 @@ and the in-call camera toggle.
 
 - **Multiple independent outbound streams per peer** (separate camera + screen without composite)
   — wire identifies a stream by sender only; changing that is a protocol bump, not a toggle.
-- **Separate content-audio wire track in v1** — prefer mix-at-sender onto existing Opus (item 4);
-  dual tracks only if product requires independent remote mute of commentary vs content.
+- ~~**Separate content-audio wire track in v1** — prefer mix-at-sender onto existing Opus.~~
+  **Reversed 2026-07-30.** Mix-at-sender was chosen because it needed no wire change, but that
+  benefit evaporated once A/V sync needed a media layer anyway — and it contradicted item 4's own
+  requirement that content audio not run the voice DSP stack, since one Opus encoder cannot hold
+  two application modes. Content audio now gets its own stream; see item 4.
 - **Frame-perfect / broadcast A/V sync** — v1 target is ±40–80 ms audio-led (item 5), not
   sample-accurate editorial sync, NTP-coupled peers, or full RTP/RTCP.
 - **WebRTC / browser video** — in-app portal stays on identity QUIC; do not reintroduce public

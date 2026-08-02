@@ -246,8 +246,16 @@ fn voice_aad(conv_id: &str, sender: &str, sequence: u64) -> Vec<u8> {
 pub enum MediaKind {
     /// Opus voice frames (`room.audio.sfu`, `core.audio.opus`).
     Voice,
-    /// VP8 video frames (`room.video.sfu`, `core.video.vp8`).
+    /// Video frames (`room.video.sfu`, `core.video.v1`).
     Video,
+    /// Content / system audio that accompanies video (`room.audio.content.sfu`,
+    /// `core.audio.content.v1`).
+    ///
+    /// Separate from [`Voice`](Self::Voice) even though both carry Opus: the
+    /// two are different streams with different sequence spaces, so without a
+    /// distinct domain a captured content frame could be replayed as a voice
+    /// frame at the same sequence and still pass the GCM tag check.
+    ContentAudio,
 }
 
 /// AAD for a media frame, domain-separated by [`MediaKind`].
@@ -265,6 +273,7 @@ fn media_aad(kind: MediaKind, conv_id: &str, sender: &str, sequence: u64) -> Vec
     match kind {
         MediaKind::Voice => {}
         MediaKind::Video => aad.push(0x02),
+        MediaKind::ContentAudio => aad.push(0x03),
     }
     aad
 }

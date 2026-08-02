@@ -21,9 +21,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use conquerd_features::video_codec::VideoCodec;
+use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use super::codec::VideoDecoder;
+use super::frame::RawFrame;
 use super::sink;
 
 /// One inbound encoded frame awaiting decode.
@@ -33,7 +35,14 @@ pub struct InboundFrame {
     pub keyframe: bool,
     /// Codec these bytes are in, from the frame's signed header.
     pub codec: VideoCodec,
+    /// Sender's capture time. Drives the hold/drop decision once decoded; see
+    /// [`crate::media_sync`].
+    pub pts_us: u64,
 }
+
+/// Shared hold/drop state, so the audio playout can advance the anchors that
+/// steer video. Cloned to whoever plays content audio.
+pub type SharedPlayout = Arc<Mutex<crate::media_sync::VideoPlayout<RawFrame>>>;
 
 /// A peer's decoder together with the codec it was built for, so a codec change
 /// is detectable rather than silently feeding bytes to the wrong decoder.
@@ -92,6 +101,8 @@ enum Control {
 
 /// Handle to the decode thread.
 pub struct VideoReceiver {
+    /// Shared with the caller so content-audio playout can advance anchors.
+    playout: SharedPlayout,
     tx: mpsc::SyncSender<InboundFrame>,
     control_tx: mpsc::Sender<Control>,
     stop: Arc<AtomicBool>,
@@ -111,6 +122,8 @@ impl VideoReceiver {
     {
         let (tx, rx) = mpsc::sync_channel::<InboundFrame>(QUEUE_DEPTH);
         let (control_tx, control_rx) = mpsc::channel::<Control>();
+        let playout: SharedPlayout = Arc::new(Mutex::new(crate::media_sync::VideoPlayout::new()));
+        let playout_t = Arc::clone(&playout);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = Arc::clone(&stop);
 
@@ -206,7 +219,22 @@ impl VideoReceiver {
                     match entry.decoder.decode(&item.encoded) {
                         Ok(frame) => {
                             failures.remove(&item.peer_id);
-                            sink::push_frame(&item.peer_id, &frame);
+                            // Through the playout rather than straight to the
+                            // sink: with content audio present this holds the
+                            // frame until the audio timeline reaches it, and
+                            // without it the playout returns the frame
+                            // immediately, which is the free-run path.
+                            let due = playout_t.lock().push(
+                                &item.peer_id,
+                                crate::media_sync::QueuedFrame {
+                                    pts_us: item.pts_us,
+                                    payload: frame,
+                                },
+                                std::time::Instant::now(),
+                            );
+                            for f in due {
+                                sink::push_frame(&item.peer_id, &f.payload);
+                            }
                         }
                         Err(e) => {
                             let n = failures.entry(item.peer_id.clone()).or_insert(0);
@@ -235,6 +263,7 @@ impl VideoReceiver {
             .ok();
 
         Self {
+            playout,
             tx,
             control_tx,
             stop,
@@ -246,12 +275,20 @@ impl VideoReceiver {
     ///
     /// Never blocks: a full queue means the decoder is behind, and the newest
     /// frame is worth less than the latency that waiting would add.
-    pub fn submit(&self, peer_id: &str, encoded: Vec<u8>, keyframe: bool, codec: VideoCodec) {
+    pub fn submit(
+        &self,
+        peer_id: &str,
+        encoded: Vec<u8>,
+        keyframe: bool,
+        codec: VideoCodec,
+        pts_us: u64,
+    ) {
         let item = InboundFrame {
             peer_id: peer_id.to_owned(),
             encoded,
             keyframe,
             codec,
+            pts_us,
         };
         match self.tx.try_send(item) {
             Ok(()) => {}
@@ -270,9 +307,19 @@ impl VideoReceiver {
     /// The sink is cleared immediately so the tile blanks without waiting for
     /// the decode thread; the decoder is dropped on that thread so COM/MF
     /// objects stay on the apartment that created them.
+    /// Handle to the shared hold/drop state.
+    ///
+    /// The content-audio playout calls `note_audio_played` on this each time it
+    /// plays a frame — including concealed ones — which is what advances the
+    /// timeline video is held against.
+    pub fn playout(&self) -> SharedPlayout {
+        Arc::clone(&self.playout)
+    }
+
     pub fn forget(&self, peer_id: &str) {
         // Immediate UI blank — do not wait for the decode thread.
         sink::clear_peer(peer_id);
+        self.playout.lock().forget(peer_id);
         let _ = self.control_tx.send(Control::Forget(peer_id.to_owned()));
     }
 
@@ -401,11 +448,63 @@ mod tests {
 
         let started = std::time::Instant::now();
         for _ in 0..(QUEUE_DEPTH * 4) {
-            rx.submit("peer", vec![1, 2, 3], false, VideoCodec::Stub);
+            rx.submit("peer", vec![1, 2, 3], false, VideoCodec::Stub, 0);
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "submit blocked; it must shed instead"
+        );
+    }
+
+    /// The playout handle must be the *same* state the decode thread uses, or
+    /// anchors set by the audio side would steer a queue nobody reads and video
+    /// would free-run forever while looking correctly wired.
+    #[test]
+    fn the_exposed_playout_is_the_one_the_decode_thread_uses() {
+        let rx = VideoReceiver::start(
+            |_codec| {
+                Some(Box::new(CountingDecoder(Arc::new(
+                    std::sync::atomic::AtomicU32::new(0),
+                ))))
+            },
+            |_| {},
+        );
+
+        let handle = rx.playout();
+        handle
+            .lock()
+            .note_audio_played("peer", 1_000_000, std::time::Instant::now());
+        // Reading through a second handle must observe the same anchor.
+        assert!(rx
+            .playout()
+            .lock()
+            .audio_now_us("peer", std::time::Instant::now())
+            .is_some());
+    }
+
+    /// Forgetting a peer must clear their sync state too. Leaving an anchor
+    /// behind would steer the next stream from that peer against a timeline
+    /// belonging to the previous one.
+    #[test]
+    fn forget_clears_sync_state_as_well_as_the_decoder() {
+        let rx = VideoReceiver::start(
+            |_codec| {
+                Some(Box::new(CountingDecoder(Arc::new(
+                    std::sync::atomic::AtomicU32::new(0),
+                ))))
+            },
+            |_| {},
+        );
+        let now = std::time::Instant::now();
+        rx.playout()
+            .lock()
+            .note_audio_played("peer", 1_000_000, now);
+        assert!(rx.playout().lock().audio_now_us("peer", now).is_some());
+
+        rx.forget("peer");
+        assert!(
+            rx.playout().lock().audio_now_us("peer", now).is_none(),
+            "a stale anchor survived the peer being forgotten"
         );
     }
 
@@ -421,7 +520,7 @@ mod tests {
             },
             |_| {},
         );
-        rx.submit("peer", vec![1], false, VideoCodec::Stub);
+        rx.submit("peer", vec![1], false, VideoCodec::Stub, 0);
         let started = std::time::Instant::now();
         drop(rx);
         assert!(
@@ -538,7 +637,7 @@ mod tests {
         );
         // Fill the frame queue so a coupled control path would block.
         for _ in 0..(QUEUE_DEPTH * 2) {
-            rx.submit("peer-a", vec![1], false, VideoCodec::Stub);
+            rx.submit("peer-a", vec![1], false, VideoCodec::Stub, 0);
         }
         let started = std::time::Instant::now();
         rx.forget("peer-a");

@@ -50,6 +50,12 @@ pub mod ffi {
         #[qproperty(QString, video_overlays_json)]
         #[qproperty(bool, video_enabled)]
         #[qproperty(QString, video_quality)]
+        /// Which audio accompanies a shared video source.
+        ///
+        /// `"auto"` follows the video source — an app shares its own audio, a
+        /// monitor shares the machine, a camera shares nothing. `"system"`
+        /// always shares the whole machine; `"off"` never shares.
+        #[qproperty(QString, content_audio_mode)]
         #[qproperty(QString, peer_audio_prefs_json)]
         #[qproperty(f32, video_region_ratio)]
         #[qproperty(QString, video_popout_geometry_json)]
@@ -173,6 +179,8 @@ struct SettingsSnapshot {
     video_enabled: bool,
     #[serde(default = "default_video_quality")]
     video_quality: String,
+    #[serde(default = "default_content_audio_mode")]
+    content_audio_mode: String,
     /// Listener-local per-peer mute/volume, as
     /// `{"<peer>":{"muted":bool,"volume":int}}`. One blob rather than a field
     /// per peer, which would grow without bound.
@@ -270,6 +278,12 @@ fn default_video_region_ratio() -> f32 {
     0.4
 }
 
+/// Follow the video source unless the user says otherwise — the pairing that
+/// is right in almost every case.
+fn default_content_audio_mode() -> String {
+    "auto".to_owned()
+}
+
 fn default_video_quality() -> String {
     "balanced".to_string()
 }
@@ -317,6 +331,7 @@ impl Default for SettingsSnapshot {
             video_overlays_json: default_overlays_blob(),
             video_enabled: false,
             video_quality: default_video_quality(),
+            content_audio_mode: default_content_audio_mode(),
             peer_audio_prefs_json: default_prefs_blob(),
             video_region_ratio: default_video_region_ratio(),
             video_popout_geometry_json: default_prefs_blob(),
@@ -371,6 +386,8 @@ pub struct SettingsModelRust {
     video_overlays_json: QString,
     video_enabled: bool,
     video_quality: QString,
+    /// See the `content_audio_mode` qproperty.
+    content_audio_mode: QString,
     peer_audio_prefs_json: QString,
     video_region_ratio: f32,
     video_popout_geometry_json: QString,
@@ -430,6 +447,7 @@ impl Default for SettingsModelRust {
             video_overlays_json: QString::from(s.video_overlays_json.as_str()),
             video_enabled: s.video_enabled,
             video_quality: QString::from(s.video_quality.as_str()),
+            content_audio_mode: QString::from(s.content_audio_mode.as_str()),
             peer_audio_prefs_json: QString::from(s.peer_audio_prefs_json.as_str()),
             video_region_ratio: s.video_region_ratio,
             video_popout_geometry_json: QString::from(s.video_popout_geometry_json.as_str()),
@@ -508,6 +526,7 @@ impl ffi::SettingsModel {
             video_overlays_json: r.video_overlays_json.to_string(),
             video_enabled: r.video_enabled,
             video_quality: r.video_quality.to_string(),
+            content_audio_mode: r.content_audio_mode.to_string(),
             peer_audio_prefs_json: r.peer_audio_prefs_json.to_string(),
             video_region_ratio: r.video_region_ratio,
             video_popout_geometry_json: r.video_popout_geometry_json.to_string(),

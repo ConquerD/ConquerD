@@ -49,8 +49,15 @@ Rectangle {
     /// Whether the local mic is muted.
     property bool muted: false
 
-    /// Whether the local camera is on.
+    /// Whether we are currently sharing video.
     property bool videoOn: false
+    /// True while audio is actually going out alongside the video.
+    ///
+    /// Reflects what the backend achieved, not what was asked for: choosing an
+    /// audio option is not a guarantee that a loopback endpoint opened. The
+    /// badge on the share button is the only place a user can see the
+    /// difference between "sharing silently on purpose" and "audio failed".
+    property bool shareAudioOn: false
 
     /// Elapsed call seconds (driven by bridge.call_duration_secs).
     property int durationSecs: 0
@@ -153,7 +160,13 @@ Rectangle {
     signal endCallRequested()
     signal muteToggled(bool muted)
     /// Camera button pressed; `on` is the requested new state.
-    signal videoToggled(bool on)
+    /// Start sharing, with `audioMode` one of "auto", "system", "off".
+    ///
+    /// Video and its audio start together: the audio is stamped against the
+    /// video session's clock, so it cannot meaningfully exist without it.
+    signal shareRequested(string audioMode)
+    /// Stop sharing video and any audio that went with it.
+    signal stopShareRequested()
 
     /// A peer's video should be shown in the centre expand region.
     signal expandVideoRequested(string peerId)
@@ -512,8 +525,16 @@ Rectangle {
                     HoverHandler { id: muteHover }
                 }
 
-                // Camera toggle
+                // One control for sharing, not two.
+                //
+                // Video and the audio that belongs with it are a single act
+                // from the user's point of view — "share this" — so the audio
+                // is an *option of sharing*, chosen when sharing starts, rather
+                // than a second toggle to remember afterwards. It also removes
+                // the state that made no sense: an audio button that did
+                // nothing until a camera was already running.
                 Rectangle {
+                    id: shareButton
                     width: 36; height: 36; radius: Theme.radiusPill
                     color: root.videoOn ? Theme.accent : Theme.bg2
 
@@ -531,15 +552,116 @@ Rectangle {
                         fillMode: Image.PreserveAspectFit
                     }
 
+                    // Audio-included badge.
+                    //
+                    // Sharing is otherwise indistinguishable whether or not the
+                    // audio half started, and it can fail on its own (no
+                    // loopback endpoint, device in use) while the video keeps
+                    // running. Without this the user's first clue is a peer
+                    // saying they hear nothing.
+                    Rectangle {
+                        visible: root.videoOn && root.shareAudioOn
+                        width: 12; height: 12; radius: 6
+                        anchors { right: parent.right; bottom: parent.bottom }
+                        color: Theme.bg2
+                        border.color: Theme.accent
+                        border.width: 1
+
+                        Image {
+                            anchors.centerIn: parent
+                            source: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg"
+                            sourceSize.width: 8; sourceSize.height: 8
+                            width: 8; height: 8
+                            fillMode: Image.PreserveAspectFit
+                        }
+                    }
+
                     MouseArea {
                         anchors.fill: parent
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: root.videoToggled(!root.videoOn)
+                        // Stopping is unambiguous, so it needs no menu. Starting
+                        // asks what to do about audio, because that choice is
+                        // only meaningful at the moment sharing begins.
+                        onClicked: {
+                            if (root.videoOn)
+                                root.stopShareRequested()
+                            else
+                                sharePopup.open()
+                        }
                     }
 
-                    ToolTip.text: root.videoOn ? qsTr("Turn off camera") : qsTr("Turn on camera")
-                    ToolTip.visible: camHover.hovered
-                    HoverHandler { id: camHover }
+                    ToolTip.text: !root.videoOn
+                        ? qsTr("Share video")
+                        : (root.shareAudioOn
+                            ? qsTr("Stop sharing (video and audio)")
+                            : qsTr("Stop sharing (video only)"))
+                    ToolTip.visible: shareHover.hovered && !sharePopup.opened
+                    HoverHandler { id: shareHover }
+
+                    Popup {
+                        id: sharePopup
+                        y: -implicitHeight - Theme.spacingXs
+                        width: 260
+                        padding: Theme.spacingSm
+                        modal: false
+                        background: Rectangle {
+                            color: Theme.bg2
+                            border.color: Theme.border
+                            radius: Theme.radiusSm
+                        }
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            spacing: Theme.spacingXs
+
+                            Label {
+                                text: qsTr("Share video with…")
+                                color: Theme.text
+                                font.pixelSize: Theme.fontSizeCaption
+                                font.bold: true
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                wrapMode: Text.WordWrap
+                                text: qsTr("Source is set in Settings › Video. Audio is sent on the same timeline as the video, so the two stay in sync.")
+                                color: Theme.muted
+                                font.pixelSize: Theme.fontTiny
+                            }
+
+                            Repeater {
+                                model: [
+                                    { key: "auto",   label: qsTr("Audio from the shared source") },
+                                    { key: "system", label: qsTr("This computer's audio") },
+                                    { key: "off",    label: qsTr("No audio") }
+                                ]
+                                delegate: Rectangle {
+                                    required property var modelData
+                                    Layout.fillWidth: true
+                                    height: 30
+                                    radius: Theme.radiusSm
+                                    color: optHover.hovered ? Theme.bg3 : "transparent"
+
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        anchors.left: parent.left
+                                        anchors.leftMargin: Theme.spacingSm
+                                        text: parent.modelData.label
+                                        color: Theme.text
+                                        font.pixelSize: Theme.fontSizeCaption
+                                    }
+                                    HoverHandler { id: optHover }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            sharePopup.close()
+                                            root.shareRequested(parent.modelData.key)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Item { Layout.fillWidth: true }
