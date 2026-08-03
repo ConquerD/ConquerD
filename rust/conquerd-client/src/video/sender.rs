@@ -21,18 +21,77 @@ use super::codec::VideoEncoder;
 use super::composite::Placement;
 use super::frame::RawFrame;
 
-/// Quality preset, mapped from the `video_quality` setting.
+/// Smallest encoded edge offered. Below this a picture conveys nothing that
+/// justifies the packets, and the fragmenter's per-frame overhead starts to
+/// dominate the payload.
+pub const MIN_DIMENSION: u32 = 128;
+/// Largest encoded edge offered — 4K, the ceiling of what a desktop capture can
+/// plausibly want. A cap exists at all because these values come from a settings
+/// file: an absurd size would be handed straight to a hardware encoder, which
+/// fails in a way that reads as a broken camera.
+pub const MAX_DIMENSION: u32 = 3840;
+/// Slowest offered frame rate. Below this motion stops reading as motion.
+pub const MIN_FPS: u32 = 5;
+/// Fastest offered frame rate.
+pub const MAX_FPS: u32 = 60;
+/// Keyframe interval used by every preset.
+///
+/// A keyframe is what lets a joining (or recovering) receiver start decoding, so
+/// this trades startup latency against bandwidth: shorter recovers faster and
+/// costs more, since a keyframe is many times the size of an inter frame.
+pub const DEFAULT_KEYFRAME_SECS: u32 = 4;
+/// Shortest offered keyframe interval.
+pub const MIN_KEYFRAME_SECS: u32 = 1;
+/// Longest offered keyframe interval. Past this a receiver that misses one
+/// keyframe waits an uncomfortably long time for the next, and the explicit
+/// keyframe request is doing all the work anyway.
+pub const MAX_KEYFRAME_SECS: u32 = 30;
+/// Ceiling for a hand-set bitrate. Far above any preset, because a LAN screen
+/// share is a legitimate reason to spend this — but not unbounded, since the
+/// value reaches a hardware encoder directly.
+pub const MAX_VIDEO_BITRATE_BPS: u32 = 8_000_000;
+
+/// Resolved encoder settings for one capture. Built from the `video_quality`
+/// preset plus the per-field overrides the Video settings page writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quality {
     pub width: u32,
     pub height: u32,
     pub bitrate_bps: u32,
     pub fps: u32,
+    /// Maximum seconds between keyframes, passed through to
+    /// [`EncoderParams`](super::codec::EncoderParams).
+    pub keyframe_interval_secs: u32,
+}
+
+/// The preset name meaning "the overrides describe this capture".
+///
+/// Size and frame rate are only taken from the overrides under this name — see
+/// [`Quality::resolve`].
+pub const CUSTOM_PRESET: &str = "custom";
+
+/// Per-field overrides applied on top of a [`Quality`] preset.
+///
+/// **Zero means "leave the preset alone"** in every field, so a caller that has
+/// nothing to say passes [`Default::default`] and gets exactly the preset. That
+/// convention is what lets one settings blob carry both "I picked Balanced" and
+/// "I picked 1080p60 at 4 Mbps" without a second flag per field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QualityOverrides {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_bps: u32,
+    pub keyframe_interval_secs: u32,
 }
 
 impl Quality {
     /// Resolve a preset name. Unknown names fall back to balanced rather than
     /// failing, since this comes from a settings string.
+    ///
+    /// `"custom"` resolves to balanced too: it is the preset name that means
+    /// "the overrides say what this is", so on its own — with every override
+    /// zero — it must still be a usable capture.
     pub fn from_name(name: &str) -> Self {
         match name {
             "low" => Self {
@@ -40,21 +99,104 @@ impl Quality {
                 height: 180,
                 bitrate_bps: 250_000,
                 fps: 20,
+                keyframe_interval_secs: DEFAULT_KEYFRAME_SECS,
             },
             "high" => Self {
                 width: 1280,
                 height: 720,
                 bitrate_bps: 1_500_000,
                 fps: 30,
+                keyframe_interval_secs: DEFAULT_KEYFRAME_SECS,
             },
-            // "balanced" and anything unrecognised.
+            // "balanced", "custom", and anything unrecognised.
             _ => Self {
                 width: 640,
                 height: 360,
                 bitrate_bps: 600_000,
                 fps: 30,
+                keyframe_interval_secs: DEFAULT_KEYFRAME_SECS,
             },
         }
+    }
+
+    /// What the encoder is actually configured with: a preset, with the user's
+    /// overrides applied and clamped to what an encoder will accept.
+    ///
+    /// **Size and frame rate are only taken from `overrides` under the
+    /// [`CUSTOM_PRESET`] name.** A settings file keeps whatever size Custom was
+    /// last set to, so without that gate, switching back to Balanced would
+    /// silently keep sending 1080p under a label that says 640x360. Bitrate and
+    /// keyframe interval are *not* gated — those are deliberately adjustable on
+    /// top of any preset, and neither one is what a preset name claims.
+    ///
+    /// Total by design: every field comes from a JSON settings file that a user
+    /// can hand-edit, so nothing here can fail — out-of-range values are clamped
+    /// and impossible ones ignored. A capture that starts at the wrong size is
+    /// recoverable; one that refuses to start reads as a broken camera.
+    ///
+    /// Note what happens when the size or rate is overridden but the bitrate is
+    /// not: the bitrate is **recomputed** from [`suggested_bitrate_bps`] rather
+    /// than inherited from the preset. Inheriting it is the trap — asking for
+    /// 1080p while silently keeping Balanced's 600 kbps produces a smeared
+    /// picture that looks like a broken encoder rather than a rate that is
+    /// simply too low for the size requested.
+    pub fn resolve(preset: &str, overrides: QualityOverrides) -> Self {
+        let mut q = Self::from_name(preset);
+        let custom = preset == CUSTOM_PRESET;
+
+        // Width and height move together: half an override would letterbox the
+        // capture into an aspect the user never chose.
+        let sized = custom
+            && overrides.width >= MIN_DIMENSION
+            && overrides.height >= MIN_DIMENSION
+            && overrides.width <= MAX_DIMENSION
+            && overrides.height <= MAX_DIMENSION;
+        if sized {
+            // 4:2:0 chroma is subsampled by two in each direction, so an odd
+            // edge has no valid plane size. Rounded down rather than up so the
+            // clamps above cannot be exceeded by the rounding.
+            q.width = overrides.width & !1;
+            q.height = overrides.height & !1;
+        }
+
+        let paced = custom && overrides.fps > 0;
+        if paced {
+            q.fps = overrides.fps.clamp(MIN_FPS, MAX_FPS);
+        }
+
+        if overrides.bitrate_bps > 0 {
+            q.bitrate_bps = overrides
+                .bitrate_bps
+                .clamp(MIN_VIDEO_BITRATE_BPS, MAX_VIDEO_BITRATE_BPS);
+        } else if sized || paced {
+            q.bitrate_bps = Self::suggested_bitrate_bps(q.width, q.height, q.fps);
+        }
+
+        if overrides.keyframe_interval_secs > 0 {
+            q.keyframe_interval_secs = overrides
+                .keyframe_interval_secs
+                .clamp(MIN_KEYFRAME_SECS, MAX_KEYFRAME_SECS);
+        }
+
+        q
+    }
+
+    /// A sensible bitrate for a given size and frame rate — what the settings
+    /// page's "Auto" bitrate resolves to.
+    ///
+    /// Sub-linear in pixel rate (an exponent of 0.75) because that is how
+    /// compression actually behaves: doubling the pixels does not double the
+    /// bits needed, since a larger frame has more spatial redundancy to exploit.
+    /// The constant is fitted to the shipping presets, so Balanced and High
+    /// resolve to approximately their own hand-tuned rates and every size in
+    /// between interpolates rather than stepping.
+    pub fn suggested_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
+        let pixels_per_sec = f64::from(width) * f64::from(height) * f64::from(fps.max(1));
+        let bps = 4.455 * pixels_per_sec.powf(0.75);
+        // `as` saturates at the u32 bound rather than wrapping, and the clamp
+        // then pulls it back into range; NaN cannot arise from a non-negative
+        // base, but would saturate to 0 and clamp to the floor if it did.
+        (bps as u32).clamp(MIN_VIDEO_BITRATE_BPS, MAX_VIDEO_BITRATE_BPS)
     }
 }
 
@@ -395,6 +537,13 @@ pub struct VideoSender {
     ceiling_bps: u32,
     /// Currently published rate, so a no-op adaptation writes nothing.
     current_bps: u32,
+    /// Whether transport loss is allowed to steer the bitrate at all.
+    ///
+    /// On by default, and off only when the user says so in Settings → Video.
+    /// Turning it off is a real choice on a link the user knows is fine — a
+    /// managed LAN, a wired screen share — where the loss estimator reacting to
+    /// a transient costs picture quality for nothing.
+    adaptive: bool,
     /// Smoothed loss. Raw per-tick loss is far too noisy to steer on: a single
     /// spike would halve the bitrate and a single clean tick would undo it.
     loss_ema: f32,
@@ -554,6 +703,7 @@ impl VideoSender {
             target_bitrate_bps,
             ceiling_bps: quality.bitrate_bps,
             current_bps: quality.bitrate_bps,
+            adaptive: true,
             loss_ema: 0.0,
             handle,
         }
@@ -583,11 +733,39 @@ impl VideoSender {
         )
     }
 
+    /// Turn adaptive bitrate control on or off.
+    ///
+    /// Switching it off restores the user's target rate immediately rather than
+    /// freezing at whatever the last adaptation had settled on — otherwise
+    /// disabling ABR during a bad patch would pin the stream at the backed-off
+    /// rate for the rest of the session, which is the opposite of what the
+    /// switch promises. The loss estimate is reset with it, so re-enabling
+    /// starts from a clean measurement rather than a stale one.
+    pub fn set_adaptive_bitrate(&mut self, on: bool) {
+        if self.adaptive == on {
+            return;
+        }
+        self.adaptive = on;
+        self.loss_ema = 0.0;
+        if !on && self.current_bps != self.ceiling_bps {
+            self.current_bps = self.ceiling_bps;
+            self.target_bitrate_bps
+                .store(self.ceiling_bps, Ordering::Relaxed);
+            debug!("[video] ABR off, restoring {} bps", self.ceiling_bps);
+        }
+    }
+
     /// Feed a transport loss measurement into adaptive bitrate control.
     ///
     /// Called on the same connection-stats tick that drives audio ABR, so both
     /// media adapt from one measurement rather than each estimating separately.
+    /// A no-op while [`set_adaptive_bitrate`](Self::set_adaptive_bitrate) is
+    /// off — including the loss estimate, which must not accumulate while
+    /// nothing is acting on it.
     pub fn apply_network_quality(&mut self, loss_pct: f32) {
+        if !self.adaptive {
+            return;
+        }
         self.loss_ema = update_video_loss_ema(self.loss_ema, loss_pct);
         let next = next_video_bitrate(self.current_bps, self.ceiling_bps, self.loss_ema);
         if next == self.current_bps {
@@ -783,6 +961,246 @@ mod tests {
         let high = Quality::from_name("high");
         assert!(low.width < bal.width && bal.width < high.width);
         assert!(low.bitrate_bps < bal.bitrate_bps && bal.bitrate_bps < high.bitrate_bps);
+    }
+
+    #[test]
+    fn every_preset_ships_a_usable_keyframe_interval() {
+        for name in ["low", "balanced", "high", "custom", "nonsense"] {
+            let secs = Quality::from_name(name).keyframe_interval_secs;
+            assert!(
+                (MIN_KEYFRAME_SECS..=MAX_KEYFRAME_SECS).contains(&secs),
+                "{name} keyframe interval {secs}s is out of range"
+            );
+        }
+    }
+
+    /// The whole point of the overrides convention: nothing said, nothing
+    /// changed. A caller with an empty settings blob must get the preset it
+    /// asked for, byte for byte.
+    #[test]
+    fn no_overrides_leaves_every_preset_untouched() {
+        for name in ["low", "balanced", "high", "nonsense"] {
+            assert_eq!(
+                Quality::resolve(name, QualityOverrides::default()),
+                Quality::from_name(name),
+                "{name} must survive an empty override set"
+            );
+        }
+    }
+
+    /// The gate that makes the preset label mean something: a settings file
+    /// keeps whatever size Custom was last set to, and switching back to
+    /// Balanced has to actually go back to 640x360 rather than keep sending
+    /// 1080p under a label that says otherwise.
+    #[test]
+    fn a_preset_ignores_a_stale_custom_size_and_rate() {
+        let stale = QualityOverrides {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            ..Default::default()
+        };
+        for name in ["low", "balanced", "high"] {
+            let q = Quality::resolve(name, stale);
+            let preset = Quality::from_name(name);
+            assert_eq!((q.width, q.height), (preset.width, preset.height), "{name}");
+            assert_eq!(q.fps, preset.fps, "{name}");
+            assert_eq!(
+                q.bitrate_bps, preset.bitrate_bps,
+                "{name}: an ignored size must not drag the bitrate with it"
+            );
+        }
+    }
+
+    /// Bitrate and keyframe interval are deliberately *not* gated: neither is
+    /// what a preset name claims, so both stay adjustable on top of one.
+    #[test]
+    fn bitrate_and_keyframes_apply_on_top_of_any_preset() {
+        let q = Quality::resolve(
+            "balanced",
+            QualityOverrides {
+                bitrate_bps: 2_000_000,
+                keyframe_interval_secs: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(q.bitrate_bps, 2_000_000);
+        assert_eq!(q.keyframe_interval_secs, 1);
+        assert_eq!((q.width, q.height), (640, 360));
+    }
+
+    #[test]
+    fn overrides_replace_the_preset_values() {
+        let q = Quality::resolve(
+            "custom",
+            QualityOverrides {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_bps: 4_000_000,
+                keyframe_interval_secs: 2,
+            },
+        );
+        assert_eq!((q.width, q.height), (1920, 1080));
+        assert_eq!(q.fps, 60);
+        assert_eq!(q.bitrate_bps, 4_000_000);
+        assert_eq!(q.keyframe_interval_secs, 2);
+    }
+
+    /// The trap this exists to avoid: asking for 1080p while silently keeping
+    /// Balanced's 600 kbps, which looks like a broken encoder rather than a
+    /// bitrate that was never going to be enough.
+    #[test]
+    fn a_size_override_without_a_bitrate_rescales_the_bitrate() {
+        let q = Quality::resolve(
+            "custom",
+            QualityOverrides {
+                width: 1920,
+                height: 1080,
+                ..Default::default()
+            },
+        );
+        assert!(
+            q.bitrate_bps > Quality::from_name("balanced").bitrate_bps,
+            "1080p must not inherit 640x360's bitrate (got {})",
+            q.bitrate_bps
+        );
+        assert_eq!(
+            q.bitrate_bps,
+            Quality::suggested_bitrate_bps(1920, 1080, 30)
+        );
+    }
+
+    /// ...and the same for frame rate alone: 60 fps at the same size is twice
+    /// the pixel rate, so the preset's bitrate is no longer the right answer.
+    #[test]
+    fn an_fps_override_without_a_bitrate_rescales_the_bitrate() {
+        let q = Quality::resolve(
+            "custom",
+            QualityOverrides {
+                fps: 60,
+                ..Default::default()
+            },
+        );
+        assert!(q.bitrate_bps > Quality::from_name("balanced").bitrate_bps);
+    }
+
+    /// An explicit bitrate is the user's decision and must survive, even when
+    /// the size was overridden in the same edit.
+    #[test]
+    fn an_explicit_bitrate_is_not_second_guessed() {
+        let q = Quality::resolve(
+            "custom",
+            QualityOverrides {
+                width: 1920,
+                height: 1080,
+                bitrate_bps: 900_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(q.bitrate_bps, 900_000);
+    }
+
+    /// These values come from a hand-editable JSON file and are handed straight
+    /// to a hardware encoder, so every one of them has to be survivable.
+    #[test]
+    fn absurd_overrides_are_clamped_rather_than_honoured() {
+        let q = Quality::resolve(
+            "custom",
+            QualityOverrides {
+                width: 99_999,
+                height: 99_999,
+                fps: 10_000,
+                bitrate_bps: u32::MAX,
+                keyframe_interval_secs: 100_000,
+            },
+        );
+        // Out-of-range dimensions are ignored outright rather than clamped: a
+        // silently different aspect ratio is worse than the preset's.
+        assert_eq!((q.width, q.height), (640, 360));
+        assert_eq!(q.fps, MAX_FPS);
+        assert_eq!(q.bitrate_bps, MAX_VIDEO_BITRATE_BPS);
+        assert_eq!(q.keyframe_interval_secs, MAX_KEYFRAME_SECS);
+    }
+
+    #[test]
+    fn a_half_specified_size_is_ignored() {
+        for o in [
+            QualityOverrides {
+                width: 1280,
+                ..Default::default()
+            },
+            QualityOverrides {
+                height: 720,
+                ..Default::default()
+            },
+        ] {
+            let q = Quality::resolve("custom", o);
+            assert_eq!(
+                (q.width, q.height),
+                (640, 360),
+                "half a size must not letterbox the capture into an unasked-for aspect"
+            );
+        }
+    }
+
+    /// 4:2:0 chroma has no valid plane size for an odd edge, so an odd request
+    /// has to be corrected here rather than rejected by the encoder at runtime.
+    #[test]
+    fn odd_dimensions_are_rounded_to_even() {
+        let q = Quality::resolve(
+            "custom",
+            QualityOverrides {
+                width: 641,
+                height: 361,
+                ..Default::default()
+            },
+        );
+        assert_eq!((q.width, q.height), (640, 360));
+    }
+
+    #[test]
+    fn a_below_floor_bitrate_is_raised_to_the_abr_floor() {
+        let q = Quality::resolve(
+            "custom",
+            QualityOverrides {
+                bitrate_bps: 1_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(q.bitrate_bps, MIN_VIDEO_BITRATE_BPS);
+    }
+
+    /// The suggestion has to land near the hand-tuned presets, or "Auto" would
+    /// quietly disagree with the preset the user just selected.
+    #[test]
+    fn suggested_bitrate_tracks_the_shipping_presets() {
+        for name in ["balanced", "high"] {
+            let p = Quality::from_name(name);
+            let suggested = Quality::suggested_bitrate_bps(p.width, p.height, p.fps);
+            let ratio = f64::from(suggested) / f64::from(p.bitrate_bps);
+            assert!(
+                (0.7..=1.4).contains(&ratio),
+                "{name}: suggested {suggested} is {ratio:.2}x the preset's {}",
+                p.bitrate_bps
+            );
+        }
+    }
+
+    #[test]
+    fn suggested_bitrate_rises_with_pixel_rate_and_stays_in_range() {
+        let small = Quality::suggested_bitrate_bps(320, 180, 30);
+        let medium = Quality::suggested_bitrate_bps(1280, 720, 30);
+        let large = Quality::suggested_bitrate_bps(1920, 1080, 60);
+        assert!(small < medium && medium < large);
+        for bps in [
+            small,
+            large,
+            Quality::suggested_bitrate_bps(MAX_DIMENSION, MAX_DIMENSION, MAX_FPS),
+            Quality::suggested_bitrate_bps(0, 0, 0),
+        ] {
+            assert!((MIN_VIDEO_BITRATE_BPS..=MAX_VIDEO_BITRATE_BPS).contains(&bps));
+        }
     }
 
     /// A sink that records what it was handed.
@@ -1077,6 +1495,84 @@ mod tests {
                 "{name} preset must be able to back off"
             );
         }
+    }
+
+    /// A handle with no capture thread behind it, so the rate-control state
+    /// machine can be exercised without a camera. `handle: None` is a state
+    /// `signal_and_join` already tolerates — it is what a failed thread spawn
+    /// leaves behind — so nothing here is a test-only code path in disguise.
+    fn sender_for_test(ceiling_bps: u32) -> VideoSender {
+        VideoSender {
+            stop: Arc::new(AtomicBool::new(false)),
+            keyframe_requested: Arc::new(AtomicBool::new(false)),
+            frames_sent: Arc::new(AtomicU32::new(0)),
+            target_bitrate_bps: Arc::new(AtomicU32::new(ceiling_bps)),
+            ceiling_bps,
+            current_bps: ceiling_bps,
+            adaptive: true,
+            loss_ema: 0.0,
+            handle: None,
+        }
+    }
+
+    #[test]
+    fn adaptation_is_on_by_default() {
+        let mut s = sender_for_test(1_000_000);
+        assert!(s.adaptive);
+        for _ in 0..5 {
+            s.apply_network_quality(60.0);
+        }
+        assert!(s.current_bitrate_bps() < 1_000_000);
+    }
+
+    #[test]
+    fn disabling_adaptation_stops_the_bitrate_moving() {
+        let mut s = sender_for_test(1_000_000);
+        s.set_adaptive_bitrate(false);
+        for _ in 0..20 {
+            s.apply_network_quality(90.0);
+        }
+        assert_eq!(
+            s.current_bitrate_bps(),
+            1_000_000,
+            "loss must not steer the rate once the user has turned adaptation off"
+        );
+        assert_eq!(s.target_bitrate_bps.load(Ordering::Relaxed), 1_000_000);
+    }
+
+    /// Turning the switch off during a bad patch must give the rate back, not
+    /// pin the stream at whatever the last back-off had settled on.
+    #[test]
+    fn disabling_adaptation_restores_the_users_target() {
+        let mut s = sender_for_test(1_000_000);
+        for _ in 0..10 {
+            s.apply_network_quality(80.0);
+        }
+        assert!(s.current_bitrate_bps() < 1_000_000);
+
+        s.set_adaptive_bitrate(false);
+        assert_eq!(s.current_bitrate_bps(), 1_000_000);
+        assert_eq!(s.target_bitrate_bps.load(Ordering::Relaxed), 1_000_000);
+    }
+
+    /// Re-enabling must start from a clean measurement: a loss estimate that
+    /// kept accumulating while nothing was acting on it would back the rate off
+    /// instantly on the first tick after the switch, for congestion that may be
+    /// long over.
+    #[test]
+    fn re_enabling_adaptation_starts_from_a_clean_estimate() {
+        let mut s = sender_for_test(1_000_000);
+        s.set_adaptive_bitrate(false);
+        for _ in 0..20 {
+            s.apply_network_quality(90.0);
+        }
+        s.set_adaptive_bitrate(true);
+        s.apply_network_quality(0.0);
+        assert_eq!(
+            s.current_bitrate_bps(),
+            1_000_000,
+            "a clean tick after re-enabling must not be read as congestion"
+        );
     }
 
     #[test]

@@ -35,6 +35,9 @@ Item {
     property bool showAudioControl: showChrome
     /// Level (0–200) and mute for this peer's shared application audio.
     /// Held here so the slider survives the popup being reopened.
+    ///
+    /// These only matter while the tile exists: closing it silences the peer's
+    /// shared audio outright, because that audio belongs to this picture.
     property int contentVolume: 100
     property bool contentMuted: false
 
@@ -70,6 +73,17 @@ Item {
         function onVideoFrameChanged(frame) { root._gotFrame = true }
     }
 
+    /// Ask the parent to push the current level and mute to the mixer.
+    ///
+    /// Declared on the root, not on the visual tree below: a function defined
+    /// inside a child object is not reachable as `root.applyContentAudio()`, so
+    /// the earlier placement made every call a silent TypeError and the mute
+    /// button did nothing at all.
+    function applyContentAudio() {
+        if (root.peerId)
+            root.contentAudioChanged(root.contentMuted, root.contentVolume)
+    }
+
     function _bind(id) {
         if (id && id.length > 0)
             VideoRegistry.registerSink(id, videoOutput)
@@ -88,6 +102,12 @@ Item {
     Component.onCompleted: {
         root._bound = root.peerId
         _bind(root._bound)
+        // Push the tile's starting state, so the mixer agrees with the control
+        // being shown. A tile is destroyed when it is closed and rebuilt fresh
+        // when reopened; without this, a mute from a previous instance would
+        // survive in the mixer while the new tile reads "unmuted".
+        if (root.showAudioControl)
+            root.applyContentAudio()
     }
     // Primary teardown path. The registry also holds QPointers so a destroyed
     // sink self-reaps, but relying on that alone would leak the peer's slot
@@ -293,11 +313,5 @@ Item {
         }
 
         HoverHandler { id: tileHover }
-
-        /// Ask the parent to push the current level and mute to the mixer.
-        function applyContentAudio() {
-            if (root.peerId)
-                root.contentAudioChanged(root.contentMuted, root.contentVolume)
-        }
     }
 }

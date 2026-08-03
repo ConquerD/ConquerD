@@ -49,7 +49,33 @@ pub mod ffi {
         /// single-source capture that predates PIP.
         #[qproperty(QString, video_overlays_json)]
         #[qproperty(bool, video_enabled)]
+        /// Capture quality preset: `"low"` | `"balanced"` | `"high"` |
+        /// `"custom"`. `"custom"` means the fields below say what the capture
+        /// is; every other value means they are ignored.
         #[qproperty(QString, video_quality)]
+        /// Encoded frame size as `"<width>x<height>"`, e.g. `"1280x720"`.
+        /// Empty (or unparseable) means "follow the preset".
+        #[qproperty(QString, video_resolution)]
+        /// Encoded frame rate. `0` means "follow the preset".
+        #[qproperty(i32, video_fps)]
+        /// Target bitrate in kbps. `0` means "derive one from the resolution
+        /// and frame rate" — the settings page's Auto.
+        #[qproperty(i32, video_bitrate_kbps)]
+        /// Maximum seconds between keyframes. Applies to every preset, not just
+        /// custom: it trades how fast a joining receiver gets a picture against
+        /// how much of the bitrate keyframes consume.
+        #[qproperty(i32, video_keyframe_secs)]
+        /// Preferred outgoing codec: `"auto"` | `"h264"` | `"vp8"`.
+        ///
+        /// `"auto"` negotiates. Anything else is honoured only when this build
+        /// can encode it *and* the receiver can decode it — a preference is
+        /// never a reason to send frames nobody can read, nor to send nothing.
+        #[qproperty(QString, video_codec)]
+        /// Let measured packet loss lower the video bitrate below the target.
+        ///
+        /// On by default. Turning it off pins the stream at the chosen bitrate,
+        /// which is a real choice on a link the user knows is fine.
+        #[qproperty(bool, video_adaptive_bitrate)]
         /// Which audio accompanies a shared video source.
         ///
         /// `"auto"` follows the video source — an app shares its own audio, a
@@ -126,6 +152,29 @@ pub mod ffi {
         #[qinvokable]
         #[rust_name = "refresh_dirty"]
         fn refreshDirty(self: Pin<&mut Self>);
+
+        /// The video encoder overrides as one JSON blob, for handing to
+        /// `AppBridge::setVideoEnabled` / `setVideoPreviewEnabled`.
+        ///
+        /// One blob rather than six more arguments on two invokables and four
+        /// call sites — and built here rather than in QML so there is exactly
+        /// one place that knows how a resolution string becomes a width and a
+        /// height. The preset itself is *not* in it: that is still the separate
+        /// `quality` argument those invokables already take.
+        #[qinvokable]
+        #[rust_name = "video_encoder_json"]
+        fn videoEncoderJson(self: Pin<&mut Self>) -> QString;
+
+        /// What the encoder will actually be configured with, once the preset
+        /// and the overrides are resolved together:
+        /// `{"width":..,"height":..,"fps":..,"bitrate_bps":..,"keyframe_secs":..}`.
+        ///
+        /// The settings page shows these and syncs its combo boxes from them,
+        /// so the preset table lives in Rust only — a copy in QML would drift
+        /// from the one the encoder uses and quietly mislabel every preset.
+        #[qinvokable]
+        #[rust_name = "effective_video_quality_json"]
+        fn effectiveVideoQualityJson(self: Pin<&mut Self>) -> QString;
     }
 }
 
@@ -179,6 +228,20 @@ struct SettingsSnapshot {
     video_enabled: bool,
     #[serde(default = "default_video_quality")]
     video_quality: String,
+    /// `"<width>x<height>"`, or empty to follow the preset.
+    #[serde(default)]
+    video_resolution: String,
+    /// Zero means "follow the preset" in both of these — see the qproperties.
+    #[serde(default)]
+    video_fps: i32,
+    #[serde(default)]
+    video_bitrate_kbps: i32,
+    #[serde(default = "default_video_keyframe_secs")]
+    video_keyframe_secs: i32,
+    #[serde(default = "default_video_codec")]
+    video_codec: String,
+    #[serde(default = "default_true")]
+    video_adaptive_bitrate: bool,
     #[serde(default = "default_content_audio_mode")]
     content_audio_mode: String,
     /// Listener-local per-peer mute/volume, as
@@ -288,6 +351,17 @@ fn default_video_quality() -> String {
     "balanced".to_string()
 }
 
+/// Negotiate by default: the codec a peer can actually decode is a fact about
+/// their build, not something a local preference should be able to override
+/// into a stream nobody can read.
+fn default_video_codec() -> String {
+    "auto".to_string()
+}
+
+fn default_video_keyframe_secs() -> i32 {
+    crate::video::sender::DEFAULT_KEYFRAME_SECS as i32
+}
+
 /// Empty JSON object — no per-peer overrides.
 fn default_prefs_blob() -> String {
     "{}".to_string()
@@ -331,6 +405,12 @@ impl Default for SettingsSnapshot {
             video_overlays_json: default_overlays_blob(),
             video_enabled: false,
             video_quality: default_video_quality(),
+            video_resolution: String::new(),
+            video_fps: 0,
+            video_bitrate_kbps: 0,
+            video_keyframe_secs: default_video_keyframe_secs(),
+            video_codec: default_video_codec(),
+            video_adaptive_bitrate: true,
             content_audio_mode: default_content_audio_mode(),
             peer_audio_prefs_json: default_prefs_blob(),
             video_region_ratio: default_video_region_ratio(),
@@ -386,6 +466,14 @@ pub struct SettingsModelRust {
     video_overlays_json: QString,
     video_enabled: bool,
     video_quality: QString,
+    /// See the matching qproperties for what each of these means and what a
+    /// zero or empty value falls back to.
+    video_resolution: QString,
+    video_fps: i32,
+    video_bitrate_kbps: i32,
+    video_keyframe_secs: i32,
+    video_codec: QString,
+    video_adaptive_bitrate: bool,
     /// See the `content_audio_mode` qproperty.
     content_audio_mode: QString,
     peer_audio_prefs_json: QString,
@@ -447,6 +535,12 @@ impl Default for SettingsModelRust {
             video_overlays_json: QString::from(s.video_overlays_json.as_str()),
             video_enabled: s.video_enabled,
             video_quality: QString::from(s.video_quality.as_str()),
+            video_resolution: QString::from(s.video_resolution.as_str()),
+            video_fps: s.video_fps,
+            video_bitrate_kbps: s.video_bitrate_kbps,
+            video_keyframe_secs: s.video_keyframe_secs,
+            video_codec: QString::from(s.video_codec.as_str()),
+            video_adaptive_bitrate: s.video_adaptive_bitrate,
             content_audio_mode: QString::from(s.content_audio_mode.as_str()),
             peer_audio_prefs_json: QString::from(s.peer_audio_prefs_json.as_str()),
             video_region_ratio: s.video_region_ratio,
@@ -493,6 +587,80 @@ pub fn settings_file() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Video encoder settings
+// ---------------------------------------------------------------------------
+
+// The ranges the Video settings page offers, as `i32` so the properties can be
+// clamped without casting at every use. Derived from the encoder's own limits
+// rather than restated, so widening one of those cannot leave the UI refusing a
+// value the encoder would have accepted.
+const MIN_FPS: i32 = crate::video::sender::MIN_FPS as i32;
+const MAX_FPS: i32 = crate::video::sender::MAX_FPS as i32;
+const MIN_KEYFRAME_SECS: i32 = crate::video::sender::MIN_KEYFRAME_SECS as i32;
+const MAX_KEYFRAME_SECS: i32 = crate::video::sender::MAX_KEYFRAME_SECS as i32;
+const MIN_BITRATE_KBPS: i32 = (crate::video::sender::MIN_VIDEO_BITRATE_BPS / 1000) as i32;
+const MAX_BITRATE_KBPS: i32 = (crate::video::sender::MAX_VIDEO_BITRATE_BPS / 1000) as i32;
+
+/// Clamp `value` into `[lo, hi]`, but leave zero alone.
+///
+/// Zero is the "follow the preset" sentinel on several of these settings, and
+/// clamping it up to `lo` would silently turn "no opinion" into a hard override
+/// at the lowest offered value.
+fn clamp_or_zero(value: i32, lo: i32, hi: i32) -> i32 {
+    if value <= 0 {
+        0
+    } else {
+        value.clamp(lo, hi)
+    }
+}
+
+/// Render the encoder overrides as the blob `AppBridge::setVideoEnabled` reads.
+///
+/// A free function so both ends of that QML round trip can be tested together —
+/// the field names here and the ones
+/// [`VideoEncoderSettings`](super::bridge) deserializes are a contract that
+/// would otherwise only break at runtime, in the form of settings that silently
+/// stop applying.
+pub fn video_encoder_blob(
+    overrides: crate::video::sender::QualityOverrides,
+    codec: &str,
+    adaptive: bool,
+) -> String {
+    serde_json::json!({
+        "width": overrides.width,
+        "height": overrides.height,
+        "fps": overrides.fps,
+        "bitrate_bps": overrides.bitrate_bps,
+        "keyframe_secs": overrides.keyframe_interval_secs,
+        "codec": codec,
+        "adaptive": adaptive,
+    })
+    .to_string()
+}
+
+/// Split a `"<width>x<height>"` setting into even, in-range dimensions.
+///
+/// Returns `(0, 0)` for anything unusable — empty, malformed, or absurd — which
+/// [`QualityOverrides`](crate::video::sender::QualityOverrides) reads as "follow
+/// the preset". Total on purpose: this string is hand-editable.
+fn parse_resolution(raw: &str) -> (u32, u32) {
+    let Some((w, h)) = raw.trim().split_once(['x', 'X']) else {
+        return (0, 0);
+    };
+    let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>()) else {
+        return (0, 0);
+    };
+    let ok = |v: u32| {
+        (crate::video::sender::MIN_DIMENSION..=crate::video::sender::MAX_DIMENSION).contains(&v)
+    };
+    if ok(w) && ok(h) {
+        (w, h)
+    } else {
+        (0, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Invokables
 // ---------------------------------------------------------------------------
 
@@ -526,6 +694,12 @@ impl ffi::SettingsModel {
             video_overlays_json: r.video_overlays_json.to_string(),
             video_enabled: r.video_enabled,
             video_quality: r.video_quality.to_string(),
+            video_resolution: r.video_resolution.to_string(),
+            video_fps: r.video_fps,
+            video_bitrate_kbps: r.video_bitrate_kbps,
+            video_keyframe_secs: r.video_keyframe_secs,
+            video_codec: r.video_codec.to_string(),
+            video_adaptive_bitrate: r.video_adaptive_bitrate,
             content_audio_mode: r.content_audio_mode.to_string(),
             peer_audio_prefs_json: r.peer_audio_prefs_json.to_string(),
             video_region_ratio: r.video_region_ratio,
@@ -589,6 +763,61 @@ impl ffi::SettingsModel {
         self.as_mut().set_dirty(false);
     }
 
+    /// The video overrides as [`QualityOverrides`], resolved from the raw
+    /// property values.
+    ///
+    /// Shared by both invokables below so what the settings page *shows* and
+    /// what the encoder is *given* can never disagree — the whole reason the
+    /// preset table stayed in Rust.
+    fn video_overrides(&self) -> crate::video::sender::QualityOverrides {
+        let r = self.rust();
+        let (width, height) = parse_resolution(&r.video_resolution.to_string());
+        crate::video::sender::QualityOverrides {
+            width,
+            height,
+            fps: clamp_or_zero(r.video_fps, MIN_FPS, MAX_FPS).max(0) as u32,
+            // Stored in kbps because that is the unit the UI speaks; the
+            // encoder wants bits per second.
+            bitrate_bps: clamp_or_zero(r.video_bitrate_kbps, MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
+                .max(0) as u32
+                * 1000,
+            keyframe_interval_secs: r.video_keyframe_secs.clamp(0, MAX_KEYFRAME_SECS).max(0) as u32,
+        }
+    }
+
+    /// The resolved encoder settings — preset plus overrides.
+    fn effective_video_quality(&self) -> crate::video::sender::Quality {
+        crate::video::sender::Quality::resolve(
+            &self.rust().video_quality.to_string(),
+            self.video_overrides(),
+        )
+    }
+
+    fn video_encoder_json(self: Pin<&mut Self>) -> QString {
+        let overrides = self.video_overrides();
+        let r = self.rust();
+        QString::from(
+            video_encoder_blob(
+                overrides,
+                &r.video_codec.to_string(),
+                r.video_adaptive_bitrate,
+            )
+            .as_str(),
+        )
+    }
+
+    fn effective_video_quality_json(self: Pin<&mut Self>) -> QString {
+        let q = self.effective_video_quality();
+        let json = serde_json::json!({
+            "width": q.width,
+            "height": q.height,
+            "fps": q.fps,
+            "bitrate_bps": q.bitrate_bps,
+            "keyframe_secs": q.keyframe_interval_secs,
+        });
+        QString::from(json.to_string().as_str())
+    }
+
     fn refresh_dirty(mut self: Pin<&mut Self>) {
         let live = serde_json::to_string(&self.snapshot()).unwrap_or_default();
         let changed = live != self.rust().saved_json;
@@ -647,6 +876,36 @@ impl ffi::SettingsModel {
         self.as_mut()
             .set_video_quality(QString::from(snap.video_quality.as_str()));
         self.as_mut()
+            .set_video_resolution(QString::from(snap.video_resolution.as_str()));
+        // Clamped on the way in for the same reason the port above is: these
+        // reach a hardware encoder, and the file is hand-editable. Zero is kept
+        // as-is in both — it is the "follow the preset" sentinel, not a value.
+        self.as_mut()
+            .set_video_fps(clamp_or_zero(snap.video_fps, MIN_FPS, MAX_FPS));
+        self.as_mut().set_video_bitrate_kbps(clamp_or_zero(
+            snap.video_bitrate_kbps,
+            MIN_BITRATE_KBPS,
+            MAX_BITRATE_KBPS,
+        ));
+        // Unlike the two above, zero is not a sentinel here — a keyframe
+        // interval always has a value — so an absent or nonsense one becomes
+        // the default rather than the shortest (and most expensive) interval.
+        self.as_mut()
+            .set_video_keyframe_secs(if snap.video_keyframe_secs <= 0 {
+                default_video_keyframe_secs()
+            } else {
+                snap.video_keyframe_secs
+                    .clamp(MIN_KEYFRAME_SECS, MAX_KEYFRAME_SECS)
+            });
+        self.as_mut()
+            .set_video_codec(QString::from(snap.video_codec.as_str()));
+        self.as_mut()
+            .set_video_adaptive_bitrate(snap.video_adaptive_bitrate);
+        // Restored like every other video setting. Omitting it left the choice
+        // saved to disk but silently reset to "auto" on every launch.
+        self.as_mut()
+            .set_content_audio_mode(QString::from(snap.content_audio_mode.as_str()));
+        self.as_mut()
             .set_peer_audio_prefs_json(QString::from(snap.peer_audio_prefs_json.as_str()));
         self.as_mut()
             .set_video_region_ratio(snap.video_region_ratio);
@@ -694,5 +953,102 @@ impl ffi::SettingsModel {
         let applied = self.snapshot();
         self.as_mut().mark_saved(&applied);
         debug!("Settings loaded from {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_resolution_setting_parses_into_dimensions() {
+        assert_eq!(parse_resolution("1280x720"), (1280, 720));
+        assert_eq!(parse_resolution(" 640 x 360 "), (640, 360));
+        assert_eq!(parse_resolution("1920X1080"), (1920, 1080));
+    }
+
+    /// This string is hand-editable and reaches a hardware encoder, so every
+    /// unusable spelling has to fall back to the preset rather than through.
+    #[test]
+    fn an_unusable_resolution_setting_falls_back_to_the_preset() {
+        for raw in [
+            "",
+            "  ",
+            "720p",
+            "1280",
+            "1280x",
+            "x720",
+            "1280*720",
+            "-640x-360",
+            "0x0",
+            "99999x99999",
+            "64x64",
+            "1280x99999",
+        ] {
+            assert_eq!(
+                parse_resolution(raw),
+                (0, 0),
+                "{raw:?} must not be honoured"
+            );
+        }
+    }
+
+    /// Zero means "follow the preset" on these settings, so it must survive the
+    /// clamp — raising it to the low bound would turn "no opinion" into a hard
+    /// override at the lowest offered value.
+    #[test]
+    fn clamping_leaves_the_follow_the_preset_sentinel_alone() {
+        assert_eq!(clamp_or_zero(0, 5, 60), 0);
+        assert_eq!(clamp_or_zero(-7, 5, 60), 0);
+        assert_eq!(clamp_or_zero(1, 5, 60), 5);
+        assert_eq!(clamp_or_zero(30, 5, 60), 30);
+        assert_eq!(clamp_or_zero(999, 5, 60), 60);
+    }
+
+    /// The saved defaults must round-trip through serde unchanged, or a fresh
+    /// install would read back as something the defaults never described.
+    #[test]
+    fn video_defaults_round_trip_through_serde() {
+        let snap = SettingsSnapshot::default();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SettingsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.video_quality, "balanced");
+        assert_eq!(back.video_codec, "auto");
+        assert_eq!(back.video_resolution, "");
+        assert_eq!(back.video_fps, 0);
+        assert_eq!(back.video_bitrate_kbps, 0);
+        assert_eq!(
+            back.video_keyframe_secs,
+            crate::video::sender::DEFAULT_KEYFRAME_SECS as i32
+        );
+        assert!(back.video_adaptive_bitrate);
+    }
+
+    /// A settings file written before these fields existed must still load, and
+    /// must land on the same behaviour that file already had.
+    #[test]
+    fn a_settings_file_without_the_video_fields_still_loads() {
+        let snap: SettingsSnapshot =
+            serde_json::from_str(r#"{"video_quality":"high"}"#).expect("older files must load");
+        assert_eq!(snap.video_quality, "high");
+        assert_eq!(
+            snap.video_codec, "auto",
+            "an older file must keep negotiating"
+        );
+        assert!(
+            snap.video_adaptive_bitrate,
+            "adaptation was always on before"
+        );
+        assert_eq!(
+            crate::video::sender::Quality::resolve(
+                &snap.video_quality,
+                crate::video::sender::QualityOverrides {
+                    keyframe_interval_secs: snap.video_keyframe_secs as u32,
+                    ..Default::default()
+                }
+            ),
+            crate::video::sender::Quality::from_name("high"),
+            "an older file must encode exactly as it did before"
+        );
     }
 }

@@ -85,6 +85,10 @@ Window {
             item.contentAudioChanged.connect(function(muted, volume) {
                 popWin.contentAudioChanged(popWin.peerId, muted, volume)
             })
+            // The tile pushed its starting state from Component.onCompleted,
+            // which ran before the connection above existed, so that first push
+            // went nowhere. Repeat it now that there is something listening.
+            item.applyContentAudio()
         }
     }
 

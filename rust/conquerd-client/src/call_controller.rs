@@ -9,7 +9,7 @@
 //! lives in `run()`. The Qt/QML UI layer signals will be wired in Phase 3
 //! via cxx-qt callbacks stored in the `CallController`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,6 +116,10 @@ struct AudioPipeline {
     /// Separate because that is the point of the split: a listener needs to be
     /// able to turn down a loud game without losing the person talking over it.
     content_mix: HashMap<String, PeerMix>,
+    /// Peers whose video this listener currently has open — expanded in the
+    /// region or popped out. Content audio from anyone else is silent; see
+    /// [`resolve_mix_gain`].
+    content_viewers: HashSet<String>,
     /// Far-end (played) 48 kHz mono reference fed to the capture-side echo
     /// canceller. `None` unless the `aec` feature is active. The mixed playback
     /// frame is tee'd here in `mix_and_play`; the capture closure pops it.
@@ -615,6 +619,7 @@ impl AudioPipeline {
                 decoders: HashMap::new(),
                 peer_mix: HashMap::new(),
                 content_mix: HashMap::new(),
+                content_viewers: HashSet::new(),
                 aec_ref_prod,
                 fec_loss_pct: fec_loss_arc,
                 ring_fill_ema: 0.0,
@@ -798,7 +803,21 @@ impl AudioPipeline {
     /// Absent means "no preference": full volume, unmuted. Muting yields 0.0
     /// rather than skipping the decode — see [`Self::set_peer_muted`].
     fn peer_gain(&self, peer_id: &str) -> f32 {
-        resolve_mix_gain(peer_id, &self.peer_mix, &self.content_mix)
+        resolve_mix_gain(
+            peer_id,
+            &self.peer_mix,
+            &self.content_mix,
+            &self.content_viewers,
+        )
+    }
+
+    /// Replace the set of peers whose video this listener has open.
+    ///
+    /// A whole set rather than per-peer toggles: the UI knows which tiles are
+    /// open and can say so idempotently, whereas a stream of add/remove events
+    /// leaves audio playing forever if one removal is ever missed.
+    fn set_content_viewers(&mut self, peers: &[String]) {
+        self.content_viewers = peers.iter().cloned().collect();
     }
 
     /// Mute or unmute one peer's *content* audio, leaving their voice alone.
@@ -931,10 +950,18 @@ impl PeerAudioState {
 /// silences the stream and leaves the person talking over it audible. That is
 /// the whole reason they are separate streams: someone narrating a game must
 /// stay mutable apart from the game.
+///
+/// **Content audio also requires the video to be open.** It is one half of a
+/// picture, not a broadcast: a peer who never opened the tile has no way to see
+/// what is making the noise, no control to turn it down that they would think
+/// to look for, and no reason to expect a room to start playing someone's game.
+/// Absence from `content_viewers` therefore silences the stream outright, and
+/// the per-peer level only applies once the tile it belongs to is on screen.
 fn resolve_mix_gain(
     slot: &str,
     peer_mix: &std::collections::HashMap<String, PeerMix>,
     content_mix: &std::collections::HashMap<String, PeerMix>,
+    content_viewers: &HashSet<String>,
 ) -> f32 {
     let level = |m: Option<&PeerMix>| match m {
         Some(m) if m.muted => 0.0,
@@ -942,6 +969,7 @@ fn resolve_mix_gain(
         None => 1.0,
     };
     match slot.strip_prefix(CONTENT_DECODER_PREFIX) {
+        Some(peer) if !content_viewers.contains(peer) => 0.0,
         Some(peer) => level(content_mix.get(peer)),
         None => level(peer_mix.get(slot)),
     }
@@ -1000,6 +1028,9 @@ pub enum CallCommand {
     SetContentMuted { peer_id: String, muted: bool },
     /// Set one peer's shared application audio level (0–200, 100 = unity).
     SetContentVolume { peer_id: String, pct: u32 },
+    /// Replace the set of peers whose video this listener has open. Only these
+    /// peers' shared audio is audible — see [`resolve_mix_gain`].
+    SetContentViewers { peer_ids: Vec<String> },
     /// Network-quality feedback from the transport layer for one peer/path,
     /// used to drive adaptive outgoing bitrate. `loss_pct` is 0–100.
     UpdateNetworkQuality { loss_pct: f32, rtt_ms: f32 },
@@ -1183,6 +1214,13 @@ pub struct CallController {
     /// pipeline so preferences survive a pipeline restart between calls. The
     /// pipeline is rebuilt whenever audio starts; this is replayed into it.
     peer_prefs: HashMap<String, PeerMix>,
+    /// The same, for *content* audio, and for the same reason.
+    content_prefs: HashMap<String, PeerMix>,
+    /// Peers whose video the listener has open. Held here as well as on the
+    /// pipeline because the UI pushes it whenever tiles change, which can be
+    /// before a call's pipeline exists — dropping it then would leave a tile
+    /// open and its audio silent until the user touched it again.
+    content_viewers: HashSet<String>,
     /// Noise gate strength index 0–4. Sent to AudioPipeline on start.
     noise_strength_idx: u32,
     /// Live outgoing Opus bitrate in bits per second (direct + room audio).
@@ -1244,6 +1282,8 @@ impl CallController {
             input_vol: 100,
             output_vol: 100,
             peer_prefs: HashMap::new(),
+            content_prefs: HashMap::new(),
+            content_viewers: HashSet::new(),
             noise_strength_idx: 2,
             outgoing_bitrate_bps: DEFAULT_OUTGOING_BITRATE_BPS,
             bitrate_ceiling_bps: DEFAULT_OUTGOING_BITRATE_BPS,
@@ -1298,6 +1338,16 @@ impl CallController {
                     pipeline.set_peer_muted(peer_id, prefs.muted);
                     pipeline.set_peer_volume(peer_id, prefs.volume_pct);
                 }
+                for (peer_id, prefs) in &self.content_prefs {
+                    pipeline.set_content_muted(peer_id, prefs.muted);
+                    pipeline.set_content_volume(peer_id, prefs.volume_pct);
+                }
+                // Which tiles are open is UI state that outlives any one
+                // pipeline; a fresh one starts silent for everyone until it is
+                // told, which would mute a share the listener is already
+                // watching.
+                let viewers: Vec<String> = self.content_viewers.iter().cloned().collect();
+                pipeline.set_content_viewers(&viewers);
                 self.audio = Some(pipeline);
                 self.encoded_rx = Some(encoded_rx);
                 self.speaking_rx = Some(speaking_rx);
@@ -1322,6 +1372,10 @@ impl CallController {
             self.emit_peer_state(&pid, PeerAudioState::Closed);
         }
         self.peers.clear();
+        // Content timelines belong to the session that produced them. Carrying
+        // one into the next call would anchor the next share's video against a
+        // clock from the last one.
+        self.content_playout.clear();
         // Drop the pipeline — CPAL streams stop when their handle is dropped.
         self.audio = None;
         self.encoded_rx = None;
@@ -1375,6 +1429,9 @@ impl CallController {
         self.peer_playout_started.remove(peer_id);
         self.room_peer_last_level.remove(peer_id);
         self.room_peer_last_audio.remove(peer_id);
+        // Including their content timeline: a peer who rejoins starts a new
+        // session clock, and the old one would steer their video against it.
+        self.content_playout.forget(peer_id);
         if let Some(ref mut pipeline) = self.audio {
             pipeline.drop_decoder(peer_id);
         }
@@ -1526,6 +1583,13 @@ impl CallController {
             if let Some(opus) = opus {
                 // Namespaced key: content and voice are different streams from
                 // the same peer, and sharing decoder state would corrupt both.
+                //
+                // Decoded even when nobody is watching this peer, exactly as a
+                // muted peer's voice is: the gain is resolved at the mixer, and
+                // skipping the decode would desynchronise the Opus decoder so
+                // that opening the tile started with artifacts. It also keeps
+                // the anchor above advancing, so a tile opened mid-stream is in
+                // sync from its first frame rather than after the next one.
                 to_decode.push((content_decoder_key(&peer_id), Some(opus)));
             }
         }
@@ -1868,14 +1932,28 @@ impl CallController {
                             }
                         }
                         CallCommand::SetContentMuted { peer_id, muted } => {
+                            self.content_prefs
+                                .entry(peer_id.clone())
+                                .or_default()
+                                .muted = muted;
                             if let Some(p) = &mut self.audio {
                                 p.set_content_muted(&peer_id, muted);
                             }
                         }
                         CallCommand::SetContentVolume { peer_id, pct } => {
                             let pct = pct.min(MAX_PEER_VOLUME_PCT);
+                            self.content_prefs
+                                .entry(peer_id.clone())
+                                .or_default()
+                                .volume_pct = pct;
                             if let Some(p) = &mut self.audio {
                                 p.set_content_volume(&peer_id, pct);
+                            }
+                        }
+                        CallCommand::SetContentViewers { peer_ids } => {
+                            self.content_viewers = peer_ids.iter().cloned().collect();
+                            if let Some(p) = &mut self.audio {
+                                p.set_content_viewers(&peer_ids);
                             }
                         }
                         CallCommand::SetOutgoingBitrate(bps) => {
@@ -2716,6 +2794,12 @@ mod tests {
         }
     }
 
+    /// Peers whose tile is open. Most gain tests are about the *controls*, so
+    /// they start from "the listener is watching" and vary one thing.
+    fn watching(peers: &[&str]) -> HashSet<String> {
+        peers.iter().map(|p| (*p).to_owned()).collect()
+    }
+
     /// The two controls are independent: "mute for me" on the voice rail is
     /// about the *person*, not about what they are sharing. Muting someone
     /// narrating a game must not also silence the game.
@@ -2724,10 +2808,11 @@ mod tests {
         let mut peers = std::collections::HashMap::new();
         peers.insert("alice".to_owned(), mix(true, 100));
         let content = std::collections::HashMap::new();
+        let open = watching(&["alice"]);
 
-        assert_eq!(resolve_mix_gain("alice", &peers, &content), 0.0);
+        assert_eq!(resolve_mix_gain("alice", &peers, &content, &open), 0.0);
         assert_eq!(
-            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content),
+            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content, &open),
             1.0,
             "muting a peer's voice must not silence what they are sharing"
         );
@@ -2739,10 +2824,11 @@ mod tests {
         let peers = std::collections::HashMap::new();
         let mut content = std::collections::HashMap::new();
         content.insert("alice".to_owned(), mix(true, 100));
+        let open = watching(&["alice"]);
 
-        assert_eq!(resolve_mix_gain("alice", &peers, &content), 1.0);
+        assert_eq!(resolve_mix_gain("alice", &peers, &content, &open), 1.0);
         assert_eq!(
-            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content),
+            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content, &open),
             0.0
         );
     }
@@ -2754,10 +2840,12 @@ mod tests {
         let peers = std::collections::HashMap::new();
         let mut content = std::collections::HashMap::new();
         content.insert("alice".to_owned(), mix(false, 20));
+        let open = watching(&["alice"]);
 
-        assert_eq!(resolve_mix_gain("alice", &peers, &content), 1.0);
+        assert_eq!(resolve_mix_gain("alice", &peers, &content, &open), 1.0);
         assert!(
-            (resolve_mix_gain(&content_decoder_key("alice"), &peers, &content) - 0.2).abs() < 1e-6
+            (resolve_mix_gain(&content_decoder_key("alice"), &peers, &content, &open) - 0.2).abs()
+                < 1e-6
         );
     }
 
@@ -2766,10 +2854,11 @@ mod tests {
         let peers = std::collections::HashMap::new();
         let mut content = std::collections::HashMap::new();
         content.insert("alice".to_owned(), mix(true, 100));
+        let open = watching(&["alice"]);
 
-        assert_eq!(resolve_mix_gain("alice", &peers, &content), 1.0);
+        assert_eq!(resolve_mix_gain("alice", &peers, &content, &open), 1.0);
         assert_eq!(
-            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content),
+            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content, &open),
             0.0
         );
     }
@@ -2778,10 +2867,74 @@ mod tests {
     fn unknown_slots_play_at_unity() {
         let peers = std::collections::HashMap::new();
         let content = std::collections::HashMap::new();
-        assert_eq!(resolve_mix_gain("nobody", &peers, &content), 1.0);
+        let open = watching(&["nobody"]);
+        assert_eq!(resolve_mix_gain("nobody", &peers, &content, &open), 1.0);
         assert_eq!(
-            resolve_mix_gain(&content_decoder_key("nobody"), &peers, &content),
+            resolve_mix_gain(&content_decoder_key("nobody"), &peers, &content, &open),
             1.0
+        );
+    }
+
+    /// The defect this gate exists to fix: a peer sharing a game was audible to
+    /// everyone in the room, including people who never opened the video and had
+    /// no on-screen control to turn it off.
+    #[test]
+    fn shared_audio_is_silent_for_a_listener_who_has_not_opened_the_video() {
+        let peers = std::collections::HashMap::new();
+        let content = std::collections::HashMap::new();
+        let nobody_watching = HashSet::new();
+
+        assert_eq!(
+            resolve_mix_gain(
+                &content_decoder_key("alice"),
+                &peers,
+                &content,
+                &nobody_watching
+            ),
+            0.0,
+            "shared audio must not play to a listener who is not watching"
+        );
+        // Their voice is unaffected: not watching a share is not muting a person.
+        assert_eq!(
+            resolve_mix_gain("alice", &peers, &content, &nobody_watching),
+            1.0
+        );
+    }
+
+    /// The gate is per peer, not global: opening one share must not unmute
+    /// another peer's.
+    #[test]
+    fn opening_one_peers_video_does_not_unmute_anothers_audio() {
+        let peers = std::collections::HashMap::new();
+        let content = std::collections::HashMap::new();
+        let open = watching(&["alice"]);
+
+        assert_eq!(
+            resolve_mix_gain(&content_decoder_key("alice"), &peers, &content, &open),
+            1.0
+        );
+        assert_eq!(
+            resolve_mix_gain(&content_decoder_key("bob"), &peers, &content, &open),
+            0.0
+        );
+    }
+
+    /// Watching is a precondition, not an override: a tile the listener muted
+    /// stays muted while it is open.
+    #[test]
+    fn watching_does_not_override_an_explicit_mute() {
+        let peers = std::collections::HashMap::new();
+        let mut content = std::collections::HashMap::new();
+        content.insert("alice".to_owned(), mix(true, 100));
+
+        assert_eq!(
+            resolve_mix_gain(
+                &content_decoder_key("alice"),
+                &peers,
+                &content,
+                &watching(&["alice"])
+            ),
+            0.0
         );
     }
 

@@ -55,6 +55,24 @@ pub const JITTER_DEPTH: usize = 3;
 /// the stream indefinitely.
 pub const RESYNC_GAP: u32 = 50;
 
+/// Consecutive concealed frames after which the stream is declared over.
+///
+/// Concealment exists to carry the timeline across a *gap*, not to invent one.
+/// Without a bound the tick concealed forever once a peer had ever sent audio,
+/// which is not merely wasteful: every concealed frame re-anchors the A/V
+/// timeline in [`crate::media_sync`], so a peer who stopped sharing left a
+/// runaway clock climbing at real time on every receiver. When that peer next
+/// shared *without* audio, their video restarted from zero on a fresh session
+/// clock while the phantom timeline was minutes ahead — so every frame looked
+/// hopelessly late and was dropped, and the tile sat on "Waiting for video…"
+/// forever. Stopping here lets the anchor go stale
+/// ([`crate::media_sync::ANCHOR_STALE_AFTER`]) so video free-runs as it should.
+///
+/// 20 frames is 400 ms: longer than any loss burst worth concealing, and it
+/// matches the staleness window so the two halves of "the sender has stopped"
+/// agree on how long that takes to conclude.
+pub const MAX_CONCEALED_FRAMES: u32 = 20;
+
 /// One received, not-yet-played content frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingFrame {
@@ -84,6 +102,9 @@ pub struct JitterBuffer {
     /// Timestamp the next tick will report, advanced every tick including
     /// concealed ones.
     next_pts_us: u64,
+    /// Concealed frames since the last real one, bounded by
+    /// [`MAX_CONCEALED_FRAMES`].
+    concealed_streak: u32,
 }
 
 impl JitterBuffer {
@@ -114,18 +135,17 @@ impl JitterBuffer {
 
     /// Decide what to play now, advancing the timeline by one frame.
     ///
-    /// Always advances when the stream is running, which is the property the
+    /// Always advances while the stream is running, which is the property the
     /// video side depends on: a tick that returned nothing on loss would let
-    /// the anchor go stale and video would jump.
+    /// the anchor go stale and video would jump. It stops advancing once the
+    /// stream has plainly ended — see [`MAX_CONCEALED_FRAMES`].
     pub fn tick(&mut self) -> TickAction {
         let Some(expected) = self.next_seq else {
             // Not started: adopt the earliest buffered frame as the origin.
             let Some(first) = self.pending.first().cloned() else {
                 return TickAction::Idle;
             };
-            self.pending.retain(|f| f.seq != first.seq);
-            self.next_seq = Some(first.seq.wrapping_add(1));
-            self.next_pts_us = first.pts_us.saturating_add(FRAME_DURATION_US);
+            self.start_from(&first);
             return TickAction::Play(first);
         };
 
@@ -136,18 +156,45 @@ impl JitterBuffer {
                 || self.pending.len() > JITTER_DEPTH
                 || first.seq == expected
             {
-                self.pending.retain(|f| f.seq != first.seq);
-                self.next_seq = Some(first.seq.wrapping_add(1));
-                self.next_pts_us = first.pts_us.saturating_add(FRAME_DURATION_US);
+                self.start_from(&first);
                 return TickAction::Play(first);
             }
+        }
+
+        // Nothing has arrived for long enough that this is a stopped stream,
+        // not a gap in a running one. Forget the timeline rather than keep
+        // inventing it; a later frame starts a fresh one.
+        if self.concealed_streak >= MAX_CONCEALED_FRAMES {
+            self.reset();
+            return TickAction::Idle;
         }
 
         // Expected frame not here yet: conceal and keep the timeline moving.
         let pts_us = self.next_pts_us;
         self.next_seq = Some(expected.wrapping_add(1));
         self.next_pts_us = pts_us.saturating_add(FRAME_DURATION_US);
+        self.concealed_streak += 1;
         TickAction::Conceal { pts_us }
+    }
+
+    /// Adopt `frame` as the frame being played now, and continue from it.
+    fn start_from(&mut self, frame: &PendingFrame) {
+        self.pending.retain(|f| f.seq != frame.seq);
+        self.next_seq = Some(frame.seq.wrapping_add(1));
+        self.next_pts_us = frame.pts_us.saturating_add(FRAME_DURATION_US);
+        // A real frame ends any run of concealment, however long.
+        self.concealed_streak = 0;
+    }
+
+    /// Return to the not-started state, discarding the timeline.
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Whether this buffer holds no frames and no timeline — i.e. the peer is
+    /// not sending and nothing is pending on their behalf.
+    pub fn is_idle(&self) -> bool {
+        self.next_seq.is_none() && self.pending.is_empty()
     }
 
     /// Frames currently buffered.
@@ -181,15 +228,19 @@ impl ContentPlayout {
     /// Advance every peer by one frame, returning what each should play.
     ///
     /// Peers with nothing to play are omitted rather than reported as idle, so
-    /// a caller can iterate the result directly.
+    /// a caller can iterate the result directly. They are also dropped: a peer
+    /// who has stopped sending is indistinguishable from one who never started,
+    /// and keeping an inert buffer for everyone who ever shared audio in a
+    /// long-lived room is an unbounded map with nothing in it.
     pub fn tick(&mut self) -> Vec<(String, TickAction)> {
         let mut out = Vec::new();
-        for (peer, buf) in self.buffers.iter_mut() {
-            match buf.tick() {
-                TickAction::Idle => {}
-                action => out.push((peer.clone(), action)),
+        self.buffers.retain(|peer, buf| match buf.tick() {
+            TickAction::Idle => !buf.is_idle(),
+            action => {
+                out.push((peer.clone(), action));
+                true
             }
-        }
+        });
         out
     }
 
@@ -347,6 +398,100 @@ mod tests {
             TickAction::Play(fr) => assert_eq!(fr.seq, 1_000),
             other => panic!("expected resync, got {other:?}"),
         }
+    }
+
+    /// The defect this bound exists to stop. Concealment used to run forever
+    /// once a peer had sent anything, and every concealed frame re-anchored the
+    /// A/V timeline — so a peer who stopped sharing left a clock climbing at
+    /// real time on every receiver, and their *next* share (video with no
+    /// audio, so nothing to correct it) had every frame dropped as late.
+    #[test]
+    fn a_stopped_stream_stops_advancing_the_timeline() {
+        let mut b = JitterBuffer::new();
+        b.push(f(0));
+        assert!(matches!(b.tick(), TickAction::Play(_)));
+
+        let mut concealed = 0;
+        for _ in 0..(MAX_CONCEALED_FRAMES + 5) {
+            match b.tick() {
+                TickAction::Conceal { .. } => concealed += 1,
+                TickAction::Idle => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(concealed, MAX_CONCEALED_FRAMES);
+        assert!(
+            matches!(b.tick(), TickAction::Idle),
+            "a stopped stream must stay idle, not resume concealing"
+        );
+    }
+
+    /// Stopping must not poison the peer: sharing again starts a clean
+    /// timeline from whatever they send next, at whatever timestamp.
+    #[test]
+    fn a_restarted_stream_starts_a_fresh_timeline() {
+        let mut b = JitterBuffer::new();
+        // A first session that ran a while, then stopped.
+        b.push(PendingFrame {
+            seq: 900,
+            pts_us: 60_000_000,
+            opus: vec![1],
+        });
+        let _ = b.tick();
+        for _ in 0..(MAX_CONCEALED_FRAMES + 1) {
+            let _ = b.tick();
+        }
+
+        // A new session: sequence and timestamps both restart near zero.
+        b.push(f(0));
+        match b.tick() {
+            TickAction::Play(fr) => {
+                assert_eq!(fr.seq, 0);
+                assert_eq!(fr.pts_us, 0, "the new session's own timeline, not the old");
+            }
+            other => panic!("expected the new session to play, got {other:?}"),
+        }
+    }
+
+    /// Concealment must still cover an ordinary gap — the bound is an end-of-
+    /// stream test, not a reason to abandon a stream that is merely lossy.
+    #[test]
+    fn a_short_gap_still_conceals_and_recovers() {
+        let mut b = JitterBuffer::new();
+        b.push(f(0));
+        let _ = b.tick();
+
+        for _ in 0..3 {
+            assert!(matches!(b.tick(), TickAction::Conceal { .. }));
+        }
+        // Frame 4 arrives; the stream carries on and the streak is forgotten.
+        b.push(f(4));
+        assert!(matches!(b.tick(), TickAction::Play(_)));
+        for _ in 0..MAX_CONCEALED_FRAMES {
+            assert!(
+                matches!(b.tick(), TickAction::Conceal { .. }),
+                "a real frame must reset the concealment budget"
+            );
+        }
+    }
+
+    /// A peer who stops is dropped rather than kept as an inert buffer: in a
+    /// long-lived room the map would otherwise grow for everyone who ever
+    /// shared audio.
+    #[test]
+    fn a_stopped_peer_is_forgotten_by_the_playout() {
+        let mut p = ContentPlayout::new();
+        p.accept("alice", f(0));
+        assert_eq!(p.tracked_peers(), 1);
+
+        for _ in 0..(MAX_CONCEALED_FRAMES + 2) {
+            let _ = p.tick();
+        }
+        assert_eq!(
+            p.tracked_peers(),
+            0,
+            "a peer who stopped sending should not be tracked forever"
+        );
     }
 
     #[test]

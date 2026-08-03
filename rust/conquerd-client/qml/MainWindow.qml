@@ -809,6 +809,32 @@ ApplicationWindow {
     /// Live popout windows keyed by peer id.
     property var videoPopouts: ({})
 
+    /// Peers whose video is on screen right now — expanded tiles plus popouts.
+    ///
+    /// Shared application audio is gated on this: that audio is one half of a
+    /// picture, so playing it to someone who never opened the tile gives them a
+    /// noise with no context and no visible control to stop it.
+    ///
+    /// Derived rather than maintained by hand. Both inputs are reassigned
+    /// wholesale on every change, so one binding cannot miss an update the way
+    /// the five call sites that mutate them could — and a missed *removal* is
+    /// the failure that matters, since it leaves a closed tile audible.
+    readonly property var contentAudioViewers: {
+        var out = root.expandedVideoPeers.slice()
+        for (var pid in root.videoPopouts) {
+            if (root.videoPopouts[pid] && out.indexOf(pid) === -1)
+                out.push(pid)
+        }
+        return out
+    }
+
+    onContentAudioViewersChanged: {
+        // Guarded: this binding evaluates during component completion, which
+        // can precede the backend object being constructed.
+        if (typeof backend !== "undefined" && backend)
+            backend.setContentAudioViewers(JSON.stringify(root.contentAudioViewers))
+    }
+
     function isVideoExpanded(peerId) {
         return root.expandedVideoPeers.indexOf(peerId) !== -1
     }
@@ -2641,7 +2667,8 @@ ApplicationWindow {
                     true,
                     settingsModel.video_input_device,
                     settingsModel.video_quality,
-                    settingsModel.video_overlays_json)
+                    settingsModel.video_overlays_json,
+                    settingsModel.videoEncoderJson())
                 if (!got) {
                     console.warn("[video] could not start sharing")
                     return
@@ -2689,7 +2716,8 @@ ApplicationWindow {
                     false,
                     settingsModel.video_input_device,
                     settingsModel.video_quality,
-                    settingsModel.video_overlays_json)
+                    settingsModel.video_overlays_json,
+                    settingsModel.videoEncoderJson())
                 if (roomModel && roomModel.setVideoActive && backend.public_id)
                     roomModel.setVideoActive(backend.public_id, false)
                 root.setPeerVideoActive(backend.public_id, false)

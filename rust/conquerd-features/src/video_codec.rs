@@ -122,6 +122,67 @@ pub fn negotiate(local: &[VideoCodec], remote: &[VideoCodec]) -> Option<VideoCod
         .find(|c| local.contains(c) && remote.contains(c))
 }
 
+/// Read the `video_codec` setting into a preference.
+///
+/// `"auto"` (and anything unrecognised, including an empty string) means "no
+/// preference" — let [`negotiate`] decide. A name that parses is a request to
+/// send in that codec when it is possible to do so.
+pub fn preference_from_setting(setting: &str) -> Option<VideoCodec> {
+    match setting.trim() {
+        "" | "auto" => None,
+        // The stub is a transport-test fixture and is never advertised, so it
+        // must not be selectable from settings either.
+        "stub" => None,
+        other => VideoCodec::parse(other),
+    }
+}
+
+/// [`negotiate`], but honour the sender's own codec preference first.
+///
+/// # Why asymmetry is safe here
+///
+/// [`negotiate`] documents that both peers must reach the same answer from the
+/// same pair of lists, and a user preference deliberately breaks that: A can
+/// prefer VP8 while B prefers H.264. That is fine because the two directions are
+/// independent. Each frame carries its codec in the fragment header, and a
+/// receiver builds a decoder per (sender, codec) — so A sending VP8 while B
+/// sends H.264 is two working streams, not a mismatch. What must never happen is
+/// sending a codec the *receiver* cannot decode, which is why `preferred` is
+/// only honoured when it is in both lists.
+///
+/// Falls back to plain [`negotiate`] when the preference is absent or not
+/// mutually supported: a preference the peer cannot decode is a reason to pick
+/// something else, never a reason to send nothing.
+pub fn negotiate_preferring(
+    local: &[VideoCodec],
+    remote: &[VideoCodec],
+    preferred: Option<VideoCodec>,
+) -> Option<VideoCodec> {
+    if let Some(want) = preferred {
+        if local.contains(&want) && remote.contains(&want) {
+            return Some(want);
+        }
+    }
+    negotiate(local, remote)
+}
+
+/// Our own most-preferred codec out of `available`, honouring `preferred`.
+///
+/// The one-sided counterpart to [`negotiate_preferring`], for a room send where
+/// there is no single remote list to intersect with. A preference this build
+/// cannot encode is ignored rather than fatal.
+pub fn best_available(
+    available: &[VideoCodec],
+    preferred: Option<VideoCodec>,
+) -> Option<VideoCodec> {
+    if let Some(want) = preferred {
+        if available.contains(&want) {
+            return Some(want);
+        }
+    }
+    PREFERENCE.iter().copied().find(|c| available.contains(c))
+}
+
 /// Filter a locally-available codec set down to what should be advertised.
 ///
 /// Drops [`VideoCodec::Stub`]: it is a transport-test fixture, and advertising
@@ -229,6 +290,100 @@ mod tests {
         assert_eq!(negotiate(&[VideoCodec::H264], &[VideoCodec::Vp8]), None);
         assert_eq!(negotiate(&[], &[VideoCodec::Vp8]), None);
         assert_eq!(negotiate(&[VideoCodec::H264], &[]), None);
+    }
+
+    #[test]
+    fn a_preference_wins_when_both_peers_have_it() {
+        let both = [VideoCodec::H264, VideoCodec::Vp8];
+        assert_eq!(
+            negotiate_preferring(&both, &both, Some(VideoCodec::Vp8)),
+            Some(VideoCodec::Vp8),
+            "a user who asked for VP8 must get VP8, not the default preference"
+        );
+    }
+
+    /// A preference the receiver cannot decode must fall back, not send bytes
+    /// nobody can read and not refuse to send at all.
+    #[test]
+    fn a_preference_the_peer_lacks_falls_back_to_negotiation() {
+        let windows = [VideoCodec::H264, VideoCodec::Vp8];
+        let linux = [VideoCodec::Vp8];
+        assert_eq!(
+            negotiate_preferring(&windows, &linux, Some(VideoCodec::H264)),
+            Some(VideoCodec::Vp8)
+        );
+    }
+
+    /// Likewise for a preference this build cannot *encode* — a settings file
+    /// carried over from a Windows machine to a Linux one.
+    #[test]
+    fn a_preference_this_build_lacks_falls_back_to_negotiation() {
+        let linux = [VideoCodec::Vp8];
+        assert_eq!(
+            negotiate_preferring(&linux, &linux, Some(VideoCodec::H264)),
+            Some(VideoCodec::Vp8)
+        );
+    }
+
+    #[test]
+    fn no_preference_is_plain_negotiation() {
+        let both = [VideoCodec::H264, VideoCodec::Vp8];
+        assert_eq!(
+            negotiate_preferring(&both, &both, None),
+            negotiate(&both, &both)
+        );
+    }
+
+    /// A preference cannot conjure a mutual codec that does not exist.
+    #[test]
+    fn a_preference_does_not_override_an_empty_intersection() {
+        assert_eq!(
+            negotiate_preferring(
+                &[VideoCodec::H264],
+                &[VideoCodec::Vp8],
+                Some(VideoCodec::H264)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn best_available_honours_a_preference_and_falls_back_in_order() {
+        let both = [VideoCodec::H264, VideoCodec::Vp8];
+        assert_eq!(
+            best_available(&both, Some(VideoCodec::Vp8)),
+            Some(VideoCodec::Vp8)
+        );
+        assert_eq!(best_available(&both, None), Some(VideoCodec::H264));
+        // Unencodable preference: ignored rather than fatal.
+        assert_eq!(
+            best_available(&[VideoCodec::Vp8], Some(VideoCodec::H264)),
+            Some(VideoCodec::Vp8)
+        );
+        assert_eq!(best_available(&[], Some(VideoCodec::Vp8)), None);
+    }
+
+    #[test]
+    fn the_codec_setting_parses_to_a_preference() {
+        assert_eq!(preference_from_setting("h264"), Some(VideoCodec::H264));
+        assert_eq!(preference_from_setting("vp8"), Some(VideoCodec::Vp8));
+        assert_eq!(preference_from_setting(" vp8 "), Some(VideoCodec::Vp8));
+    }
+
+    /// "auto" is the default, and an unset or nonsense setting must read the
+    /// same way — as "let negotiation decide", never as a hard failure.
+    #[test]
+    fn an_absent_or_unknown_codec_setting_means_auto() {
+        for s in ["", "auto", "   ", "av1", "H264"] {
+            assert_eq!(preference_from_setting(s), None, "{s:?} must mean auto");
+        }
+    }
+
+    /// The stub is never advertised, so it must not be reachable by writing it
+    /// into a settings file either.
+    #[test]
+    fn the_stub_cannot_be_selected_from_settings() {
+        assert_eq!(preference_from_setting("stub"), None);
     }
 
     #[test]

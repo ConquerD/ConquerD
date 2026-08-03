@@ -758,17 +758,29 @@ pub mod ffi {
         #[rust_name = "list_video_devices"]
         fn listVideoDevices(self: Pin<&mut AppBridge>) -> QString;
 
-        /// Turn the local camera on or off.
+        /// Turn adaptive bitrate control on or off on a running share.
         ///
-        /// Starts (or stops) capture+encode on a dedicated thread and announces
-        /// the change to the room so other members' indicators update. Returns
-        /// the resulting state, which may be `false` even when `on` was `true`
-        /// if no camera could be opened.
+        /// Applied live rather than through a capture restart: every other
+        /// encoder setting is fixed at construction, but this one only steers
+        /// the rate controller — and restarting the camera to flip a boolean
+        /// would drop frames and re-open the device for nothing.
         ///
-        /// `overlays_json` is the `video_overlays_json` setting: a JSON array of
-        /// picture-in-picture insets drawn over `device_id`. Empty or `[]` gives
-        /// plain single-source capture. Only one stream ever leaves this client,
-        /// composited or not — see [`CaptureLayout`](crate::video::sender::CaptureLayout).
+        /// A no-op when nothing is being shared; the value is passed with the
+        /// rest of the settings when the next share starts.
+        #[qinvokable]
+        #[rust_name = "set_video_adaptive_bitrate"]
+        fn setVideoAdaptiveBitrate(self: Pin<&mut AppBridge>, on: bool);
+
+        /// Codecs this build can encode, most preferred first, as
+        /// `{"codecs":[{"id":"h264","name":"H.264"}]}`.
+        ///
+        /// A *build* capability, not a live probe — the same set advertised to
+        /// peers. The settings page offers these as the codec preference, so a
+        /// user can never select a codec this binary has no encoder for.
+        #[qinvokable]
+        #[rust_name = "list_video_codecs"]
+        fn listVideoCodecs(self: Pin<&mut AppBridge>) -> QString;
+
         /// Start or stop sharing the machine's audio output.
         ///
         /// This is the audio the computer is *playing* — a game, a video, a
@@ -792,6 +804,22 @@ pub mod ffi {
             mode: &QString,
         ) -> bool;
 
+        /// Turn the local camera on or off.
+        ///
+        /// Starts (or stops) capture+encode on a dedicated thread and announces
+        /// the change to the room so other members' indicators update. Returns
+        /// the resulting state, which may be `false` even when `on` was `true`
+        /// if no camera could be opened.
+        ///
+        /// `overlays_json` is the `video_overlays_json` setting: a JSON array of
+        /// picture-in-picture insets drawn over `device_id`. Empty or `[]` gives
+        /// plain single-source capture. Only one stream ever leaves this client,
+        /// composited or not — see [`CaptureLayout`](crate::video::sender::CaptureLayout).
+        ///
+        /// `encoder_json` is `SettingsModel::videoEncoderJson()`: the size,
+        /// rate, bitrate, keyframe interval, codec preference, and adaptation
+        /// switch from Settings → Video. Empty or unparseable means "the preset
+        /// alone", which is what this did before those settings existed.
         #[qinvokable]
         #[rust_name = "set_video_enabled"]
         fn setVideoEnabled(
@@ -800,6 +828,7 @@ pub mod ffi {
             device_id: &QString,
             quality: &QString,
             overlays_json: &QString,
+            encoder_json: &QString,
         ) -> bool;
 
         /// Show or hide the settings preview of `device_id` plus `overlays_json`.
@@ -816,6 +845,11 @@ pub mod ffi {
         /// `true`: the call's capture already feeds the same surface, and
         /// opening the device a second time would simply fail. `false` means
         /// nothing could be opened.
+        ///
+        /// `encoder_json` is the same blob `setVideoEnabled` takes. Only its
+        /// size and frame rate can matter here — a preview encodes nothing — but
+        /// those are exactly what makes the preview show the framing peers would
+        /// actually receive.
         #[qinvokable]
         #[rust_name = "set_video_preview_enabled"]
         fn setVideoPreviewEnabled(
@@ -824,6 +858,7 @@ pub mod ffi {
             device_id: &QString,
             quality: &QString,
             overlays_json: &QString,
+            encoder_json: &QString,
         ) -> bool;
 
         /// Set this listener's local mute / volume for one peer.
@@ -850,6 +885,18 @@ pub mod ffi {
             muted: bool,
             volume_pct: i32,
         );
+
+        /// Declare whose video is currently on screen, as a JSON array of peer
+        /// ids (expanded tiles plus popouts).
+        ///
+        /// Shared audio only plays for peers in this set: it is half of a
+        /// picture, and a listener who never opened the tile has neither the
+        /// context for the noise nor a visible control to stop it. The whole set
+        /// is sent on every change so one missed removal cannot leave a closed
+        /// tile audible.
+        #[qinvokable]
+        #[rust_name = "set_content_audio_viewers"]
+        fn setContentAudioViewers(self: Pin<&mut AppBridge>, peer_ids_json: &QString);
 
         /// Replay a stored preference blob (`{"<peer>":{"muted":..,"volume":..}}`)
         /// into the mixer, so choices saved in an earlier session take effect
@@ -2618,12 +2665,27 @@ impl ffi::AppBridge {
         true
     }
 
+    fn set_video_adaptive_bitrate(mut self: Pin<&mut Self>, on: bool) {
+        if let Some(sender) = self.as_mut().rust_mut().video_sender.as_mut() {
+            sender.set_adaptive_bitrate(on);
+        }
+    }
+
+    fn list_video_codecs(self: Pin<&mut Self>) -> QString {
+        let codecs: Vec<serde_json::Value> = crate::video::codec::available_codecs()
+            .into_iter()
+            .map(|c| serde_json::json!({ "id": c.as_str(), "name": video_codec_label(c) }))
+            .collect();
+        QString::from(serde_json::json!({ "codecs": codecs }).to_string().as_str())
+    }
+
     fn set_video_enabled(
         mut self: Pin<&mut Self>,
         on: bool,
         device_id: &QString,
         quality: &QString,
         overlays_json: &QString,
+        encoder_json: &QString,
     ) -> bool {
         // Stopping first also covers the restart case (device or quality
         // changed while running): the old thread must release the camera
@@ -2653,11 +2715,14 @@ impl ffi::AppBridge {
             return false;
         };
 
-        let quality = crate::video::sender::Quality::from_name(&quality.to_string());
+        let encoder = VideoEncoderSettings::parse(&encoder_json.to_string());
+        let quality =
+            crate::video::sender::Quality::resolve(&quality.to_string(), encoder.overrides());
 
         // Pick the codec before anything else: with no mutual codec there is
         // nothing worth opening the camera for, and failing here keeps the
         // capture light off rather than streaming into a void.
+        let preferred = encoder.preferred_codec();
         let direct_target = self.rust().direct_video_target();
         let codec = match &direct_target {
             Some(peer_id) => {
@@ -2667,7 +2732,7 @@ impl ffi::AppBridge {
                     .get(peer_id)
                     .cloned()
                     .unwrap_or_default();
-                match pick_direct_video_codec(&peer_codecs) {
+                match pick_direct_video_codec(&peer_codecs, preferred) {
                     Some(c) => c,
                     None => {
                         warn!(
@@ -2681,7 +2746,7 @@ impl ffi::AppBridge {
                     }
                 }
             }
-            None => match pick_room_video_codec() {
+            None => match pick_room_video_codec(preferred) {
                 Some(c) => c,
                 None => {
                     warn!("[video] this build has no video encoder; not starting the camera");
@@ -2702,6 +2767,7 @@ impl ffi::AppBridge {
                 overlays_json,
                 codec,
                 direct_target,
+                encoder,
             );
             warn!("[video] capture/encode is not implemented on this platform");
             return false;
@@ -2709,18 +2775,26 @@ impl ffi::AppBridge {
 
         #[cfg(target_os = "windows")]
         {
-            let encoder = match crate::video::codec::make_encoder(
+            let video_encoder = match crate::video::codec::make_encoder(
                 codec,
                 crate::video::codec::EncoderParams {
                     width: quality.width,
                     height: quality.height,
                     bitrate_bps: quality.bitrate_bps,
                     fps: quality.fps,
-                    keyframe_interval_secs: 4,
+                    keyframe_interval_secs: quality.keyframe_interval_secs,
                 },
             ) {
                 Ok(e) => {
-                    info!("[video] {} encoder ready", codec.as_str());
+                    info!(
+                        "[video] {} encoder ready at {}x{}@{} fps, {} bps, keyframe every {}s",
+                        codec.as_str(),
+                        quality.width,
+                        quality.height,
+                        quality.fps,
+                        quality.bitrate_bps,
+                        quality.keyframe_interval_secs
+                    );
                     e
                 }
                 Err(e) => {
@@ -2784,14 +2858,18 @@ impl ffi::AppBridge {
                 clock
             };
 
-            let sender = crate::video::sender::VideoSender::start(
+            let mut sender = crate::video::sender::VideoSender::start(
                 layout,
                 quality,
-                encoder,
+                video_encoder,
                 sink,
                 preview_id,
                 Some(clock),
             );
+            // Applied after start rather than passed in: adaptation is a
+            // property of the rate controller, not of the capture, and the
+            // sender is where the ceiling it would adapt below already lives.
+            sender.set_adaptive_bitrate(encoder.adaptive);
             self.as_mut().rust_mut().video_sender = Some(sender);
             self.as_mut().set_video_active(true);
             self.as_mut().announce_video_state(true);
@@ -2805,6 +2883,7 @@ impl ffi::AppBridge {
         device_id: &QString,
         quality: &QString,
         overlays_json: &QString,
+        encoder_json: &QString,
     ) -> bool {
         // Unconditional stop first, which is also the restart path: the running
         // thread must release the device before another can open it.
@@ -2833,14 +2912,19 @@ impl ffi::AppBridge {
         // no connection — but it does need a capture backend.
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (device_id, quality, overlays_json);
+            let _ = (device_id, quality, overlays_json, encoder_json);
             warn!("[video] capture is not implemented on this platform");
             return false;
         }
 
         #[cfg(target_os = "windows")]
         {
-            let quality = crate::video::sender::Quality::from_name(&quality.to_string());
+            // Same resolution rules as the call path, so the preview is framed
+            // exactly like the stream it stands in for.
+            let quality = crate::video::sender::Quality::resolve(
+                &quality.to_string(),
+                VideoEncoderSettings::parse(&encoder_json.to_string()).overrides(),
+            );
             // The same layout the call path would build, so what the user sees
             // here is what peers would receive — including every overlay.
             let layout = crate::video::sender::CaptureLayout::from_settings(
@@ -3038,6 +3122,21 @@ impl ffi::AppBridge {
                 peer_id: id,
                 pct: volume as u32,
             });
+        }
+    }
+
+    /// Declare whose video tiles are open. See the bridge declaration.
+    fn set_content_audio_viewers(self: Pin<&mut Self>, peer_ids_json: &QString) {
+        // A malformed blob means an empty set, not "leave it as it was": the
+        // failure that matters here is audio that keeps playing for a tile the
+        // listener closed, so the safe reading of nonsense is "nothing is open".
+        let peer_ids: Vec<String> = serde_json::from_str::<Vec<String>>(&peer_ids_json.to_string())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| !id.is_empty())
+            .collect();
+        if let Some(tx) = self.rust().call_cmd_tx.clone() {
+            let _ = tx.try_send(CallCommand::SetContentViewers { peer_ids });
         }
     }
 
@@ -6600,13 +6699,36 @@ fn video_codecs_from_caps_json(caps_json: &str) -> Vec<conquerd_features::video_
         .unwrap_or_default()
 }
 
-/// Codec for a direct 1:1 call: the best codec both ends can run.
+/// Human-readable name for a codec in the settings picker.
+///
+/// Names the *implementation* where there is only one, because that is what
+/// decides whether the encode lands on the GPU — the difference a user choosing
+/// between these actually feels.
+fn video_codec_label(codec: conquerd_features::video_codec::VideoCodec) -> &'static str {
+    match codec {
+        conquerd_features::video_codec::VideoCodec::H264 => {
+            if cfg!(target_os = "windows") {
+                "H.264 (Media Foundation, hardware when available)"
+            } else {
+                "H.264"
+            }
+        }
+        conquerd_features::video_codec::VideoCodec::Vp8 => {
+            "VP8 (software, works with every platform)"
+        }
+        conquerd_features::video_codec::VideoCodec::Stub => "Uncompressed (test only)",
+    }
+}
+
+/// Codec for a direct 1:1 call: the best codec both ends can run, preferring
+/// `preferred` when both ends have it.
 ///
 /// `None` means no mutual codec, and the caller must not start the camera —
 /// sending frames the peer provably cannot decode wastes their bandwidth and
 /// shows them nothing.
 fn pick_direct_video_codec(
     peer_codecs: &[conquerd_features::video_codec::VideoCodec],
+    preferred: Option<conquerd_features::video_codec::VideoCodec>,
 ) -> Option<conquerd_features::video_codec::VideoCodec> {
     // An *empty* list means "we have not heard what this peer speaks", which is
     // not the same as "this peer speaks nothing we do". Treating the two alike
@@ -6618,12 +6740,17 @@ fn pick_direct_video_codec(
     // receiver that cannot decode it drops the frames and says so in its log,
     // which is a far better failure than a camera that never turns on.
     if peer_codecs.is_empty() {
-        return pick_room_video_codec();
+        return pick_room_video_codec(preferred);
     }
-    conquerd_features::video_codec::negotiate(&crate::video::codec::available_codecs(), peer_codecs)
+    conquerd_features::video_codec::negotiate_preferring(
+        &crate::video::codec::available_codecs(),
+        peer_codecs,
+        preferred,
+    )
 }
 
-/// Codec for room video: our own most-preferred available codec.
+/// Codec for room video: our own most-preferred available codec, or the user's
+/// choice when this build can encode it.
 ///
 /// Deliberately not a negotiation. A room sender fans one encoded stream out to
 /// every member, so satisfying everyone would mean either encoding once per
@@ -6633,12 +6760,94 @@ fn pick_direct_video_codec(
 /// best, stamps it on each frame, and a member without that decoder drops the
 /// frames and logs why. Room-wide codec convergence is a later problem, and the
 /// per-frame codec byte is what leaves room to solve it.
-fn pick_room_video_codec() -> Option<conquerd_features::video_codec::VideoCodec> {
-    let available = crate::video::codec::available_codecs();
-    conquerd_features::video_codec::PREFERENCE
-        .iter()
-        .copied()
-        .find(|c| available.contains(c))
+///
+/// That structure is also why a user preference is safe here: nothing about a
+/// room send was ever agreed pairwise, so choosing VP8 over H.264 changes only
+/// which decoder each member routes the frames to.
+fn pick_room_video_codec(
+    preferred: Option<conquerd_features::video_codec::VideoCodec>,
+) -> Option<conquerd_features::video_codec::VideoCodec> {
+    conquerd_features::video_codec::best_available(
+        &crate::video::codec::available_codecs(),
+        preferred,
+    )
+}
+
+/// The `video_*` encoder settings, as they arrive from
+/// `SettingsModel::videoEncoderJson()`.
+///
+/// Parsing is total: this crosses the QML boundary from a hand-editable file, so
+/// a malformed blob resolves to "no overrides" and the preset alone — the
+/// behaviour that predates these settings — rather than refusing to start a
+/// capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+struct VideoEncoderSettings {
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u32,
+    keyframe_secs: u32,
+    /// `"auto"` | `"h264"` | `"vp8"`, resolved to a preference on the way in so
+    /// no caller has to know that `"auto"` and an unknown name mean the same
+    /// thing. `None` is "let negotiation decide".
+    #[serde(deserialize_with = "deserialize_codec")]
+    codec: Option<conquerd_features::video_codec::VideoCodec>,
+    adaptive: bool,
+}
+
+impl Default for VideoEncoderSettings {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            fps: 0,
+            bitrate_bps: 0,
+            keyframe_secs: 0,
+            codec: None,
+            // Adaptation was unconditional before this setting existed, so its
+            // absence has to mean "on" — otherwise upgrading would silently pin
+            // every existing user's stream at their ceiling.
+            adaptive: true,
+        }
+    }
+}
+
+fn deserialize_codec<'de, D>(
+    d: D,
+) -> Result<Option<conquerd_features::video_codec::VideoCodec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(d)?;
+    Ok(conquerd_features::video_codec::preference_from_setting(
+        &raw,
+    ))
+}
+
+impl VideoEncoderSettings {
+    fn parse(json: &str) -> Self {
+        serde_json::from_str(json).unwrap_or_else(|e| {
+            if !json.trim().is_empty() {
+                debug!("[video] ignoring unusable encoder settings ({e})");
+            }
+            Self::default()
+        })
+    }
+
+    fn overrides(&self) -> crate::video::sender::QualityOverrides {
+        crate::video::sender::QualityOverrides {
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bitrate_bps: self.bitrate_bps,
+            keyframe_interval_secs: self.keyframe_secs,
+        }
+    }
+
+    fn preferred_codec(&self) -> Option<conquerd_features::video_codec::VideoCodec> {
+        self.codec
+    }
 }
 
 fn emit_rooms_sidebar_sync(mut bridge: Pin<&mut ffi::AppBridge>) {
@@ -8685,5 +8894,118 @@ mod cluster_grouping_tests {
         let s = abc_cluster();
         assert!(cluster_full_set(&s, "A").iter().any(|m| pub_id_eq(m, "C")));
         assert!(cluster_full_set(&s, "C").iter().any(|m| pub_id_eq(m, "A")));
+    }
+}
+
+#[cfg(test)]
+mod video_encoder_settings_tests {
+    use super::*;
+    use conquerd_features::video_codec::VideoCodec;
+
+    #[test]
+    fn a_full_blob_parses_every_field() {
+        let s = VideoEncoderSettings::parse(
+            r#"{"width":1920,"height":1080,"fps":60,"bitrate_bps":4000000,
+                "keyframe_secs":2,"codec":"vp8","adaptive":false}"#,
+        );
+        assert_eq!(s.overrides().width, 1920);
+        assert_eq!(s.overrides().height, 1080);
+        assert_eq!(s.overrides().fps, 60);
+        assert_eq!(s.overrides().bitrate_bps, 4_000_000);
+        assert_eq!(s.overrides().keyframe_interval_secs, 2);
+        assert_eq!(s.preferred_codec(), Some(VideoCodec::Vp8));
+        assert!(!s.adaptive);
+    }
+
+    /// The blob crosses the QML boundary from a hand-editable file, so every
+    /// unusable spelling has to land on the behaviour that predates it: the
+    /// preset alone, negotiated codec, adaptation on.
+    #[test]
+    fn an_unusable_blob_falls_back_to_the_preset_alone() {
+        for raw in ["", "   ", "not json", "[]", "null", r#"{"width":"wide"}"#] {
+            let s = VideoEncoderSettings::parse(raw);
+            assert_eq!(
+                s.overrides(),
+                crate::video::sender::QualityOverrides::default(),
+                "{raw:?} must not override the preset"
+            );
+            assert_eq!(s.preferred_codec(), None, "{raw:?} must still negotiate");
+            assert!(s.adaptive, "{raw:?} must leave adaptation on");
+        }
+    }
+
+    /// Upgrading from a build without these settings must not silently pin an
+    /// existing user's stream at their ceiling.
+    #[test]
+    fn a_blob_missing_the_adaptive_flag_keeps_adaptation_on() {
+        assert!(VideoEncoderSettings::parse(r#"{"width":1280,"height":720}"#).adaptive);
+    }
+
+    #[test]
+    fn auto_and_unknown_codecs_both_mean_negotiate() {
+        for raw in [
+            r#"{"codec":"auto"}"#,
+            r#"{"codec":"av1"}"#,
+            r#"{"codec":""}"#,
+        ] {
+            assert_eq!(VideoEncoderSettings::parse(raw).preferred_codec(), None);
+        }
+    }
+
+    /// The stub is never advertised to peers, so it must not be reachable by
+    /// writing it into a settings file either.
+    #[test]
+    fn the_stub_codec_cannot_be_requested_from_settings() {
+        assert_eq!(
+            VideoEncoderSettings::parse(r#"{"codec":"stub"}"#).preferred_codec(),
+            None
+        );
+    }
+
+    /// The contract across the QML boundary: what `SettingsModel` writes is
+    /// exactly what this parses. A field renamed on one side only would leave
+    /// the setting silently not applying, with nothing failing anywhere.
+    #[test]
+    fn what_the_settings_model_writes_is_what_this_reads() {
+        let overrides = crate::video::sender::QualityOverrides {
+            width: 1600,
+            height: 900,
+            fps: 48,
+            bitrate_bps: 3_000_000,
+            keyframe_interval_secs: 8,
+        };
+        let blob = crate::ui::settings_model::video_encoder_blob(overrides, "vp8", false);
+        let parsed = VideoEncoderSettings::parse(&blob);
+        assert_eq!(parsed.overrides(), overrides);
+        assert_eq!(parsed.preferred_codec(), Some(VideoCodec::Vp8));
+        assert!(!parsed.adaptive);
+    }
+
+    /// ...including the empty case, which must mean "the preset alone" on both
+    /// sides rather than a capture pinned at zero.
+    #[test]
+    fn an_empty_settings_model_blob_round_trips_as_no_overrides() {
+        let blob = crate::ui::settings_model::video_encoder_blob(
+            crate::video::sender::QualityOverrides::default(),
+            "auto",
+            true,
+        );
+        let parsed = VideoEncoderSettings::parse(&blob);
+        assert_eq!(parsed, VideoEncoderSettings::default());
+    }
+
+    /// Every codec offered in the picker must be one this build can actually
+    /// encode — the picker is built from this list, so a name here that
+    /// `make_encoder` rejects would be a setting that cannot work.
+    #[test]
+    fn every_labelled_codec_is_one_this_build_can_encode() {
+        for codec in crate::video::codec::available_codecs() {
+            assert!(!video_codec_label(codec).is_empty());
+            assert_eq!(
+                conquerd_features::video_codec::preference_from_setting(codec.as_str()),
+                Some(codec),
+                "{codec:?} is offered in the picker but does not round-trip as a preference"
+            );
+        }
     }
 }

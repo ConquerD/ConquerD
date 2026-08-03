@@ -505,13 +505,14 @@ Item {
                             true,
                             root.settings.video_input_device,
                             root.settings.video_quality,
-                            root.settings.video_overlays_json)
+                            root.settings.video_overlays_json,
+                            root.settings.videoEncoderJson())
                     }
 
                     function stopPreview() {
                         // Only ever stops the preview capture — a call's camera
                         // is not this button's to turn off.
-                        if (backend) backend.setVideoPreviewEnabled(false, "", "", "")
+                        if (backend) backend.setVideoPreviewEnabled(false, "", "", "", "")
                     }
 
                     function applyCameraSettings() {
@@ -525,7 +526,8 @@ Item {
                                 true,
                                 root.settings.video_input_device,
                                 root.settings.video_quality,
-                                root.settings.video_overlays_json)
+                                root.settings.video_overlays_json,
+                                root.settings.videoEncoderJson())
                         } else if (backend.video_preview_active) {
                             cameraCard.startPreview()
                         }
@@ -548,21 +550,6 @@ Item {
                                 // "first available camera".
                                 root.settings.video_input_device =
                                     currentIndex === 0 ? "" : (cameraCard.cameraIds[currentIndex - 1] || "")
-                                cameraCard.applyCameraSettings()
-                            }
-                        }
-
-                        Label { text: "Quality"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
-                        ComboBox {
-                            id: qualityCombo
-                            Layout.fillWidth: true
-                            // Display order matches `Quality::from_name`; the
-                            // stored value is the lowercase key, not the label.
-                            model: ["Low (320x180)", "Balanced (640x360)", "High (1280x720)"]
-                            property var keys: ["low", "balanced", "high"]
-                            onActivated: {
-                                if (!root.settings) return
-                                root.settings.video_quality = keys[currentIndex] || "balanced"
                                 cameraCard.applyCameraSettings()
                             }
                         }
@@ -597,7 +584,7 @@ Item {
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
                             color: Theme.muted
-                            font.pixelSize: Theme.fontTiny
+                            font.pixelSize: Theme.fontSizeMicro
                             text: {
                                 var dev = root.settings ? root.settings.video_input_device : ""
                                 var isScreen = dev.indexOf("window:") === 0
@@ -764,8 +751,6 @@ Item {
                             idx = at >= 0 ? at + 1 : 0
                         }
                         cameraCombo.currentIndex = idx
-                        var q = qualityCombo.keys.indexOf(root.settings.video_quality)
-                        qualityCombo.currentIndex = q >= 0 ? q : 1
                         var a = contentAudioCombo.keys.indexOf(root.settings.content_audio_mode)
                         contentAudioCombo.currentIndex = a >= 0 ? a : 0
                     }
@@ -778,11 +763,355 @@ Item {
                     Connections {
                         target: root.settings
                         function onVideo_input_deviceChanged() { cameraCard.syncFromSettings() }
-                        function onVideo_qualityChanged() { cameraCard.syncFromSettings() }
                         function onContent_audio_modeChanged() { cameraCard.syncFromSettings() }
                     }
 
                     Component.onCompleted: cameraCard.reloadCameras()
+                }
+
+                // Encoding and streaming.
+                //
+                // An encoder is configured once at construction and cannot be
+                // resized under a running capture, so every control here
+                // restarts one through `cameraCard.applyCameraSettings`. The
+                // adaptation switch is the exception: it only steers the rate
+                // controller, so it applies live.
+                //
+                // No preset values are written here. The table lives in
+                // `Quality::from_name`, and this card reads back what the
+                // encoder will actually be given via
+                // `effectiveVideoQualityJson()` — a copy in QML would drift and
+                // quietly mislabel every preset.
+                SettingsCard {
+                    id: encodingCard
+                    title: "Encoding"
+                    subtitle: "What leaves this machine when you share video. Changes apply "
+                        + "immediately to a share that is already running."
+
+                    // "custom" is the one key with meaning in Rust: it is what
+                    // makes the resolution and frame rate below take effect at
+                    // all. See `Quality::resolve`.
+                    readonly property var presetKeys: ["low", "balanced", "high", "custom"]
+                    readonly property var presetLabels: ["Low", "Balanced", "High", "Custom"]
+
+                    readonly property var resolutions: [
+                        "320x180", "480x270", "640x360", "854x480",
+                        "960x540", "1280x720", "1600x900", "1920x1080"
+                    ]
+                    readonly property var frameRates: [10, 15, 20, 24, 30, 48, 60]
+                    // 0 is Auto — the bitrate the encoder derives from the size
+                    // and frame rate actually chosen.
+                    readonly property var bitrates: [
+                        0, 250, 400, 600, 800, 1200, 1500, 2000, 2500, 3000, 4000, 6000, 8000
+                    ]
+                    readonly property var keyframeSecs: [1, 2, 4, 8, 10]
+
+                    /// Codec ids offered by the picker, "auto" first. Filled
+                    /// from the backend so a build without an H.264 encoder
+                    /// never offers H.264.
+                    property var codecIds: ["auto"]
+
+                    /// The settings the encoder will actually be configured
+                    /// with, once preset and overrides are resolved together.
+                    /// Recomputed rather than cached because a preset change
+                    /// moves all of them at once.
+                    property var effective: ({ width: 640, height: 360, fps: 30,
+                                               bitrate_bps: 600000, keyframe_secs: 4 })
+
+                    /// True while `syncFromSettings` is writing combo indices,
+                    /// so the `onActivated` handlers can tell a user's click
+                    /// from the sync that follows it. Without this, syncing
+                    /// would look like an edit and flip the preset to Custom.
+                    property bool syncing: false
+
+                    function refreshEffective() {
+                        if (!root.settings) return
+                        try {
+                            encodingCard.effective =
+                                JSON.parse(root.settings.effectiveVideoQualityJson())
+                        } catch (e) {}
+                    }
+
+                    /// Record an explicit choice for one of the three settings a
+                    /// preset also decides, and switch the preset to Custom.
+                    ///
+                    /// Silently leaving the preset saying "Balanced" while the
+                    /// resolution said 1080p would be a label that lies, so the
+                    /// preset follows the edit rather than the other way round.
+                    function takeOver() {
+                        if (!root.settings) return
+                        if (root.settings.video_quality === "custom") return
+                        // Freeze what the preset was giving, so switching to
+                        // Custom changes exactly the one field just edited.
+                        root.settings.video_resolution =
+                            encodingCard.effective.width + "x" + encodingCard.effective.height
+                        root.settings.video_fps = encodingCard.effective.fps
+                        root.settings.video_quality = "custom"
+                    }
+
+                    GridLayout {
+                        Layout.fillWidth: true
+                        columns: 2
+                        columnSpacing: Theme.spacingLg
+                        rowSpacing: Theme.spacingMd
+
+                        Label { text: "Quality"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        ComboBox {
+                            id: qualityCombo
+                            Layout.fillWidth: true
+                            // The stored value is the lowercase key, not the label.
+                            model: encodingCard.presetLabels
+                            onActivated: {
+                                if (!root.settings || encodingCard.syncing) return
+                                root.settings.video_quality =
+                                    encodingCard.presetKeys[currentIndex] || "balanced"
+                                cameraCard.applyCameraSettings()
+                            }
+                        }
+
+                        Label { text: "Resolution"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        ComboBox {
+                            id: resolutionCombo
+                            Layout.fillWidth: true
+                            model: encodingCard.resolutions
+                            onActivated: {
+                                if (!root.settings || encodingCard.syncing) return
+                                // Read before `takeOver`: it writes settings,
+                                // which re-syncs this combo back to the value
+                                // that was in effect a moment ago.
+                                var picked = encodingCard.resolutions[currentIndex] || ""
+                                encodingCard.takeOver()
+                                root.settings.video_resolution = picked
+                                cameraCard.applyCameraSettings()
+                            }
+                        }
+
+                        Label { text: "Frame rate"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        ComboBox {
+                            id: fpsCombo
+                            Layout.fillWidth: true
+                            model: encodingCard.frameRates.map(function(f) { return f + " fps" })
+                            onActivated: {
+                                // Read before `takeOver`, same as above.
+                                if (!root.settings || encodingCard.syncing) return
+                                var picked = encodingCard.frameRates[currentIndex] || 30
+                                encodingCard.takeOver()
+                                root.settings.video_fps = picked
+                                cameraCard.applyCameraSettings()
+                            }
+                        }
+
+                        Label { text: "Bitrate"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        ComboBox {
+                            id: bitrateVideoCombo
+                            Layout.fillWidth: true
+                            model: encodingCard.bitrates.map(function(kbps) {
+                                return kbps === 0
+                                    ? qsTr("Auto — match the resolution")
+                                    : (kbps >= 1000
+                                        ? (kbps / 1000).toFixed(kbps % 1000 === 0 ? 0 : 1) + " Mbps"
+                                        : kbps + " kbps")
+                            })
+                            onActivated: {
+                                if (!root.settings || encodingCard.syncing) return
+                                // Unlike resolution and frame rate, this does
+                                // not force Custom: an explicit bitrate on top
+                                // of a preset is a coherent thing to want, and
+                                // the preset label stays honest about the size.
+                                root.settings.video_bitrate_kbps =
+                                    encodingCard.bitrates[currentIndex] || 0
+                                cameraCard.applyCameraSettings()
+                            }
+                        }
+
+                        Label { text: "Keyframe every"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        ComboBox {
+                            id: keyframeCombo
+                            Layout.fillWidth: true
+                            model: encodingCard.keyframeSecs.map(function(s) {
+                                return s === 1 ? qsTr("1 second") : s + qsTr(" seconds")
+                            })
+                            onActivated: {
+                                if (!root.settings || encodingCard.syncing) return
+                                root.settings.video_keyframe_secs =
+                                    encodingCard.keyframeSecs[currentIndex] || 4
+                                cameraCard.applyCameraSettings()
+                            }
+                        }
+
+                        Item {}
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            color: Theme.muted
+                            font.pixelSize: Theme.fontSizeMicro
+                            text: qsTr("Shorter means someone joining sees a picture sooner and "
+                                       + "costs more of the bitrate; longer is cheaper but leaves "
+                                       + "a late joiner waiting.")
+                        }
+
+                        Label { text: "Codec"; color: Theme.muted; Layout.alignment: Qt.AlignRight }
+                        ComboBox {
+                            id: codecCombo
+                            Layout.fillWidth: true
+                            model: [qsTr("Automatic — best both ends support")]
+                            onActivated: {
+                                if (!root.settings || encodingCard.syncing) return
+                                root.settings.video_codec =
+                                    encodingCard.codecIds[currentIndex] || "auto"
+                                cameraCard.applyCameraSettings()
+                            }
+                        }
+
+                        Item {}
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            color: Theme.muted
+                            font.pixelSize: Theme.fontSizeMicro
+                            text: {
+                                if (!root.settings || root.settings.video_codec === "auto")
+                                    return qsTr("Each peer is sent the best codec you both have.")
+                                return qsTr("Used when the peer can decode it; otherwise the best "
+                                            + "shared codec is used instead, so this can never "
+                                            + "stop video from working.")
+                            }
+                        }
+                    }
+
+                    SettingSwitch {
+                        title: "Adapt bitrate to the connection"
+                        description: "Lower the bitrate when packets start dropping, and climb "
+                            + "back when the link clears. Turn this off to hold the bitrate you "
+                            + "chose on a link you know is fine."
+                        checked: root.settings ? root.settings.video_adaptive_bitrate : true
+                        // Applied live rather than through a capture restart:
+                        // this only steers the rate controller, and restarting
+                        // the camera to flip a switch would drop frames.
+                        onChanged: function(on) {
+                            if (!root.settings) return
+                            root.settings.video_adaptive_bitrate = on
+                            if (backend) backend.setVideoAdaptiveBitrate(on)
+                        }
+                    }
+
+                    // What all of the above adds up to, in one line. Read back
+                    // from the resolver rather than assembled from the controls,
+                    // so a clamp applied in Rust is visible here rather than
+                    // silently disagreeing with what the combos show.
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        color: Theme.muted
+                        font.pixelSize: Theme.fontSizeCaption
+                        text: {
+                            var e = encodingCard.effective
+                            var mbps = (e.bitrate_bps / 1000000).toFixed(2)
+                            return qsTr("Sending %1x%2 at %3 fps, up to %4 Mbps.")
+                                .arg(e.width).arg(e.height).arg(e.fps).arg(mbps)
+                        }
+                    }
+
+                    /// Point every combo at what is actually stored.
+                    ///
+                    /// The resolution and frame rate combos are synced from the
+                    /// *effective* values, not the stored overrides: on a preset
+                    /// the overrides are ignored, and showing them would label
+                    /// Balanced with whatever Custom was last set to.
+                    function syncFromSettings() {
+                        if (!root.settings) return
+                        encodingCard.refreshEffective()
+                        encodingCard.syncing = true
+
+                        var p = encodingCard.presetKeys.indexOf(root.settings.video_quality)
+                        qualityCombo.currentIndex = p >= 0 ? p : 1
+
+                        var res = encodingCard.effective.width + "x" + encodingCard.effective.height
+                        var r = encodingCard.resolutions.indexOf(res)
+                        // A size with no entry — hand-edited, or a preset that
+                        // gained one — is shown as the nearest offered instead
+                        // of silently snapping the combo to the first entry.
+                        resolutionCombo.currentIndex =
+                            r >= 0 ? r : encodingCard.nearestResolutionIndex(encodingCard.effective.width)
+
+                        var f = encodingCard.frameRates.indexOf(encodingCard.effective.fps)
+                        fpsCombo.currentIndex = f >= 0 ? f : encodingCard.frameRates.indexOf(30)
+
+                        var stored = root.settings.video_bitrate_kbps
+                        var b = encodingCard.bitrates.indexOf(stored)
+                        // A hand-edited rate is shown as the nearest offered
+                        // one rather than as "Auto", which would claim the
+                        // opposite of what the file actually says.
+                        bitrateVideoCombo.currentIndex =
+                            b >= 0 ? b : (stored > 0 ? encodingCard.nearestBitrateIndex(stored) : 0)
+
+                        var k = encodingCard.keyframeSecs.indexOf(root.settings.video_keyframe_secs)
+                        keyframeCombo.currentIndex = k >= 0 ? k : encodingCard.keyframeSecs.indexOf(4)
+
+                        var c = encodingCard.codecIds.indexOf(root.settings.video_codec)
+                        codecCombo.currentIndex = c >= 0 ? c : 0
+
+                        encodingCard.syncing = false
+                    }
+
+                    /// Nearest offered bitrate, never Auto — index 0 means
+                    /// "derive one", which is a different answer entirely.
+                    function nearestBitrateIndex(kbps) {
+                        var best = 1
+                        var bestGap = 1e9
+                        for (var i = 1; i < encodingCard.bitrates.length; i++) {
+                            var gap = Math.abs(encodingCard.bitrates[i] - kbps)
+                            if (gap < bestGap) { bestGap = gap; best = i }
+                        }
+                        return best
+                    }
+
+                    function nearestResolutionIndex(width) {
+                        var best = 0
+                        var bestGap = 1e9
+                        for (var i = 0; i < encodingCard.resolutions.length; i++) {
+                            var w = parseInt(encodingCard.resolutions[i].split("x")[0], 10)
+                            var gap = Math.abs(w - width)
+                            if (gap < bestGap) { bestGap = gap; best = i }
+                        }
+                        return best
+                    }
+
+                    /// Offer only codecs this build can actually encode — the
+                    /// list is a build fact, so a preference the binary has no
+                    /// encoder for must not be selectable at all.
+                    function reloadCodecs() {
+                        var ids = ["auto"]
+                        var labels = [qsTr("Automatic — best both ends support")]
+                        if (backend) {
+                            try {
+                                var res = JSON.parse(backend.listVideoCodecs())
+                                var list = res.codecs || []
+                                for (var i = 0; i < list.length; i++) {
+                                    if (!list[i].id) continue
+                                    ids.push(list[i].id)
+                                    labels.push(list[i].name || list[i].id)
+                                }
+                            } catch (e) {}
+                        }
+                        encodingCard.codecIds = ids
+                        codecCombo.model = labels
+                        encodingCard.syncFromSettings()
+                    }
+
+                    // Same reason as the camera card's: the stored values arrive
+                    // as property changes after this page is built.
+                    Connections {
+                        target: root.settings
+                        function onVideo_qualityChanged() { encodingCard.syncFromSettings() }
+                        function onVideo_resolutionChanged() { encodingCard.syncFromSettings() }
+                        function onVideo_fpsChanged() { encodingCard.syncFromSettings() }
+                        function onVideo_bitrate_kbpsChanged() { encodingCard.syncFromSettings() }
+                        function onVideo_keyframe_secsChanged() { encodingCard.syncFromSettings() }
+                        function onVideo_codecChanged() { encodingCard.syncFromSettings() }
+                    }
+
+                    Component.onCompleted: encodingCard.reloadCodecs()
                 }
 
                 // Picture-in-picture.
