@@ -32,6 +32,12 @@ pub const MIN_DIMENSION: u32 = 128;
 pub const MAX_DIMENSION: u32 = 3840;
 /// Slowest offered frame rate. Below this motion stops reading as motion.
 pub const MIN_FPS: u32 = 5;
+/// Consecutive failed reads before a source is given up on.
+///
+/// The first reads routinely fail while a device spins up, so this has to
+/// tolerate a burst. Past it the device is gone — unplugged, claimed by another
+/// application, or a display that was being captured and no longer exists.
+pub const MAX_CONSECUTIVE_CAMERA_ERRORS: u32 = 120;
 /// Fastest offered frame rate.
 pub const MAX_FPS: u32 = 60;
 /// Keyframe interval used by every preset.
@@ -517,6 +523,36 @@ const ABR_BACKOFF_LOSS_PCT: f32 = 10.0;
 /// Loss below which the encoder may climb again.
 const ABR_RECOVER_LOSS_PCT: f32 = 4.0;
 
+/// Why a capture thread stopped, reported to `on_ended`.
+///
+/// The distinction is the whole point: [`Stopped`](Self::Stopped) is the user
+/// turning the camera off and needs no reaction, while the other two are the
+/// capture dying underneath a session that still believes it is streaming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureEnd {
+    /// `stop()` was called or the handle was dropped. The ordinary path.
+    Stopped,
+    /// The source could never be opened, so no frame was ever produced.
+    OpenFailed(String),
+    /// The source opened, then failed
+    /// [`MAX_CONSECUTIVE_CAMERA_ERRORS`] times running and was given up on —
+    /// a webcam unplugged mid-call, or a captured window that closed.
+    Lost(String),
+}
+
+impl CaptureEnd {
+    /// The failure text, or `None` when the capture simply stopped.
+    ///
+    /// Lets a caller handle "this ended badly" without matching two variants
+    /// that it would treat identically anyway.
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Stopped => None,
+            Self::OpenFailed(e) | Self::Lost(e) => Some(e),
+        }
+    }
+}
+
 /// Handle to a running capture thread.
 ///
 /// Dropping this stops the thread and releases the camera — which is what turns
@@ -563,17 +599,26 @@ impl VideoSender {
     /// clocks would each look self-consistent while being mutually meaningless.
     /// `None` means this capture is not part of a synchronised session (the
     /// settings preview, which reaches no peer).
-    pub fn start<S, E>(
+    ///
+    /// `on_ended` is called once, on the capture thread, as the last thing it
+    /// does — with why it stopped. A capture can die on its own (the device is
+    /// unplugged, or a captured window closes), and without this the thread
+    /// simply vanished: the toggle still read "on", no camera-off ever reached
+    /// the room, and every peer kept the last frame on screen indefinitely.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start<S, E, X>(
         layout: CaptureLayout,
         quality: Quality,
         mut encoder: E,
         mut sink: S,
         preview_peer_id: Option<String>,
         clock: Option<crate::media_clock::SessionMediaClock>,
+        on_ended: X,
     ) -> Self
     where
         S: FrameSink + 'static,
         E: VideoEncoder + 'static,
+        X: FnOnce(CaptureEnd) + Send + 'static,
     {
         let stop = Arc::new(AtomicBool::new(false));
         let keyframe_requested = Arc::new(AtomicBool::new(false));
@@ -594,6 +639,7 @@ impl VideoSender {
                     Ok(c) => c,
                     Err(e) => {
                         warn!("[video] could not open {kind} source: {e}");
+                        on_ended(CaptureEnd::OpenFailed(e.to_string()));
                         return;
                     }
                 };
@@ -607,6 +653,9 @@ impl VideoSender {
                     std::time::Duration::from_micros(1_000_000 / quality.fps.max(1) as u64);
                 let mut consecutive_errors = 0u32;
                 let mut applied_bitrate = quality.bitrate_bps;
+                // Overwritten only by the give-up path below; reaching the end
+                // of the loop any other way means `stop` was set.
+                let mut ended = CaptureEnd::Stopped;
 
                 while !stop_t.load(Ordering::Relaxed) {
                     let started = std::time::Instant::now();
@@ -634,8 +683,9 @@ impl VideoSender {
                             consecutive_errors += 1;
                             // The first reads routinely fail while the device
                             // spins up, so tolerate a burst before giving up.
-                            if consecutive_errors > 120 {
+                            if consecutive_errors > MAX_CONSECUTIVE_CAMERA_ERRORS {
                                 warn!("[video] camera failed {consecutive_errors} times, stopping: {e}");
+                                ended = CaptureEnd::Lost(e.to_string());
                                 break;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -693,6 +743,7 @@ impl VideoSender {
                     }
                 }
                 info!("[video] {kind} capture stopped");
+                on_ended(ended);
             })
             .ok();
 
@@ -730,6 +781,10 @@ impl VideoSender {
             // The settings preview reaches no peer, so it is not part of a
             // synchronised session and needs no clock.
             None,
+            // Nor is anyone told when it ends: a preview that dies leaves the
+            // settings page showing a still, which is exactly what "this source
+            // is not working" should look like there.
+            |_| {},
         )
     }
 

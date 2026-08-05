@@ -129,6 +129,43 @@ pub const PARTIAL_TIMEOUT: Duration = Duration::from_millis(200);
 /// rendered — the decoder has already moved on.
 const MONOTONIC_LAG: u32 = 2;
 
+/// A backward jump this large is a sender that restarted, not a late fragment.
+///
+/// Sequence numbers start at zero in a fresh process, so a peer who restarts
+/// their client re-uses numbers this receiver has long since passed. Judged
+/// purely by [`MONOTONIC_LAG`] every one of those frames is "superseded", and
+/// because a sender is never forgotten while it has completed-frame history,
+/// the receiver drops that peer's video *permanently* — for the minutes or
+/// hours it takes the counter to climb back past where it was. Leaving the room
+/// does not clear it either; only restarting the receiving client does.
+///
+/// Nothing legitimate lands here. Fragments are reordered by tens of
+/// milliseconds at worst and abandoned entirely after [`PARTIAL_TIMEOUT`], so
+/// 256 frames — more than eight seconds at 30 fps — cannot be jitter.
+const RESTART_BACKWARD_JUMP: u32 = 256;
+
+/// Whether `hdr` is the start of a new stream from a sender we have history
+/// for, rather than a fragment of a frame already superseded.
+///
+/// Two conditions, and the keyframe one is doing real work in both directions:
+///
+/// * **Correctness.** A decoder cannot resume from an inter frame — its
+///   reference frames belong to the process that exited. Resyncing on anything
+///   else would accept bytes only to fail decoding them. A restarting encoder
+///   always emits a keyframe first, and every fragment of it carries the flag,
+///   so the one we happen to receive first is enough.
+/// * **Blast radius.** Reassembly runs *before* the per-frame signature is
+///   checked — it has to, since the signature covers the reassembled frame — so
+///   until then a sender id is merely claimed. Requiring the flag means a
+///   stray fragment from an old session cannot reset a healthy stream's state
+///   in passing. It is not an authentication check and is not load-bearing as
+///   one: a room member could always forge this much. It keeps an accident from
+///   costing a stream, and the cost of being wrong is bounded — a reset loses
+///   at most the frames currently in flight, which the next keyframe replaces.
+fn is_stream_restart(last_completed: u32, hdr: &FragmentHeader) -> bool {
+    hdr.keyframe && last_completed.wrapping_sub(hdr.frame_seq) > RESTART_BACKWARD_JUMP
+}
+
 /// Parsed fragment header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentHeader {
@@ -398,6 +435,17 @@ impl Reassembler {
         self.senders.get(sender).map_or(0, |s| s.bytes)
     }
 
+    /// Forget every sender: partials and completed-frame history alike.
+    ///
+    /// Called when the session a stream belonged to ends (leaving a room,
+    /// joining another). The history is what suppresses late fragments, and
+    /// keeping it across sessions means judging a new stream against a counter
+    /// from an old one — [`RESTART_BACKWARD_JUMP`] recovers from that, but not
+    /// carrying the stale state in the first place is better.
+    pub fn clear(&mut self) {
+        self.senders.clear();
+    }
+
     /// Drop every partial older than [`PARTIAL_TIMEOUT`], and forget senders
     /// that are left with nothing buffered.
     pub fn evict_expired(&mut self, now: Instant) {
@@ -432,11 +480,25 @@ impl Reassembler {
         }
         let state = self.senders.entry(hdr.sender.clone()).or_default();
 
-        // Ignore fragments for frames the decoder has already moved past.
+        // Ignore fragments for frames the decoder has already moved past —
+        // unless the sender has plainly started over, in which case "behind" is
+        // the wrong reading of the number and dropping it would wedge this peer
+        // for good. See RESTART_BACKWARD_JUMP.
         if let Some(last) = state.last_completed {
             let cutoff = last.wrapping_sub(MONOTONIC_LAG);
             if seq_newer(cutoff, hdr.frame_seq) || hdr.frame_seq == last {
-                return None;
+                if is_stream_restart(last, &hdr) {
+                    // Everything buffered belongs to the previous stream, and
+                    // its numbering no longer means anything here. Silent by
+                    // design — this module keeps no logging of its own; the
+                    // receiver's stall watchdog is what makes the outage that
+                    // this prevents visible in a log.
+                    state.partials.clear();
+                    state.bytes = 0;
+                    state.last_completed = None;
+                } else {
+                    return None;
+                }
             }
         }
 
@@ -574,6 +636,136 @@ mod tests {
 
     fn frags(sealed: &[u8], seq: u32, keyframe: bool) -> Vec<Vec<u8>> {
         fragment_frame(SENDER, seq, keyframe, CODEC, PTS, &SIG, sealed, MAX_PAYLOAD).unwrap()
+    }
+
+    /// The bug this guards: sequence numbers restart at zero in a fresh
+    /// process, so a peer who restarts their client re-uses numbers this
+    /// receiver has passed. Judged only by MONOTONIC_LAG every frame reads as
+    /// superseded, and since a sender with completed-frame history is never
+    /// evicted, their video is dropped for as long as it takes the counter to
+    /// climb back — which leaving and rejoining the room does not fix, because
+    /// the reassembler outlives the room session.
+    #[test]
+    fn a_sender_that_restarts_from_zero_is_accepted_again() {
+        let mut r = Reassembler::new();
+        let now = Instant::now();
+
+        // A long-running stream.
+        for seq in [5_000u32, 5_001, 5_002] {
+            let f = frags(b"frame from the old process", seq, true);
+            assert!(r.push(&f[0], now).is_some(), "seq {seq} should complete");
+        }
+
+        // Same peer, new process, counter back to zero.
+        let f = frags(b"frame from the new process", 0, true);
+        let out = r
+            .push(&f[0], now)
+            .expect("a restarted sender must not be ignored");
+        assert_eq!(out.frame_seq, 0);
+
+        // And the stream continues from the new numbering.
+        let f = frags(b"and the next one", 1, false);
+        assert!(r.push(&f[0], now).is_some());
+    }
+
+    /// Only a keyframe resyncs. An inter frame cannot start a decoder — its
+    /// references died with the old process — so accepting one would take the
+    /// bytes and fail to decode them, and it would let a stray fragment from a
+    /// finished session reset a healthy stream in passing.
+    #[test]
+    fn a_restart_is_only_taken_from_a_keyframe() {
+        let mut r = Reassembler::new();
+        let now = Instant::now();
+        let f = frags(b"established stream", 5_000, true);
+        assert!(r.push(&f[0], now).is_some());
+
+        // Inter frame at the restarted numbering: ignored.
+        let f = frags(b"inter frame after restart", 1, false);
+        assert!(
+            r.push(&f[0], now).is_none(),
+            "an inter frame must not resync the stream"
+        );
+
+        // The keyframe that follows does resync it.
+        let f = frags(b"keyframe after restart", 2, true);
+        assert!(r.push(&f[0], now).is_some());
+    }
+
+    /// Every fragment of a keyframe carries the flag, so a restart is picked up
+    /// from whichever one arrives first — not only fragment 0.
+    #[test]
+    fn a_restart_is_detected_from_any_fragment_of_the_keyframe() {
+        let mut r = Reassembler::new();
+        let now = Instant::now();
+        let f = frags(b"established stream", 9_000, true);
+        assert!(r.push(&f[0], now).is_some());
+
+        // A multi-fragment keyframe from the restarted sender, delivered from
+        // its *second* fragment onward — fragment 0 arrives last.
+        let restarted = frags(&vec![4u8; 4_000], 3, true);
+        assert!(restarted.len() > 2, "need a multi-fragment frame");
+        let mut completed = None;
+        for part in restarted.iter().skip(1) {
+            completed = completed.or(r.push(part, now));
+        }
+        assert!(completed.is_none(), "frame 0 is still missing");
+        let out = r
+            .push(&restarted[0], now)
+            .expect("the restarted keyframe must complete");
+        assert_eq!(out.frame_seq, 3);
+    }
+
+    /// The other half of the rule: ordinary lateness must still be suppressed,
+    /// or a duplicated or reordered fragment would reset the stream and hand
+    /// the decoder a frame it has already shown.
+    #[test]
+    fn an_ordinary_late_frame_is_still_dropped() {
+        let mut r = Reassembler::new();
+        let now = Instant::now();
+        let f = frags(b"current", 1_000, true);
+        assert!(r.push(&f[0], now).is_some());
+
+        // Anything past the MONOTONIC_LAG tolerance but short of the restart
+        // jump — including the boundary itself, which must read as late.
+        // Keyframes, so it is the *distance* rule being tested here and not
+        // the keyframe requirement standing in for it.
+        for late in [997u32, 990, 1_000 - RESTART_BACKWARD_JUMP] {
+            let f = frags(b"late", late, true);
+            assert!(
+                r.push(&f[0], now).is_none(),
+                "seq {late} is late, not a restart"
+            );
+        }
+    }
+
+    /// Restart detection must not fire on the wrap itself: at the u32 boundary
+    /// the next sequence number is genuinely newer, not a restart.
+    #[test]
+    fn wrapping_past_the_boundary_is_not_read_as_a_restart() {
+        let mut r = Reassembler::new();
+        let now = Instant::now();
+        let f = frags(b"before the wrap", u32::MAX, true);
+        assert!(r.push(&f[0], now).is_some());
+        let f = frags(b"after the wrap", 0, false);
+        let out = r.push(&f[0], now).expect("0 follows u32::MAX");
+        assert_eq!(out.frame_seq, 0);
+    }
+
+    #[test]
+    fn clear_forgets_every_sender() {
+        let mut r = Reassembler::new();
+        let now = Instant::now();
+        let f = frags(&vec![9u8; 4_000], 1, true);
+        // Push all but the last fragment so there is buffered state to lose.
+        for part in &f[..f.len() - 1] {
+            assert!(r.push(part, now).is_none());
+        }
+        assert!(r.buffered_bytes(SENDER) > 0);
+        assert_eq!(r.tracked_senders(), 1);
+
+        r.clear();
+        assert_eq!(r.tracked_senders(), 0);
+        assert_eq!(r.buffered_bytes(SENDER), 0);
     }
 
     #[test]

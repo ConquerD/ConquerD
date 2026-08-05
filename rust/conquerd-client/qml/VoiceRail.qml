@@ -59,6 +59,24 @@ Rectangle {
     /// difference between "sharing silently on purpose" and "audio failed".
     property bool shareAudioOn: false
 
+    /// Capture sources the share menu offers, as `[{ id, name }]`, with the
+    /// empty-id "Default camera" entry first.
+    ///
+    /// Supplied by the host rather than read from the backend here: `AppBridge`
+    /// declares its id in MainWindow, and a QML id is scoped to the file that
+    /// declares it, so it is simply not in scope in this one.
+    property var videoSources: []
+
+    /// Main capture source id — `video_input_device`. Empty means the default
+    /// camera.
+    property string videoSourceId: ""
+
+    /// Picture-in-picture layout, verbatim `video_overlays_json`.
+    property string videoOverlaysJson: "[]"
+
+    /// Audio mode the share menu pre-selects: "auto" | "system" | "off".
+    property string contentAudioMode: "auto"
+
     /// Elapsed call seconds (driven by bridge.call_duration_secs).
     property int durationSecs: 0
 
@@ -168,6 +186,16 @@ Rectangle {
     /// Stop sharing video and any audio that went with it.
     signal stopShareRequested()
 
+    /// The share menu is opening — re-enumerate capture sources. Windows and
+    /// cameras come and go between one share and the next, so the list is a
+    /// snapshot rather than something held across sessions.
+    signal shareOptionsOpened()
+    /// Main capture source picked in the share menu.
+    signal videoSourceSelected(string sourceId)
+    /// Overlay layout edited in the share menu; carries the replacement
+    /// `video_overlays_json`.
+    signal videoOverlaysEdited(string overlaysJson)
+
     /// A peer's video should be shown in the centre expand region.
     signal expandVideoRequested(string peerId)
     /// A peer's video should be shown in its own detached window.
@@ -183,6 +211,106 @@ Rectangle {
 
     // ── Helpers ───────────────────────────────────────────────────────────
     function pad(n) { return n < 10 ? "0" + n : n.toString() }
+
+    // ── Share menu model ──────────────────────────────────────────────────
+    //
+    // Settings › Video owns the full editor, warnings and preview included.
+    // What is repeated here is only what can still be decided in the moment
+    // before sharing starts — which source, which insets, which audio — because
+    // that is the one moment the answer is actually in question, and sending a
+    // whole screen when a webcam was meant is not something a user can take
+    // back afterwards.
+
+    readonly property var shareCorners: ["top-left", "top-right", "bottom-left", "bottom-right"]
+    readonly property var shareCornerLabels: [
+        qsTr("Top left"), qsTr("Top right"), qsTr("Bottom left"), qsTr("Bottom right")
+    ]
+    readonly property var shareOverlaySizes: [10, 15, 20, 25, 30, 40, 50]
+    /// Kept in step with `composite::MAX_OVERLAYS`.
+    readonly property int shareMaxOverlays: 3
+
+    /// Sources offerable as an inset: every real device, minus the "Default
+    /// camera" entry, which names no device of its own.
+    readonly property var shareOverlaySources:
+        root.videoSources.filter(function (s) { return s && s.id !== "" })
+
+    readonly property var shareOverlays: root.parseShareOverlays(root.videoOverlaysJson)
+
+    /// Tolerant by design: the blob is user-editable, and a layout that failed
+    /// to parse must mean "no overlays" rather than a share menu that cannot
+    /// open.
+    function parseShareOverlays(json) {
+        var list
+        try { list = JSON.parse(json || "[]") } catch (e) { return [] }
+        return Array.isArray(list) ? list.slice(0, root.shareMaxOverlays) : []
+    }
+
+    function shareSourceIndex(id) {
+        for (var i = 0; i < root.videoSources.length; i++) {
+            if (root.videoSources[i].id === id)
+                return i
+        }
+        return -1
+    }
+
+    function shareOverlaySourceIndex(id) {
+        for (var i = 0; i < root.shareOverlaySources.length; i++) {
+            if (root.shareOverlaySources[i].id === id)
+                return i
+        }
+        return -1
+    }
+
+    /// First source not already spoken for. A device cannot be opened twice, so
+    /// offering one that is already the main source (or another inset) would
+    /// only add a row that fails to capture.
+    function firstFreeOverlaySource() {
+        var used = [root.videoSourceId]
+        var list = root.shareOverlays
+        for (var i = 0; i < list.length; i++)
+            used.push(list[i].id)
+        for (var j = 0; j < root.shareOverlaySources.length; j++) {
+            var id = root.shareOverlaySources[j].id
+            if (used.indexOf(id) < 0)
+                return id
+        }
+        return ""
+    }
+
+    function editShareOverlay(index, key, value) {
+        var list = root.parseShareOverlays(root.videoOverlaysJson)
+        if (index < 0 || index >= list.length)
+            return
+        list[index][key] = value
+        root.videoOverlaysEdited(JSON.stringify(list))
+    }
+
+    function removeShareOverlay(index) {
+        var list = root.parseShareOverlays(root.videoOverlaysJson)
+        if (index < 0 || index >= list.length)
+            return
+        list.splice(index, 1)
+        root.videoOverlaysEdited(JSON.stringify(list))
+    }
+
+    function addShareOverlay() {
+        var id = root.firstFreeOverlaySource()
+        var list = root.parseShareOverlays(root.videoOverlaysJson)
+        if (id === "" || list.length >= root.shareMaxOverlays)
+            return
+        list.push({ id: id, corner: "bottom-right", size: 25 })
+        root.videoOverlaysEdited(JSON.stringify(list))
+    }
+
+    /// What "audio from the shared source" actually resolves to for the source
+    /// currently selected — the one part of that option a user cannot infer.
+    function shareAudioHint() {
+        if (root.videoSourceId.indexOf("window:") === 0)
+            return qsTr("Only that application's audio is sent.")
+        if (root.videoSourceId.indexOf("monitor:") === 0)
+            return qsTr("Everything this computer plays is sent.")
+        return qsTr("A camera carries no audio of its own — your microphone already carries you.")
+    }
 
     // ── Left border separator ─────────────────────────────────────────────
     Rectangle {
@@ -600,10 +728,18 @@ Rectangle {
 
                     Popup {
                         id: sharePopup
+                        // Right-aligned to the button. The menu is far wider
+                        // than the rail it hangs off, so growing rightward
+                        // would put most of it past the window edge.
+                        x: shareButton.width - width
                         y: -implicitHeight - Theme.spacingXs
-                        width: 260
+                        width: 320
                         padding: Theme.spacingSm
                         modal: false
+                        // A snapshot, taken each time: windows open and close
+                        // constantly, and a list built once at startup would
+                        // offer things that are no longer there.
+                        onAboutToShow: root.shareOptionsOpened()
                         background: Rectangle {
                             color: Theme.bg2
                             border.color: Theme.border
@@ -620,12 +756,156 @@ Rectangle {
                                 font.pixelSize: Theme.fontSizeCaption
                                 font.bold: true
                             }
+
+                            // ── What is being shared ──────────────────────
                             Label {
+                                text: qsTr("Source")
+                                color: Theme.muted
+                                font.pixelSize: Theme.fontSizeMicro
+                            }
+
+                            ComboBox {
+                                id: shareSourceCombo
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 32
+                                font.pixelSize: Theme.fontSizeCaption
+                                model: root.videoSources.map(function (s) { return s.name || s.id })
+                                currentIndex: root.shareSourceIndex(root.videoSourceId)
+                                // -1 when the saved device is gone — an
+                                // unplugged camera or a closed window is
+                                // routine, and saying so beats silently
+                                // sharing whatever happens to be first.
+                                displayText: currentIndex >= 0
+                                    ? currentText
+                                    : qsTr("Source unavailable")
+                                onActivated: {
+                                    var s = root.videoSources[currentIndex]
+                                    root.videoSourceSelected(s ? (s.id || "") : "")
+                                    // Selecting broke the binding above by
+                                    // writing currentIndex directly, and this
+                                    // combo outlives the menu — without
+                                    // rebinding, a source changed from Settings
+                                    // afterwards would never show here.
+                                    currentIndex = Qt.binding(function () {
+                                        return root.shareSourceIndex(root.videoSourceId)
+                                    })
+                                }
+                            }
+
+                            // ── Overlays ──────────────────────────────────
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Theme.spacingXs
+
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: qsTr("Overlays")
+                                    color: Theme.muted
+                                    font.pixelSize: Theme.fontSizeMicro
+                                }
+                                StyledButton {
+                                    text: qsTr("Add")
+                                    enabled: root.shareOverlays.length < root.shareMaxOverlays
+                                        && root.firstFreeOverlaySource() !== ""
+                                    onClicked: root.addShareOverlay()
+                                }
+                            }
+
+                            Label {
+                                visible: root.shareOverlays.length === 0
                                 Layout.fillWidth: true
                                 wrapMode: Text.WordWrap
-                                text: qsTr("Source is set in Settings › Video. Audio is sent on the same timeline as the video, so the two stay in sync.")
+                                text: qsTr("None — the source fills the frame. Overlays are merged "
+                                    + "into it before encoding, so peers still see one picture.")
                                 color: Theme.muted
-                                font.pixelSize: Theme.fontTiny
+                                font.pixelSize: Theme.fontSizeMicro
+                            }
+
+                            Repeater {
+                                model: root.shareOverlays
+
+                                delegate: ColumnLayout {
+                                    id: overlayRow
+                                    required property int index
+                                    required property var modelData
+
+                                    Layout.fillWidth: true
+                                    spacing: 2
+
+                                    ComboBox {
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 30
+                                        font.pixelSize: Theme.fontSizeCaption
+                                        model: root.shareOverlaySources.map(
+                                            function (s) { return s.name || s.id })
+                                        currentIndex: root.shareOverlaySourceIndex(
+                                            overlayRow.modelData.id)
+                                        // Names the row that will be left out
+                                        // of the picture, and why: a device
+                                        // cannot be captured twice, so an
+                                        // overlay that is also the main source
+                                        // is dropped by the compositor.
+                                        displayText: overlayRow.modelData.id === root.videoSourceId
+                                            ? qsTr("Same as source — not shown")
+                                            : (currentIndex >= 0
+                                                ? currentText
+                                                : qsTr("Source unavailable"))
+                                        onActivated: {
+                                            var s = root.shareOverlaySources[currentIndex]
+                                            root.editShareOverlay(
+                                                overlayRow.index, "id", s ? s.id : "")
+                                        }
+                                    }
+
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: Theme.spacingXs
+
+                                        ComboBox {
+                                            Layout.fillWidth: true
+                                            Layout.preferredHeight: 30
+                                            font.pixelSize: Theme.fontSizeCaption
+                                            model: root.shareCornerLabels
+                                            currentIndex: Math.max(0, root.shareCorners.indexOf(
+                                                overlayRow.modelData.corner))
+                                            onActivated: root.editShareOverlay(
+                                                overlayRow.index, "corner",
+                                                root.shareCorners[currentIndex] || "bottom-right")
+                                        }
+
+                                        ComboBox {
+                                            Layout.preferredWidth: 96
+                                            Layout.preferredHeight: 30
+                                            font.pixelSize: Theme.fontSizeCaption
+                                            // Width only: the height follows
+                                            // the source's own aspect ratio.
+                                            model: root.shareOverlaySizes.map(
+                                                function (s) { return s + "%" })
+                                            currentIndex: Math.max(0, root.shareOverlaySizes.indexOf(
+                                                Number(overlayRow.modelData.size) || 25))
+                                            onActivated: root.editShareOverlay(
+                                                overlayRow.index, "size",
+                                                root.shareOverlaySizes[currentIndex] || 25)
+                                        }
+
+                                        StyledButton {
+                                            text: qsTr("Remove")
+                                            onClicked: root.removeShareOverlay(overlayRow.index)
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ── Audio, which also starts the share ────────
+                            //
+                            // Picking the audio is the commit, so everything
+                            // above it is still editable when the choice is
+                            // made.
+                            Label {
+                                Layout.topMargin: Theme.spacingXs
+                                text: qsTr("Audio — pick one to start sharing")
+                                color: Theme.muted
+                                font.pixelSize: Theme.fontSizeMicro
                             }
 
                             Repeater {
@@ -635,6 +915,7 @@ Rectangle {
                                     { key: "off",    label: qsTr("No audio") }
                                 ]
                                 delegate: Rectangle {
+                                    id: audioOption
                                     required property var modelData
                                     Layout.fillWidth: true
                                     height: 30
@@ -645,7 +926,14 @@ Rectangle {
                                         anchors.verticalCenter: parent.verticalCenter
                                         anchors.left: parent.left
                                         anchors.leftMargin: Theme.spacingSm
-                                        text: parent.modelData.label
+                                        // The last choice made is marked, not
+                                        // pre-applied: this list is a set of
+                                        // actions, so a "selected" row with no
+                                        // way to confirm it would read as a
+                                        // share that had already started.
+                                        text: (audioOption.modelData.key === root.contentAudioMode
+                                                ? "• " : "   ")
+                                            + audioOption.modelData.label
                                         color: Theme.text
                                         font.pixelSize: Theme.fontSizeCaption
                                     }
@@ -655,10 +943,18 @@ Rectangle {
                                         cursorShape: Qt.PointingHandCursor
                                         onClicked: {
                                             sharePopup.close()
-                                            root.shareRequested(parent.modelData.key)
+                                            root.shareRequested(audioOption.modelData.key)
                                         }
                                     }
                                 }
+                            }
+
+                            Label {
+                                Layout.fillWidth: true
+                                wrapMode: Text.WordWrap
+                                text: root.shareAudioHint()
+                                color: Theme.muted
+                                font.pixelSize: Theme.fontSizeMicro
                             }
                         }
                     }

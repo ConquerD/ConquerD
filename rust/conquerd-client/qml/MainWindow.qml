@@ -804,6 +804,23 @@ ApplicationWindow {
             delete next[peerId]
         root.videoActivePeers = next
     }
+
+    /// Peers whose video stopped arriving while their camera is still on.
+    /// Same shape and same reassign-whole rule as `videoActivePeers`.
+    property var videoStalledPeers: ({})
+
+    function setPeerVideoStalled(peerId, stalled) {
+        if (!peerId || peerId === "")
+            return
+        var next = {}
+        for (var k in root.videoStalledPeers)
+            next[k] = true
+        if (stalled)
+            next[peerId] = true
+        else
+            delete next[peerId]
+        root.videoStalledPeers = next
+    }
     /// Fraction of the content area the region occupies (persisted).
     property real videoRegionRatio: 0.4
     /// Live popout windows keyed by peer id.
@@ -892,6 +909,7 @@ ApplicationWindow {
         // Bound after creation, not passed in: createObject's property map sets
         // static values, and this one has to keep tracking the peer's camera.
         win.streaming = Qt.binding(() => root.videoActivePeers[peerId] === true)
+        win.stalled = Qt.binding(() => root.videoStalledPeers[peerId] === true)
         var map = root.videoPopouts
         map[peerId] = win
         root.videoPopouts = map
@@ -933,6 +951,42 @@ ApplicationWindow {
             }
         }
         return peerId
+    }
+
+    /// Capture sources the share menu offers, as `[{ id, name }]`.
+    ///
+    /// The empty-id entry first is the "default camera" selection an empty
+    /// `video_input_device` means — the same convention `SourceSpec` reads.
+    property var shareCaptureSources: [{ id: "", name: qsTr("Default camera") }]
+
+    /// Re-enumerate capture sources for the share menu.
+    ///
+    /// Cameras, monitors and windows share one list because any of them can be
+    /// either the main source or an inset over it.
+    function refreshShareCaptureSources() {
+        var out = [{ id: "", name: qsTr("Default camera") }]
+        try {
+            var res = JSON.parse(backend.listVideoDevices())
+            var groups = [
+                { items: res.cameras || [], prefix: "Camera — " },
+                { items: res.screens || [], prefix: "" },
+                { items: res.windows || [], prefix: "Window — " }
+            ]
+            for (var g = 0; g < groups.length; g++) {
+                var items = groups[g].items
+                for (var i = 0; i < items.length; i++) {
+                    out.push({
+                        id: items[i].id,
+                        name: groups[g].prefix + (items[i].name || items[i].id)
+                    })
+                }
+            }
+        } catch (e) {
+            // Leaves the default-camera entry standing: enumeration failing is
+            // no reason to be unable to share at all.
+            console.warn("share menu: could not list video devices:", e)
+        }
+        root.shareCaptureSources = out
     }
 
     // Debounced persist of the region ratio, mirroring the window-geometry
@@ -1074,6 +1128,19 @@ ApplicationWindow {
             roomModel.setVideoActive(peerId, active)
             // Drives the video region, which cannot read model roles.
             root.setPeerVideoActive(peerId, active)
+            // A camera that just turned on or off cannot also be stalled; the
+            // backend retracts its own report, but not before the tile would
+            // have flashed the badge over a fresh stream.
+            if (!active)
+                root.setPeerVideoStalled(peerId, false)
+        })
+        backend.peerVideoStalledChanged.connect(function(peerId, stalled) {
+            root.setPeerVideoStalled(peerId, stalled)
+        })
+        backend.cameraCaptureFailed.connect(function(reason) {
+            // The toggle is already off by the time this arrives — the backend
+            // turned it off, because the capture is gone either way.
+            console.warn("[video] camera stopped:", reason)
         })
         // File transfer model wiring
         backend.fileOffered.connect(fileTransferModel.upsertTransfer)
@@ -2443,6 +2510,7 @@ ApplicationWindow {
                 onLoaded: {
                     item.expandedPeers = Qt.binding(() => root.expandedVideoPeers)
                     item.videoActivePeers = Qt.binding(() => root.videoActivePeers)
+                    item.videoStalledPeers = Qt.binding(() => root.videoStalledPeers)
                     item.participantModel = Qt.binding(() =>
                         backend.voice_active && backend.in_room ? roomModel : directCallModel)
                     item.heightRatio = Qt.binding(() => root.videoRegionRatio)
@@ -2654,6 +2722,19 @@ ApplicationWindow {
 
             videoOn: backend.video_active
             shareAudioOn: backend.content_audio_active
+
+            videoSources: root.shareCaptureSources
+            videoSourceId: settingsModel.video_input_device
+            videoOverlaysJson: settingsModel.video_overlays_json
+            contentAudioMode: settingsModel.content_audio_mode
+
+            onShareOptionsOpened: root.refreshShareCaptureSources()
+            // Written straight to settings, so the menu and Settings › Video
+            // are two views of one choice rather than two choices that can
+            // disagree. Not saved here: the settings page's Save button owns
+            // that, exactly as the audio mode below has always worked.
+            onVideoSourceSelected: (sourceId) => settingsModel.video_input_device = sourceId
+            onVideoOverlaysEdited: (json) => settingsModel.video_overlays_json = json
 
             /// Start sharing video, and the audio that belongs with it.
             ///

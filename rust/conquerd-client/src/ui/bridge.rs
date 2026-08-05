@@ -675,6 +675,25 @@ pub mod ffi {
         #[rust_name = "peer_video_state_changed"]
         fn peerVideoStateChanged(self: Pin<&mut AppBridge>, peer_id: QString, active: bool);
 
+        /// Emitted when a peer's video stops arriving while their camera is
+        /// still announced as on, and again when it comes back.
+        ///
+        /// Distinct from `peerVideoStateChanged`: that one carries what the
+        /// sender *says*, this one carries what actually reaches us. A tile
+        /// keeps showing its last frame either way, so without this a frozen
+        /// picture is indistinguishable from a very still room.
+        #[qsignal]
+        #[rust_name = "peer_video_stalled_changed"]
+        fn peerVideoStalledChanged(self: Pin<&mut AppBridge>, peer_id: QString, stalled: bool);
+
+        /// Emitted when local capture stops on its own — the device was
+        /// unplugged, taken by another application, or the captured window
+        /// closed. The camera toggle has already been turned off by the time
+        /// this arrives; `reason` is for display.
+        #[qsignal]
+        #[rust_name = "camera_capture_failed"]
+        fn cameraCaptureFailed(self: Pin<&mut AppBridge>, reason: QString);
+
         /// Start a microphone test: starts audio capture and emits live level
         /// updates via the `mic_level` property.
         #[qinvokable]
@@ -2858,6 +2877,11 @@ impl ffi::AppBridge {
                 clock
             };
 
+            // Posted back rather than acted on directly: `on_ended` runs on the
+            // capture thread, and everything it triggers (stopping the sender,
+            // announcing camera-off, touching qproperties) belongs to the Qt
+            // thread.
+            let qt = self.as_mut().qt_thread();
             let mut sender = crate::video::sender::VideoSender::start(
                 layout,
                 quality,
@@ -2865,6 +2889,14 @@ impl ffi::AppBridge {
                 sink,
                 preview_id,
                 Some(clock),
+                move |end| {
+                    let Some(reason) = end.failure().map(str::to_owned) else {
+                        return; // Ordinary stop — the UI asked for it.
+                    };
+                    let _ = qt.queue(move |bridge: Pin<&mut ffi::AppBridge>| {
+                        capture_died(bridge, &reason);
+                    });
+                },
             );
             // Applied after start rather than passed in: adaptation is a
             // property of the rate controller, not of the capture, and the
@@ -4824,6 +4856,37 @@ fn publish_ollama_models(mut bridge: Pin<&mut ffi::AppBridge>, models_json: &str
     bridge.as_mut().set_ollama_models_json(models_q.clone());
     bridge.as_mut().set_ollama_models_error(error_q.clone());
     bridge.as_mut().ollama_models_ready(models_q, error_q);
+}
+
+/// React to a capture thread that stopped on its own.
+///
+/// Runs on the Qt thread, posted from the capture thread. The camera is already
+/// gone by the time this lands; the job here is to make everything else agree
+/// with that. Without it the sender handle stayed in place, the toggle kept
+/// reading "on", and — worst of the three — no camera-off ever reached the
+/// room, so every peer held the last frame on screen indefinitely. A stopped
+/// stream is indistinguishable from a still one at the far end, so the
+/// announcement is the only signal they will ever get.
+///
+/// Deliberately not a restart: a device that was unplugged, or a window that
+/// was closed, is not coming back on its own, and a capture that reopens in a
+/// loop would spin on the failure while the user wonders why the camera light
+/// keeps flickering. Turning the toggle off puts the decision back where it
+/// belongs.
+fn capture_died(mut bridge: Pin<&mut ffi::AppBridge>, reason: &str) {
+    if bridge.rust().video_sender.is_none() {
+        // The normal stop path already tore this down and the thread's report
+        // merely arrived after it — nothing to correct.
+        return;
+    }
+    warn!("[video] capture ended on its own: {reason}");
+    // Stops the (already dead) sender, drops the media clock, and announces
+    // camera-off to the room or the direct peer.
+    bridge.as_mut().stop_local_video();
+    bridge
+        .as_mut()
+        .set_session_banner(QString::from(format!("Camera stopped — {reason}").as_str()));
+    bridge.camera_capture_failed(QString::from(reason));
 }
 
 /// Where an auto-reply should be sent once the Ollama stream finishes.
@@ -7988,6 +8051,7 @@ fn dispatch_event(
             // Hand straight to the decode thread. Decoding here would run on
             // the connection-manager task; decoding after the Qt hop would run
             // on the GUI thread. Both are wrong for a blocking codec call.
+            let stall_qt = qt_thread.clone();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 if bridge.rust().video_receiver.is_none() {
                     // Spawned on first inbound frame rather than at startup, so
@@ -8013,6 +8077,18 @@ fn dispatch_event(
                                 });
                             }
                         },
+                        move |peer_id, stalled| {
+                            // Straight to QML: a stalled tile is a display
+                            // concern, and nothing in the backend acts on it.
+                            let id = peer_id.to_owned();
+                            let _ = stall_qt.queue(move |bridge: Pin<&mut ffi::AppBridge>| {
+                                bridge.peer_video_stalled_changed(
+                                    QString::from(id.as_str()),
+                                    stalled,
+                                );
+                            });
+                        },
+                        crate::video::sink::has_sink,
                     );
                     // The call controller anchors the sync timeline from its
                     // own playout tick, so it needs the same state this

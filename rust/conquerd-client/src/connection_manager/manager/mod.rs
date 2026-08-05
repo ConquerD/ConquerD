@@ -775,6 +775,9 @@ impl ConnectionManager {
                         ConnectionCommand::JoinRoom { supernode_id, room_id } => {
                             self.current_supernode_id = supernode_id.clone();
                             self.current_room_id = room_id.clone();
+                            // Nothing buffered or remembered from a previous
+                            // room describes this one; see `Reassembler::clear`.
+                            self.video_reassembler.clear();
                             // Voice join also receives room chat while present.
                             self.chat_active_rooms
                                 .insert(room_scope_key(&supernode_id, &room_id));
@@ -791,6 +794,7 @@ impl ConnectionManager {
                             let route = self.live_room_route(&supernode_id);
                             self.current_supernode_id = route.clone();
                             self.current_room_id = room_id.clone();
+                            self.video_reassembler.clear();
                             let key = format!("{route}:{room_id}");
                             self.chat_active_rooms
                                 .insert(room_scope_key(&route, &room_id));
@@ -817,6 +821,11 @@ impl ConnectionManager {
                             {
                                 self.current_room_id.clear();
                                 self.current_supernode_id.clear();
+                                // Video state is per *stream*, and every stream
+                                // in that room just ended. Keeping the
+                                // completed-frame history would judge the next
+                                // session's numbering against this one's.
+                                self.video_reassembler.clear();
                             }
                             // An intentional leave outranks any in-flight
                             // `room_absent` retry for this room — don't let the

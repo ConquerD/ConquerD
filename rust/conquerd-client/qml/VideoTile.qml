@@ -25,6 +25,13 @@ Item {
     property string displayName: ""
     /// Whether the peer is currently sending. Drives the placeholder.
     property bool streaming: false
+    /// Whether their camera is announced on but nothing is reaching us.
+    ///
+    /// Separate from `streaming` because the two answer different questions:
+    /// that one is what the sender says, this one is what arrives. A frozen
+    /// picture is otherwise indistinguishable from a very still one, and the
+    /// tile would sit there looking live indefinitely.
+    property bool stalled: false
     /// Show the name label and hover controls.
     property bool showChrome: true
     /// Show the shared-audio control.
@@ -148,6 +155,33 @@ Item {
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: root.streaming ? qsTr("Waiting for video…") : qsTr("Camera off")
                 color: Theme.muted
+                font.pixelSize: Theme.fontSizeCaption
+            }
+        }
+
+        // Stale-picture badge.
+        //
+        // Over the picture rather than replacing it: the last frame is still
+        // the most useful thing to show, and blanking the tile would throw away
+        // the only content it has in exchange for saying the same thing. Hidden
+        // once the placeholder is up, which already explains itself.
+        Rectangle {
+            visible: root.stalled && root.streaming && root._gotFrame
+            anchors {
+                horizontalCenter: parent.horizontalCenter
+                top: parent.top
+                topMargin: Theme.spacingXs
+            }
+            width: stalledLabel.implicitWidth + Theme.spacingSm * 2
+            height: stalledLabel.implicitHeight + Theme.spacingXs
+            radius: Theme.radiusSm
+            color: Qt.rgba(0, 0, 0, 0.7)
+
+            Text {
+                id: stalledLabel
+                anchors.centerIn: parent
+                text: qsTr("Stream stalled — waiting for video")
+                color: Theme.warn
                 font.pixelSize: Theme.fontSizeCaption
             }
         }

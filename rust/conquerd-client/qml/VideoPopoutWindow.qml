@@ -27,6 +27,8 @@ Window {
     /// peer switching their camera off shows "Camera off" here rather than
     /// leaving their last frame frozen on screen.
     property bool streaming: false
+    /// Whether their video has stopped arriving — see `VideoTile.stalled`.
+    property bool stalled: false
 
     signal closed()
     /// Shared-audio level/mute changed for this popout's peer.
@@ -82,6 +84,7 @@ Window {
             // video is exactly where someone turns a loud stream down.
             item.showAudioControl = true
             item.streaming = Qt.binding(() => popWin.streaming)
+            item.stalled = Qt.binding(() => popWin.stalled)
             item.contentAudioChanged.connect(function(muted, volume) {
                 popWin.contentAudioChanged(popWin.peerId, muted, volume)
             })

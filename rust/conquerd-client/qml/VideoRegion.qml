@@ -24,6 +24,10 @@ Item {
     /// placeholder no matter what was actually arriving.
     property var videoActivePeers: ({})
 
+    /// Peer ids whose video has stopped arriving, as a set (`{peerId: true}`).
+    /// Same shape and same reason as `videoActivePeers`.
+    property var videoStalledPeers: ({})
+
     /// Fraction of the content area this region occupies, persisted by the
     /// caller. Clamped to keep chat usable at either extreme.
     property real heightRatio: 0.4
@@ -98,6 +102,7 @@ Item {
                     peerId: modelData
                     displayName: root._handle(modelData)
                     streaming: root.videoActivePeers[modelData] === true
+                    stalled: root.videoStalledPeers[modelData] === true
 
                     onCloseRequested: root.collapseRequested(modelData)
                     onPopoutRequested: root.popoutRequested(modelData)

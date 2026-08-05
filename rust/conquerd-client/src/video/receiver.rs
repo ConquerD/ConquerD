@@ -14,7 +14,7 @@
 //! is built to match. A sender that changes codec gets a fresh decoder, since
 //! the old one's reference frames are meaningless to the new format.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::Arc;
@@ -60,6 +60,55 @@ const QUEUE_DEPTH: usize = 8;
 
 /// Consecutive decode failures from one peer before asking for a keyframe.
 const FAILURES_BEFORE_KEYFRAME_REQUEST: u32 = 3;
+
+/// Consecutive decode failures before the decoder itself is thrown away.
+///
+/// A keyframe repairs a decoder that lost its references. It does nothing for
+/// one that has stopped working — a Media Foundation transform that no longer
+/// requests input fails *every* call from then on, so a receiver that only ever
+/// asks for keyframes sits on a frozen tile until the user leaves the room.
+/// Dropping the decoder here means the next frame builds a fresh one, which is
+/// the only recovery that does not need the session torn down.
+///
+/// Well above the keyframe threshold on purpose: rebuilding costs a decoder
+/// (and, on the hardware path, GPU surfaces), so a keyframe gets several
+/// chances to work before it comes to this.
+const FAILURES_BEFORE_DECODER_REBUILD: u32 = 15;
+
+/// Minimum gap between keyframe requests for the same peer.
+///
+/// The connection manager rate-limits these too, but throttling at the source
+/// is what makes re-asking safe: without it a wedged decoder would queue a
+/// request per failed frame, thirty times a second, for the manager to throw
+/// away.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Gap between keyframe requests once a stream has been quiet long enough to
+/// report — see [`STALL_REPORT_AFTER`].
+///
+/// By then the fast retry has failed for ten seconds and is unlikely to start
+/// working on the eleventh; an outage that lasts minutes should not cost a
+/// signalling message a second for its whole duration. Recovery does not depend
+/// on the request either way, since senders emit a keyframe every few seconds
+/// regardless — this only shortens the wait when it works.
+const STALLED_KEYFRAME_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a peer that was delivering frames may go quiet before we ask for a
+/// keyframe.
+///
+/// A stream that simply stops — a relay reconnect, a shed burst, a frame the
+/// group key could not open — produces no decode error at all, so nothing in
+/// the failure path above ever fires. Asking here is cheap and is the only
+/// prompt a sender gets that its frames are not landing.
+const STALL_KEYFRAME_AFTER: Duration = Duration::from_secs(2);
+
+/// How long a peer stays quiet before the UI is told the tile is stale.
+///
+/// Long enough that a bad few seconds of network does not flag every call, and
+/// short enough that a user staring at a frozen picture is told why. The tile
+/// keeps its last frame either way — this only distinguishes "still live" from
+/// "this picture is old".
+const STALL_REPORT_AFTER: Duration = Duration::from_secs(10);
 
 /// How many peers may be decoded at once.
 ///
@@ -114,11 +163,27 @@ impl VideoReceiver {
     ///
     /// `request_keyframe` is invoked (from the decode thread) with the peer id
     /// whose stream cannot be decoded, so the caller can send a keyframe
-    /// request. It is rate-limited by the caller, not here.
-    pub fn start<F, D>(mut make_decoder: F, mut request_keyframe: D) -> Self
+    /// request. Throttled here as well as by the caller — see
+    /// [`KEYFRAME_REQUEST_INTERVAL`].
+    ///
+    /// `report_stall` is invoked with `(peer_id, stalled)` when a stream that
+    /// was arriving goes quiet for [`STALL_REPORT_AFTER`], and again with
+    /// `false` when frames resume or the peer is forgotten. Edges only: it is
+    /// never called twice with the same state for one peer.
+    ///
+    /// `has_sink` answers "is anything displaying this peer?". Injected rather
+    /// than called directly so the loop can be exercised without a Qt render
+    /// surface; production passes [`sink::has_sink`].
+    pub fn start<F, D, S>(
+        mut make_decoder: F,
+        mut request_keyframe: D,
+        mut report_stall: S,
+        has_sink: fn(&str) -> bool,
+    ) -> Self
     where
         F: FnMut(VideoCodec) -> Option<Box<dyn VideoDecoder>> + Send + 'static,
         D: FnMut(&str) + Send + 'static,
+        S: FnMut(&str, bool) + Send + 'static,
     {
         let (tx, rx) = mpsc::sync_channel::<InboundFrame>(QUEUE_DEPTH);
         let (control_tx, control_rx) = mpsc::channel::<Control>();
@@ -134,13 +199,40 @@ impl VideoReceiver {
                 let mut failures: HashMap<String, u32> = HashMap::new();
                 // When each decoded peer last delivered a frame, for the cap.
                 let mut last_frame: HashMap<String, std::time::Instant> = HashMap::new();
+                // When we last asked each peer for a keyframe, for the throttle.
+                let mut keyframe_asked: HashMap<String, std::time::Instant> = HashMap::new();
+                // Peers currently reported to the UI as stalled, so the report
+                // fires on edges rather than once per sweep.
+                let mut stalled: HashSet<String> = HashSet::new();
                 info!("[video] decode thread started");
 
                 while !stop_t.load(Ordering::Relaxed) {
                     // Lifecycle first: a peer who just left must not keep a
                     // decoder (and its HW surfaces) alive until the next frame
                     // arrives — which may never happen.
-                    drain_control(&control_rx, &mut decoders, &mut failures, &mut last_frame);
+                    drain_control(
+                        &control_rx,
+                        &mut decoders,
+                        &mut failures,
+                        &mut last_frame,
+                        &mut keyframe_asked,
+                        &mut stalled,
+                        &mut report_stall,
+                    );
+
+                    // Runs on the idle tick as well as after every frame, which
+                    // is the whole point: a stream that stopped produces no
+                    // frames to hang the check off, so a loop that only looked
+                    // at arrivals would never notice it went away.
+                    sweep_stalls(
+                        &last_frame,
+                        &mut stalled,
+                        &mut keyframe_asked,
+                        &mut request_keyframe,
+                        &mut report_stall,
+                        has_sink,
+                        std::time::Instant::now(),
+                    );
 
                     let item = match rx.recv_timeout(IDLE_POLL) {
                         Ok(item) => item,
@@ -150,7 +242,7 @@ impl VideoReceiver {
 
                     // Don't spend CPU decoding for a peer nobody is watching.
                     // Cheap to check and it is the common case in a large room.
-                    if !sink::has_sink(&item.peer_id) {
+                    if !has_sink(&item.peer_id) {
                         continue;
                     }
 
@@ -168,10 +260,29 @@ impl VideoReceiver {
                             decoders.remove(&stale);
                             failures.remove(&stale);
                             last_frame.remove(&stale);
+                            keyframe_asked.remove(&stale);
+                            // Clear the report with the state behind it: an
+                            // evicted peer leaves `last_frame`, so the sweep
+                            // would never revisit it and the tile would wear a
+                            // stalled badge for the rest of the session.
+                            if stalled.remove(&stale) {
+                                report_stall(&stale, false);
+                            }
                         }
                         Admission::Reject => continue,
                     }
                     last_frame.insert(item.peer_id.clone(), now);
+                    // Arrival is the recovery signal, not a successful decode:
+                    // the picture may still need a keyframe or a rebuilt
+                    // decoder, but the stream itself is demonstrably back and
+                    // both of those are handled below.
+                    if stalled.remove(&item.peer_id) {
+                        info!(
+                            "[video] frames resumed from {}",
+                            &item.peer_id[..8.min(item.peer_id.len())]
+                        );
+                        report_stall(&item.peer_id, false);
+                    }
 
                     // A decoder built for a different codec cannot be reused:
                     // drop it so the entry below rebuilds. This is the path a
@@ -216,7 +327,11 @@ impl VideoReceiver {
                         }
                     };
 
-                    match entry.decoder.decode(&item.encoded) {
+                    // Bound to a local so the `decoders` borrow ends here: the
+                    // failure arm below has to be able to drop the very
+                    // decoder this call came from.
+                    let decoded = entry.decoder.decode(&item.encoded);
+                    match decoded {
                         Ok(frame) => {
                             failures.remove(&item.peer_id);
                             // Through the playout rather than straight to the
@@ -237,27 +352,64 @@ impl VideoReceiver {
                             }
                         }
                         Err(e) => {
-                            let n = failures.entry(item.peer_id.clone()).or_insert(0);
-                            *n += 1;
-                            if *n == FAILURES_BEFORE_KEYFRAME_REQUEST {
-                                // Exactly at the threshold, not past it: the
-                                // caller rate-limits, but not re-firing every
-                                // frame keeps the request path quiet.
-                                debug!(
-                                    "[video] {} decode failures from {}; requesting keyframe: {e}",
-                                    n,
+                            let n = {
+                                let n = failures.entry(item.peer_id.clone()).or_insert(0);
+                                *n += 1;
+                                *n
+                            };
+                            if n >= FAILURES_BEFORE_KEYFRAME_REQUEST {
+                                // Past the threshold, not merely at it, and
+                                // throttled rather than fired once: a single
+                                // request can itself be lost, and a receiver
+                                // that asked exactly once then gave up stays
+                                // frozen until the sender's periodic keyframe
+                                // comes round — or forever, when the stream is
+                                // already past what a keyframe can fix.
+                                if request_keyframe_throttled(
+                                    &mut request_keyframe,
+                                    &mut keyframe_asked,
+                                    &item.peer_id,
+                                    now,
+                                    KEYFRAME_REQUEST_INTERVAL,
+                                ) {
+                                    debug!(
+                                        "[video] {n} decode failures from {}; requesting keyframe: {e}",
+                                        &item.peer_id[..8.min(item.peer_id.len())]
+                                    );
+                                }
+                            }
+                            if n >= FAILURES_BEFORE_DECODER_REBUILD {
+                                // See FAILURES_BEFORE_DECODER_REBUILD: at this
+                                // point the decoder, not the stream, is what is
+                                // broken. Dropping both entries makes the next
+                                // frame build a fresh decoder and start the
+                                // count over.
+                                warn!(
+                                    "[video] rebuilding {} decoder for {} after {n} failures: {e}",
+                                    item.codec.as_str(),
                                     &item.peer_id[..8.min(item.peer_id.len())]
                                 );
-                                request_keyframe(&item.peer_id);
+                                decoders.remove(&item.peer_id);
+                                failures.remove(&item.peer_id);
                             }
                         }
                     }
                 }
                 // Final drain so a forget issued during shutdown still lands.
-                drain_control(&control_rx, &mut decoders, &mut failures, &mut last_frame);
+                drain_control(
+                    &control_rx,
+                    &mut decoders,
+                    &mut failures,
+                    &mut last_frame,
+                    &mut keyframe_asked,
+                    &mut stalled,
+                    &mut report_stall,
+                );
                 decoders.clear();
                 failures.clear();
                 last_frame.clear();
+                keyframe_asked.clear();
+                stalled.clear();
                 info!("[video] decode thread stopped");
             })
             .ok();
@@ -372,11 +524,84 @@ fn admit(
     }
 }
 
+/// Ask `peer` for a keyframe unless one was asked for too recently.
+///
+/// Returns whether the request actually went out, so callers can log the
+/// request rather than the intent.
+fn request_keyframe_throttled(
+    request: &mut impl FnMut(&str),
+    asked: &mut HashMap<String, std::time::Instant>,
+    peer: &str,
+    now: std::time::Instant,
+    interval: Duration,
+) -> bool {
+    let due = asked
+        .get(peer)
+        .is_none_or(|t| now.saturating_duration_since(*t) >= interval);
+    if !due {
+        return false;
+    }
+    asked.insert(peer.to_owned(), now);
+    request(peer);
+    true
+}
+
+/// Notice streams that have gone quiet, ask for a keyframe, and eventually tell
+/// the UI the picture it is showing is stale.
+///
+/// Only peers something is actually displaying are chased: a tile that was
+/// closed mid-stream leaves its entry behind (nothing forgets a peer merely for
+/// being off screen), and pestering a sender for keyframes nobody will draw is
+/// pure cost.
+///
+/// Pure enough to test without a decode thread — it touches only the maps
+/// handed to it and the callbacks.
+fn sweep_stalls(
+    last_frame: &HashMap<String, std::time::Instant>,
+    stalled: &mut HashSet<String>,
+    keyframe_asked: &mut HashMap<String, std::time::Instant>,
+    request_keyframe: &mut impl FnMut(&str),
+    report_stall: &mut impl FnMut(&str, bool),
+    has_sink: fn(&str) -> bool,
+    now: std::time::Instant,
+) {
+    for (peer, seen) in last_frame {
+        if !has_sink(peer) {
+            continue;
+        }
+        let quiet = now.saturating_duration_since(*seen);
+        if quiet < STALL_KEYFRAME_AFTER {
+            continue;
+        }
+        // A stream that stopped arriving never fails to decode, so this is the
+        // only place a keyframe gets asked for on its behalf. Chased hard for
+        // the first few seconds, then slowly — see STALLED_KEYFRAME_INTERVAL.
+        let interval = if quiet >= STALL_REPORT_AFTER {
+            STALLED_KEYFRAME_INTERVAL
+        } else {
+            KEYFRAME_REQUEST_INTERVAL
+        };
+        request_keyframe_throttled(request_keyframe, keyframe_asked, peer, now, interval);
+
+        if quiet >= STALL_REPORT_AFTER && stalled.insert(peer.clone()) {
+            warn!(
+                "[video] no frames from {} for {}s; marking the tile stale",
+                &peer[..8.min(peer.len())],
+                quiet.as_secs()
+            );
+            report_stall(peer, true);
+        }
+    }
+}
+
 fn drain_control(
     control_rx: &mpsc::Receiver<Control>,
     decoders: &mut HashMap<String, PeerDecoder>,
     failures: &mut HashMap<String, u32>,
     last_frame: &mut HashMap<String, std::time::Instant>,
+    keyframe_asked: &mut HashMap<String, std::time::Instant>,
+    stalled: &mut HashSet<String>,
+    report_stall: &mut impl FnMut(&str, bool),
 ) {
     while let Ok(cmd) = control_rx.try_recv() {
         match cmd {
@@ -386,12 +611,23 @@ fn drain_control(
                 // Free the stream slot too, or a peer who left would keep
                 // holding it against the cap until the idle timer expired.
                 last_frame.remove(&id);
+                keyframe_asked.remove(&id);
+                // A forgotten peer leaves `last_frame`, so the sweep can never
+                // retract the report itself; leaving it set would badge the
+                // tile of whoever occupies that id next.
+                if stalled.remove(&id) {
+                    report_stall(&id, false);
+                }
                 sink::clear_peer(&id);
             }
             Control::ForgetAll => {
                 decoders.clear();
                 failures.clear();
                 last_frame.clear();
+                keyframe_asked.clear();
+                for id in stalled.drain() {
+                    report_stall(&id, false);
+                }
                 // Blank every tile, including peers that never produced a
                 // decoder (e.g. indicator-only, or frames still in reassembly).
                 sink::clear_all();
@@ -435,6 +671,21 @@ mod tests {
         }
     }
 
+    /// Sink probe for tests: everyone is on screen.
+    ///
+    /// A test build has no Qt render surface, so the real `sink::has_sink`
+    /// answers "nobody is watching" for every peer — with it, the decode loop
+    /// would skip every frame and none of these tests would exercise anything.
+    fn watched(_peer: &str) -> bool {
+        true
+    }
+
+    /// The opposite: nothing is displayed, which is what a closed tile looks
+    /// like to the sweep.
+    fn unwatched(_peer: &str) -> bool {
+        false
+    }
+
     #[test]
     fn submitting_to_a_full_queue_does_not_block() {
         // The property that matters: a wedged decoder must never back-pressure
@@ -444,6 +695,8 @@ mod tests {
         let rx = VideoReceiver::start(
             move |_codec| Some(Box::new(CountingDecoder(Arc::clone(&c)))),
             |_| {},
+            |_, _| {},
+            watched,
         );
 
         let started = std::time::Instant::now();
@@ -468,6 +721,8 @@ mod tests {
                 ))))
             },
             |_| {},
+            |_, _| {},
+            watched,
         );
 
         let handle = rx.playout();
@@ -494,6 +749,8 @@ mod tests {
                 ))))
             },
             |_| {},
+            |_, _| {},
+            watched,
         );
         let now = std::time::Instant::now();
         rx.playout()
@@ -519,6 +776,8 @@ mod tests {
                 ))))
             },
             |_| {},
+            |_, _| {},
+            watched,
         );
         rx.submit("peer", vec![1], false, VideoCodec::Stub, 0);
         let started = std::time::Instant::now();
@@ -625,6 +884,289 @@ mod tests {
         assert_eq!(admit("d", &active, now), Admission::Decode);
     }
 
+    // ── Recovery from a wedged decoder ──────────────────────────────────────
+
+    /// The failure this exists for: a Media Foundation transform that stops
+    /// requesting input fails *every* subsequent call, so a receiver that only
+    /// ever asks for keyframes shows a frozen tile until the user leaves the
+    /// room. The decoder must be thrown away and rebuilt.
+    #[test]
+    fn a_permanently_failing_decoder_is_rebuilt() {
+        let built = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let b = Arc::clone(&built);
+        let rx = VideoReceiver::start(
+            move |_codec| {
+                b.fetch_add(1, Ordering::SeqCst);
+                Some(Box::new(CountingDecoder(Arc::new(
+                    std::sync::atomic::AtomicU32::new(0),
+                ))))
+            },
+            |_| {},
+            |_, _| {},
+            watched,
+        );
+
+        // 0xFF makes CountingDecoder fail, so every frame wedges it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while built.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+            rx.submit("peer", vec![0xFF], false, VideoCodec::Stub, 0);
+            // Paced under the queue depth so frames are not simply shed: the
+            // rebuild is counted in decode *attempts*, not submissions.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            built.load(Ordering::SeqCst) >= 2,
+            "decoder was never rebuilt after sustained failure"
+        );
+    }
+
+    /// Asking once and giving up is what left a frozen tile in the first place:
+    /// the request itself can be lost. It must repeat — but not per frame.
+    #[test]
+    fn keyframe_requests_repeat_but_are_throttled() {
+        let mut asked: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut fired = 0u32;
+        let mut request = |_: &str| fired += 1;
+        let t0 = std::time::Instant::now();
+
+        assert!(request_keyframe_throttled(
+            &mut request,
+            &mut asked,
+            "alice",
+            t0,
+            KEYFRAME_REQUEST_INTERVAL
+        ));
+        // Everything inside the interval is swallowed.
+        for ms in [1, 10, 100, 999] {
+            assert!(!request_keyframe_throttled(
+                &mut request,
+                &mut asked,
+                "alice",
+                t0 + Duration::from_millis(ms),
+                KEYFRAME_REQUEST_INTERVAL
+            ));
+        }
+        // Past it, we ask again.
+        assert!(request_keyframe_throttled(
+            &mut request,
+            &mut asked,
+            "alice",
+            t0 + KEYFRAME_REQUEST_INTERVAL,
+            KEYFRAME_REQUEST_INTERVAL
+        ));
+        assert_eq!(fired, 2);
+    }
+
+    /// One peer's throttle must not silence another's — they fail independently.
+    #[test]
+    fn the_keyframe_throttle_is_per_peer() {
+        let mut asked: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut request = |_: &str| {};
+        let now = std::time::Instant::now();
+        assert!(request_keyframe_throttled(
+            &mut request,
+            &mut asked,
+            "alice",
+            now,
+            KEYFRAME_REQUEST_INTERVAL
+        ));
+        assert!(request_keyframe_throttled(
+            &mut request,
+            &mut asked,
+            "bob",
+            now,
+            KEYFRAME_REQUEST_INTERVAL
+        ));
+    }
+
+    // ── Stall watchdog ──────────────────────────────────────────────────────
+
+    fn seen_at(
+        now: std::time::Instant,
+        ages: &[(&str, Duration)],
+    ) -> HashMap<String, std::time::Instant> {
+        ages.iter()
+            .map(|(id, age)| ((*id).to_owned(), now - *age))
+            .collect()
+    }
+
+    /// A stream that simply stops produces no decode error at all, so nothing
+    /// in the failure path fires. The sweep is the only thing that notices.
+    #[test]
+    fn a_quiet_stream_is_chased_with_a_keyframe_then_reported() {
+        let now = std::time::Instant::now();
+        let mut stalled = HashSet::new();
+        let mut asked = HashMap::new();
+        let mut requested: Vec<String> = Vec::new();
+        let mut reports: Vec<(String, bool)> = Vec::new();
+
+        // Quiet long enough to chase, not long enough to report.
+        let last = seen_at(now, &[("alice", STALL_KEYFRAME_AFTER)]);
+        sweep_stalls(
+            &last,
+            &mut stalled,
+            &mut asked,
+            &mut |p: &str| requested.push(p.to_owned()),
+            &mut |p: &str, s: bool| reports.push((p.to_owned(), s)),
+            watched,
+            now,
+        );
+        assert_eq!(requested, vec!["alice".to_owned()]);
+        assert!(reports.is_empty(), "reported stale far too early");
+
+        // Long enough to report.
+        let last = seen_at(now, &[("alice", STALL_REPORT_AFTER)]);
+        sweep_stalls(
+            &last,
+            &mut stalled,
+            &mut asked,
+            &mut |p: &str| requested.push(p.to_owned()),
+            &mut |p: &str, s: bool| reports.push((p.to_owned(), s)),
+            watched,
+            now,
+        );
+        assert_eq!(reports, vec![("alice".to_owned(), true)]);
+    }
+
+    /// A live stream must never be flagged — the whole feature is worthless if
+    /// it cries wolf during a normal call.
+    #[test]
+    fn a_live_stream_is_left_alone() {
+        let now = std::time::Instant::now();
+        let last = seen_at(now, &[("alice", Duration::from_millis(33))]);
+        let mut stalled = HashSet::new();
+        let mut asked = HashMap::new();
+        let mut requests = 0u32;
+        let mut reports = 0u32;
+        sweep_stalls(
+            &last,
+            &mut stalled,
+            &mut asked,
+            &mut |_: &str| requests += 1,
+            &mut |_: &str, _: bool| reports += 1,
+            watched,
+            now,
+        );
+        assert_eq!((requests, reports), (0, 0));
+        assert!(stalled.is_empty());
+    }
+
+    /// Reported on the edge only: a sweep every 50 ms must not re-signal the
+    /// same stall two hundred times before anything changes.
+    #[test]
+    fn a_continuing_stall_is_reported_once() {
+        let now = std::time::Instant::now();
+        let last = seen_at(now, &[("alice", STALL_REPORT_AFTER * 3)]);
+        let mut stalled = HashSet::new();
+        let mut asked = HashMap::new();
+        let mut reports = 0u32;
+        for tick in 0..10u32 {
+            sweep_stalls(
+                &last,
+                &mut stalled,
+                &mut asked,
+                &mut |_: &str| {},
+                &mut |_: &str, _: bool| reports += 1,
+                watched,
+                now + Duration::from_millis(50 * u64::from(tick)),
+            );
+        }
+        assert_eq!(reports, 1, "the stall was re-reported on every sweep");
+    }
+
+    /// Past the reporting threshold the chase slows down: a multi-minute
+    /// outage must not cost a signalling message a second for its duration.
+    #[test]
+    fn a_long_outage_is_chased_slowly() {
+        let t0 = std::time::Instant::now();
+        let last = seen_at(t0, &[("alice", STALL_REPORT_AFTER)]);
+        let mut stalled = HashSet::new();
+        let mut asked = HashMap::new();
+        let mut requests = 0u32;
+        // One sweep a second for four seconds — all inside the slow interval.
+        for sec in 0..4u64 {
+            sweep_stalls(
+                &last,
+                &mut stalled,
+                &mut asked,
+                &mut |_: &str| requests += 1,
+                &mut |_: &str, _: bool| {},
+                watched,
+                t0 + Duration::from_secs(sec),
+            );
+        }
+        assert_eq!(
+            requests, 1,
+            "the backed-off chase fired again inside its own interval"
+        );
+    }
+
+    /// A tile the user closed leaves its entry behind — nothing forgets a peer
+    /// merely for being off screen. Chasing keyframes for a picture nobody is
+    /// drawing costs the sender bitrate for nothing.
+    #[test]
+    fn a_stream_nobody_is_watching_is_not_chased() {
+        let now = std::time::Instant::now();
+        let last = seen_at(now, &[("alice", STALL_REPORT_AFTER * 2)]);
+        let mut stalled = HashSet::new();
+        let mut asked = HashMap::new();
+        let mut requests = 0u32;
+        let mut reports = 0u32;
+        sweep_stalls(
+            &last,
+            &mut stalled,
+            &mut asked,
+            &mut |_: &str| requests += 1,
+            &mut |_: &str, _: bool| reports += 1,
+            unwatched,
+            now,
+        );
+        assert_eq!((requests, reports), (0, 0));
+    }
+
+    /// Forgetting a stalled peer must retract the report: they leave
+    /// `last_frame`, so the sweep can never do it, and a stale badge would
+    /// follow the id into its next session.
+    #[test]
+    fn forgetting_a_stalled_peer_retracts_the_report() {
+        let (tx, rx) = mpsc::channel::<Control>();
+        let mut decoders = HashMap::new();
+        let mut failures = HashMap::new();
+        let mut last_frame = HashMap::new();
+        let mut asked = HashMap::new();
+        let mut stalled: HashSet<String> = HashSet::new();
+        stalled.insert("alice".to_owned());
+        stalled.insert("bob".to_owned());
+        let mut reports: Vec<(String, bool)> = Vec::new();
+
+        tx.send(Control::Forget("alice".to_owned())).unwrap();
+        drain_control(
+            &rx,
+            &mut decoders,
+            &mut failures,
+            &mut last_frame,
+            &mut asked,
+            &mut stalled,
+            &mut |p: &str, s: bool| reports.push((p.to_owned(), s)),
+        );
+        assert_eq!(reports, vec![("alice".to_owned(), false)]);
+        assert!(stalled.contains("bob"), "bob's stall was cleared too");
+
+        // Leaving the room clears everyone.
+        tx.send(Control::ForgetAll).unwrap();
+        drain_control(
+            &rx,
+            &mut decoders,
+            &mut failures,
+            &mut last_frame,
+            &mut asked,
+            &mut stalled,
+            &mut |p: &str, s: bool| reports.push((p.to_owned(), s)),
+        );
+        assert!(stalled.is_empty());
+        assert!(reports.contains(&("bob".to_owned(), false)));
+    }
+
     #[test]
     fn forget_does_not_block_on_full_frame_queue() {
         let rx = VideoReceiver::start(
@@ -634,6 +1176,8 @@ mod tests {
                 ))))
             },
             |_| {},
+            |_, _| {},
+            watched,
         );
         // Fill the frame queue so a coupled control path would block.
         for _ in 0..(QUEUE_DEPTH * 2) {
