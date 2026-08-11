@@ -3,7 +3,7 @@ use sevenz_rust2::{decompress_file_with_extract_fn, default_entry_extract_fn, Ar
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Extract a .7z archive into `dest_dir`.
 /// Returns a map of relative paths → SHA-256 hex digests for all extracted files.
@@ -41,23 +41,45 @@ pub fn extract_7z(archive: &Path, dest_dir: &Path) -> Result<HashMap<String, Str
 /// downgrade or a decoder regression cannot silently remove the check. The
 /// tests below assert the *outcome* — nothing lands outside the destination —
 /// rather than which layer produced it.
+///
+/// # Why this parses the string instead of using `std::path`
+///
+/// `Path` semantics are a property of the *host*, not of the archive. An entry
+/// named `C:\Windows\System32\evil.dll` is a drive-absolute path that discards
+/// the destination on Windows, but on Linux the very same string is an ordinary
+/// relative path whose first segment happens to be called `C:` — `is_absolute`
+/// is false and every component is `Normal`. A guard written against `Path`
+/// therefore accepts on Linux exactly what it rejects on Windows, which is the
+/// worst shape a security check can have: it passes CI on one platform while
+/// the behaviour that ships is never the one that was tested.
+///
+/// So the decision is made on the normalized string alone and comes out
+/// identical on every host, which is also what lets Linux CI verify the rule
+/// that matters on Windows.
 fn entry_name_is_safe(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    // Normalize separators first: a Windows-style `..\` is a traversal on a
-    // path parsed with Unix rules, where `\` is an ordinary character.
+    // Normalize separators first: a Windows-style `..\` is a traversal even
+    // where `\` is an ordinary filename character.
     let normalized = name.replace('\\', "/");
-    let path = Path::new(&normalized);
-    if path.is_absolute() {
+
+    // Absolute, and — after normalization — UNC (`\\server\share` → `//…`).
+    if normalized.starts_with('/') {
         return false;
     }
-    // `.` is allowed through, matching the decoder's own sanitizer: a curdir
-    // component cannot escape anything, and refusing it would reject an
-    // otherwise valid `./ConquerD.exe` — a real archive on the install path,
-    // failed by a guard that is supposed to catch attacks rather than styles.
-    path.components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    // A drive prefix: `C:/…` (absolute) and `C:foo` (drive-relative) both
+    // escape on Windows. Checked by hand because `std::path` only recognises
+    // this shape when compiled *for* Windows.
+    let b = normalized.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return false;
+    }
+    // Finally the traversal itself. `.` is allowed through, matching the
+    // decoder's own sanitizer: a curdir segment cannot escape anything, and
+    // refusing it would reject an otherwise valid `./ConquerD.exe` — a real
+    // archive failed by a guard meant to catch attacks rather than styles.
+    normalized.split('/').all(|segment| segment != "..")
 }
 
 /// Decompress a .7z archive with the embedded `sevenz-rust2` decoder.
@@ -602,6 +624,13 @@ mod tests {
     /// `..` walks out of the destination, and an absolute name makes
     /// `dest.join(name)` discard the destination altogether and write wherever
     /// the archive says.
+    ///
+    /// **Every case here must be refused on every host.** The Windows-shaped
+    /// entries are the reason: an earlier version of this guard delegated to
+    /// `std::path`, which recognises a `C:` drive prefix only when compiled for
+    /// Windows — so `C:\Windows\System32\evil.dll` was rejected locally and
+    /// accepted on Linux CI, where this test caught it. The verdict is a
+    /// property of the archive, not of the machine reading it.
     #[test]
     fn traversal_entry_names_are_refused() {
         for name in [
@@ -611,7 +640,13 @@ mod tests {
             r"..\escaped.txt",
             r"ConquerD\..\..\escaped.txt",
             "/etc/cron.d/pwned",
+            // Drive-absolute and drive-*relative*; both discard the
+            // destination on Windows and neither is a `Path` prefix on Unix.
             r"C:\Windows\System32\evil.dll",
+            "C:/Windows/System32/evil.dll",
+            r"C:evil.dll",
+            r"z:\evil.dll",
+            // UNC, which normalizes to a leading `//`.
             r"\\server\share\evil.dll",
             "",
         ] {
