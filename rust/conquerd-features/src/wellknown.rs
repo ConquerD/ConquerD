@@ -229,14 +229,87 @@ pub fn room_audio_sfu() -> CapabilityDescriptor {
         .with_auth(AuthTier::RoomMember)
 }
 
+/// Byte quota for **one** video sender, inbound.
+///
+/// Sized from what a client can actually be configured to emit rather than from
+/// a preset: the Video settings page allows a hand-set bitrate up to 8 Mbps, and
+/// a quota below that would let the UI offer a rate the relay silently shreds.
+/// 8 Mbps of payload plus roughly 6% of fragment header and relay framing is
+/// ~1.03 MB/s, so 1.25 MB/s covers the whole settable range with room for the
+/// keyframe spike inside the bucket's one-second burst.
+///
+/// For reference at the auto bitrate, measured with the Media Foundation
+/// encoder: 720p30 ≈ 220 KB/s, 1080p30 ≈ 404 KB/s, 1080p60 ≈ 679 KB/s.
+///
+/// This is the cap that matters for abuse: it is enforced by the supernode on
+/// what one peer may push in, and it stays per-sender no matter how large rooms
+/// get. See [`ROOM_VIDEO_RECIPIENT_BYTES_PER_SEC`] for the other direction.
+pub const VIDEO_SENDER_BYTES_PER_SEC: u32 = 1280 * 1024;
+
+/// Datagram quota for one video sender, inbound.
+///
+/// [`VIDEO_SENDER_BYTES_PER_SEC`] over the ~1070-byte usable fragment payload is
+/// ~1223 datagrams/s; 2000 leaves room for the partial fragment that ends every
+/// frame, which inflates the count above what the byte rate alone implies.
+pub const VIDEO_SENDER_DATAGRAMS_PER_SEC: u32 = 2000;
+
+/// Concurrent video senders a room is expected to carry.
+///
+/// Video is opt-in — a member chooses to share and others choose to watch — so
+/// this is a deliberate ceiling on a feature people join, not a limit that
+/// silently binds an ordinary call. It exists to size the fan-out quota below;
+/// nothing enforces the count itself.
+pub const ROOM_VIDEO_CONCURRENT_SENDERS: u32 = 5;
+
+/// Byte quota for what the supernode fans **at one room member**.
+///
+/// Keyed on the recipient, so unlike [`VIDEO_SENDER_BYTES_PER_SEC`] this one
+/// bucket carries every *other* sender at once — `ROOM_VIDEO_CONCURRENT_SENDERS
+/// - 1` streams, since the relay never echoes a sender their own frames.
+///
+/// Sized from the 1080p60 auto bitrate (~679 KB/s on the wire) rather than from
+/// the 8 Mbps hand-set ceiling: the intent is that every streamer gets a full
+/// 1080p stream through, not that four people simultaneously maxing the manual
+/// slider are underwritten. A room that does the latter sheds, which is the
+/// right answer for that configuration.
+///
+/// It is a ceiling, not a reservation — nothing is consumed until traffic
+/// actually arrives — but it does bound what one room can cost a supernode:
+/// five senders fanning to four members each is ~65 Mbps of egress at the
+/// 1080p30 auto rate.
+pub const ROOM_VIDEO_RECIPIENT_BYTES_PER_SEC: u32 =
+    ROOM_VIDEO_STREAM_BYTES_PER_SEC * (ROOM_VIDEO_CONCURRENT_SENDERS - 1);
+
+/// What one received 1080p stream is allowed, before the fan-out multiplier.
+///
+/// 768 KB/s against a measured 1080p60 wire rate of ~679 KB/s — enough headroom
+/// for ABR overshoot and the keyframe spike without underwriting a hand-set
+/// bitrate several times larger.
+const ROOM_VIDEO_STREAM_BYTES_PER_SEC: u32 = 768 * 1024;
+
+/// Datagram quota for what the supernode fans at one room member. Scales with
+/// [`ROOM_VIDEO_RECIPIENT_BYTES_PER_SEC`] on the same reasoning as
+/// [`VIDEO_SENDER_DATAGRAMS_PER_SEC`]: ~735 datagrams/s of payload per stream,
+/// rounded up to absorb each frame's trailing partial fragment.
+pub const ROOM_VIDEO_RECIPIENT_DATAGRAMS_PER_SEC: u32 = 1200 * (ROOM_VIDEO_CONCURRENT_SENDERS - 1);
+
+// The whole point of splitting the two rates is that fan-out gets more than one
+// sender does. Checked at compile time rather than in a test: if a later tuning
+// pass inverts them, every watcher is silently capped at less than one stream,
+// which looks like packet loss rather than a misconfiguration.
+const _: () = assert!(ROOM_VIDEO_RECIPIENT_BYTES_PER_SEC > VIDEO_SENDER_BYTES_PER_SEC);
+const _: () = assert!(ROOM_VIDEO_RECIPIENT_DATAGRAMS_PER_SEC > VIDEO_SENDER_DATAGRAMS_PER_SEC);
+
 /// `core.video.v1` — direct peer video over QUIC datagrams.
 ///
 /// Unlike audio, one encoded frame spans many datagrams: the sender fragments
 /// each frame to fit the 1200-byte relay ceiling. At the 640x360 / 30 fps /
 /// ~600 kbps default that is roughly 4 fragments per frame (~120 datagrams/s),
-/// spiking to ~25 for a keyframe. Quotas are sized ~3x that ceiling so ABR
-/// overshoot and keyframe bursts do not trip supernode shedding — the same
-/// headroom rationale as [`room_audio_sfu`].
+/// spiking to ~25 for a keyframe.
+///
+/// Sized to [`VIDEO_SENDER_BYTES_PER_SEC`], which covers the whole range the
+/// settings page can produce — including 1080p. Direct video has no fan-out, so
+/// there is nothing for an outbound override to do here.
 ///
 /// The id names no codec: which codecs this build can actually run is a
 /// platform and build-time fact, advertised in `params.codecs` and resolved by
@@ -256,8 +329,8 @@ pub fn core_video_v1_for(codecs: &[VideoCodec]) -> CapabilityDescriptor {
     CapabilityDescriptor::new("core.video.v1", "1.0", ChannelKind::Datagram)
         .with_params(json!({
             "codecs": video_codec::codec_names(&video_codec::advertised_codecs(codecs)),
-            "quota_bytes_per_sec": 512 * 1024,
-            "quota_datagrams_per_sec": 1200,
+            "quota_bytes_per_sec": VIDEO_SENDER_BYTES_PER_SEC,
+            "quota_datagrams_per_sec": VIDEO_SENDER_DATAGRAMS_PER_SEC,
         }))
         .with_auth(AuthTier::TrustedPeer)
 }
@@ -288,8 +361,15 @@ pub fn room_video_sfu_for(codecs: &[VideoCodec]) -> CapabilityDescriptor {
     CapabilityDescriptor::new("room.video.sfu", "1.0", ChannelKind::Datagram)
         .with_params(json!({
             "codecs": video_codec::codec_names(&video_codec::advertised_codecs(codecs)),
-            "quota_bytes_per_sec": 512 * 1024,
-            "quota_datagrams_per_sec": 1200,
+            // Inbound is per *sender*: one peer's stream, and the cap that
+            // stops one client flooding the relay.
+            "quota_bytes_per_sec": VIDEO_SENDER_BYTES_PER_SEC,
+            "quota_datagrams_per_sec": VIDEO_SENDER_DATAGRAMS_PER_SEC,
+            // Outbound is per *recipient*: every other sender at once. Raising
+            // the inbound number to cover fan-out instead would have handed
+            // each individual sender the whole room's allowance.
+            "quota_bytes_per_sec_outbound": ROOM_VIDEO_RECIPIENT_BYTES_PER_SEC,
+            "quota_datagrams_per_sec_outbound": ROOM_VIDEO_RECIPIENT_DATAGRAMS_PER_SEC,
             "allow_public_rooms": false,
             "allow_private_rooms": true,
         }))

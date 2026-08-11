@@ -121,7 +121,7 @@ impl Vp8Encoder {
         keyframe_interval_secs: u32,
     ) -> anyhow::Result<Self> {
         // VP8 needs even dimensions for its 4:2:0 chroma planes.
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             anyhow::bail!("VP8 needs non-zero even dimensions, got {width}x{height}");
         }
         // SAFETY: dimensions validated above; the shim returns null on failure.

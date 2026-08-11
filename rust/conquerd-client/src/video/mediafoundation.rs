@@ -788,6 +788,11 @@ impl MfDecoder {
         // until unlocked.
         let is_async = unlock_if_async(&transform)?;
 
+        // Before any media type, because the attribute is read when the
+        // transform configures its picture buffers. See `request_low_latency`:
+        // without it this decoder emits nothing for its first ~30 submissions.
+        request_low_latency(&transform);
+
         // Frame size and rate are nominally optional on an H.264 decoder input
         // type, but omitting them leaves Microsoft's decoder incompletely
         // configured: it accepts `SetInputType`, reports `ACCEPT_DATA`, and
@@ -984,7 +989,7 @@ impl MfDecoder {
 }
 
 impl VideoDecoder for MfDecoder {
-    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<RawFrame> {
+    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<Option<RawFrame>> {
         if encoded.is_empty() {
             anyhow::bail!("empty frame");
         }
@@ -1014,7 +1019,7 @@ impl VideoDecoder for MfDecoder {
             if let Some(frame) = pending {
                 // The drained frame is older than the one just submitted, so it
                 // is the correct one to return now.
-                return Ok(frame);
+                return Ok(Some(frame));
             }
         }
 
@@ -1027,17 +1032,23 @@ impl VideoDecoder for MfDecoder {
         }
 
         // A decoder pipelines: the frame just submitted is not the one it hands
-        // back, and on the first few calls it has nothing at all. Report that
-        // the same way the synchronous path does.
-        self.pending_frames
-            .pop_front()
-            .ok_or_else(|| anyhow::anyhow!("decoder produced no frame yet"))
+        // back, and on the first calls after construction — or before a
+        // keyframe has been seen — it has nothing at all. That is `Ok(None)`,
+        // not an error: reported as a failure it drives the receiver to request
+        // keyframes and eventually rebuild this decoder, which restarts the
+        // very warm-up being waited on. See `request_low_latency`, which is
+        // what keeps the wait to a couple of frames.
+        Ok(self.pending_frames.pop_front())
     }
 }
 
 /// Reject encoder settings Media Foundation would refuse or mis-handle.
 fn validate_config(config: &MfEncoderConfig) -> Result<(), MfError> {
-    if config.width == 0 || config.height == 0 || config.width % 2 != 0 || config.height % 2 != 0 {
+    if config.width == 0
+        || config.height == 0
+        || !config.width.is_multiple_of(2)
+        || !config.height.is_multiple_of(2)
+    {
         return Err(MfError::InvalidArgument(format!(
             "dimensions must be even and non-zero, got {}x{}",
             config.width, config.height
@@ -1125,6 +1136,48 @@ fn unlock_if_async(transform: &IMFTransform) -> Result<bool, MfError> {
                 .map_err(|e| MfError::Configure(format!("MF_TRANSFORM_ASYNC_UNLOCK: {e}")))?;
         }
         Ok(is_async)
+    }
+}
+
+/// Ask a transform to hand each picture over as soon as it is decoded.
+///
+/// Microsoft's H.264 decoder defaults to a *playback* pipeline: it fills a
+/// reorder buffer before releasing the first picture, which measures at around
+/// **thirty submissions** — a full second at 30 fps — of `ProcessOutput`
+/// returning nothing. For a media file that is invisible. For a call it is
+/// fatal in two ways: a second of added latency, and, worse, a receiver whose
+/// watchdogs conclude the decoder is broken and rebuild it long before it would
+/// have produced anything. A rebuilt decoder starts the wait over, so the
+/// stream never produces a single frame — the tile sits on "Waiting for video…"
+/// while frames arrive at full rate.
+///
+/// `MF_LOW_LATENCY` is the documented switch: it tells the transform the stream
+/// is real time, so it emits each picture immediately and skips the reordering
+/// that a call's bitstream (no B-frames) does not need anyway.
+///
+/// Best-effort on purpose. Not every transform implements either control, and
+/// one that ignores both is merely slow to start rather than broken — which is
+/// precisely the case [`super::receiver`] now tolerates instead of treating as
+/// a decode failure.
+fn request_low_latency(transform: &IMFTransform) {
+    // SAFETY: reading/setting attributes on a live transform. Both controls are
+    // optional; a failure costs an optimisation, never correctness.
+    unsafe {
+        match transform.GetAttributes() {
+            Ok(attrs) => {
+                if let Err(e) = attrs.SetUINT32(&MF_LOW_LATENCY, 1) {
+                    debug!("[video] transform refused MF_LOW_LATENCY: {e}");
+                }
+            }
+            Err(e) => debug!("[video] transform exposes no attribute store: {e}"),
+        }
+        // Some hardware decoders expose the same idea only through ICodecAPI.
+        // VT_BOOL is what this property is defined as — the tag has to match or
+        // the codec rejects the value, exactly as for the bitrate VARIANT.
+        if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
+            let value = VARIANT::from(true);
+            let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &value);
+        }
     }
 }
 
@@ -1582,16 +1635,23 @@ mod tests {
         );
 
         let mut decoded = None;
+        let mut decoded_at = usize::MAX;
         for (n, (data, _key)) in encoded_frames.iter().enumerate() {
             match dec.decode(data) {
-                Ok(frame) => {
+                Ok(Some(frame)) => {
                     println!("decoded on submission {n}");
                     decoded = Some(frame);
+                    decoded_at = n;
                     break;
                 }
+                // Accepted, nothing out yet — the pipeline filling. Print the
+                // first few so a warm-up is distinguishable from a rejection.
+                Ok(None) => {
+                    if n < 4 {
+                        println!("submission {n}: no picture yet");
+                    }
+                }
                 Err(e) => {
-                    // Print the first few so a failure on submission 0 is
-                    // distinguishable from one that only appears later.
                     if n < 4 {
                         println!("submission {n} failed: {e}");
                     }
@@ -1600,6 +1660,13 @@ mod tests {
         }
 
         let out = decoded.expect("decoder never produced a frame");
+        // Low latency is the difference between a couple of submissions and
+        // about thirty — see `request_low_latency`. Asserting the bound here is
+        // what keeps a regression in that setup from reading as merely "slow".
+        assert!(
+            decoded_at < 10,
+            "first picture took {decoded_at} submissions — low-latency mode is not in effect"
+        );
         assert_eq!((out.width, out.height), (320, 240));
         assert!(out.is_consistent(), "decoded frame planes are inconsistent");
         // H.264 is lossy, so compare structure rather than exact bytes: a

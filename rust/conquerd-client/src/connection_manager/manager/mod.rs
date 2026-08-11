@@ -260,6 +260,14 @@ pub struct ConnectionManager {
     /// Last keyframe request sent per peer, for the rate limit in
     /// [`Self::send_video_keyframe_request`].
     video_keyframe_last: HashMap<String, std::time::Instant>,
+    /// Senders whose room video we last asked the supernode to forward, sorted.
+    ///
+    /// `None` means we have never announced a set, which is materially
+    /// different from `Some(vec![])`: the supernode forwards everything until
+    /// told otherwise, so "nothing announced yet" must not be replayed as
+    /// "subscribe to nobody" on reconnect. See
+    /// [`Self::resend_video_subscriptions`].
+    video_subscriptions: Option<Vec<String>>,
     /// Whether our camera is on, as last announced by
     /// [`Self::send_video_state`].
     ///
@@ -433,6 +441,7 @@ impl ConnectionManager {
             direct_video_seq: HashMap::new(),
             video_reassembler: crate::video::fragment::Reassembler::new(),
             video_keyframe_last: HashMap::new(),
+            video_subscriptions: None,
             local_video_active: false,
             pending_join_space_creds: HashMap::new(),
             pending_group_key_acks: HashMap::new(),
@@ -591,6 +600,18 @@ impl ConnectionManager {
     #[cfg(test)]
     pub(super) async fn test_reannounce_video_state(&mut self, room_id: &str) {
         self.reannounce_video_state(room_id).await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn test_set_video_subscriptions(&mut self, senders: Vec<String>) {
+        self.send_video_subscriptions(senders, false).await;
+    }
+
+    /// Test-only: the failover replay, as a `SfuMembers` from a sibling would
+    /// trigger it.
+    #[cfg(test)]
+    pub(super) async fn test_resend_video_subscriptions(&mut self) {
+        self.resend_video_subscriptions().await;
     }
 
     #[cfg(test)]
@@ -902,6 +923,9 @@ impl ConnectionManager {
                         ConnectionCommand::RequestVideoKeyframe { peer_id } => {
                             self.send_video_keyframe_request(&peer_id).await;
                         }
+                        ConnectionCommand::SetVideoSubscriptions { senders } => {
+                            self.send_video_subscriptions(senders, false).await;
+                        }
                         ConnectionCommand::AnnounceSpaceRoot { supernode_id, root_json } => {
                             self.send_space_root_announce(&supernode_id, &root_json).await;
                         }
@@ -1140,8 +1164,11 @@ impl ConnectionManager {
                     // buffer its bytes. The real sender is not known until the
                     // fragment parses, and trusting a self-declared id for
                     // accounting would let one peer exhaust another's budget.
+                    // Metered at the fan-out rate, not the per-sender one: this
+                    // bucket is keyed on the supernode, so it holds every
+                    // sender in the room at once.
                     let sn = video.supernode_id.clone();
-                    if !self.check_inbound_feature_quota(
+                    if !self.check_inbound_fanout_quota(
                         "room.video.sfu",
                         &sn,
                         video.fragment.len(),

@@ -20,7 +20,7 @@
         powershell -ExecutionPolicy Bypass -File scripts/coverage.ps1 -FailUnderLines 50
 
 .PARAMETER RustToolchain
-    Must match env.RUST_TOOLCHAIN in ci.yml (default: 1.89.0).
+    Must match env.RUST_TOOLCHAIN in ci.yml (default: 1.97.1).
 
 .PARAMETER Scope
     hot       — features + supernode + headless client (default)
@@ -42,7 +42,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$RustToolchain = '1.89.0',
+    [string]$RustToolchain = '1.97.1',
     [ValidateSet('hot', 'all', 'features', 'supernode', 'client', 'installer')]
     [string]$Scope = 'hot',
     [switch]$Html,

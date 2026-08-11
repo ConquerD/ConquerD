@@ -51,6 +51,22 @@ struct PeerDecoder {
     decoder: Box<dyn VideoDecoder>,
 }
 
+/// How a peer's decoder is faring, as one entry rather than two maps.
+///
+/// The two counts are different diagnoses and escalate on different schedules
+/// (see [`FAILURES_BEFORE_DECODER_REBUILD`] and
+/// [`STARVED_BEFORE_DECODER_REBUILD`]), but they share every lifecycle: a peer
+/// who leaves, is evicted, or changes codec must lose both. Keeping them in one
+/// entry is what makes that automatic instead of a second `remove` each of the
+/// five teardown paths has to remember.
+#[derive(Default)]
+struct DecodeHealth {
+    /// Consecutive `Err` results — frames the decoder rejected.
+    errors: u32,
+    /// Consecutive `Ok(None)` results — frames it took without drawing.
+    starved: u32,
+}
+
 /// How many undecoded frames to queue before shedding.
 ///
 /// Small on purpose: video is real-time, so a backlog is worth less than the
@@ -59,6 +75,11 @@ struct PeerDecoder {
 const QUEUE_DEPTH: usize = 8;
 
 /// Consecutive decode failures from one peer before asking for a keyframe.
+///
+/// A *failure* is an error, not a decoder that has yet to produce its first
+/// picture — see [`STARVED_BEFORE_KEYFRAME_REQUEST`] for the latter, and
+/// [`VideoDecoder::decode`](crate::video::codec::VideoDecoder::decode) for why
+/// the two are different answers.
 const FAILURES_BEFORE_KEYFRAME_REQUEST: u32 = 3;
 
 /// Consecutive decode failures before the decoder itself is thrown away.
@@ -74,6 +95,32 @@ const FAILURES_BEFORE_KEYFRAME_REQUEST: u32 = 3;
 /// (and, on the hardware path, GPU surfaces), so a keyframe gets several
 /// chances to work before it comes to this.
 const FAILURES_BEFORE_DECODER_REBUILD: u32 = 15;
+
+/// Frames accepted without a picture coming back before a keyframe is asked for.
+///
+/// This is the "decoder is fine, it just has nothing to draw" path: it has not
+/// seen a keyframe yet, so every inter frame it is handed refers to pictures it
+/// does not have. A keyframe is exactly the fix, and one second of inter frames
+/// at 30 fps is long enough to be sure that is the situation rather than a
+/// decoder still filling its pipeline.
+const STARVED_BEFORE_KEYFRAME_REQUEST: u32 = 30;
+
+/// Frames accepted without a picture coming back before the decoder is replaced.
+///
+/// Distinct from [`FAILURES_BEFORE_DECODER_REBUILD`], and far larger, because
+/// this counts a decoder that is *working* — accepting every frame without
+/// complaint — and the honest reading of that is "not enough input yet", not
+/// "broken". Rebuilding on a low count is actively harmful: a fresh decoder has
+/// to fill its pipeline and wait for the next keyframe all over again, so a
+/// threshold below the warm-up cost turns a slow start into a stream that never
+/// produces a single frame. That is precisely what a 15-frame limit did against
+/// Media Foundation's default ~30-frame buffering, on every call, in both
+/// directions.
+///
+/// Ten seconds of frames leaves room for several sender keyframe intervals and
+/// still recovers a genuinely wedged transform — one that swallows input and
+/// returns nothing forever — within a bounded time.
+const STARVED_BEFORE_DECODER_REBUILD: u32 = 300;
 
 /// Minimum gap between keyframe requests for the same peer.
 ///
@@ -196,7 +243,7 @@ impl VideoReceiver {
             .name("conquerd-video-decode".into())
             .spawn(move || {
                 let mut decoders: HashMap<String, PeerDecoder> = HashMap::new();
-                let mut failures: HashMap<String, u32> = HashMap::new();
+                let mut health: HashMap<String, DecodeHealth> = HashMap::new();
                 // When each decoded peer last delivered a frame, for the cap.
                 let mut last_frame: HashMap<String, std::time::Instant> = HashMap::new();
                 // When we last asked each peer for a keyframe, for the throttle.
@@ -213,7 +260,7 @@ impl VideoReceiver {
                     drain_control(
                         &control_rx,
                         &mut decoders,
-                        &mut failures,
+                        &mut health,
                         &mut last_frame,
                         &mut keyframe_asked,
                         &mut stalled,
@@ -258,7 +305,7 @@ impl VideoReceiver {
                                 &stale[..8.min(stale.len())]
                             );
                             decoders.remove(&stale);
-                            failures.remove(&stale);
+                            health.remove(&stale);
                             last_frame.remove(&stale);
                             keyframe_asked.remove(&stale);
                             // Clear the report with the state behind it: an
@@ -297,7 +344,7 @@ impl VideoReceiver {
                             item.codec.as_str()
                         );
                         decoders.remove(&item.peer_id);
-                        failures.remove(&item.peer_id);
+                        health.remove(&item.peer_id);
                     }
 
                     let entry = match decoders.entry(item.peer_id.clone()) {
@@ -332,8 +379,8 @@ impl VideoReceiver {
                     // decoder this call came from.
                     let decoded = entry.decoder.decode(&item.encoded);
                     match decoded {
-                        Ok(frame) => {
-                            failures.remove(&item.peer_id);
+                        Ok(Some(frame)) => {
+                            health.remove(&item.peer_id);
                             // Through the playout rather than straight to the
                             // sink: with content audio present this holds the
                             // frame until the audio timeline reaches it, and
@@ -351,11 +398,50 @@ impl VideoReceiver {
                                 sink::push_frame(&item.peer_id, &f.payload);
                             }
                         }
+                        // Accepted, but nothing to draw yet: warming up, or
+                        // waiting for the keyframe that lets it start. Neither
+                        // is an error, so the failure counters above stay
+                        // untouched — this has its own, much longer leash.
+                        Ok(None) => {
+                            let n = {
+                                let h = health.entry(item.peer_id.clone()).or_default();
+                                h.errors = 0;
+                                h.starved += 1;
+                                h.starved
+                            };
+                            if n >= STARVED_BEFORE_KEYFRAME_REQUEST
+                                && request_keyframe_throttled(
+                                    &mut request_keyframe,
+                                    &mut keyframe_asked,
+                                    &item.peer_id,
+                                    now,
+                                    KEYFRAME_REQUEST_INTERVAL,
+                                )
+                            {
+                                debug!(
+                                    "[video] {n} frames from {} with no picture out; requesting keyframe",
+                                    &item.peer_id[..8.min(item.peer_id.len())]
+                                );
+                            }
+                            if n >= STARVED_BEFORE_DECODER_REBUILD {
+                                // See STARVED_BEFORE_DECODER_REBUILD: ten
+                                // seconds of accepted frames and not one
+                                // picture is no longer a warm-up.
+                                warn!(
+                                    "[video] rebuilding {} decoder for {}: {n} frames accepted, none decoded",
+                                    item.codec.as_str(),
+                                    &item.peer_id[..8.min(item.peer_id.len())]
+                                );
+                                decoders.remove(&item.peer_id);
+                                health.remove(&item.peer_id);
+                            }
+                        }
                         Err(e) => {
                             let n = {
-                                let n = failures.entry(item.peer_id.clone()).or_insert(0);
-                                *n += 1;
-                                *n
+                                let h = health.entry(item.peer_id.clone()).or_default();
+                                h.starved = 0;
+                                h.errors += 1;
+                                h.errors
                             };
                             if n >= FAILURES_BEFORE_KEYFRAME_REQUEST {
                                 // Past the threshold, not merely at it, and
@@ -390,7 +476,7 @@ impl VideoReceiver {
                                     &item.peer_id[..8.min(item.peer_id.len())]
                                 );
                                 decoders.remove(&item.peer_id);
-                                failures.remove(&item.peer_id);
+                                health.remove(&item.peer_id);
                             }
                         }
                     }
@@ -399,14 +485,14 @@ impl VideoReceiver {
                 drain_control(
                     &control_rx,
                     &mut decoders,
-                    &mut failures,
+                    &mut health,
                     &mut last_frame,
                     &mut keyframe_asked,
                     &mut stalled,
                     &mut report_stall,
                 );
                 decoders.clear();
-                failures.clear();
+                health.clear();
                 last_frame.clear();
                 keyframe_asked.clear();
                 stalled.clear();
@@ -597,7 +683,7 @@ fn sweep_stalls(
 fn drain_control(
     control_rx: &mpsc::Receiver<Control>,
     decoders: &mut HashMap<String, PeerDecoder>,
-    failures: &mut HashMap<String, u32>,
+    health: &mut HashMap<String, DecodeHealth>,
     last_frame: &mut HashMap<String, std::time::Instant>,
     keyframe_asked: &mut HashMap<String, std::time::Instant>,
     stalled: &mut HashSet<String>,
@@ -607,7 +693,7 @@ fn drain_control(
         match cmd {
             Control::Forget(id) => {
                 decoders.remove(&id);
-                failures.remove(&id);
+                health.remove(&id);
                 // Free the stream slot too, or a peer who left would keep
                 // holding it against the cap until the idle timer expired.
                 last_frame.remove(&id);
@@ -622,7 +708,7 @@ fn drain_control(
             }
             Control::ForgetAll => {
                 decoders.clear();
-                failures.clear();
+                health.clear();
                 last_frame.clear();
                 keyframe_asked.clear();
                 for id in stalled.drain() {
@@ -659,15 +745,28 @@ mod tests {
     use super::*;
     use crate::video::frame::RawFrame;
 
+    /// Test decoder: counts submissions, and lets a frame's first byte pick
+    /// which of the three outcomes it produces.
+    ///
+    /// `0xFF` fails, `0xNO` (see [`NO_PICTURE`]) is accepted without a picture,
+    /// anything else decodes. The middle case is the one worth having a marker
+    /// for: it is what a real decoder returns while it warms up or waits for a
+    /// keyframe, and treating it as a failure is what wedged the stream.
     struct CountingDecoder(Arc<std::sync::atomic::AtomicU32>);
 
+    /// First byte marking a frame the test decoder accepts without decoding.
+    const NO_PICTURE: u8 = 0xFE;
+
     impl VideoDecoder for CountingDecoder {
-        fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<RawFrame> {
+        fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<Option<RawFrame>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             if encoded.first() == Some(&0xFF) {
                 anyhow::bail!("simulated decode failure");
             }
-            Ok(RawFrame::black(16, 16))
+            if encoded.first() == Some(&NO_PICTURE) {
+                return Ok(None);
+            }
+            Ok(Some(RawFrame::black(16, 16)))
         }
     }
 
@@ -920,6 +1019,54 @@ mod tests {
         );
     }
 
+    /// The bug this guards, which shipped and broke every call: a decoder that
+    /// accepts frames without producing a picture yet is *warming up*, not
+    /// broken. Media Foundation's H.264 decoder buffers around thirty
+    /// submissions before its first output by default, so a rebuild at fifteen
+    /// destroyed it mid-warm-up, every time, and the replacement started the
+    /// same wait over — video that never produced a single frame while frames
+    /// arrived at full rate.
+    ///
+    /// Well past `FAILURES_BEFORE_DECODER_REBUILD` on purpose: the point is
+    /// that the *error* threshold must not govern this path at all.
+    #[test]
+    fn a_decoder_that_is_only_warming_up_is_not_rebuilt() {
+        let built = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let decoded = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let b = Arc::clone(&built);
+        let d = Arc::clone(&decoded);
+        let rx = VideoReceiver::start(
+            move |_codec| {
+                b.fetch_add(1, Ordering::SeqCst);
+                Some(Box::new(CountingDecoder(Arc::clone(&d))))
+            },
+            |_| {},
+            |_, _| {},
+            watched,
+        );
+
+        let submissions = (FAILURES_BEFORE_DECODER_REBUILD * 4) as usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (decoded.load(Ordering::SeqCst) as usize) < submissions
+            && std::time::Instant::now() < deadline
+        {
+            rx.submit("peer", vec![NO_PICTURE], false, VideoCodec::Stub, 0);
+            // Paced under the queue depth, as above, so these are decode
+            // attempts rather than frames shed before they reach the decoder.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(
+            decoded.load(Ordering::SeqCst) as usize >= submissions,
+            "the decode loop never got through the submissions"
+        );
+        assert_eq!(
+            built.load(Ordering::SeqCst),
+            1,
+            "a decoder that is merely waiting for a keyframe was thrown away"
+        );
+    }
+
     /// Asking once and giving up is what left a frozen tile in the first place:
     /// the request itself can be lost. It must repeat — but not per frame.
     #[test]
@@ -1131,7 +1278,7 @@ mod tests {
     fn forgetting_a_stalled_peer_retracts_the_report() {
         let (tx, rx) = mpsc::channel::<Control>();
         let mut decoders = HashMap::new();
-        let mut failures = HashMap::new();
+        let mut health = HashMap::new();
         let mut last_frame = HashMap::new();
         let mut asked = HashMap::new();
         let mut stalled: HashSet<String> = HashSet::new();
@@ -1143,7 +1290,7 @@ mod tests {
         drain_control(
             &rx,
             &mut decoders,
-            &mut failures,
+            &mut health,
             &mut last_frame,
             &mut asked,
             &mut stalled,
@@ -1157,7 +1304,7 @@ mod tests {
         drain_control(
             &rx,
             &mut decoders,
-            &mut failures,
+            &mut health,
             &mut last_frame,
             &mut asked,
             &mut stalled,

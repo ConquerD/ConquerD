@@ -97,17 +97,29 @@ const FLAG_HAS_SIGNATURE: u8 = 0b0000_0010;
 /// Maximum fragments one frame may claim.
 ///
 /// Chunks are sized to fragment 0's budget (which also carries the signature),
-/// so with a 1198-byte datagram and a 44-byte sender id each holds ~1078
-/// bytes, capping a single frame at ~69 KB. That is ample for the CBR
-/// bitrates this pipeline targets — a 640x360 keyframe at 600 kbps lands
-/// around 10-20 KB — though a high-quality 720p keyframe could brush it. If
-/// that ever happens the encoder should lower quality rather than this cap
-/// rise, since the cap is what bounds reassembly memory.
+/// so with a 1198-byte datagram and a 44-byte sender id each holds ~1070 bytes.
+/// At 128 that caps a single frame at ~134 KB.
+///
+/// **Why not 64.** It was, and 64 is ~67 KB — which 1080p exceeds on every
+/// keyframe. Measured against the Media Foundation encoder at the auto bitrate,
+/// 1080p keyframes run 72–80 KB (75 fragments) where 720p runs ~35 KB (33).
+/// A frame over the cap is not truncated or degraded: [`fragment_frame`]
+/// returns `None` and the sender drops it whole. Dropping *keyframes*
+/// specifically means receivers never get the one frame a decoder can start
+/// from, so the stream produces no picture at all while inter frames keep
+/// arriving — indistinguishable, from the outside, from a broken decoder.
+///
+/// Raising it is a compatibility change even though the header is untouched:
+/// [`parse_fragment`] rejects a `frag_count` above this bound, so a receiver
+/// still on 64 drops every 1080p keyframe a sender on 128 emits. Both ends must
+/// ship together.
 ///
 /// It is also the allocation guard: the count is validated *before* any
 /// per-fragment `Vec` is sized, so a hostile `frag_count = 65535` cannot make
-/// us reserve 65535 slots.
-pub const MAX_FRAGS_PER_FRAME: u16 = 64;
+/// us reserve 65535 slots. The real memory bound is
+/// [`MAX_PARTIAL_BYTES_PER_SENDER`], which is unchanged and still sheds the
+/// oldest partial long before 128 × 8 in-flight fragments could accumulate.
+pub const MAX_FRAGS_PER_FRAME: u16 = 128;
 
 /// Maximum bytes of partially-reassembled frames held for one sender.
 pub const MAX_PARTIAL_BYTES_PER_SENDER: usize = 512 * 1024;
@@ -636,6 +648,53 @@ mod tests {
 
     fn frags(sealed: &[u8], seq: u32, keyframe: bool) -> Vec<Vec<u8>> {
         fragment_frame(SENDER, seq, keyframe, CODEC, PTS, &SIG, sealed, MAX_PAYLOAD).unwrap()
+    }
+
+    /// Largest 1080p keyframe measured from the Media Foundation encoder at the
+    /// auto bitrate (3.12 Mbps at 30 fps), plus the GCM seal's 13-byte header
+    /// and 16-byte tag. The cap has to clear this or 1080p produces no picture
+    /// at all — see [`MAX_FRAGS_PER_FRAME`].
+    const MEASURED_1080P_KEYFRAME: usize = 79_627 + 29;
+
+    /// The regression this guards: at 64 fragments every 1080p keyframe was
+    /// dropped by the sender, so receivers never got a frame their decoder
+    /// could start from and the tile sat on "Waiting for video…" while inter
+    /// frames arrived normally.
+    #[test]
+    fn a_1080p_keyframe_fits_the_fragment_budget() {
+        let sealed = vec![0xA5u8; MEASURED_1080P_KEYFRAME];
+        let parts = fragment_frame(SENDER, 1, true, CODEC, PTS, &SIG, &sealed, MAX_PAYLOAD)
+            .expect("a measured 1080p keyframe must fit");
+        assert!(
+            parts.len() <= MAX_FRAGS_PER_FRAME as usize,
+            "{} fragments exceeds the cap of {MAX_FRAGS_PER_FRAME}",
+            parts.len()
+        );
+        // And it must survive the round trip, not merely fragment: the receiver
+        // enforces the same bound when parsing.
+        let mut r = Reassembler::new();
+        let now = Instant::now();
+        let mut out = None;
+        for part in &parts {
+            out = out.or(r.push(part, now));
+        }
+        let frame = out.expect("a 1080p keyframe must reassemble");
+        assert_eq!(frame.sealed.len(), MEASURED_1080P_KEYFRAME);
+        assert!(frame.keyframe);
+    }
+
+    /// Headroom is deliberate but not unlimited: the cap is still what bounds
+    /// reassembly memory, so a frame past it must be refused rather than
+    /// silently truncated.
+    #[test]
+    fn a_frame_past_the_cap_is_still_refused() {
+        let chunk =
+            MAX_PAYLOAD - (FIXED_PREFIX_LEN + SENDER.len() + FIXED_SUFFIX_LEN) - SIGNATURE_LEN;
+        let too_big = vec![0u8; chunk * (MAX_FRAGS_PER_FRAME as usize + 1)];
+        assert!(
+            fragment_frame(SENDER, 1, true, CODEC, PTS, &SIG, &too_big, MAX_PAYLOAD).is_none(),
+            "a frame needing more than the cap must not be fragmented"
+        );
     }
 
     /// The bug this guards: sequence numbers restart at zero in a fresh

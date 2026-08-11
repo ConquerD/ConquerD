@@ -60,6 +60,20 @@ pub struct RelayState {
     game_sessions: HashMap<String, HashSet<String>>,
     /// peer → active game session id (at most one portal game session per peer).
     peer_game_session: HashMap<String, String>,
+    /// Which senders each member wants room video from.
+    ///
+    /// Keyed by **normalized** peer id on both sides, because the two halves of
+    /// this map arrive by different routes: the subscriber is a relay peer
+    /// (un-padded base64url from the certificate CN) while the sender ids come
+    /// from a signed signaling payload (padded `public_id`). Comparing them raw
+    /// would silently match nothing and drop every frame.
+    ///
+    /// **Absence is not an empty set.** A member with no entry has never told
+    /// us anything — an older client, or one whose subscription has not landed
+    /// yet — and receives everything, exactly as before this existed. An entry
+    /// that is present and empty means "nothing, I have no tiles open", which
+    /// is the case that actually saves the bandwidth.
+    video_subs: HashMap<String, HashSet<String>>,
     /// Next available peer index.
     next_index: u8,
     /// Total bytes relayed since start.
@@ -76,8 +90,39 @@ impl RelayState {
             rooms: HashMap::new(),
             game_sessions: HashMap::new(),
             peer_game_session: HashMap::new(),
+            video_subs: HashMap::new(),
             next_index: 1,
             total_bytes_relayed: 0,
+        }
+    }
+
+    /// Replace `subscriber`'s video subscription set.
+    ///
+    /// Replace rather than merge: the message carries the whole set precisely
+    /// so that a lost or reordered one cannot leave this map permanently out of
+    /// step with the tiles the member actually has open.
+    fn set_video_subscriptions(&mut self, subscriber: &str, senders: &[String]) {
+        let key = crate::crypto::normalize_public_id(subscriber);
+        let set = senders
+            .iter()
+            .map(|s| crate::crypto::normalize_public_id(s))
+            .collect();
+        self.video_subs.insert(key, set);
+    }
+
+    /// Whether `recipient` wants room video from `sender`.
+    ///
+    /// True for a recipient we have heard nothing from — see [`video_subs`] on
+    /// why absence has to mean "everything" rather than "nothing".
+    ///
+    /// [`video_subs`]: RelayState::video_subs
+    fn wants_video(&self, recipient: &str, sender: &str) -> bool {
+        match self
+            .video_subs
+            .get(&crate::crypto::normalize_public_id(recipient))
+        {
+            Some(set) => set.contains(&crate::crypto::normalize_public_id(sender)),
+            None => true,
         }
     }
 
@@ -106,6 +151,12 @@ impl RelayState {
     }
 
     fn remove_peer(&mut self, peer_id: &str) {
+        // Subscriptions describe one connection's open tiles, so they must not
+        // outlive it: a reconnecting peer re-announces, and until it does the
+        // absence correctly reads as "send everything" rather than as a stale
+        // set that would black out whatever it used to watch.
+        self.video_subs
+            .remove(&crate::crypto::normalize_public_id(peer_id));
         if let Some(peer) = self.peers.remove(peer_id) {
             self.index_to_peer.remove(&peer.peer_index);
             // Remove from any room
@@ -228,6 +279,21 @@ impl QUICRelayServer {
     /// inbound datagram, so registering it after `start` still applies.
     pub fn set_room_audio_bridge(&self, hook: RoomAudioBridgeHook) {
         *self.room_audio_bridge.write() = Some(hook);
+    }
+
+    /// Record which senders `subscriber` wants room video from.
+    ///
+    /// Called from the signaling layer on an authenticated `SfuVideoSubscribe`.
+    /// The set replaces whatever was there; a member that has never sent one
+    /// keeps receiving every sender, so this can only ever *reduce* what the
+    /// relay forwards to a peer that asked for it.
+    ///
+    /// Applies to the peer's current relay connection only — [`RelayState`]
+    /// drops the entry when the peer disconnects.
+    pub fn set_video_subscriptions(&self, subscriber: &str, senders: &[String]) {
+        self.state
+            .write()
+            .set_video_subscriptions(subscriber, senders);
     }
 
     /// Forward a pre-built room-audio datagram to `recipient` over their relay
@@ -901,12 +967,23 @@ fn handle_datagram(
     }
 
     if target_idx == wire::BROADCAST_INDEX {
-        // Broadcast to all room members except sender
+        // Broadcast to all room members except sender.
+        //
+        // Room video is the one channel filtered per recipient: it is the only
+        // one where fan-out to a member who is not displaying the sender is
+        // pure waste, and the only one big enough for that waste to matter —
+        // five 1080p senders in a room is tens of Mbps of egress per member,
+        // most of it decoded by nobody. Every other channel is small, and a
+        // member missing one is a correctness bug rather than a saving.
+        let filter_by_subscription = feature_id == "room.video.sfu";
         if let Some(ref room_id) = from.room_id {
             if let Some(members) = st.rooms.get(room_id) {
                 let fwd = wire::build_forwarded_datagram(sender_index, payload);
                 for member_id in members {
                     if member_id != from_peer {
+                        if filter_by_subscription && !st.wants_video(member_id, from_peer) {
+                            continue;
+                        }
                         if let Some(member) = st.peers.get(member_id) {
                             if try_forward_datagram(features, feature_id, member_id, &fwd, member) {
                                 relayed += fwd.len() as u64;
@@ -1550,6 +1627,86 @@ mod tests {
         let fwd = wire::build_forwarded_datagram(3, &payload);
         assert_eq!(fwd[0], 3);
         assert_eq!(&fwd[1..], &payload[..]);
+    }
+
+    // ── Video subscriptions ─────────────────────────────────────────────────
+
+    /// A member who has never subscribed must keep receiving everything.
+    ///
+    /// This is the whole compatibility story: an older client, or one whose
+    /// subscription has not arrived yet, has no entry — and reading absence as
+    /// "wants nothing" would black out every stream in the room rather than
+    /// merely failing to save bandwidth.
+    #[test]
+    fn a_member_who_never_subscribed_receives_every_sender() {
+        let s = RelayState::new();
+        assert!(s.wants_video("watcher", "alice"));
+        assert!(s.wants_video("watcher", "bob"));
+    }
+
+    /// The case the feature exists for: tiles closed, so nothing is forwarded.
+    /// An *empty* set is a real answer and must not be confused with absence.
+    #[test]
+    fn an_empty_subscription_receives_nothing() {
+        let mut s = RelayState::new();
+        s.set_video_subscriptions("watcher", &[]);
+        assert!(!s.wants_video("watcher", "alice"));
+    }
+
+    #[test]
+    fn only_subscribed_senders_are_wanted() {
+        let mut s = RelayState::new();
+        s.set_video_subscriptions("watcher", &["alice".to_owned()]);
+        assert!(s.wants_video("watcher", "alice"));
+        assert!(!s.wants_video("watcher", "bob"));
+        // Another member is unaffected by this one's choices.
+        assert!(s.wants_video("someone-else", "bob"));
+    }
+
+    /// Replace, never merge: a set that only grew would leave a closed tile
+    /// streaming for the rest of the session.
+    #[test]
+    fn a_later_subscription_replaces_the_earlier_one() {
+        let mut s = RelayState::new();
+        s.set_video_subscriptions("watcher", &["alice".to_owned(), "bob".to_owned()]);
+        s.set_video_subscriptions("watcher", &["bob".to_owned()]);
+        assert!(!s.wants_video("watcher", "alice"));
+        assert!(s.wants_video("watcher", "bob"));
+    }
+
+    /// The two halves of this map arrive by different routes: the subscriber is
+    /// a relay peer id (un-padded, from the certificate CN) while the sender
+    /// ids come from a signed signaling payload (padded `public_id`). Compared
+    /// raw they would never match and every frame would be dropped.
+    #[test]
+    fn padded_and_unpadded_ids_are_the_same_peer() {
+        let unpadded = crate::crypto::b64url_encode(&[7u8; 32]);
+        let padded = crate::crypto::normalize_public_id(&unpadded);
+        assert_ne!(padded, unpadded, "a 32-byte key must encode with one pad");
+
+        let mut s = RelayState::new();
+        // Subscribed by padded id, looked up by the un-padded relay form.
+        s.set_video_subscriptions(&padded, std::slice::from_ref(&padded));
+        assert!(s.wants_video(&unpadded, &unpadded));
+
+        // And the reverse, since either side may be the padded one.
+        let mut s = RelayState::new();
+        s.set_video_subscriptions(&unpadded, std::slice::from_ref(&unpadded));
+        assert!(s.wants_video(&padded, &padded));
+    }
+
+    /// Subscriptions belong to a connection. A reconnecting peer must come back
+    /// as "never subscribed" — receiving everything until it re-announces —
+    /// rather than inheriting a stale set that blacks out what it now watches.
+    #[test]
+    fn disconnecting_forgets_a_subscription() {
+        let mut s = RelayState::new();
+        s.set_video_subscriptions("watcher", &["alice".to_owned()]);
+        assert!(!s.wants_video("watcher", "bob"));
+
+        s.remove_peer("watcher");
+        assert!(s.wants_video("watcher", "alice"));
+        assert!(s.wants_video("watcher", "bob"));
     }
 
     // ── QUICRelayServer (no live QUIC needed) ───────────────────────────────

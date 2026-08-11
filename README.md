@@ -30,13 +30,26 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Live call duration display in the call overlay.
 - Missed call counter badge shown in the peer list and tray; increments when a call ends unanswered.
 
+### Video & Screen Sharing
+
+> Working on Windows; the Linux and macOS camera backends compile but have not been validated against real hardware, and screen capture is Windows-only. See [Known limitations](#known-limitations).
+
+- **Share a camera, a screen, or a single window** from one **Share video** control. Starting a share asks what to do about audio; stopping does not ask anything. Screen and window capture use `Windows.Graphics.Capture` and are **Windows-only** — cameras work on all three platforms.
+- **Codecs are negotiated, not assumed.** H.264 via Media Foundation on Windows (using the codec licence the OS already holds) and VP8 everywhere via the vendored `conquerd-vpx`. A build advertises only what it can actually encode *and* decode, so a Windows peer and a Linux peer always share VP8. Direct calls intersect both peers' sets; a room sender picks its own codec and stamps every frame with it.
+- **One stream per peer.** Picture-in-picture overlays are composited *before* encoding rather than sent as extra streams, so adding an overlay costs no extra bandwidth and no extra decoder.
+- **Audio shared with a video is its own track**, not a second microphone. It is stamped from the same session clock as the picture, so it stays in sync, and it is mixed independently of voice: muting someone does not silence what they are presenting, and shared audio is only mixed for peers whose video you actually have open. Capturing shared audio is currently **Windows-only** (WASAPI loopback, whole-machine or per-application).
+- **Audio-led A/V sync.** Video is held or dropped to meet the shared-audio timeline. A camera-only call has no such timeline and simply free-runs, exactly as it did before sync existed.
+- **Adaptive bitrate** driven by the same loss measurement that drives audio ABR — it backs off above 10 % loss, recovers below 4 %, and never drops below 120 kbps (past that, video stops being a picture and just costs bandwidth). Your quality preset sets the ceiling; adaptation only moves downward from it.
+- **Room video is relay-datagram-only.** There is no WebSocket fallback for video media by design: a member on a WS-only path keeps audio rather than stalling the call. Frames are E2E-sealed under the same per-room sender key as voice, with domain separation so the two can never be confused. Supernodes ship with **public room creation disabled**, so rooms — and the video in them — are private unless an operator opts in.
+- Video tiles, an expandable video region, and a detachable pop-out window; camera device list, quality presets, and a live local preview in **Settings → Video**.
+
 ### Rooms (Multi-Peer Voice)
 - SFU (Selective Forwarding Unit) room hosting on volunteer supernodes — **ephemeral in memory only**; the supernode does not persist room definitions or chat history.
 - **Client-owned room definitions** — rooms you create, join, or subscribe to are saved in encrypted `my_rooms.dat` on your device, keyed by `(supernode, room_id)`. When you reconnect to a supernode, saved rooms are materialized automatically via `SfuRoomCreate` (without auto-joining voice).
 - Idle user-created rooms are removed on the supernode after ~15 minutes with no voice participants or chat subscribers; the built-in `default` room is always present.
 - QUIC relay transport for NAT-traversed room audio plus room chat/file signaling when available; WebSocket remains the membership and fallback signaling path.
 - Room parity with direct-peer features: chat, voice, file transfer.
-- Create public or private rooms from the Rooms sidebar; right-click **Remove room** hides the room locally (does not delete server-side state — there is none to delete).
+- Create rooms from the Rooms sidebar; right-click **Remove room** hides the room locally (does not delete server-side state — there is none to delete). Whether **public** rooms can be created is the operator's call: supernodes default to private-only (`allow_public_rooms = false`), and a refused create comes back as a signed denial rather than a silent failure. The built-in `default` room is always there regardless.
 - **Sub-rooms**: nest a room under any existing room (not just directly under the supernode) via **Create Public/Private Sub-room…**; the sidebar shows expand/collapse for rooms that have children.
 - Private rooms can enable **"Members can invite"** so any current member — not just the creator — can mint new invite tokens for that room.
 - Peer room invites with accept/decline flow.
@@ -71,12 +84,10 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - **CI/CD Hardening**: GitHub Actions pinned to immutable commit SHAs to prevent supply-chain attacks.
 
 ### NAT Traversal
-- Multi-layer connection strategy: QUIC direct → WebSocket → UDP hole punch → supernode relay.
-- STUN public IP discovery (Google `stun.l.google.com`, `stun1.l.google.com`; Cloudflare `stun.cloudflare.com`).
+- Multi-layer connection strategy: direct QUIC → WebSocket candidates (connected supernode endpoints, the peer's invite endpoint, LAN hint, then any further relay hints) → supernode QUIC relay.
 - UPnP automatic port mapping.
-- UDP hole punching for peers behind non-symmetric NATs.
-- Supernode-coordinated hole punch for timing alignment.
-- QUIC relay fallback through trusted supernodes.
+- QUIC relay fallback through trusted supernodes, with relay tickets auto-renewed and an endpoint mailbox so peers find each other again across restarts.
+- Direct calls that cannot establish within five seconds move to a temporary private SFU room and upgrade back to direct if it becomes available.
 
 ### Desktop Application
 - Native Rust desktop binary with a Qt 6 / QML UI (via [CXX-Qt](https://kdab.github.io/cxx-qt/)).
@@ -205,7 +216,7 @@ xdg-mime default conquerd.desktop x-scheme-handler/conquerd
 │  │ Chat      │ ◄── messages ──►│ Chat      │                    │
 │  │ QUIC      │ ◄── voice ─────►│ QUIC      │                    │
 │  └──────────┘                  └──────────┘                    │
-│         Optional: STUN / supernode QUIC relay (rooms)           │
+│         Optional: supernode QUIC relay (rooms, NAT traversal)    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -226,6 +237,7 @@ Conquerd is pure Rust.
 - **Direct calls**: QUIC peer-to-peer via `ConnectionManager` (`quinn::Endpoint`, inside `conquerd-client`).
 - **Direct-call fallback**: after a call is accepted, the caller waits up to 5 seconds for direct QUIC. If it is still unavailable, both peers are moved to a temporary private SFU room on a mutually trusted supernode.
 - **Room audio and room broadcasts**: QUIC relay (`QuicRelayClient` → supernode `QUICRelayServer`) for room audio plus room chat/file signaling when available; WebSocket handles room membership and remains the fallback signaling path.
+- **Video and shared audio**: dedicated datagram channels (`0x06`/`0x07` video, `0x08`/`0x09` content audio) kept separate from the voice path, so the battle-tested voice wire is unchanged. Room video and room shared-audio are relay-datagram-only — deliberately no WebSocket fallback, so a member on a WS-only path keeps audio rather than stalling.
 - **Signaling/chat**: Ed25519-signed, transcript-bound messages; prefers QUIC signaling stream when a peer session is connected, falls back to WebSocket.
 - **Relay**: QUIC relay protocol on supernodes (transport-only; no app-layer decryption).
 
@@ -236,7 +248,7 @@ Conquerd is pure Rust.
 - **Forward secrecy**: invite handshakes use ephemeral X25519 + HKDF + AES-GCM.
 - **Local trust graph**: successful handshakes persist to local peer store.
 - **Endpoint stability**: signaling port persisted across restarts; peers notified of changes via `ENDPOINT_UPDATE`.
-- **Auto-connect**: trusted peers can be marked for automatic reconnection on startup (30-second retry, up to 5 attempts).
+- **Auto-connect**: trusted peers can be marked for automatic reconnection on startup. Direct-QUIC reconnects are scanned every second and backed off exponentially to a 60-second ceiling, so a peer that stays offline costs a probe a minute rather than a tight retry loop.
 
 ### Key Data Flows
 
@@ -321,7 +333,11 @@ For the precise runtime contract (auth tier enforcement order, quota symmetry ac
 | `core.chat.v1` | stream | trusted-peer | desktop client |
 | `core.audio.opus` | datagram | trusted-peer | `conquerd-client` (via `conquerd-opus`) |
 | `core.file.v1` | stream | trusted-peer | desktop client |
+| `core.video.v1` | datagram | trusted-peer | `conquerd-client` (H.264 / VP8; `params.codecs` carries what this build can run) |
+| `core.audio.content.v1` | datagram | trusted-peer | `conquerd-client` — audio shared *with* a video, on its own synchronised track |
 | `room.audio.sfu` | datagram | room-member | supernode SFU/relay routing (`sfu.rs`, `main.rs`) |
+| `room.video.sfu` | datagram | room-member | supernode opaque relay fan-out (relay datagrams only — no WS fallback) |
+| `room.audio.content.sfu` | datagram | room-member | supernode opaque relay fan-out (audio shared with room video) |
 | `room.chat.v1` | stream | room-member | supernode SFU/relay routing (`sfu.rs`, `main.rs`) |
 | `room.file.v1` | stream | room-member | supernode SFU file broadcast |
 | `web.host.app.v1` | stream | public | supernode QUIC bidi-stream portal (`conquerd://` pages for native client) |
@@ -464,11 +480,14 @@ Most consumer NATs silently drop unsolicited inbound connections. Conquerd emplo
 
 | Priority | Strategy | Requires | Transport |
 |---|---|---|---|
-| 0 | **QUIC direct** | Peer's QUIC port known (from relay hints or prior session) | QUIC (quinn) |
-| 1 | **WebSocket assist** (1.25 s timeout) | At least one candidate endpoint reachable | WebSocket (TCP) |
-| 2 | **WebSocket fallback** (4 s timeout) | Same candidates, longer timeout for slower paths | WebSocket (TCP) |
-| 3 | **UDP hole punch** | Both sides online, non-symmetric NAT | Custom UDP protocol |
-| 4 | **Supernode relay** | Both peers trusted by a common supernode | QUIC relay via supernode |
+| 0 | **Direct QUIC** | Peer's QUIC endpoint known (from the invite, a prior session, or relay hints) | QUIC (quinn) |
+| 1 | **WebSocket via a connected supernode** | A mutually trusted supernode already connected | WebSocket (TCP) |
+| 2 | **WebSocket to the peer's own endpoint** | Peer's invite/stored endpoint reachable | WebSocket (TCP) |
+| 3 | **WebSocket to a LAN hint** | Both peers on the same network | WebSocket (TCP) |
+| 4 | **Supernode QUIC relay** | Both peers trusted by a common supernode | QUIC relay via supernode |
+
+Candidate ordering lives in `build_ws_candidates` (`connection_fallback.rs`) and is de-duplicated,
+so a supernode that is already connected is tried before anything that needs a fresh dial.
 
 For most home users, **no manual port configuration is needed** — UPnP handles it automatically. If you're behind a strict firewall, forward one TCP port for signaling and let QUIC use ephemeral UDP ports.
 
@@ -484,36 +503,20 @@ You **don't** need a supernode if:
 You **do** need a supernode if:
 - Both you and your peer are behind **strict NATs** that block direct connections (double-NAT, CGNAT, corporate firewalls).
 - You want **group voice rooms** (SFU) with 3+ participants.
+- You want a **reliable rendezvous** across restarts — the supernode's endpoint mailbox (24 h TTL) is how peers relocate each other after an address change.
 
-### UDP Hole Punching
+### On STUN and UDP hole punching
 
-When QUIC direct and WebSocket candidates both fail, Conquerd automatically attempts UDP hole punching. Each invite contains a `udp_hole_punch_hint` with the sender's STUN-discovered external UDP endpoint. Both peers simultaneously send probe packets to each other's external endpoint, creating NAT mappings that allow the other side's packets through.
+Neither is implemented in the current Rust client, and the supernode relay covers the cases they
+would have. Two leftovers are worth knowing about so they are not mistaken for working features:
 
-```
-Alice                              Internet                              Bob
-NAT-A (104.54.197.38:57100)                         NAT-B (72.133.90.194:57240)
+- The supernode still implements **coordinated hole punch** (`PUNCH_REGISTER` → `PUNCH_READY`
+  with a synchronised `punch_at`), and the message types remain in the protocol enum, but the
+  client never registers for it. It is server-side scaffolding awaiting a client.
+- The invite envelope carries a `udp_hole_punch_hint` field that is always `null`.
 
-Alice sends probe ────────────────────────────────────────────→ NAT-B maps it
-                  ←──────────────────────────────────────────── Bob sends probe
-NAT-A maps it
-
-Both receive ack → channel ESTABLISHED (bidirectional UDP)
-```
-
-**NAT compatibility:**
-
-| NAT Type | Works? |
-|---|---|
-| Full-cone NAT (most home routers) | ✅ Yes |
-| Address-restricted cone NAT | ✅ Yes |
-| Port-restricted cone NAT | ✅ Yes |
-| Symmetric NAT (CGNAT, corporate) | ❌ No — use supernode relay instead |
-
-Symmetric NAT affects roughly 10–20% of users, primarily on mobile carrier NATs and some corporate networks. These users connect through a supernode relay automatically.
-
-### Supernode-Coordinated Hole Punch
-
-When uncoordinated hole punching fails due to timing mismatch, a trusted supernode can coordinate the attempt. Both peers send a `PUNCH_REGISTER` message to the supernode, which responds with `PUNCH_READY` containing each peer's endpoint and a synchronised `punch_at` timestamp so both sides begin probing simultaneously.
+Peers behind symmetric NAT (roughly 10–20 % of users, mostly mobile carrier and corporate
+networks) therefore connect through a supernode relay rather than punching through.
 
 ---
 
@@ -807,11 +810,13 @@ Access settings via the gear icon in Conquerd.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Network mode | `public` | `public` = use STUN for IP discovery; `local` = LAN only |
-| Public endpoint | (auto) | Manual override: `IP:port` |
-| Signaling port | `0` (auto) | Set a fixed port if you need a firewall rule |
-| UPnP enabled | `true` | Auto port-mapping on router |
-| STUN servers | 3 built-in | Google (`stun.l.google.com`, `stun1.l.google.com`) + Cloudflare (`stun.cloudflare.com`) + custom servers with per-server enable/disable |
+| Direct P2P | `true` | Accept direct peer QUIC sessions (`direct_p2p_enabled`) |
+| Direct P2P port | `0` (auto) | Fixed listening port when you need a firewall rule (`direct_p2p_port`) |
+| UPnP port mapping | `true` | Auto port-mapping on the router (`upnp_enabled`) |
+| Relay port | (auto) | Local port used for supernode relay sessions (`relay_port`) |
+| Allow gated supernodes | `true` | Allow supernodes that require portal access (`relay_allow_gated`) |
+| Auto-renew relay tickets | `true` | Keep relay access alive without a reconnect (`relay_auto_renew`) |
+| Auto-connect | `true` | Reconnect trusted peers on startup (`auto_connect`) |
 
 ### Audio
 
@@ -824,11 +829,17 @@ Access settings via the gear icon in Conquerd.
 | Noise suppression | `true` | Background noise reduction |
 | Jitter buffer depth | `3` | Frames (1–20). Higher = more latency, smoother audio |
 
-### Relay
+### Video
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Allow gated supernodes | `true` | Allow connecting to supernodes that require portal access |
+| Camera source | (none) | Capture device — or a monitor/window on Windows — with a live local preview (`video_input_device`) |
+| Quality preset | `balanced` | Sets the **ceiling** for resolution, frame rate, and bitrate; adaptation only moves downward from it (`video_quality`) |
+| Adaptive bitrate | `true` | Let measured loss lower the bitrate. Off pins the stream at the chosen rate (`video_adaptive_bitrate`) |
+| Codec | `auto` | Preferred encoder where more than one is available; `auto` negotiates (`video_codec`). H.264 is Windows-only, VP8 is everywhere |
+| Keyframe interval | `4 s` | How often a full frame is sent — the recovery point after loss (`video_keyframe_secs`) |
+| Shared audio | `auto` | Which audio accompanies a share: `auto` follows the source, `system` always shares the machine, `off` shares picture only (`content_audio_mode`). Also asked when a share starts |
+| Picture-in-picture | (none) | Extra sources composited over the main one *before* encoding — a webcam over a game — so overlays cost no extra stream (`video_overlays_json`) |
 
 ### Security
 
@@ -877,7 +888,7 @@ SFU **room state is not persisted** on the supernode — rooms exist in memory w
 - Both peers need network reachability — check UPnP status in settings.
 - Ensure both peers completed the invite handshake (trusted peer appears in left panel).
 - Try a supernode as relay if direct connections fail.
-- For UDP hole punching, both sides need to exchange invites at roughly the same time (within 30 seconds).
+- If neither peer is directly reachable, both need to trust a common supernode — that relay is the fallback path, since the client does not hole-punch.
 
 ### No audio in calls
 - Check audio input/output device selection in Settings.
@@ -1067,13 +1078,22 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 │   │       ├── main.rs            # Entry point: identity init, QGuiApplication, QML engine
 │   │       ├── identity.rs        # Ed25519 keypair, keyring AES key, passphrase handling
 │   │       ├── connection_manager/ # Invite handshake, signaling, peer tracking
-│   │       ├── connection_fallback.rs # QUIC → WS → hole-punch → relay strategy ladder
+│   │       ├── connection_fallback.rs # WS candidate ordering + direct-call → temp SFU room fallback
 │   │       ├── call_controller.rs # Call state machine; audio + QUIC peer wiring
 │   │       ├── chat_store.rs      # SQLite chat history (per-peer trim_by_age / count / purge)
 │   │       ├── file_transfer.rs   # P2P file send/receive with chunking + progress
+│   │       ├── video/             # Camera/screen capture, codec registry (H.264/VP8), composite PiP,
+│   │       │                      #   fragmentation, sender ABR, per-sender decode
+│   │       ├── content_capture.rs / content_sender.rs / content_playout.rs / content_audio.rs
+│   │       │                      # Audio shared *with* a video: loopback capture, send, wire
+│   │       │                      #   format, jitter-buffered playout (separate from the mic path)
+│   │       ├── media_clock.rs / media_sync.rs # One session clock per video call; audio-led A/V sync
+│   │       ├── group_key.rs       # Per-room sender keys (E2E seal for room chat/voice/file/video)
+│   │       ├── space.rs           # Space Merkle tree (signed roots, inclusion proofs, grants)
 │   │       ├── sfu_client.rs      # SFU membership (join/leave/member list)
 │   │       ├── room_manager.rs    # Per-participant room state
 │   │       ├── room_store.rs      # Encrypted client-owned room definitions (my_rooms.dat)
+│   │       ├── cluster.rs         # Verified cluster roster from SUPERNODE_INFO; member failover
 │   │       ├── quic_relay_client.rs # QUIC relay client (room audio + signaling fallback)
 │   │       ├── quic_tls.rs        # rustls config for QUIC peer/relay sessions
 │   │       ├── metrics.rs / network_monitor.rs # Per-peer QUIC stats → ConnectionQuality
@@ -1122,12 +1142,13 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 | SFU Subscription | `sfu_subscribe`, `sfu_unsubscribe` |
 | SFU Room Mgmt | `sfu_room_create`, `sfu_room_created`, `sfu_room_invite`, `sfu_room_invite_result`, `sfu_room_invite_generate` |
 | SFU File Transfer | `sfu_file_offer`, `sfu_file_chunk`, `sfu_file_complete` |
+| SFU Video (control plane only) | `sfu_video_state` (camera on/off + join-time reannounce), `sfu_video_keyframe_request` |
 | SFU Group Key | `sfu_group_key`, `sfu_group_key_ack` (inside `encrypted_signal`) |
 | Space Tree | `space_root_announce` |
 | File Transfer | `file_transfer_offer`, `file_transfer_accept`, `file_transfer_reject`, `file_transfer_chunk`, `file_transfer_complete`, `file_transfer_ack`, `file_transfer_error` |
 | Trust | `trust_request`, `trust_accept` |
 | Peer Room Invite | `peer_room_invite` |
-| Hole Punch | `punch_register`, `punch_ready` |
+| Hole Punch (supernode-side only; no client participates today) | `punch_register`, `punch_ready` |
 | Endpoint | `endpoint_update` |
 | Handle | `handle_update` |
 | Avatar | `avatar_config` |
@@ -1145,7 +1166,8 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 | UI | Qt 6 / QML via [CXX-Qt](https://kdab.github.io/cxx-qt/) |
 | QUIC transport | `quinn` + `tokio` + `rustls` |
 | Audio capture / playback | `cpal` + `ringbuf` |
-| Codec | `conquerd-opus` — first-party libopus 1.6.1 wrapper with DRED (Deep Redundancy Encoding) and OSCE (Opus Speech Coding Enhancement) neural voice enhancement. DNN model data compiled in from Xiph.Org source arrays; no third-party crate dependency. |
+| Audio codec | `conquerd-opus` — first-party libopus 1.6.x wrapper (vendored submodule) with DRED (Deep Redundancy Encoding) and OSCE (Opus Speech Coding Enhancement) neural voice enhancement. DNN model data compiled in from Xiph.Org source arrays; no third-party crate dependency. |
+| Video codecs | `conquerd-vpx` — first-party VP8 wrapper over a vendored libvpx submodule, built without libvpx's own `configure`/`make` (needs **perl** for RTCD codegen). Available on every platform. Media Foundation H.264 on Windows via the `windows` crate, using the codec licence the OS already holds. |
 | DSP | `rustfft` (spectral-gate noise suppression), in-house VAD + jitter buffer |
 | Cryptography | `ed25519-dalek`, `x25519-dalek`, `aes-gcm`, `argon2`, `hkdf` |
 | Signaling serialisation | JSON over WebSocket (`tokio-tungstenite`) and QUIC bidirectional streams |
@@ -1218,6 +1240,8 @@ The following network contacts occur automatically or on user action (see [PRIVA
 
 No account credentials, message content, or contact lists are transmitted to ConquerD-operated servers (there are none). Build-attestation metadata (version / build id) may be exchanged directly between peers you connect to.
 
+**Local capture** (camera, screen or window, and audio shared with a video) starts only when you turn the camera on, open the Settings preview, or start a share — never in the background. Captured media goes to the peers in that call and nowhere else: it is not recorded, not written to disk, and room media is E2E-sealed before it reaches a supernode. Two things are worth reading before you share: a whole-screen share includes anything that pops up over it, and per-application audio capture needs Windows 10 build 20348 or later — on older builds it **falls back to whole-machine audio**. Full detail in [PRIVACY.md](PRIVACY.md#camera-screen-and-shared-audio-capture).
+
 ## Release Notes
 
 Detailed, per-version release notes are published with each [GitHub release](https://github.com/ConquerD/ConquerD/releases). The summary below covers the **1.0** milestone.
@@ -1227,17 +1251,18 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 - **Zero-trust P2P architecture** — direct peer-to-peer; no central server stores your data. Ed25519 identity with derived peer IDs, invite-only discovery via signed `conquerd://` links, forward-secret handshakes (ephemeral X25519 + HKDF + AES-GCM).
 - **Chat-first UX** — text is the primary interaction after connecting; voice is opt-in per conversation. Per-conversation scroll persistence, typing indicators, unread badges on taskbar + tray.
 - **Voice calls** — low-latency Opus over QUIC, push-to-talk and voice activation, spectral-gate noise suppression, jitter buffer with de-click.
+- **Video and screen sharing** — negotiated H.264/VP8, pre-encode picture-in-picture, a separately-mixed synchronised track for audio shared with the video, and adaptive bitrate. Complete on Windows; camera capture on Linux and macOS is built but unvalidated, and screen capture is Windows-only (see [Known limitations](#known-limitations)).
 - **Rooms (multi-peer voice)** — client-owned room definitions (`my_rooms.dat`); supernodes host SFU sessions ephemerally over QUIC relay with chat/voice/file parity, idle GC, and reconnect materialization.
 - **Game relay & in-app portal**: `game.relay.v1` opaque datagrams over the identity QUIC relay; three bundled demos (cursor relay, brick breaker, shared drawing) under `<data_dir>/games/`, opened only from the native portal at `conquerd://<supernode_id>/games/<slug>/`. No public WebTransport port or TLS game certs.
 - **Supernode release binaries**: pre-built packages for Linux x86_64, Linux ARM64, and Windows x86_64 on GitHub Releases and nightlies (`scripts/build_supernode.sh` / `scripts/build_supernode.ps1`).
-- **NAT traversal** — UPnP port mapping, QUIC/WebSocket direct connect, supernode relay fallback, relay-coordinated hole punching.
+- **NAT traversal** — UPnP port mapping, QUIC/WebSocket direct connect, ordered WebSocket candidates, and supernode QUIC relay fallback with auto-renewed tickets and an endpoint mailbox.
 - **Security** — signed, transcript-bound signaling with timestamp freshness checks and per-sender replay deduplication; peer revocation with propagation; release-signed P2P updates with Ed25519 + threshold validation; crash/installer logging.
 - **Desktop application** — DPI-aware dark theme, first-run onboarding wizard (display name, identity fingerprint + QR, supernode setup), `conquerd://` URI scheme for one-click invites, system tray with badges, collapsible event log, save-to-PNG invite QR codes.
 
 ### Known limitations
 
 - Desktop only (no mobile clients) for 1.0.
-- **No video calls yet.** The pieces exist — VP8 on every platform (vendored libvpx), H.264 via Media Foundation on Windows, camera capture on Windows/Linux/macOS, negotiated codecs, and an end-to-end encrypted transport — but video is not shipped: there is no audio/video synchronisation, no adaptive bitrate for video, and screen sharing is Windows-only. Progress is tracked in `backlog.md`.
+- **Video is complete on Windows and unvalidated elsewhere.** The full path is built and encrypted end to end — VP8 on every platform (vendored libvpx), H.264 via Media Foundation on Windows, negotiated codecs, camera capture written for Windows/Linux/macOS, audio-led A/V synchronisation, and adaptive bitrate. What is not done is platform reach and proof: **screen and window capture are Windows-only**, **shared application audio is Windows-only**, and the Linux and macOS camera backends have not been run against real hardware. Treat video as working on Windows and provisional elsewhere; remaining items are tracked in `backlog.md`.
 - Supernode discovery is manual (invite-link based).
 
 ## License

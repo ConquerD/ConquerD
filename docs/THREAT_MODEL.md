@@ -8,7 +8,7 @@
 - Long-term Ed25519 identity (private seed)
 - Per-session forward-secret keys (X25519 + HKDF)
 - Signed invites and capability announcements
-- Feature payloads (chat, audio, files, room state)
+- Feature payloads (chat, voice, video, audio shared with a video, files, room state)
 - Supernode relay/SFU forwarding (metadata only)
 - Local stores (encrypted chat history, peer trust graph)
 
@@ -126,6 +126,20 @@
 - Peer trust graph only populated after successful signed handshake.
 
 **Residual:** Physical access or OS compromise (standard for client-only apps).
+
+### 9. Local media capture (camera, screen/window, shared audio)
+**Threats:**
+- A user shares more than they intended — a whole monitor exposes anything that pops up over it, and whole-machine audio capture picks up notifications or another call.
+- Per-application audio capture silently widens: it needs Windows build 20348+, and older builds fall back to **system** audio rather than to silence.
+- A supernode on the media path tries to read the picture, the sound, or their timing.
+
+**Mitigations (current):**
+- Capture starts only on an explicit user action (camera toggle, share start, settings preview) and stops with it; nothing captures in the background, and captured media is never written to disk.
+- Room video and room shared audio are E2E-sealed under the per-room sender key with `MediaKind` AAD domain separation before leaving the client; the supernode forwards `ROOM_VIDEO_TAG` / `ROOM_CONTENT_AUDIO_TAG` through the generic opaque relay path with no media arm and never parses the PTS.
+- Video PTS and codec are bound into the per-frame signature, so a relay cannot re-time or re-label a stream.
+- Both behaviours are disclosed in `PRIVACY.md` (*Camera, screen, and shared-audio capture*), including the pre-20348 fallback.
+
+**Residual:** The exposure is the user's own screen contents and machine audio — a disclosure and UX problem, not a crypto one. The supernode still sees that a media stream exists and its byte volume, plus camera on/off state via `SfuVideoState`.
 
 ## Overall Residual Risk Summary
 - **Traffic analysis / metadata leakage** by relays or network observers (accepted for usability).  

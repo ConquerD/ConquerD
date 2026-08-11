@@ -108,7 +108,7 @@ pub fn bgra_to_i420_scaled(
     }
     // I420 chroma is subsampled 2x2, so odd output dimensions are not
     // representable and the encoder rejects them.
-    if dst_w % 2 != 0 || dst_h % 2 != 0 {
+    if !dst_w.is_multiple_of(2) || !dst_h.is_multiple_of(2) {
         return None;
     }
     if stride < src_w as usize * 4 {
@@ -181,7 +181,7 @@ pub fn bgra_to_i420_letterboxed(
     dst_w: u32,
     dst_h: u32,
 ) -> Option<super::frame::RawFrame> {
-    if dst_w == 0 || dst_h == 0 || dst_w % 2 != 0 || dst_h % 2 != 0 {
+    if dst_w == 0 || dst_h == 0 || !dst_w.is_multiple_of(2) || !dst_h.is_multiple_of(2) {
         return None;
     }
     let (cw, ch) = fit_within(src_w, src_h, dst_w, dst_h);

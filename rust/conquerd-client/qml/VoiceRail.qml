@@ -736,10 +736,22 @@ Rectangle {
                         width: 320
                         padding: Theme.spacingSm
                         modal: false
+
+                        /// Audio choice for the share that has not started yet.
+                        ///
+                        /// Held here rather than written through to settings
+                        /// because nothing in this menu takes effect until the
+                        /// start button is pressed — abandoning the menu must
+                        /// leave the saved mode exactly as it was.
+                        property string pendingAudioMode: root.contentAudioMode
+
                         // A snapshot, taken each time: windows open and close
                         // constantly, and a list built once at startup would
                         // offer things that are no longer there.
-                        onAboutToShow: root.shareOptionsOpened()
+                        onAboutToShow: {
+                            root.shareOptionsOpened()
+                            pendingAudioMode = root.contentAudioMode
+                        }
                         background: Rectangle {
                             color: Theme.bg2
                             border.color: Theme.border
@@ -896,14 +908,15 @@ Rectangle {
                                 }
                             }
 
-                            // ── Audio, which also starts the share ────────
+                            // ── Audio ─────────────────────────────────────
                             //
-                            // Picking the audio is the commit, so everything
-                            // above it is still editable when the choice is
-                            // made.
+                            // A selection, not a commit: everything in this
+                            // menu stays editable until the start button below
+                            // is pressed, so the audio row can be revisited the
+                            // same way the source and overlays can.
                             Label {
                                 Layout.topMargin: Theme.spacingXs
-                                text: qsTr("Audio — pick one to start sharing")
+                                text: qsTr("Audio")
                                 color: Theme.muted
                                 font.pixelSize: Theme.fontSizeMicro
                             }
@@ -917,34 +930,36 @@ Rectangle {
                                 delegate: Rectangle {
                                     id: audioOption
                                     required property var modelData
+                                    readonly property bool selected:
+                                        modelData.key === sharePopup.pendingAudioMode
+
                                     Layout.fillWidth: true
                                     height: 30
                                     radius: Theme.radiusSm
-                                    color: optHover.hovered ? Theme.bg3 : "transparent"
+                                    color: audioOption.selected ? Theme.accent
+                                        : optHover.hovered ? Theme.bg3
+                                        : "transparent"
+
+                                    Behavior on color { ColorAnimation { duration: Theme.animFast } }
 
                                     Text {
                                         anchors.verticalCenter: parent.verticalCenter
                                         anchors.left: parent.left
                                         anchors.leftMargin: Theme.spacingSm
-                                        // The last choice made is marked, not
-                                        // pre-applied: this list is a set of
-                                        // actions, so a "selected" row with no
-                                        // way to confirm it would read as a
-                                        // share that had already started.
-                                        text: (audioOption.modelData.key === root.contentAudioMode
-                                                ? "• " : "   ")
+                                        // The dot carries the same meaning as
+                                        // the fill, for anyone the blue does
+                                        // not reach.
+                                        text: (audioOption.selected ? "• " : "   ")
                                             + audioOption.modelData.label
-                                        color: Theme.text
+                                        color: audioOption.selected ? Theme.textInv : Theme.text
                                         font.pixelSize: Theme.fontSizeCaption
                                     }
                                     HoverHandler { id: optHover }
                                     MouseArea {
                                         anchors.fill: parent
                                         cursorShape: Qt.PointingHandCursor
-                                        onClicked: {
-                                            sharePopup.close()
-                                            root.shareRequested(audioOption.modelData.key)
-                                        }
+                                        onClicked: sharePopup.pendingAudioMode
+                                            = audioOption.modelData.key
                                     }
                                 }
                             }
@@ -955,6 +970,28 @@ Rectangle {
                                 text: root.shareAudioHint()
                                 color: Theme.muted
                                 font.pixelSize: Theme.fontSizeMicro
+                            }
+
+                            // ── Commit ────────────────────────────────────
+                            //
+                            // Bottom right, where the confirming action of a
+                            // dialog is looked for, and green because it is the
+                            // one control here that puts a picture on the wire.
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.topMargin: Theme.spacingXs
+                                spacing: Theme.spacingXs
+
+                                Item { Layout.fillWidth: true }
+
+                                StyledButton {
+                                    success: true
+                                    text: qsTr("Start sharing")
+                                    onClicked: {
+                                        sharePopup.close()
+                                        root.shareRequested(sharePopup.pendingAudioMode)
+                                    }
+                                }
                             }
                         }
                     }

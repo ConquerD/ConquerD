@@ -646,6 +646,10 @@ impl ConnectionManager {
                     // else will prompt us either — the members already here see
                     // no join from us worth replaying to.
                     self.reannounce_video_state(&room_id).await;
+                    // Same for our subscriptions: the sibling defaults to
+                    // forwarding every sender, so failing over silently undoes
+                    // the saving until the UI next happens to change a tile.
+                    self.resend_video_subscriptions().await;
                 }
                 // Reconcile the room group key against the authoritative key
                 // group (participants + subscribers) so text-only members are
@@ -2434,6 +2438,25 @@ impl ConnectionManager {
     ) -> bool {
         self.feature_registry
             .gate_inbound_through_feature(feature_id, sender, byte_count)
+    }
+
+    /// Inbound gate for relayed room media, charged against the **supernode**.
+    ///
+    /// Split from [`check_inbound_feature_quota`](Self::check_inbound_feature_quota)
+    /// because that bucket then holds every sender in the room rather than one
+    /// peer, so the per-sender rate is the wrong meter for it — see
+    /// [`FeatureRegistry::gate_inbound_fanout_through_feature`].
+    pub(super) fn check_inbound_fanout_quota(
+        &self,
+        feature_id: &str,
+        supernode_id: &str,
+        byte_count: usize,
+    ) -> bool {
+        self.feature_registry.gate_inbound_fanout_through_feature(
+            feature_id,
+            supernode_id,
+            byte_count,
+        )
     }
 
     /// Gate an inbound payload through the framework's per-feature quota.

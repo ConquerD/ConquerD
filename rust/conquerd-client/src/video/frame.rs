@@ -52,8 +52,8 @@ impl RawFrame {
     /// Whether the plane lengths agree with the declared dimensions.
     pub fn is_consistent(&self) -> bool {
         let (cw, ch) = (self.width / 2, self.height / 2);
-        self.width % 2 == 0
-            && self.height % 2 == 0
+        self.width.is_multiple_of(2)
+            && self.height.is_multiple_of(2)
             && self.y.len() == (self.width * self.height) as usize
             && self.u.len() == (cw * ch) as usize
             && self.v.len() == (cw * ch) as usize

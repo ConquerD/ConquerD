@@ -8,9 +8,9 @@ on:
     branches: [main, develop]
 
 env:
-  RUST_TOOLCHAIN: "1.89.0"
+  RUST_TOOLCHAIN: "1.97.1"
   # Pinned so CI never builds "latest" cargo-audit, whose MSRV can outrun the
-  # pinned toolchain (rustsec/audit-check did exactly that). Known-good on 1.89.
+  # pinned toolchain (rustsec/audit-check did exactly that). Known-good on 1.97.
   CARGO_AUDIT_VERSION: "0.22.1"
 
 jobs:

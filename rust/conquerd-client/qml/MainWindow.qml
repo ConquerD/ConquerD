@@ -828,15 +828,21 @@ ApplicationWindow {
 
     /// Peers whose video is on screen right now — expanded tiles plus popouts.
     ///
-    /// Shared application audio is gated on this: that audio is one half of a
-    /// picture, so playing it to someone who never opened the tile gives them a
-    /// noise with no context and no visible control to stop it.
+    /// Two things are gated on this, for the same underlying reason:
+    ///
+    /// * **Shared application audio**, because that audio is one half of a
+    ///   picture — playing it to someone who never opened the tile gives them a
+    ///   noise with no context and no visible control to stop it.
+    /// * **Which senders the supernode forwards video from**, because a tile
+    ///   nobody opened is a stream nobody decodes, and in a room of 1080p
+    ///   senders that is most of a member's downlink spent on nothing.
     ///
     /// Derived rather than maintained by hand. Both inputs are reassigned
     /// wholesale on every change, so one binding cannot miss an update the way
     /// the five call sites that mutate them could — and a missed *removal* is
-    /// the failure that matters, since it leaves a closed tile audible.
-    readonly property var contentAudioViewers: {
+    /// the failure that matters, since it leaves a closed tile audible and its
+    /// stream still arriving.
+    readonly property var watchedVideoPeers: {
         var out = root.expandedVideoPeers.slice()
         for (var pid in root.videoPopouts) {
             if (root.videoPopouts[pid] && out.indexOf(pid) === -1)
@@ -845,12 +851,25 @@ ApplicationWindow {
         return out
     }
 
-    onContentAudioViewersChanged: {
-        // Guarded: this binding evaluates during component completion, which
-        // can precede the backend object being constructed.
-        if (typeof backend !== "undefined" && backend)
-            backend.setContentAudioViewers(JSON.stringify(root.contentAudioViewers))
+    onWatchedVideoPeersChanged: root.publishWatchedVideoPeers()
+
+    /// Push the watched set to the backend: what to play, and what to receive.
+    ///
+    /// Guarded because this runs during component completion, which can precede
+    /// the backend object being constructed.
+    ///
+    /// Also called on completion with an empty set, which is deliberate and not
+    /// a no-op: to the supernode "no subscription yet" means *forward
+    /// everything*, so a member who opens no tiles only stops paying for the
+    /// room's video once they have actually said so.
+    function publishWatchedVideoPeers() {
+        if (typeof backend === "undefined" || !backend)
+            return
+        var json = JSON.stringify(root.watchedVideoPeers)
+        backend.setContentAudioViewers(json)
+        backend.setVideoSubscriptions(json)
     }
+
 
     function isVideoExpanded(peerId) {
         return root.expandedVideoPeers.indexOf(peerId) !== -1
@@ -1060,6 +1079,11 @@ ApplicationWindow {
     Component.onCompleted: {
         settingsModel.load()
         applyThemePreference(settingsModel.theme)
+
+        // Announce the (empty) watched set. Not a no-op: the supernode treats
+        // "never subscribed" as "forward everything", so this is what starts
+        // the saving for a member who opens no tiles.
+        root.publishWatchedVideoPeers()
 
         // ── Push saved avatar config into the bridge so avatarSvg() uses it ─
         backend.setAvatarConfigJson(settingsModel.avatar_config_json)

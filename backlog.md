@@ -3,9 +3,10 @@
 Open work deferred while the core framework stabilized. The two original drivers — **E2E text
 chat** and **supernode cluster support** — have both landed, as has Space Merkle **Layer 1**,
 room voice/chat/file E2E (sender keys), and group-key reliability (elected keyer, ack + reseal
-loop, fail-closed room content). Video calling has substantial in-tree scaffolding (transport,
-Windows capture/encode, UI) but is **not product-finished** — see the Video section below. What
-remains is grouped below by theme; ordering within each group is rough priority.
+loop, fail-closed room content). Video calling — including A/V sync and adaptive bitrate — is complete
+on Windows; what remains there is platform reach and validation, not media plumbing. See the
+Video section below. What remains is grouped below by theme; ordering within each group is rough
+priority.
 
 **Durable *shipped* invariants live in `agents.md`, not here** — when an item below lands, move its
 invariant into the relevant `agents.md` section and delete it from this file rather than marking it
@@ -170,11 +171,15 @@ treehead signature, not a per-room/per-grant fan-out.
 
 ## Video calling — remaining
 
-Large in-tree feature, **not product-finished**. README still correctly says “No video calls yet.”
-Transport, capability ads, quotas, room E2E, camera-state signaling, Windows capture/encode, and
-call-UI plumbing are substantially built under `rust/conquerd-client/src/video/` +
-`connection_manager/manager/video_session.rs` + QML `VideoTile` / `VideoRegion` / settings preview.
-What follows is open work to make video a shippable, cross-platform capability.
+Large in-tree feature, **complete on Windows and unproven elsewhere**. Transport, capability ads,
+quotas, room E2E, camera-state signaling, codec negotiation, A/V sync, adaptive bitrate, Windows
+capture/encode, and call UI are built under `rust/conquerd-client/src/video/` +
+`connection_manager/manager/video_session.rs` + the media-layer modules + QML `VideoTile` /
+`VideoRegion` / `VideoPopoutWindow` / `VoiceRail` share control / settings preview.
+
+What follows is what stands between that and a cross-platform capability worth calling shipped.
+It is now **platform reach and validation**, not media plumbing — if you are about to write a
+design for sync or bitrate control, stop and read `agents.md` first, both are done.
 
 ### Shipped scaffolding (do not re-litigate)
 
@@ -184,7 +189,17 @@ codec invariant (Feature Module
 Reference), room-video opacity and `MediaKind::Video` AAD separation (Supernode Opacity), and the
 `src/video/` module map with the Windows-only capture caveat (Architecture Notes). Also shipped and
 not re-litigated here: quality presets (low / balanced / high), settings device list + local preview,
-and the in-call camera toggle.
+the in-call camera toggle, the `VoiceRail` share menu (source + overlays + audio choice at start),
+**audio-led A/V sync** (`media_clock.rs` / `media_sync.rs` / `content_playout.rs`), the
+**content-audio track** (`0x08` / `0x09`, `core.audio.content.v1` / `room.audio.content.sfu`), and
+**video adaptive bitrate** (`video/sender.rs`, sharing the audio ABR stats tick).
+
+**Docs are done too, as of 2026-08-07** — README video section / Known limitations / capabilities
+table, `agents.md` (media-layer invariants, channel tags, codec + opacity rules), and the
+`PRIVACY.md` *Camera, screen, and shared-audio capture* disclosure covering whole-screen exposure
+and the pre-20348 per-application-audio fallback. Adding a **new capture backend is a privacy-doc
+change as well as a code change** — that rule now lives in the Documentation Agent role in
+`agents.md`. Do not re-open a docs item for video; extend those sections in place.
 
 ### Still open (rough priority)
 
@@ -220,11 +235,18 @@ and the in-call camera toggle.
    |---|---|---|---|
    | Windows `MfCamera` | ✅ | ✅ | ✅ (dev machine) |
    | Linux `V4l2Camera` | ✅ (WSL + CI) | ✅ format choice | ❌ WSL has no `/dev/video*` |
-   | macOS `AvfCamera` | ❌ **never compiled** | — | ❌ no Mac on the team |
+   | macOS `AvfCamera` | ✅ Rust half (verified 2026-08-07) | — | ❌ no Mac on the team |
 
-   The macOS row is the important one: the Objective-C shim and its Rust FFI have **never been
-   through a compiler**. The new `test-macos` CI job is the first thing that will build them, and
-   it should be expected to need a round or two of fixes rather than passing first try.
+   The macOS Rust now type-checks clean under `-D warnings` via the `lint-macos` feature, which
+   is checkable from any host:
+
+   ```
+   cargo clippy -p conquerd-client --no-default-features --features lint-macos -- -D warnings
+   ```
+
+   That covers the Rust FFI only. The **Objective-C shim genuinely needs a Mac to compile and
+   link** — the `test-macos` CI job is the only thing exercising it, so treat a green run there
+   as the real signal, not a local clippy pass.
 
    Unverified on Linux specifically: format negotiation against a real driver (V4L2 substitutes
    silently), stride handling in each of the three accepted formats, buffer starvation under
@@ -243,80 +265,18 @@ and the in-call camera toggle.
    - Direct-call → temporary SFU fallback still routing video on the room path (`video_route`).
    - Failure modes: no camera, camera in use, encoder unavailable, quota shed, stall vs
      intentional camera-off (`SfuVideoState` is the edge signal).
-   Gate “video calls ship” (and drop the README bullet) on a written manual checklist, not compile
-   alone.
+   Gate “video calls ship” on a written manual checklist, not compile alone. The README now
+   describes video as complete on Windows and unvalidated elsewhere — this checklist is what
+   replaces that hedge with a claim.
 
-4. **Media layer: content audio + video on one clock (A/V sync).**
+4. **Content-audio capture off Windows.**
 
-   **Design decided 2026-07-30: add a media layer beside the voice path, do not modify it.**
+   The media layer itself is **done** — `SessionMediaClock`, PTS on video fragments, the
+   `core.audio.content.v1` / `room.audio.content.sfu` wire, audio-led receiver sync, and the
+   opaque supernode fan-out all shipped 2026-08-02. Durable invariants live in `agents.md`
+   (media-layer module map + content-audio playout invariants); do not re-derive the design here.
 
-   The earlier plan put a presentation timestamp on the *existing* audio wires. That is now
-   rejected. Two facts drove the change:
-
-   - **Direct audio has no sequence number.** The wire is
-     `[AUDIO_TAG][id_len][peer_id][opus]` — raw Opus with nothing to hang a timestamp off, so it
-     is a full reframing of a live format, not a field addition.
-   - **Room audio's `seq` is bound into the crypto AAD**, so adding a field there touches sealing
-     and needs golden vectors proving old frames still verify.
-
-   Against that: the voice path is the most battle-tested code in the product (jitter buffer, ABR,
-   DRED/OSCE, VAD, noise gate, PLC, cross-cluster replication, WS fallback) and **it ships today,
-   while video does not**. Changing a working wire for a feature that does not exist yet is the
-   wrong risk trade. A separate layer is purely additive: if it breaks, video breaks, and video is
-   already not shipping.
-
-   ### Shape
-
-   | Stream | Sync need | Path |
-   |---|---|---|
-   | **Mic / voice** | Loose — lip sync on a 640x360 tile is forgiving | **Unchanged.** `core.audio.opus` / `room.audio.sfu`, no PTS, no clock |
-   | **Content audio** (game, browser, screen share, music) | **Tight** — a gunshot before the muzzle flash is glaring | **New**, stamped from the same clock as video |
-   | **Video** | — | Existing path, gains a PTS field |
-
-   Content audio and video are both captured locally and stamped from one `SessionMediaClock`, so
-   they share a timeline by construction — which is most of the sync problem gone. The receiver
-   runs content audio as the master and slaves video to it, exactly as the audio-led design below
-   describes; the mic stream plays on its own existing path, independently.
-
-   **This merges the old items 4 and 5.** They were sequential (sync gating content audio); under
-   this design they are one piece of work, and likely less of it.
-
-   ### What this deliberately does not solve
-
-   **Lip sync for a talking-head call.** The mic is not on the synced timeline, so a face and its
-   voice can drift by whatever the two paths' buffering differs by. Accepted for v1: the target
-   was always "some sync, not frame-perfect", and a small webcam tile is forgiving. If it proves
-   inadequate, the mic can be *additionally* carried on the media layer during video calls — an
-   optional follow-on, not a prerequisite, and one that would need a clean handoff at camera
-   toggle.
-
-   ### Wire
-
-   Tags `0x08`–`0x0F` are free in the first-party range, and `classify` falls through to
-   `FrameClass::Other`, so the supernode forwards a new tag opaquely with **no media logic** —
-   the same property `ROOM_VIDEO_TAG` relies on. The SFU active-speaker gate reads `SfuAudio`
-   only and never sees this stream.
-
-   - `core.audio.content.v1` (direct) and `room.audio.content.sfu` (relay), sitting beside
-     `core.audio.opus` / `room.audio.sfu`.
-   - One Opus frame fits one datagram, so no fragmentation: `[ver][flags][pts:u64 BE]
-     [sender_len][sender][sig:64][payload]`, payload sealed under the room sender key on the relay
-     path and raw on the direct path (matching how direct video is unsealed — mTLS, no relay).
-   - PTS is `u64` microseconds since session `t0`, **bound into the signature and AAD** so a relay
-     cannot shift a stream's timing. Advisory timing is not worth having.
-   - Video fragments gain the same `pts` field (`FRAGMENT_VERSION` -> `0x03`), bound into
-     `video_frame_signing_bytes` as the codec byte already is.
-   - Capability params advertise `av_sync=1`, `pts_unit=us`. No mutual support -> no content audio,
-     and video free-runs as it does today.
-
-   ### Encoding
-
-   Content audio must **not** run the voice DSP stack: noise gate, VAD-gated send, and
-   `Application::Voip` will suppress or mangle music and game audio. It wants
-   `Application::Audio`, a higher bitrate, and no gating. This is precisely why mix-at-sender onto
-   the voice stream was rejected — one encoder cannot have two application modes.
-
-   ### Capture (per platform, the unbuilt half)
+   What is left is capture on the other two platforms:
 
    | Platform | Source | State |
    |---|---|---|
@@ -327,89 +287,35 @@ and the in-call camera toggle.
    Whichever backend a platform gets, it must report **device capture offsets** per frame rather
    than counting frames out: a loopback device emits nothing at all while its source is quiet, and
    a counter silently converts every silence into permanent audio-behind-video lag. See
-   `CaptureTimeline`.
+   `CaptureTimeline`, and the content-audio playout invariants in `agents.md`.
 
    Pairs naturally with screen capture (item 1), which needs the same permissions on Linux/macOS.
-   **Echo hazard:** if content is system loopback, remote peers' audio played locally re-enters
-   the loop. Needs exclude-our-own-output, ducking, or a virtual cable.
+   **Echo hazard (open on every platform):** if content is system loopback, remote peers' audio
+   played locally re-enters the loop. Needs exclude-our-own-output, ducking, or a virtual cable.
 
-   ### Receiver policy (content audio master, video slave)
+   Still unsolved by design: **lip sync for a talking-head call.** The mic is not on the synced
+   timeline, so a face and its voice can drift by whatever the two paths' buffering differs by.
+   Accepted: the target was "some sync, not frame-perfect", and a small webcam tile is forgiving.
+   If it proves inadequate, the mic can be *additionally* carried on the media layer during video
+   calls — a follow-on, and one that would need a clean handoff at camera toggle.
 
-   - Content audio keeps a jitter buffer and a 20 ms playout tick, as voice does.
-   - On each played content frame for peer P, set `playout_anchor[P] = (pts_a, Instant::now())`.
-   - On PLC / silence, **advance expected audio PTS** by ~20 ms so video does not wait forever.
-   - Decoded video `{pts_v, pixels}` -> per-peer hold queue; display tick (~30-60 Hz):
-     - `audio_now_pts = extrapolate(playout_anchor[P])`
-     - drop if `pts_v < audio_now_pts - late_tol`
-     - show if `pts_v <= audio_now_pts + early_tol`
-     - else hold last frame
-   - Starting constants (tunable): `late_tol` 40-60 ms; hold window 40-80 ms; max queue ~5-8
-     frames; stall placeholder after ~300-500 ms without a renderable frame.
-   - Light EMA of measured offset; step-correct by skip/hold frames only — **never** resample
-     audio in v1. Reset on camera off/on, long gap, keyframe after stall, session restart.
-   - **When no content audio is present** (camera-only call), video free-runs exactly as today.
-     There is no fallback to slaving video against the mic stream — that is the lip-sync
-     follow-on, not v1.
-   - **Never block a playout tick on video.**
+5. **Validate A/V sync on a real network.**
 
-   ### Phases
+   The sync logic has unit coverage with a fake clock, but the lab measurement it was specified
+   against has not been run: clap+flash under a clean network, ~1–2 % loss, and a keyframe burst,
+   plus a multi-peer check that per-sender timelines never cross. Target is ±40–80 ms audio-led.
+   Also confirm the voice path is byte-identical to before the media layer landed — that was the
+   central premise of building beside it rather than modifying it.
 
-   | Phase | Work | Rough effort |
-   |---|---|---|
-   | **A — Clock** | `SessionMediaClock` (`media_clock.rs`); created on video session start, destroyed on end; thread-safe `now_pts_us()`. No wire change. | 0.5-1 d |
-   | **B — Video PTS** | Fragment `0x03` + PTS bound into signing bytes; golden vectors. Isolated from audio entirely. | 1-2 d |
-   | **C — Content audio transport** | Tags, capability descriptors, quotas, seal/sign, send + receive, supernode opaque fan-out test. | 2-4 d |
-   | **D — Content capture** | WASAPI loopback first (matching Windows-first video), then PipeWire monitor. macOS last. | 2-4 d |
-   | **E — Receiver sync** | Playout anchor, video hold/drop queue, debug offset metrics. **Hardest product logic.** | 3-5 d |
-   | **F — Validation** | Clap+flash under clean net, ~1-2% loss, keyframe burst; multi-peer per-sender. | 2-3 d |
-
-   Phases A and B are useful on their own and touch nothing that ships.
-
-   ### Ship checklist
-
-   - [ ] Voice path byte-identical to before — diff it and confirm
-   - [ ] One `SessionMediaClock` per video session; not reused across calls
-   - [ ] Content audio and video stamped at capture/mix, never post-encode
-   - [ ] PTS bound in signature / AAD on both streams
-   - [ ] Receiver: content audio master, video hold/drop to PTS
-   - [ ] Per-peer timelines only; PLC advances audio PTS
-   - [ ] Camera-only call still free-runs video with no regression
-   - [ ] Lab offset inside +/-40-80 ms (clean / light loss / keyframe burst)
-   - [ ] `av_sync` graceful degrade for peers without it
-   - [ ] Supernode still opaque; no PTS logic in the SFU
-   - [ ] Content audio never routed through the voice DSP stack
-
-   ### Files (expected touch set)
-
-   | Area | Likely paths |
-   |---|---|
-   | Clock | new `conquerd-client/src/media_clock.rs`; `ui/bridge.rs` lifecycle |
-   | Video wire | `video/fragment.rs`, `video/mod.rs` (signing), `manager/video_session.rs` |
-   | Content audio | new module; `conquerd-features` `channel_frame.rs` + `wellknown.rs` |
-   | Capture | new per-platform loopback backends |
-   | Playout | `call_controller.rs` (new stream, existing voice untouched); `video/receiver.rs` |
-   | Tests | fragment/crypto/transport; sync tests with a fake clock |
-
-   Supernode stays **content-opaque**: forward the new tag verbatim, never parse PTS. Do not
-   teach the SFU a media timeline.
-
-6. **Video adaptive bitrate (ABR).**
-   Audio has room/direct ABR in `call_controller`. Video encoder exposes `set_bitrate` (MF path
-   retargets a live MFT without full rebuild) but there is no closed-loop controller driving it
-   from loss / underrun / fragment-drop signals. Wire a video ABR loop (or share a media-quality
-   signal) so keyframe bursts and 720p presets do not melt constrained relays. Content-audio
-   bitrate (item 4) should participate in the same congestion story so video + music do not
-   starve each other on the relay quota. ABR must not fight A/V sync (item 5): prefer dropping
-   or downscaling video before lengthening the audio buffer in ways that push lip-sync out of band.
-
-7. **Receiver resilience polish.**
+6. **Receiver resilience polish.**
    Decode thread, per-peer decoder map, queue drop, and keyframe-request-on-decode-failure exist;
    still open: PLI/FIR cadence tuning, idle decoder GC under many room members, graceful degrade
    when Qt Multimedia / sink is absent (`cfg(qt_multimedia)` already degrades UI — keep that
-   path honest in docs and settings). Align drop/keyframe policy with the A/V sync hold queue
-   (item 5) so a PLI storm does not empty the video timeline while audio keeps playing.
+   path honest in docs and settings). Align drop/keyframe policy with the shipped A/V sync hold
+   queue (`media_sync.rs`; invariants in `agents.md`) so a PLI storm does not empty the video
+   timeline while audio keeps playing.
 
-8. **UX completeness.**
+7. **UX completeness.**
    Camera toggle + settings preview + tiles exist; remaining polish as the path stabilizes:
    - Clear “video unavailable on this platform / no encoder” messaging (not a silent toggle fail).
    - Screen-share picker UX (monitor/window ids are `monitor:` / `window:` in settings today;
@@ -418,14 +324,6 @@ and the in-call camera toggle.
    - Confirm local-preview vs remote tile identity (preview uses local public id).
    - Separate level meters / mute for voice vs content when both are live (mix-at-sender still
      benefits from local “content mute” and “mic mute”).
-
-9. **Docs + agent contract.**
-   When video is product-ready (or when capability IDs/codec change): update README (“No video
-   calls yet”, Built-in Capabilities table, privacy surface — content/loopback capture is a new
-   disclosure), `agents.md` Feature Module Reference / channel-tag table, and supernode opacity
-   notes if any control-plane fields grow. Keep supernode opacity: still forward opaque
-   fragments; never log or persist frame payloads. Document A/V sync expectations (item 5)
-   so agents do not treat independent seq counters as “good enough” for shipping video.
 
 ### Video non-goals (near-term)
 

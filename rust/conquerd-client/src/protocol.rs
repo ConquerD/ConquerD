@@ -115,6 +115,18 @@ pub enum MessageType {
     /// Peer → room: "my camera just turned on/off", so receivers can light up
     /// or tear down a tile without waiting for the first frame to arrive.
     SfuVideoState,
+    /// Receiver → supernode: "these are the senders whose video I want".
+    ///
+    /// The whole set, every time, rather than add/remove deltas: a lost or
+    /// reordered delta leaves the supernode's idea of what to send permanently
+    /// out of step with the tiles that are actually open, and nothing would
+    /// ever correct it. Replacing the set makes every message self-healing.
+    ///
+    /// Purely an optimisation of what crosses the wire — it decides *delivery*,
+    /// not access. Frames stay end-to-end sealed under the room key, so
+    /// subscribing to a sender reveals nothing a member could not already
+    /// receive, and the supernode learns only which tiles are open.
+    SfuVideoSubscribe,
 
     // E2E room group-key distribution (sealed per member; supernode forwards blind)
     SfuGroupKey,
@@ -232,6 +244,7 @@ impl MessageType {
             Self::SfuAudio => "sfu_audio",
             Self::SfuVideoKeyframeRequest => "sfu_video_keyframe_request",
             Self::SfuVideoState => "sfu_video_state",
+            Self::SfuVideoSubscribe => "sfu_video_subscribe",
             Self::SfuGroupKey => "sfu_group_key",
             Self::SfuGroupKeyAck => "sfu_group_key_ack",
             Self::SpaceRootAnnounce => "space_root_announce",

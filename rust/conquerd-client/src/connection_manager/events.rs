@@ -561,6 +561,19 @@ pub enum ConnectionCommand {
     RequestVideoKeyframe {
         peer_id: String,
     },
+    /// Tell the supernode which senders' video we actually want.
+    ///
+    /// The whole set, not a delta — see
+    /// [`MessageType::SfuVideoSubscribe`](crate::protocol::MessageType::SfuVideoSubscribe).
+    /// Room-only: on a direct session there is no relay deciding who to fan to,
+    /// and the peer either sends or does not.
+    ///
+    /// Idempotent and cheap, so callers re-send freely rather than tracking
+    /// whether the supernode already knows — the manager suppresses repeats of
+    /// an unchanged set.
+    SetVideoSubscriptions {
+        senders: Vec<String>,
+    },
     /// Announce our camera going on or off.
     ///
     /// Low rate, so it rides the signed JSON signaling path rather than the

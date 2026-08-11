@@ -20,7 +20,7 @@
         powershell -ExecutionPolicy Bypass -File scripts/ci_local.ps1 -SkipTests -SkipAudit
 
 .PARAMETER RustToolchain
-    Must match env.RUST_TOOLCHAIN in ci.yml (default: 1.89.0).
+    Must match env.RUST_TOOLCHAIN in ci.yml (default: 1.97.1).
 
 .PARAMETER SkipTests
     Skip cargo test --release (saves several minutes).
@@ -34,7 +34,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$RustToolchain = '1.89.0',
+    [string]$RustToolchain = '1.97.1',
     [switch]$SkipTests,
     [switch]$SkipAudit,
     [switch]$SkipOpusFetch

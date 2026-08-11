@@ -44,9 +44,18 @@ impl FeatureRegistry {
         Self::default()
     }
 
-    /// Extract quota params from a descriptor, using defaults where absent.
+    /// Extract inbound quota params from a descriptor, using defaults where
+    /// absent.
     fn quota_params_for(descriptor: &CapabilityDescriptor) -> QuotaParams {
         QuotaParams::from_params(&descriptor.params)
+    }
+
+    /// Extract outbound quota params, which may legitimately differ: an SFU
+    /// feature's outbound bucket is keyed on the *recipient* and carries every
+    /// sender fanned to them, while the inbound one carries a single sender. See
+    /// [`QuotaParams::from_params_outbound`].
+    fn quota_params_outbound_for(descriptor: &CapabilityDescriptor) -> QuotaParams {
+        QuotaParams::from_params_outbound(&descriptor.params)
     }
 
     /// Register a capability. Fails if `id` is already present or the
@@ -285,6 +294,38 @@ impl FeatureRegistry {
             .try_consume(feature_id, peer_id, byte_count, quota_params)
     }
 
+    /// Gate an inbound message whose bucket carries a **fan-out**, not one
+    /// sender.
+    ///
+    /// Same bucket as [`gate_inbound_through_feature`](Self::gate_inbound_through_feature),
+    /// metered at the outbound rate. A relay client charges inbound room media
+    /// against the *supernode it arrived from* rather than the sender — the true
+    /// sender is not known until the frame parses, and trusting a self-declared
+    /// id for accounting would let one peer exhaust another's budget — so that
+    /// single bucket carries every sender in the room at once, exactly like the
+    /// supernode's own outbound bucket. Metering it per-sender would cap a
+    /// watcher at one incoming stream no matter what the room is allowed.
+    ///
+    /// For a feature with no outbound override the two rates are identical, so
+    /// this differs from the plain inbound gate only where a descriptor has
+    /// deliberately said fan-out costs more.
+    pub fn gate_inbound_fanout_through_feature(
+        &self,
+        feature_id: &str,
+        peer_id: &str,
+        byte_count: usize,
+    ) -> bool {
+        let quota_params = {
+            let g = self.inner.read();
+            match g.get(feature_id) {
+                Some(e) => Self::quota_params_outbound_for(&e.descriptor),
+                None => return true,
+            }
+        };
+        self.quotas
+            .try_consume(feature_id, peer_id, byte_count, quota_params)
+    }
+
     // -- Outbound gating ------------------------------------------------
 
     /// Gate an outbound send through the local feature descriptor's quota.
@@ -303,7 +344,7 @@ impl FeatureRegistry {
         let quota_params = {
             let g = self.inner.read();
             match g.get(feature_id) {
-                Some(e) => Self::quota_params_for(&e.descriptor),
+                Some(e) => Self::quota_params_outbound_for(&e.descriptor),
                 None => return true, // no local descriptor ⇒ pass through unmetered
             }
         };
@@ -713,6 +754,53 @@ mod tests {
             r.gate_through_feature("x.test.perpeer", "peer-b", 10),
             "peer-b should still pass"
         );
+    }
+
+    /// The asymmetry room video needs: outbound is keyed on the *recipient* and
+    /// carries every other sender at once, so it must be larger than the
+    /// per-sender inbound cap — without the inbound cap moving with it, which
+    /// would hand each individual sender the whole room's allowance.
+    #[test]
+    fn room_video_outbound_carries_the_whole_fan_out() {
+        let r = FeatureRegistry::new();
+        r.register(wellknown::room_video_sfu()).unwrap();
+
+        let per_sender = wellknown::VIDEO_SENDER_BYTES_PER_SEC as usize;
+        let per_recipient = wellknown::ROOM_VIDEO_RECIPIENT_BYTES_PER_SEC as usize;
+        assert!(
+            per_recipient > per_sender,
+            "fan-out must get more than one sender's allowance"
+        );
+
+        // One sender's full second is accepted inbound, and a second helping is
+        // not: the per-sender cap is still doing its job. Asked for in bulk
+        // rather than a single byte because the bucket refills against the wall
+        // clock, and at this rate even the microseconds between two calls put a
+        // byte back.
+        assert!(r.gate_inbound_through_feature("room.video.sfu", "sender-a", per_sender));
+        assert!(
+            !r.gate_inbound_through_feature("room.video.sfu", "sender-a", per_sender / 2),
+            "one sender must not exceed the per-sender inbound cap"
+        );
+
+        // A recipient absorbs several senders' worth in the same second.
+        assert!(r.gate_through_feature("room.video.sfu", "watcher", per_sender));
+        assert!(
+            r.gate_through_feature("room.video.sfu", "watcher", per_recipient - per_sender),
+            "the fan-out bucket must hold every sender at once"
+        );
+    }
+
+    /// Features that say nothing about outbound must behave exactly as they did
+    /// before the keys existed — same rate in both directions.
+    #[test]
+    fn outbound_falls_back_to_the_inbound_rate() {
+        let r = FeatureRegistry::new();
+        r.register(wellknown::room_audio_sfu()).unwrap();
+        let p = FeatureRegistry::quota_params_for(&r.get("room.audio.sfu").unwrap());
+        let out = FeatureRegistry::quota_params_outbound_for(&r.get("room.audio.sfu").unwrap());
+        assert_eq!(p.bytes_per_sec, out.bytes_per_sec);
+        assert_eq!(p.datagrams_per_sec, out.datagrams_per_sec);
     }
 
     // --- P1 #6: Room feature quota symmetry tests ---

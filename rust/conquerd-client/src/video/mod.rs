@@ -407,7 +407,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened, encoded);
-        assert_eq!(StubDecoder.decode(&opened).unwrap(), original);
+        assert_eq!(StubDecoder.decode(&opened).unwrap(), Some(original));
     }
 
     /// The impersonation the per-frame signature exists to stop: a room member

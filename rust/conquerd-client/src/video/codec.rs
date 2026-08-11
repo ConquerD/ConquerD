@@ -81,12 +81,20 @@ impl VideoEncoder for Box<dyn VideoEncoder> {
 /// Decodes what a [`VideoEncoder`] produced.
 pub trait VideoDecoder: Send {
     /// Decode one encoded frame.
-    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<RawFrame>;
+    ///
+    /// `Ok(None)` means the frame was **accepted but produced no picture yet**
+    /// — a pipelined decoder holds the first submissions while it fills, and a
+    /// decoder that has not seen a keyframe yet has nothing it could draw. That
+    /// is a normal state, not a failure, and the distinction is load-bearing:
+    /// the receiver escalates on `Err` (keyframe request, then rebuilding the
+    /// decoder) and would tear a healthy decoder down mid-warm-up if the two
+    /// were collapsed into one. See [`super::receiver`].
+    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<Option<RawFrame>>;
 }
 
 /// See the [`VideoEncoder`] box forward above.
 impl VideoDecoder for Box<dyn VideoDecoder> {
-    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<RawFrame> {
+    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<Option<RawFrame>> {
         (**self).decode(encoded)
     }
 }
@@ -128,13 +136,15 @@ impl VideoEncoder for StubEncoder {
 pub struct StubDecoder;
 
 impl VideoDecoder for StubDecoder {
-    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<RawFrame> {
+    /// Never `Ok(None)`: the stub carries a whole picture in every frame, so
+    /// there is no pipeline to fill and nothing to wait for.
+    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<Option<RawFrame>> {
         if encoded.len() < STUB_HEADER_LEN {
             anyhow::bail!("stub frame too short: {} bytes", encoded.len());
         }
         let width = u16::from_be_bytes([encoded[0], encoded[1]]) as u32;
         let height = u16::from_be_bytes([encoded[2], encoded[3]]) as u32;
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             anyhow::bail!("stub frame has bad dimensions {width}x{height}");
         }
 
@@ -152,13 +162,13 @@ impl VideoDecoder for StubDecoder {
 
         let y_end = STUB_HEADER_LEN + y_len;
         let u_end = y_end + c_len;
-        Ok(RawFrame {
+        Ok(Some(RawFrame {
             width,
             height,
             y: encoded[STUB_HEADER_LEN..y_end].to_vec(),
             u: encoded[y_end..u_end].to_vec(),
             v: encoded[u_end..].to_vec(),
-        })
+        }))
     }
 }
 
@@ -210,15 +220,17 @@ impl VideoEncoder for Vp8EncoderAdapter {
 pub struct Vp8DecoderAdapter(conquerd_vpx::Vp8Decoder);
 
 impl VideoDecoder for Vp8DecoderAdapter {
-    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<RawFrame> {
+    /// libvpx decodes each packet on the call that submits it, so like the stub
+    /// this never reports "not yet" — a packet either yields a picture or fails.
+    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<Option<RawFrame>> {
         let f = self.0.decode(encoded)?;
-        Ok(RawFrame {
+        Ok(Some(RawFrame {
             width: f.width,
             height: f.height,
             y: f.y,
             u: f.u,
             v: f.v,
-        })
+        }))
     }
 }
 
@@ -343,7 +355,7 @@ mod tests {
             encoded.len(),
             STUB_HEADER_LEN + RawFrame::packed_len(STUB_WIDTH, STUB_HEIGHT)
         );
-        assert_eq!(StubDecoder.decode(&encoded).unwrap(), frame);
+        assert_eq!(StubDecoder.decode(&encoded).unwrap(), Some(frame));
     }
 
     #[test]
@@ -476,7 +488,7 @@ mod tests {
         let (packet, keyframe) = enc.encode(&original).expect("encode");
         assert!(!packet.is_empty() && keyframe);
 
-        let out = dec.decode(&packet).expect("decode");
+        let out = dec.decode(&packet).expect("decode").expect("a picture");
         assert_eq!((out.width, out.height), (320, 240));
         assert!(out.is_consistent());
     }

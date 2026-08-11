@@ -1,13 +1,13 @@
 # ConquerD Privacy Policy
 
-**Effective date:** 2026-06-08
+**Effective date:** 2026-08-07
 
-ConquerD is a local-first, invite-only peer-to-peer application. Voice, chat,
-and file transfer travel directly between clients you connect to, or through
-volunteer supernodes you explicitly choose to trust. Application payloads are
-encrypted on the wire; supernodes relay signed/encrypted frames and cannot read
-message or audio content. ConquerD does not operate any central servers that
-store your identity, messages, or call data.
+ConquerD is a local-first, invite-only peer-to-peer application. Voice, video,
+chat, and file transfer travel directly between clients you connect to, or
+through volunteer supernodes you explicitly choose to trust. Application
+payloads are encrypted on the wire; supernodes relay signed/encrypted frames and
+cannot read message, audio, or video content. ConquerD does not operate any
+central servers that store your identity, messages, or call data.
 
 ---
 
@@ -25,7 +25,7 @@ optional feature described below (updates, link previews, Ollama, and so on).
 | `identity.json` | Legacy v1 plaintext identity (read-only after migration, if present) |
 | `peers.dat` | Trusted-peer records (encrypted): public keys, handles, relay hints, block state, optional avatar config, build-attestation metadata |
 | `chat_history.db` | Local chat history; message bodies and sender handles are AES-256-GCM encrypted at rest |
-| `settings.json` | App preferences (audio, plugins, privacy toggles, window size, etc.) |
+| `settings.json` | App preferences (audio, video/capture choices, plugins, privacy toggles, window size, etc.) |
 | `my_rooms.dat` | Saved room invites (encrypted) |
 | OS keyring (`conquerd` service) | Optional cached AES unlock key so you are not prompted for your passphrase every launch |
 | OS **Downloads** folder | Files received from peers (saved by the desktop client on completion) |
@@ -90,6 +90,51 @@ QUIC/WebSocket candidates and supernode relay when needed.
 ---
 
 ## Information transmitted when you opt in or take an action
+
+### Camera, screen, and shared-audio capture
+
+**What:** Nothing is captured until you start it. Turning your camera on in a
+call, opening the local preview in **Settings → Video**, or choosing a source
+from the **Share video** control starts capture; stopping the share or the call
+ends it. ConquerD does not capture in the background and does not capture
+while idle.
+
+Three kinds of source can be captured, and they differ in how much they expose:
+
+| Source | Platforms | What it captures |
+|---|---|---|
+| Camera | Windows, Linux, macOS | The camera device you select |
+| Screen or single window | **Windows only** (`Windows.Graphics.Capture`) | Everything visible on the chosen monitor, or the contents of the chosen window |
+| Audio shared with a video | **Windows only** (WASAPI loopback) | Either *all* sound this machine plays, or the sound of one application's process tree |
+
+**Two things worth knowing before you share:**
+
+- **Sharing a whole screen shares everything on it** — notifications, other
+  windows you switch to, and anything that pops up while the share is running.
+- **Whole-machine audio capture picks up every sound the machine plays**,
+  including notification chimes and audio from another call. Per-application
+  capture is narrower, but it requires Windows 10 build 20348 or later; on older
+  builds ConquerD **falls back to whole-machine audio** rather than sharing
+  nothing. If you are on an older Windows build and picked a single application,
+  assume system audio is what your peers hear.
+
+**Where it goes:** only to the peers in that call. Direct 1:1 media travels over
+your authenticated QUIC session to that peer. Room media is end-to-end sealed
+under the per-room sender key before it leaves your machine, so a supernode
+forwards opaque bytes it cannot decode. A supernode can see that a stream is
+flowing, its byte volume, and whether your camera is on or off — never the
+picture or the sound.
+
+**What is not done with it:** captured video and audio are not recorded, not
+written to disk, and not sent to any ConquerD service (there are none). Device
+enumeration for the settings list and the local preview stay on your machine.
+
+**How to disable:** turn the camera off, stop the share, or simply never start
+one. Which audio accompanies a share is chosen when the share starts and is also
+settable in **Settings → Video** (`content_audio_mode` in `settings.json`):
+`auto` follows the source (an application shares its own audio, a monitor shares
+the machine, a camera shares nothing), `system` always shares the whole machine,
+and `off` never shares audio at all.
 
 ### Inline link / video previews in chat
 
@@ -161,6 +206,8 @@ signaling and session channels:
 - Your display name (chosen during onboarding)
 - Your long-term Ed25519 public key (your identity)
 - Messages, voice audio, and files you explicitly send
+- Video and shared audio while you are sharing (see *Camera, screen, and
+  shared-audio capture* above)
 - Optional `AvatarConfig` after handshake (trusted peers only)
 - Negotiated capability descriptors (`CAPABILITY_ANNOUNCE`)
 
@@ -188,6 +235,9 @@ above.
 | [Qt 6 / CXX-Qt](https://www.qt.io/privacy-policy) | Desktop UI | None from Qt itself |
 | [Qt WebEngine](https://www.qt.io/privacy-policy) | Inline previews, supernode portal | Only when you load external or embed URLs (see above) |
 | [quinn](https://github.com/quinn-rs/quinn) | QUIC transport | None |
+| [libopus](https://opus-codec.org/) (vendored, `conquerd-opus`) | Voice and shared-audio codec | None |
+| [libvpx](https://www.webmproject.org/) (vendored, `conquerd-vpx`) | VP8 video codec on every platform | None |
+| OS media APIs (Media Foundation, `Windows.Graphics.Capture`, WASAPI, V4L2, AVFoundation) | Camera / screen / audio capture and H.264 encode | None — local device access only |
 | [egui / eframe](https://github.com/emilk/egui) | Installer UI | None |
 | [Ollama](https://ollama.com/) (user-installed, optional) | Local AI backend | Only the URL you configure |
 

@@ -10,7 +10,7 @@
 # See scripts/coverage.ps1 for the Windows equivalent and full option notes.
 set -euo pipefail
 
-RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-1.89.0}"
+RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-1.97.1}"
 SCOPE="hot"
 HTML=0
 FAIL_UNDER=0

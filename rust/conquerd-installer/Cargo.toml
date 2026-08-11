@@ -16,7 +16,16 @@ path = "src/bin/sign_release_manifest.rs"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "persistence", "x11", "wayland"] }
 egui = "0.31"
 egui_extras = { version = "0.31", features = ["svg"] }
-sevenz-rust = "0.6"
+# Successor to `sevenz-rust`, which was abandoned with an unfixed arbitrary
+# file write (RUSTSEC-2026-0245) and whose advisory names this crate as the
+# migration target.
+#
+# 0.21 is the first series with the fork's own traversal check (`safe_join`),
+# and it needs rustc 1.93 — hence the toolchain floor this crate imposes on the
+# repo. `extract::entry_name_is_safe` screens entry names at our call site as
+# well; that is deliberate belt-and-braces on a component that writes to a
+# user's filesystem, and it is what kept us safe on 0.20 before this bump.
+sevenz-rust2 = "0.21"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,7 +45,7 @@ winresource = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
-sevenz-rust = { version = "0.6", features = ["compress"] }
+sevenz-rust2 = { version = "0.21", features = ["compress"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

@@ -174,6 +174,14 @@ pub enum MessageType {
     /// Peer → room: camera turned on/off.
     #[serde(rename = "sfu_video_state")]
     SfuVideoState,
+    /// Receiver → supernode: the set of senders whose video it wants forwarded.
+    ///
+    /// The one message in this plane the supernode acts on itself rather than
+    /// forwarding: it decides which members each video datagram is fanned to.
+    /// Carries the whole set every time so a lost message cannot leave the
+    /// relay permanently out of step with the receiver's open tiles.
+    #[serde(rename = "sfu_video_subscribe")]
+    SfuVideoSubscribe,
     /// Owner announces a signed Space root; the supernode verifies, stores, and
     /// cluster-gossips it (authenticated room-set sync).
     #[serde(rename = "space_root_announce")]

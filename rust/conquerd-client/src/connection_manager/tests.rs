@@ -1785,6 +1785,94 @@ async fn sfu_media_does_not_fall_back_to_websocket() {
     );
 }
 
+/// Video subscriptions carry the whole set, are suppressed when unchanged, and
+/// are replayed after a failover.
+///
+/// The replay is the part worth pinning: the supernode's copy is per-connection,
+/// so a sibling that takes the room over defaults to forwarding *every* sender.
+/// Without the replay a failover silently undoes the saving and nothing would
+/// ever restore it, because the local set has not changed and the suppression
+/// below would swallow any re-send.
+#[tokio::test]
+async fn video_subscriptions_replace_suppress_and_replay() {
+    use crate::protocol::MessageType;
+
+    fn subscriptions(sent: &[crate::protocol::SignalingMessage]) -> Vec<Vec<String>> {
+        sent.iter()
+            .filter(|m| m.msg_type == MessageType::SfuVideoSubscribe)
+            .map(|m| {
+                m.payload
+                    .get("senders")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    t.cm.test_set_room("SN-AAAA", "room-1");
+
+    // Sorted on the way out, so an unchanged set is recognisable whatever
+    // order the UI happened to list its tiles in.
+    t.cm.test_set_video_subscriptions(vec!["bob".into(), "alice".into()])
+        .await;
+    assert_eq!(
+        subscriptions(&harness::drain_ws(&mut sn)),
+        vec![vec!["alice".to_owned(), "bob".to_owned()]],
+        "the first announcement must go out, sorted"
+    );
+
+    // Same set, different order and with a duplicate: nothing on the wire.
+    t.cm.test_set_video_subscriptions(vec!["bob".into(), "alice".into(), "bob".into()])
+        .await;
+    assert!(
+        subscriptions(&harness::drain_ws(&mut sn)).is_empty(),
+        "an unchanged set must not be re-sent"
+    );
+
+    // Closing every tile is a real subscription, not an absence of one.
+    t.cm.test_set_video_subscriptions(vec![]).await;
+    assert_eq!(
+        subscriptions(&harness::drain_ws(&mut sn)),
+        vec![Vec::<String>::new()],
+        "an empty set must be announced — it is what stops the fan-out"
+    );
+
+    // Failover: re-sent even though the set is identical, because the node
+    // being told is a different one.
+    t.cm.test_resend_video_subscriptions().await;
+    assert_eq!(
+        subscriptions(&harness::drain_ws(&mut sn)),
+        vec![Vec::<String>::new()],
+        "failover must re-announce to a supernode that has never heard it"
+    );
+}
+
+/// Before the UI has said anything there is no set to replay, and announcing an
+/// empty one would be wrong: the supernode's default is "forward everything",
+/// which is exactly right until the first tile decision is made.
+#[tokio::test]
+async fn a_failover_before_any_subscription_announces_nothing() {
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-AAAA");
+    t.cm.test_set_room("SN-AAAA", "room-1");
+
+    t.cm.test_resend_video_subscriptions().await;
+    let sent = harness::drain_ws(&mut sn);
+    assert!(
+        !sent
+            .iter()
+            .any(|m| m.msg_type == crate::protocol::MessageType::SfuVideoSubscribe),
+        "nothing to replay yet, so nothing may be sent"
+    );
+}
+
 /// Camera-state announcements pick their lane from the session kind. Both are
 /// covered because the direct arm was missing entirely at first: the sender was
 /// gated on being in a room, so a 1:1 call announced nothing and the peer's

@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
-use sevenz_rust::decompress_file;
+use sevenz_rust2::{decompress_file_with_extract_fn, default_entry_extract_fn, ArchiveEntry};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Extract a .7z archive into `dest_dir`.
 /// Returns a map of relative paths → SHA-256 hex digests for all extracted files.
@@ -20,15 +20,82 @@ pub fn extract_7z(archive: &Path, dest_dir: &Path) -> Result<HashMap<String, Str
     Ok(files)
 }
 
-/// Decompress a .7z archive with the embedded `sevenz-rust` decoder.
+/// Whether an archive entry name is safe to write under the destination.
+///
+/// A 7z entry carries whatever path string the archive author chose, and
+/// `dest.join(name)` does not defend the destination: `..` walks out of it, and
+/// an absolute name (`/etc/...`, `C:\...`) makes `join` *discard* the
+/// destination entirely and write wherever the name says. That is
+/// RUSTSEC-2026-0245 — an arbitrary file write from opening an archive.
+///
+/// Rejecting the name is the whole check, and rejecting is deliberately all it
+/// does: there is no rewriting-into-safety here, because a release bundle has
+/// no legitimate reason to contain such an entry, and an archive that does is
+/// either corrupt or hostile.
+///
+/// `sevenz-rust2` 0.21 performs an equivalent check of its own (`safe_join`)
+/// before this is ever reached, so in the normal case the decoder rejects the
+/// archive first and this never fires. It is kept anyway: it is one comparison
+/// per entry on a component that writes to a user's filesystem, it is what made
+/// 0.20 safe before the toolchain bump that allowed 0.21, and it means a future
+/// downgrade or a decoder regression cannot silently remove the check. The
+/// tests below assert the *outcome* — nothing lands outside the destination —
+/// rather than which layer produced it.
+fn entry_name_is_safe(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // Normalize separators first: a Windows-style `..\` is a traversal on a
+    // path parsed with Unix rules, where `\` is an ordinary character.
+    let normalized = name.replace('\\', "/");
+    let path = Path::new(&normalized);
+    if path.is_absolute() {
+        return false;
+    }
+    // `.` is allowed through, matching the decoder's own sanitizer: a curdir
+    // component cannot escape anything, and refusing it would reject an
+    // otherwise valid `./ConquerD.exe` — a real archive on the install path,
+    // failed by a guard that is supposed to catch attacks rather than styles.
+    path.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// Decompress a .7z archive with the embedded `sevenz-rust2` decoder.
 ///
 /// Release archives must be built non-solid (`7z a -ms=off`); solid archives
-/// are not fully supported by `sevenz-rust`.
+/// are not fully supported by the decoder.
+///
+/// Every entry is screened by [`entry_name_is_safe`] before a byte is written.
+/// The extraction aborts on the first bad name rather than skipping it: a
+/// bundle containing one is not a bundle we should be installing at all, and
+/// half-extracting it would leave a partial install behind.
 fn decompress_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
     fs::create_dir_all(dest_dir)?;
 
-    decompress_file(archive, dest_dir)
-        .with_context(|| format!("Failed to extract archive: {}", archive.display()))?;
+    let mut rejected: Option<String> = None;
+    let result = decompress_file_with_extract_fn(
+        archive,
+        dest_dir,
+        |entry: &ArchiveEntry, reader: &mut dyn std::io::Read, dest: &PathBuf| {
+            if !entry_name_is_safe(entry.name()) {
+                rejected = Some(entry.name().to_owned());
+                // Stop the walk. The name is reported through `rejected` because
+                // this callback's error type belongs to the decoder.
+                return Ok(false);
+            }
+            default_entry_extract_fn(entry, reader, dest)
+        },
+    );
+
+    if let Some(name) = rejected {
+        bail!(
+            "Refusing to extract {}: entry {:?} escapes the destination directory",
+            archive.display(),
+            name
+        );
+    }
+    result.with_context(|| format!("Failed to extract archive: {}", archive.display()))?;
+
     validate_bundle_layout(dest_dir)?;
     Ok(())
 }
@@ -134,7 +201,7 @@ pub fn extract_7z_with_progress<F>(
 where
     F: Fn(usize, usize),
 {
-    // sevenz-rust doesn't have per-file callbacks, so we extract all at once
+    // sevenz-rust2 doesn't have per-file callbacks, so we extract all at once
     // then walk and hash with progress
     fs::create_dir_all(dest_dir)?;
     decompress_archive(archive, dest_dir)
@@ -482,7 +549,7 @@ mod tests {
 
     #[test]
     fn extract_7z_round_trips_non_solid_bundle() {
-        use sevenz_rust::SevenZWriter;
+        use sevenz_rust2::ArchiveWriter;
         use std::fs::File;
         use std::io::BufWriter;
 
@@ -508,7 +575,7 @@ mod tests {
 
         let archive = src.path().join("bundle.7z");
         let file = File::create(&archive).unwrap();
-        let mut writer = SevenZWriter::new(BufWriter::new(file)).unwrap();
+        let mut writer = ArchiveWriter::new(BufWriter::new(file)).unwrap();
         writer
             .push_source_path_non_solid(&bundle, |_| true)
             .unwrap();
@@ -529,5 +596,100 @@ mod tests {
             hashes.keys().collect::<Vec<_>>()
         );
         validate_bundle_layout(dest.path()).expect("extracted bundle should be complete");
+    }
+
+    /// Entry names that must never reach a write. Both shapes matter:
+    /// `..` walks out of the destination, and an absolute name makes
+    /// `dest.join(name)` discard the destination altogether and write wherever
+    /// the archive says.
+    #[test]
+    fn traversal_entry_names_are_refused() {
+        for name in [
+            "../escaped.txt",
+            "../../escaped.txt",
+            "ConquerD/../../escaped.txt",
+            r"..\escaped.txt",
+            r"ConquerD\..\..\escaped.txt",
+            "/etc/cron.d/pwned",
+            r"C:\Windows\System32\evil.dll",
+            r"\\server\share\evil.dll",
+            "",
+        ] {
+            assert!(
+                !entry_name_is_safe(name),
+                "{name:?} escapes the destination and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_entry_names_are_accepted() {
+        for name in [
+            "ConquerD.exe",
+            "ConquerD/ConquerD.exe",
+            "ConquerD/platforms/qwindows.dll",
+            r"ConquerD\platforms\qwindows.dll",
+            "a.b.c/d-e_f/g.h",
+            // A curdir component cannot escape, and some writers emit it.
+            "./ConquerD.exe",
+            "ConquerD/./platforms/qwindows.dll",
+        ] {
+            assert!(entry_name_is_safe(name), "{name:?} is a normal entry");
+        }
+    }
+
+    /// The end-to-end version of the above, against a real archive built to
+    /// escape: RUSTSEC-2026-0245 is an arbitrary *file write*, so the property
+    /// that matters is that nothing lands outside the destination — not merely
+    /// that the call returns an error.
+    #[test]
+    fn a_traversal_archive_writes_nothing_outside_the_destination() {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+        use std::fs::File;
+        use std::io::BufWriter;
+
+        let src = TempDir::new().unwrap();
+        let archive = src.path().join("evil.7z");
+        {
+            let file = File::create(&archive).unwrap();
+            let mut writer = ArchiveWriter::new(BufWriter::new(file)).unwrap();
+            // The name is what carries the attack; the payload is irrelevant.
+            let mut entry = ArchiveEntry::default();
+            entry.name = "../escaped.txt".to_owned();
+            entry.has_stream = true;
+            writer
+                .push_archive_entry(entry, Some(&b"pwned"[..]))
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        // `dest` is nested so there is a real directory above it to escape into,
+        // and so the check is "did anything appear up there", not "did the call
+        // fail".
+        let outer = TempDir::new().unwrap();
+        let dest = outer.path().join("install");
+        fs::create_dir_all(&dest).unwrap();
+
+        let err = extract_7z(&archive, &dest).expect_err("a traversal archive must be refused");
+
+        // Asserted *first*, and deliberately: this is the vulnerability. Without
+        // the guard the call still returns an error — `validate_bundle_layout`
+        // rejects the archive for having no `ConquerD.exe` — so a test that led
+        // with the error message would pass while the file sat outside the
+        // destination. Checking the filesystem is what makes this a regression
+        // test for RUSTSEC-2026-0245 rather than for an error string.
+        assert!(
+            !outer.path().join("escaped.txt").exists(),
+            "the archive escaped the destination directory"
+        );
+        // Matched loosely on purpose: either layer may be the one that refuses
+        // — the decoder's own `safe_join` (0.21+) or `entry_name_is_safe` here
+        // — and they word it differently. Pinning the exact text would make
+        // this a test of which layer fired rather than of the refusal.
+        let text = format!("{err:#}").to_lowercase();
+        assert!(
+            text.contains("escape"),
+            "expected a traversal refusal, got: {err:#}"
+        );
     }
 }

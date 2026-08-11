@@ -14,6 +14,25 @@
 //!
 //! These defaults also apply to any feature in an unknown namespace (i.e.
 //! not under `core.*`, `transport.*`, `room.*`, `web.*`, or `game.*`).
+//!
+//! ## Why the outbound rate can differ
+//!
+//! Inbound and outbound already use separate *buckets*; the optional
+//! `quota_bytes_per_sec_outbound` / `quota_datagrams_per_sec_outbound` params
+//! let them use separate *rates* as well. One number cannot serve both roles for
+//! an SFU feature, because the two gates count different things:
+//!
+//! * **Inbound** is keyed on the *sender* and carries one peer's stream. Its job
+//!   is to stop a single client flooding the relay, so it should sit just above
+//!   what one legitimate client can emit.
+//! * **Outbound** is keyed on the *recipient* and carries every other sender
+//!   fanned to them at once. In an N-way room that is (N-1) streams through one
+//!   bucket.
+//!
+//! Sizing the shared number for fan-out would hand every individual sender the
+//! whole room's allowance inbound — losing the per-sender cap as a side effect
+//! of making rooms work. Features that do not fan out simply omit the outbound
+//! keys and both directions keep the same rate, exactly as before.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -52,14 +71,48 @@ impl QuotaParams {
     /// of the quota entirely.  Any other positive value is clamped to a minimum
     /// of `1.0` to avoid near-zero bucket sizes.
     pub fn from_params(params: &serde_json::Value) -> Self {
+        Self::read(
+            params,
+            "quota_bytes_per_sec",
+            "quota_datagrams_per_sec",
+            DEFAULT_BYTES_PER_SEC,
+            DEFAULT_DATAGRAMS_PER_SEC,
+        )
+    }
+
+    /// Rates for the **outbound** direction.
+    ///
+    /// Reads `quota_bytes_per_sec_outbound` / `quota_datagrams_per_sec_outbound`
+    /// and falls back to the inbound rate for each axis independently, so a
+    /// descriptor that says nothing about outbound behaves exactly as it did
+    /// before these keys existed. See the module docs for why a fan-out feature
+    /// needs the two to differ.
+    pub fn from_params_outbound(params: &serde_json::Value) -> Self {
+        let inbound = Self::from_params(params);
+        Self::read(
+            params,
+            "quota_bytes_per_sec_outbound",
+            "quota_datagrams_per_sec_outbound",
+            inbound.bytes_per_sec,
+            inbound.datagrams_per_sec,
+        )
+    }
+
+    fn read(
+        params: &serde_json::Value,
+        bytes_key: &str,
+        datagrams_key: &str,
+        default_bytes: f64,
+        default_datagrams: f64,
+    ) -> Self {
         let raw_bytes = params
-            .get("quota_bytes_per_sec")
+            .get(bytes_key)
             .and_then(|v| v.as_f64())
-            .unwrap_or(DEFAULT_BYTES_PER_SEC);
+            .unwrap_or(default_bytes);
         let raw_dg = params
-            .get("quota_datagrams_per_sec")
+            .get(datagrams_key)
             .and_then(|v| v.as_f64())
-            .unwrap_or(DEFAULT_DATAGRAMS_PER_SEC);
+            .unwrap_or(default_datagrams);
         // 0.0 → unbounded; any other value → at least 1.0.
         let bytes_per_sec = if raw_bytes == 0.0 {
             0.0

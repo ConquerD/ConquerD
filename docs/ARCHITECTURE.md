@@ -15,6 +15,7 @@ graph TD
             SP[SettingsPage]
             BP[BrowserPanel]
             STATS[StatsPanel / ConnectionStatsChip]
+            VID[VideoTile / VideoRegion / VideoPopoutWindow]
         end
 
         subgraph BRIDGE["cxx-qt Bridge  src/ui/"]
@@ -41,7 +42,7 @@ graph TD
             QUIC[QUIC — quinn]
             WS[WebSocket — tungstenite]
             RELAY_C[QuicRelayClient]
-            NAT[relay.rs + UPnP]
+            NAT[upnp.rs — router port mapping]
         end
 
         subgraph ID_LAYER["Identity & Crypto"]
@@ -62,6 +63,22 @@ graph TD
             CPAL_IO[CPAL — audio I/O]
             AEC_R[aec.rs — NLMS echo cancel]
             JB[Jitter Buffer]
+        end
+
+        subgraph MEDIA["Media Layer — video + shared audio"]
+            VCAP["video/camera + screen
+MF / V4L2 / AVFoundation
+Windows.Graphics.Capture"]
+            VCODEC["video/codec
+MF H.264 (Win) / VP8 (all)"]
+            VFRAG["video/fragment + sender
+fragmentation, per-frame sig, ABR"]
+            VRECV[video/receiver — per-sender decode]
+            CCAP["content_capture — WASAPI loopback
+system or per-application"]
+            CPLAY[content_sender / content_playout]
+            MCLK[media_clock — one clock per session]
+            MSYNC[media_sync — audio-led hold/drop]
         end
     end
 
@@ -84,18 +101,26 @@ graph TD
         QUOTA[QuotaSystem — token buckets]
         CF[ChannelFraming — 1-byte tag]
         WK["WellKnown caps
-core.audio.opus
-core.chat.v1
-core.file.v1
-room.audio.sfu
-web.host.app.v1
-game.relay.v1"]
+core.audio.opus / core.chat.v1 / core.file.v1
+core.video.v1 / core.audio.content.v1
+room.audio.sfu / room.video.sfu
+room.audio.content.sfu
+web.host.app.v1 / game.relay.v1"]
+        VCODEC_NEG[video_codec — frozen wire bytes + negotiate]
     end
 
     subgraph OPUS_LIB["conquerd-opus  (Audio Codec)"]
         ENC[OpusEncoder — 48kHz / 128kbps]
         DEC[OpusDecoder — FEC / PLC]
         LIBOPUS[libopus C — DRED / OSCE]
+    end
+
+    subgraph VPX_LIB["conquerd-vpx  (Video Codec)"]
+        VPX[Vp8Encoder / Vp8Decoder]
+        LIBVPX["libvpx C — VP8, generic arch
+built by our build.rs, no SIMD"]
+        MFT["Media Foundation H.264
+Windows only — OS-held AVC licence"]
     end
 
     subgraph INSTALLER["conquerd-installer  (Updater GUI)"]
@@ -116,7 +141,6 @@ example"]
     subgraph EXTERNAL["External"]
         GH_REL[GitHub Releases API]
         OS_KR[OS Keyring]
-        STUN_S[STUN Servers]
         OLLAMA_E[Ollama — local AI]
     end
 
@@ -156,11 +180,24 @@ example"]
     AUDIO --> ENC & DEC
     ENC & DEC --> LIBOPUS
 
+    %% ── Media Layer (video + audio shared with it) ───────
+    AB --> VCAP & CCAP
+    VCAP --> VCODEC --> VFRAG --> QUIC
+    VCODEC --> VPX & MFT
+    VPX --> LIBVPX
+    CCAP --> CPLAY --> QUIC
+    MCLK --> VFRAG & CPLAY
+    QUIC --> VRECV --> MSYNC
+    CPLAY --> ENC
+    MSYNC -.->|"audio-led anchor"| VID
+
     %% ── Feature System (client) ──────────────────────────
     FTR --> REG
     SFU_C --> REG
     FT --> REG
     REG --> DESC & QUOTA & CF & WK
+    WK --> VCODEC_NEG
+    VCODEC --> VCODEC_NEG
 
     %% ── Client → Supernode ───────────────────────────────
     WS -->|"WebSocket — signaling"| SIG
@@ -191,7 +228,6 @@ example"]
     SIGN -.->|"signs release manifest"| GH_REL
 
     %% ── External ─────────────────────────────────────────
-    NAT --> STUN_S
     OLLAMA --> OLLAMA_E
 
     %% ── Style ────────────────────────────────────────────
@@ -205,23 +241,27 @@ example"]
     class ID_C,CRYPTO_C,HS_C,TLS_C box
     class PS_C,CS,RS,SET box
     class CPAL_IO,AEC_R,JB box
+    class VCAP,VCODEC,VFRAG,VRECV,CCAP,CPLAY,MCLK,MSYNC box
     class SIG,HS_S,REL_S,SFU_S,TICKET,WAM,ACCESS,PS_S,CFG box
-    class REG,DESC,QUOTA,CF,WK shared
+    class REG,DESC,QUOTA,CF,WK,VCODEC_NEG shared
     class ENC,DEC,LIBOPUS shared
+    class VPX,LIBVPX,MFT shared
     class IGUI,GH_API,EXTRACT,SIGN box
     class SDK,GAMES box
-    class GH_REL,OS_KR,STUN_S,OLLAMA_E ext
+    class GH_REL,OS_KR,OLLAMA_E ext
 ```
 
 ## Component Summary
 
 | Crate / Module | Role |
 |---|---|
-| **conquerd-client** | Rust/QML desktop app; owns all UI, audio, and peer-to-peer logic |
+| **conquerd-client** | Rust/QML desktop app; owns all UI, media, and peer-to-peer logic |
 | **conquerd-supernode** | Standalone server: WebSocket signaling, QUIC relay, SFU, in-app portal |
-| **conquerd-features** | Shared capability registry, channel framing, quota enforcement |
+| **conquerd-features** | Shared capability registry, channel framing, quota enforcement, video-codec negotiation |
 | **conquerd-opus** | Rust wrapper around libopus (DRED / OSCE neural models) |
+| **conquerd-vpx** | Rust wrapper around a vendored libvpx (VP8 on every platform; built without libvpx's own `configure`/`make`) |
 | **conquerd-installer** | Cross-platform egui updater GUI; polls GitHub Releases |
+| **conquerd-supernode-manager** | Separate workspace: cluster provisioning, `cluster-sync`, `build-deploy`, remote `exec` |
 | **web-sdk** | In-app portal game SDK (identity QUIC channel APIs) |
 | **games/** | Demo multiplayer games opened only via `conquerd://` portal |
 
@@ -232,6 +272,9 @@ example"]
 | Peer message | QML → AppBridge → ConnectionManager → tagged QUIC peer stream, or supernode relay fallback → peer |
 | Direct voice audio | CPAL mic → AEC/noise/VAD → OpusEncoder → direct QUIC datagram → peer → JitterBuffer → OpusDecoder → CPAL speaker |
 | Room voice audio | CPAL mic → OpusEncoder → QuicRelayClient room datagram → supernode SFU/relay fan-out → peers |
+| Video | Camera/screen capture → composite (PiP drawn before encode) → H.264 or VP8 → fragments stamped with the session clock and signed → `VIDEO_TAG` direct datagram, or `ROOM_VIDEO_TAG` sealed under the room sender key → opaque relay fan-out → per-sender decode |
+| Audio shared with a video | WASAPI loopback (system or one application) → OpusEncoder in `audio` mode → PTS from the same session clock → `CONTENT_AUDIO_TAG` / `ROOM_CONTENT_AUDIO_TAG` → receiver jitter buffer → playout anchor |
+| A/V sync | Content-audio playout sets a per-sender anchor → `media_sync` extrapolates between anchors → video is held or dropped to meet it; with no anchor (camera-only call) video free-runs |
 | File transfer | FileTransfer module → FeatureRegistry quota gate → `core.file.v1` / `room.file.v1` reliable signaling path |
 | Portal game | games/index.html → web-sdk.mjs → window.conquerd channel → client QUIC relay → supernode game session fan-out |
 | Identity handshake | identity.rs (Ed25519) → handshake.rs (X25519 ECDH) → HKDF → AES-GCM session |

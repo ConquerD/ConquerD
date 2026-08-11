@@ -257,7 +257,12 @@ fn scale_plane(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usiz
 /// sizes here derive from what a capture device negotiated, which is not ours
 /// to trust.
 pub fn scale_i420(src: &RawFrame, dst_w: u32, dst_h: u32) -> Option<RawFrame> {
-    if dst_w < 2 || dst_h < 2 || dst_w % 2 != 0 || dst_h % 2 != 0 || !src.is_consistent() {
+    if dst_w < 2
+        || dst_h < 2
+        || !dst_w.is_multiple_of(2)
+        || !dst_h.is_multiple_of(2)
+        || !src.is_consistent()
+    {
         return None;
     }
     if src.width == dst_w && src.height == dst_h {
@@ -282,7 +287,12 @@ pub fn scale_i420(src: &RawFrame, dst_w: u32, dst_h: u32) -> Option<RawFrame> {
 /// nearest supported mode for the one we asked for would otherwise produce a
 /// stream where *every* frame fails to encode.
 pub fn letterbox_i420(src: &RawFrame, dst_w: u32, dst_h: u32) -> Option<RawFrame> {
-    if dst_w < 2 || dst_h < 2 || dst_w % 2 != 0 || dst_h % 2 != 0 || !src.is_consistent() {
+    if dst_w < 2
+        || dst_h < 2
+        || !dst_w.is_multiple_of(2)
+        || !dst_h.is_multiple_of(2)
+        || !src.is_consistent()
+    {
         return None;
     }
     if src.width == dst_w && src.height == dst_h {

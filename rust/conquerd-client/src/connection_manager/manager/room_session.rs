@@ -1037,6 +1037,65 @@ impl ConnectionManager {
         self.dispatch_outbound(msg).await;
     }
 
+    /// Tell the supernode which senders' room video to forward to us.
+    ///
+    /// Suppressed when the set has not changed, because the callers that drive
+    /// this — a tile opening, a roster update, a reconnect — fire far more
+    /// often than the set actually moves, and each message would otherwise cost
+    /// a signature and a round trip to say nothing.
+    ///
+    /// Sent again unconditionally after a room join or failover even if the set
+    /// is identical, since the *supernode's* copy is per-connection and a new
+    /// one starts out knowing nothing. That is why `force` exists rather than
+    /// the caller clearing the cache.
+    pub(super) async fn send_video_subscriptions(&mut self, senders: Vec<String>, force: bool) {
+        if self.current_room_id.is_empty() || self.current_supernode_id.is_empty() {
+            return; // Direct sessions have no relay fan-out to steer.
+        }
+        let mut senders = senders;
+        senders.sort();
+        senders.dedup();
+        if !force && self.video_subscriptions.as_ref() == Some(&senders) {
+            return;
+        }
+
+        let room_id = self.current_room_id.clone();
+        let supernode_id = self.live_room_route(&self.current_supernode_id.clone());
+        let mut msg =
+            SignalingMessage::new(MessageType::SfuVideoSubscribe, self.identity.public_id());
+        msg.target = Some(supernode_id);
+        msg.payload
+            .insert("room_id".to_owned(), Value::String(room_id));
+        msg.payload.insert(
+            "senders".to_owned(),
+            Value::Array(
+                senders
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        debug!(
+            "[room.video.sfu] subscribing to {} sender(s)",
+            senders.len()
+        );
+        self.video_subscriptions = Some(senders);
+        self.dispatch_outbound(msg).await;
+    }
+
+    /// Re-announce the current subscription set to a supernode that has not
+    /// seen it — after a join, a reconnect, or a failover onto another node.
+    ///
+    /// A no-op before the UI has said anything: with no set to announce, the
+    /// supernode's default of "forward everything" is the correct behaviour,
+    /// and announcing an empty set here would black out video that is about to
+    /// be asked for.
+    pub(super) async fn resend_video_subscriptions(&mut self) {
+        if let Some(current) = self.video_subscriptions.clone() {
+            self.send_video_subscriptions(current, true).await;
+        }
+    }
+
     /// Tell the room, or a single peer, that our camera turned on or off.
     ///
     /// Uses the signed JSON signaling envelope, unlike the media frames

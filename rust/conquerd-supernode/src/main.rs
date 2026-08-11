@@ -187,6 +187,14 @@ fn build_feature_registry(
 /// redundant broadcasts it removes are not.
 const ROOM_LIST_COALESCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// Most video senders one member may subscribe to.
+///
+/// Bounds what a signed payload can make the relay allocate per peer. Well
+/// above any plausible layout — a client that decodes four streams at once has
+/// no use for more — so it never truncates a legitimate subscription; it just
+/// stops a hostile one from being unbounded.
+const MAX_VIDEO_SUBSCRIPTIONS: usize = 32;
+
 struct SupernodeState {
     config: Config,
     identity: Identity,
@@ -1781,7 +1789,11 @@ async fn handle_relay_signaling_stream(
             MessageType::SfuChat
             | MessageType::SfuFileOffer
             | MessageType::SfuFileChunk
-            | MessageType::SfuFileComplete => {
+            | MessageType::SfuFileComplete
+            // Video rides this connection's datagrams, so the subscription that
+            // steers them belongs on the same connection. Arriving here also
+            // means it is already bound to a verified relay identity.
+            | MessageType::SfuVideoSubscribe => {
                 handler.on_message(msg, &raw);
             }
             other => {
@@ -1836,6 +1848,9 @@ impl SignalingHandler for SupernodeHandler {
             }
             MessageType::SfuVideoKeyframeRequest => {
                 self.handle_sfu_video_keyframe_request(&msg, raw);
+            }
+            MessageType::SfuVideoSubscribe => {
+                self.handle_sfu_video_subscribe(&msg);
             }
             MessageType::SfuAudio => {
                 self.handle_sfu_audio_broadcast(&msg, raw);
@@ -2651,6 +2666,57 @@ impl SupernodeHandler {
                 return;
             }
         }
+    }
+
+    /// Record which senders a member wants room video from.
+    ///
+    /// The only message in the video control plane the supernode acts on rather
+    /// than forwards: it steers the relay's per-recipient fan-out so five 1080p
+    /// senders do not cost every member five streams' worth of downlink for
+    /// tiles they never opened.
+    ///
+    /// Not an access control. Frames are end-to-end sealed under the room key,
+    /// so a subscription can only reduce what a member is *sent*, never widen
+    /// what they could decode. The membership check below exists so a peer
+    /// outside the room cannot register state against it, not to protect the
+    /// media.
+    fn handle_sfu_video_subscribe(&self, msg: &SignalingMessage) {
+        let Some(ref sfu) = self.state.sfu else {
+            return;
+        };
+        let Some(ref relay) = self.state.relay else {
+            // No relay session means no video datagrams to steer.
+            return;
+        };
+        let room_id = msg
+            .payload
+            .get("room_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(sfu::DEFAULT_ROOM_ID);
+        if !sfu.read().is_chat_sender(room_id, &msg.sender) {
+            return;
+        }
+        // An absent `senders` array is not an empty one: dropping the message
+        // leaves the member on "send everything", which is the safe reading of
+        // a malformed subscription. Only an explicit (possibly empty) list
+        // narrows what they receive.
+        let Some(list) = msg.payload.get("senders").and_then(|v| v.as_array()) else {
+            return;
+        };
+        let senders: Vec<String> = list
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .take(MAX_VIDEO_SUBSCRIPTIONS)
+            .map(|s| s.to_owned())
+            .collect();
+        debug!(
+            "Peer {} subscribed to {} video sender(s) in room {}",
+            &msg.sender[..12.min(msg.sender.len())],
+            senders.len(),
+            &room_id[..12.min(room_id.len())]
+        );
+        relay.set_video_subscriptions(&msg.sender, &senders);
     }
 
     fn handle_sfu_subscribe(&self, msg: &SignalingMessage) {

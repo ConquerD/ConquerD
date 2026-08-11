@@ -94,3 +94,4 @@ ruff_audit.json
 /rust/target-headless
 /rust/target-headless2
 /rust/target-headless-check
+rust/sz2.html

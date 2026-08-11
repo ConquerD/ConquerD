@@ -850,6 +850,22 @@ pub mod ffi {
             encoder_json: &QString,
         ) -> bool;
 
+        /// Tell the supernode which peers' video we are actually displaying.
+        ///
+        /// `peer_ids_json` is a JSON array of peer ids — the tiles currently on
+        /// screen, in the centre region and any popouts. The supernode forwards
+        /// only these senders' frames to us, so a member who opens no tiles
+        /// pays no downlink for a room full of 1080p streams.
+        ///
+        /// Safe to call on every change: an unchanged set is dropped before it
+        /// reaches the wire. Call it with an empty array when the last tile
+        /// closes — that is the case the whole feature exists for, and it is
+        /// meaningfully different from never calling at all, which leaves the
+        /// supernode forwarding everything.
+        #[qinvokable]
+        #[rust_name = "set_video_subscriptions"]
+        fn setVideoSubscriptions(self: Pin<&mut AppBridge>, peer_ids_json: &QString);
+
         /// Show or hide the settings preview of `device_id` plus `overlays_json`.
         ///
         /// Captures without encoding or transmitting anything, so it works with
@@ -1130,6 +1146,13 @@ pub struct AppBridgeRust {
     /// emission is exactly what a join produces. Without this the indicator was
     /// cleared for everyone the moment anyone joined or left.
     peer_video_active: HashSet<String>,
+    /// Peers whose video the UI last said it is displaying.
+    ///
+    /// Kept here only to spot *newly* watched senders, so a keyframe is
+    /// requested exactly when a tile opens rather than on every unrelated
+    /// change to the set. The authoritative copy — the one compared against
+    /// before anything goes on the wire — lives in the connection manager.
+    video_subscribed: HashSet<String>,
     /// Video codecs each peer advertised in `CAPABILITY_ANNOUNCE`.
     ///
     /// Mirrored here rather than queried from the manager because the codec has
@@ -1512,6 +1535,7 @@ impl Default for AppBridgeRust {
             call_cmd_tx: None,
             video_active: false,
             peer_video_active: HashSet::new(),
+            video_subscribed: HashSet::new(),
             peer_video_codecs: HashMap::new(),
             media_clock: None,
             content_audio_active: false,
@@ -3094,6 +3118,41 @@ impl ffi::AppBridge {
             active,
             direct_peer,
         });
+    }
+
+    /// Publish the set of peers whose video is on screen. See the QML
+    /// declaration of `setVideoSubscriptions` for the contract.
+    ///
+    /// Newly-watched senders are asked for a keyframe here rather than left to
+    /// the receiver's starvation timer: the supernode was not forwarding them a
+    /// moment ago, so the next frames to arrive are mid-GOP inter frames the
+    /// decoder cannot start from. Without the nudge the tile stays blank until
+    /// the sender's own keyframe interval comes round — seconds of nothing at
+    /// exactly the moment the user asked to see someone.
+    fn set_video_subscriptions(mut self: Pin<&mut Self>, peer_ids_json: &QString) {
+        let Some(tx) = self.rust().conn_cmd_tx.clone() else {
+            return;
+        };
+        let senders: Vec<String> = serde_json::from_str::<Vec<String>>(&peer_ids_json.to_string())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let added: Vec<String> = {
+            let known = &self.rust().video_subscribed;
+            senders
+                .iter()
+                .filter(|s| !known.contains(*s))
+                .cloned()
+                .collect()
+        };
+        self.as_mut().rust_mut().video_subscribed = senders.iter().cloned().collect();
+
+        let _ = tx.try_send(ConnectionCommand::SetVideoSubscriptions { senders });
+        for peer_id in added {
+            let _ = tx.try_send(ConnectionCommand::RequestVideoKeyframe { peer_id });
+        }
     }
 
     fn list_video_devices(self: Pin<&mut Self>) -> QString {
