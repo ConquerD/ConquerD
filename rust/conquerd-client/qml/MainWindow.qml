@@ -15,7 +15,7 @@ ApplicationWindow {
     title: ""
     width: 1100
     height: 700
-    visible: true
+    visible: false
     minimumWidth: 960
     minimumHeight: 640
     // CustomizeWindowHint hides Qt's default title-bar widgets. On Windows,
@@ -1099,12 +1099,43 @@ ApplicationWindow {
         // interacted with yet this run.
         backend.applyPeerAudioPrefs(settingsModel.peer_audio_prefs_json)
 
-        // ── Restore window geometry (clamp to minimum usable size) ───────
+        // Restore the last normal geometry. Ignore a position that no longer
+        // overlaps a connected screen so monitor changes cannot strand us.
         root._restoringGeometry = true
-        if (settingsModel.window_width > 0)
-            root.width = Math.max(root.minimumWidth, settingsModel.window_width)
-        if (settingsModel.window_height > 0)
-            root.height = Math.max(root.minimumHeight, settingsModel.window_height)
+        var savedWidth = settingsModel.window_width > 0
+            ? Math.max(root.minimumWidth, settingsModel.window_width)
+            : root.width
+        var savedHeight = settingsModel.window_height > 0
+            ? Math.max(root.minimumHeight, settingsModel.window_height)
+            : root.height
+        var restoreScreen = null
+        if (settingsModel.window_position_saved) {
+            for (var screenIndex = 0; screenIndex < Qt.application.screens.length; screenIndex++) {
+                var candidate = Qt.application.screens[screenIndex]
+                var overlapsX = settingsModel.window_x + savedWidth > candidate.virtualX
+                    && settingsModel.window_x < candidate.virtualX + candidate.width
+                var overlapsY = settingsModel.window_y + savedHeight > candidate.virtualY
+                    && settingsModel.window_y < candidate.virtualY + candidate.height
+                if (overlapsX && overlapsY) {
+                    restoreScreen = candidate
+                    break
+                }
+            }
+        }
+        if (restoreScreen) {
+            root.width = Math.min(savedWidth, restoreScreen.width)
+            root.height = Math.min(savedHeight, restoreScreen.height)
+            root.x = Math.max(restoreScreen.virtualX,
+                Math.min(settingsModel.window_x,
+                    restoreScreen.virtualX + restoreScreen.width - root.width))
+            root.y = Math.max(restoreScreen.virtualY,
+                Math.min(settingsModel.window_y,
+                    restoreScreen.virtualY + restoreScreen.height - root.height))
+        } else {
+            root.width = savedWidth
+            root.height = savedHeight
+        }
+        root._windowWasMaximized = settingsModel.window_maximized
         root._restoringGeometry = false
 
         // ── Present the main window ───────────────────────────────────────
@@ -1114,7 +1145,10 @@ ApplicationWindow {
             root.showMinimized()
         } else {
             root.visible = true
-            root.show()
+            if (settingsModel.window_maximized)
+                root.showMaximized()
+            else
+                root.show()
             root.raise()
             root.requestActivate()
         }
@@ -2844,11 +2878,7 @@ ApplicationWindow {
         menu: Platform.Menu {
             Platform.MenuItem {
                 text: qsTr("Show ConquerD")
-                onTriggered: {
-                    root.show()
-                    root.raise()
-                    root.requestActivate()
-                }
+                onTriggered: root.showFromTray()
             }
             Platform.MenuItem {
                 text: qsTr("Mute microphone")
@@ -2858,7 +2888,11 @@ ApplicationWindow {
             Platform.MenuSeparator { }
             Platform.MenuItem {
                 text: qsTr("Quit")
-                onTriggered: Qt.quit()
+                onTriggered: {
+                    geometrySaveTimer.stop()
+                    root.persistWindowGeometry()
+                    Qt.quit()
+                }
             }
         }
 
@@ -2870,7 +2904,7 @@ ApplicationWindow {
                     root.raise()
                     root.requestActivate()
                 } else {
-                    root.show()
+                    root.showFromTray()
                 }
             }
         }
@@ -2878,17 +2912,39 @@ ApplicationWindow {
 
     // Guard to suppress geometry saves during initial restore.
     property bool _restoringGeometry: false
+    property bool _windowWasMaximized: false
 
-    // Debounce timer: save geometry 600ms after the last resize.
+    function showFromTray() {
+        if (root._windowWasMaximized)
+            root.showMaximized()
+        else
+            root.showNormal()
+        root.raise()
+        root.requestActivate()
+    }
+
+    function persistWindowGeometry() {
+        if (root._restoringGeometry)
+            return
+        if (root.visibility === Window.Windowed) {
+            settingsModel.window_x = root.x
+            settingsModel.window_y = root.y
+            settingsModel.window_width = root.width
+            settingsModel.window_height = root.height
+            settingsModel.window_position_saved = true
+        }
+        settingsModel.window_maximized = root._windowWasMaximized
+        settingsModel.save()
+    }
+
+    // Debounce saves while the user moves or resizes the normal window.
     Timer {
         id: geometrySaveTimer
         interval: 600
-        onTriggered: {
-            settingsModel.window_width  = root.width
-            settingsModel.window_height = root.height
-            settingsModel.save()
-        }
+        onTriggered: root.persistWindowGeometry()
     }
+    onXChanged:      if (!root._restoringGeometry && root.visibility === Window.Windowed) geometrySaveTimer.restart()
+    onYChanged:      if (!root._restoringGeometry && root.visibility === Window.Windowed) geometrySaveTimer.restart()
     onWidthChanged:  if (!root._restoringGeometry) geometrySaveTimer.restart()
     onHeightChanged: if (!root._restoringGeometry) geometrySaveTimer.restart()
 
@@ -2918,6 +2974,8 @@ ApplicationWindow {
     // the process was still alive.) The tray icon's Quit / Show items always
     // provide explicit control.
     onClosing: function(close) {
+        geometrySaveTimer.stop()
+        root.persistWindowGeometry()
         if (settingsModel.minimize_to_tray && trayIcon.available) {
             close.accepted = false
             hideToTray()
@@ -2932,6 +2990,14 @@ ApplicationWindow {
 
     // Minimizing the window also tucks it into the tray when the setting is on.
     onVisibilityChanged: function(visibility) {
+        if (!root._restoringGeometry) {
+            if (visibility === Window.Maximized)
+                root._windowWasMaximized = true
+            else if (visibility === Window.Windowed)
+                root._windowWasMaximized = false
+            if (visibility === Window.Maximized || visibility === Window.Windowed)
+                geometrySaveTimer.restart()
+        }
         if (visibility === Window.Minimized
                 && settingsModel.minimize_to_tray
                 && trayIcon.available) {

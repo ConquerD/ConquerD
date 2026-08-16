@@ -117,6 +117,14 @@ pub mod ffi {
         #[qproperty(i32, window_width)]
         /// Last-seen window height (0 = use default).
         #[qproperty(i32, window_height)]
+        /// Last-seen normal window left edge.
+        #[qproperty(i32, window_x)]
+        /// Last-seen normal window top edge.
+        #[qproperty(i32, window_y)]
+        /// Whether window_x/window_y contain a saved position.
+        #[qproperty(bool, window_position_saved)]
+        /// Whether the main window was maximized when last shown.
+        #[qproperty(bool, window_maximized)]
         /// Own avatar configuration serialised as a JSON object.
         /// Empty string means "use defaults".
         #[qproperty(QString, avatar_config_json)]
@@ -298,6 +306,14 @@ struct SettingsSnapshot {
     #[serde(default)]
     window_height: i32,
     #[serde(default)]
+    window_x: i32,
+    #[serde(default)]
+    window_y: i32,
+    #[serde(default)]
+    window_position_saved: bool,
+    #[serde(default)]
+    window_maximized: bool,
+    #[serde(default)]
     avatar_config_json: String,
     #[serde(default)]
     debug_logging: bool,
@@ -435,6 +451,10 @@ impl Default for SettingsSnapshot {
             onboarding_complete: false,
             window_width: 0,
             window_height: 0,
+            window_x: 0,
+            window_y: 0,
+            window_position_saved: false,
+            window_maximized: false,
             avatar_config_json: String::new(),
             debug_logging: false,
         }
@@ -499,6 +519,10 @@ pub struct SettingsModelRust {
     attestation_policy: QString,
     window_width: i32,
     window_height: i32,
+    window_x: i32,
+    window_y: i32,
+    window_position_saved: bool,
+    window_maximized: bool,
     avatar_config_json: QString,
     debug_logging: bool,
     dirty: bool,
@@ -565,6 +589,10 @@ impl Default for SettingsModelRust {
             attestation_policy: QString::from(s.attestation_policy.as_str()),
             window_width: s.window_width,
             window_height: s.window_height,
+            window_x: s.window_x,
+            window_y: s.window_y,
+            window_position_saved: s.window_position_saved,
+            window_maximized: s.window_maximized,
             avatar_config_json: QString::default(),
             debug_logging: s.debug_logging,
             dirty: false,
@@ -724,6 +752,10 @@ impl ffi::SettingsModel {
             attestation_policy: r.attestation_policy.to_string(),
             window_width: r.window_width,
             window_height: r.window_height,
+            window_x: r.window_x,
+            window_y: r.window_y,
+            window_position_saved: r.window_position_saved,
+            window_maximized: r.window_maximized,
             avatar_config_json: r.avatar_config_json.to_string(),
             debug_logging: r.debug_logging,
         }
@@ -936,6 +968,11 @@ impl ffi::SettingsModel {
             .set_onboarding_complete(snap.onboarding_complete);
         self.as_mut().set_window_width(snap.window_width);
         self.as_mut().set_window_height(snap.window_height);
+        self.as_mut().set_window_x(snap.window_x);
+        self.as_mut().set_window_y(snap.window_y);
+        self.as_mut()
+            .set_window_position_saved(snap.window_position_saved);
+        self.as_mut().set_window_maximized(snap.window_maximized);
         self.as_mut().set_theme(QString::from(snap.theme.as_str()));
         self.as_mut().set_relay_allow_gated(snap.relay_allow_gated);
         self.as_mut().set_relay_auto_renew(snap.relay_auto_renew);

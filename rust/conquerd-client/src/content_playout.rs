@@ -47,6 +47,19 @@ use crate::content_sender::FRAME_DURATION_US;
 /// jitter, and the ceiling on how far this stream can drag video behind it.
 pub const JITTER_DEPTH: usize = 3;
 
+/// Hard ceiling on frames held per peer, beyond which the oldest are shed.
+///
+/// [`JITTER_DEPTH`] is the *target* cushion, not a limit: the tick plays one
+/// frame per 20 ms while the sender's capture device runs on its own clock, so
+/// a sender running fast — or one delivering a burst after a stall — grows the
+/// buffer faster than it drains. Left unbounded that is unbounded latency, and
+/// because video is synchronised to this stream the picture is dragged back
+/// with it. Shedding the oldest costs a skip; not shedding costs the sync.
+///
+/// Four times the target depth (240 ms) leaves room for ordinary bursts so the
+/// bound only bites on genuine drift.
+pub const MAX_BUFFERED_FRAMES: usize = JITTER_DEPTH * 4;
+
 /// Gap in sequence numbers past which the buffer resynchronises rather than
 /// waiting.
 ///
@@ -94,10 +107,10 @@ pub enum TickAction {
 }
 
 /// Reorder buffer for one peer's content-audio stream.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct JitterBuffer {
     pending: Vec<PendingFrame>,
-    /// Sequence the next tick expects. `None` until the first frame arrives.
+    /// Sequence the next tick expects. `None` until the first frame plays.
     next_seq: Option<u32>,
     /// Timestamp the next tick will report, advanced every tick including
     /// concealed ones.
@@ -105,6 +118,27 @@ pub struct JitterBuffer {
     /// Concealed frames since the last real one, bounded by
     /// [`MAX_CONCEALED_FRAMES`].
     concealed_streak: u32,
+    /// Filling the cushion: play nothing until [`JITTER_DEPTH`] frames are
+    /// held. See [`Self::tick`] for why starting without one is not merely
+    /// less smooth but self-sustaining.
+    buffering: bool,
+    /// Ticks spent waiting for the cushion, so a slow or ending stream is not
+    /// held forever waiting for frames that are not coming.
+    fill_ticks: usize,
+}
+
+impl Default for JitterBuffer {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            next_seq: None,
+            next_pts_us: 0,
+            concealed_streak: 0,
+            // A fresh buffer has no cushion, so it starts by building one.
+            buffering: true,
+            fill_ticks: 0,
+        }
+    }
 }
 
 impl JitterBuffer {
@@ -131,6 +165,14 @@ impl JitterBuffer {
         }
         self.pending.push(frame);
         self.pending.sort_by_key(|f| f.seq);
+        // A sender whose capture device runs faster than this receiver's 20 ms
+        // playout tick delivers more than one frame per tick, and every frame
+        // held is latency the video it belongs to must also wait out. Shedding
+        // the oldest bounds both; the release rule below resynchronises on
+        // whatever is left.
+        while self.pending.len() > MAX_BUFFERED_FRAMES {
+            self.pending.remove(0);
+        }
     }
 
     /// Decide what to play now, advancing the timeline by one frame.
@@ -140,13 +182,45 @@ impl JitterBuffer {
     /// the anchor go stale and video would jump. It stops advancing once the
     /// stream has plainly ended — see [`MAX_CONCEALED_FRAMES`].
     pub fn tick(&mut self) -> TickAction {
+        // Build a cushion before playing anything, and rebuild it after an
+        // underrun. Playing the instant a frame lands leaves no tolerance at
+        // all, and the resulting failure is not a graceful one: the next frame
+        // to arrive a millisecond after its tick is concealed, `push` then
+        // discards it as already-played, and because the sender's cadence and
+        // this tick keep the same phase every following frame meets the same
+        // fate — the stream locks into concealing until MAX_CONCEALED_FRAMES
+        // resets it, so roughly one frame in twenty reaches the speakers.
+        if self.buffering {
+            let stalled = self.fill_ticks >= JITTER_DEPTH && !self.pending.is_empty();
+            if self.pending.len() < JITTER_DEPTH && !stalled {
+                self.fill_ticks = self.fill_ticks.saturating_add(1);
+                return match self.next_seq {
+                    // A timeline already exists, so keep it moving across the
+                    // refill or held video would stall. `next_seq` is *not*
+                    // advanced: the frames still in flight are what the refill
+                    // is waiting for, and advancing past them is precisely what
+                    // would make `push` throw them away.
+                    Some(_) => self.conceal(false),
+                    None => TickAction::Idle,
+                };
+            }
+            self.buffering = false;
+            self.fill_ticks = 0;
+            // Leaving the cushion always resumes from whatever is buffered,
+            // even if the head is not the expected sequence. The refill already
+            // spent those ticks concealing; stepping through the hole a frame
+            // at a time would pay for the same gap twice and leave playout
+            // permanently that much further behind.
+            if let Some(first) = self.pending.first().cloned() {
+                self.start_from(&first);
+                return TickAction::Play(first);
+            }
+            return TickAction::Idle;
+        }
+
         let Some(expected) = self.next_seq else {
-            // Not started: adopt the earliest buffered frame as the origin.
-            let Some(first) = self.pending.first().cloned() else {
-                return TickAction::Idle;
-            };
-            self.start_from(&first);
-            return TickAction::Play(first);
+            // No timeline and not buffering can only mean nothing has arrived.
+            return TickAction::Idle;
         };
 
         // A long gap means the sender restarted or was away; resynchronise on
@@ -159,8 +233,23 @@ impl JitterBuffer {
                 self.start_from(&first);
                 return TickAction::Play(first);
             }
+            // Later frames are here but the expected one is not: it was lost
+            // rather than delayed, so conceal in its place and move on.
+            return self.conceal(true);
         }
 
+        // Underrun — nothing buffered at all. Rebuild the cushion rather than
+        // limping on with none, and hold `next_seq` so frames still in flight
+        // are accepted when they land.
+        self.buffering = true;
+        self.conceal(false)
+    }
+
+    /// Play silence for one frame, advancing the timeline.
+    ///
+    /// `advance_seq` distinguishes a frame known to be lost (advance past it)
+    /// from one still expected to arrive (hold, so `push` does not discard it).
+    fn conceal(&mut self, advance_seq: bool) -> TickAction {
         // Nothing has arrived for long enough that this is a stopped stream,
         // not a gap in a running one. Forget the timeline rather than keep
         // inventing it; a later frame starts a fresh one.
@@ -168,10 +257,10 @@ impl JitterBuffer {
             self.reset();
             return TickAction::Idle;
         }
-
-        // Expected frame not here yet: conceal and keep the timeline moving.
+        if advance_seq {
+            self.next_seq = self.next_seq.map(|s| s.wrapping_add(1));
+        }
         let pts_us = self.next_pts_us;
-        self.next_seq = Some(expected.wrapping_add(1));
         self.next_pts_us = pts_us.saturating_add(FRAME_DURATION_US);
         self.concealed_streak += 1;
         TickAction::Conceal { pts_us }
@@ -277,16 +366,140 @@ mod tests {
         }
     }
 
+    /// A buffer that has played `seq` and is expecting `seq + 1`.
+    ///
+    /// Priming is not incidental to these tests: the cushion is the fix for
+    /// [`a_late_stream_is_not_locked_into_concealment`], so a test that starts
+    /// by playing on the first pushed frame would be asserting the defect.
+    fn started_at(seq: u32) -> JitterBuffer {
+        let mut b = JitterBuffer::new();
+        b.push(f(seq));
+        for _ in 0..=JITTER_DEPTH {
+            match b.tick() {
+                TickAction::Play(fr) => {
+                    assert_eq!(fr.seq, seq);
+                    return b;
+                }
+                TickAction::Idle => {}
+                other => panic!("unexpected {other:?} while priming"),
+            }
+        }
+        panic!("the cushion never released");
+    }
+
     #[test]
     fn an_empty_buffer_is_idle() {
         assert_eq!(JitterBuffer::new().tick(), TickAction::Idle);
     }
 
+    /// The regression this module's cushion exists for. Every frame arrives one
+    /// tick after the tick that wanted it — the ordinary case, since the
+    /// sender's capture clock and this playout tick share no phase.
+    ///
+    /// Without a cushion the first frame played immediately, the second was
+    /// concealed a millisecond before it landed, `push` then dropped it as
+    /// already-played, and the phase never corrected: roughly one frame in
+    /// twenty reached the speakers and the rest was silence. That is what
+    /// "garbled" sounded like.
     #[test]
-    fn the_first_frame_starts_the_timeline() {
+    fn a_late_stream_is_not_locked_into_concealment() {
+        let mut b = JitterBuffer::new();
+        let mut played = 0usize;
+        let total = 200u32;
+
+        for seq in 0..total {
+            // Tick first, so the frame for this tick is always one tick late.
+            if let TickAction::Play(_) = b.tick() {
+                played += 1;
+            }
+            b.push(f(seq));
+        }
+        // Drain the cushion.
+        for _ in 0..(JITTER_DEPTH + 2) {
+            if let TickAction::Play(_) = b.tick() {
+                played += 1;
+            }
+        }
+
+        assert!(
+            played as u32 >= total - JITTER_DEPTH as u32 - 2,
+            "a uniformly late stream must still play: {played} of {total}"
+        );
+    }
+
+    /// The cushion is built before anything plays. One frame in hand is no
+    /// tolerance at all.
+    #[test]
+    fn playout_waits_for_the_cushion_before_starting() {
         let mut b = JitterBuffer::new();
         b.push(f(10));
+        assert_eq!(b.tick(), TickAction::Idle, "one frame is not a cushion");
+        b.push(f(11));
+        assert_eq!(b.tick(), TickAction::Idle);
+        b.push(f(12));
         assert_eq!(b.tick(), TickAction::Play(f(10)));
+    }
+
+    /// A sender that never fills the cushion — a slow or ending stream — must
+    /// not be held silent waiting for frames that are not coming.
+    #[test]
+    fn a_short_stream_starts_anyway_rather_than_waiting_forever() {
+        let mut b = JitterBuffer::new();
+        b.push(f(0));
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            match b.tick() {
+                TickAction::Play(fr) => {
+                    assert_eq!(fr.seq, 0);
+                    break;
+                }
+                TickAction::Idle => assert!(ticks <= JITTER_DEPTH + 1, "waited too long"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// An underrun rebuilds the cushion instead of limping on without one —
+    /// and, critically, holds `next_seq` so the frames still in flight are not
+    /// discarded as already-played the moment they land.
+    #[test]
+    fn an_underrun_rebuffers_without_discarding_frames_in_flight() {
+        let mut b = started_at(0);
+        // Nothing arrives for a while.
+        for _ in 0..3 {
+            assert!(matches!(b.tick(), TickAction::Conceal { .. }));
+        }
+        // The frames that were merely delayed now land.
+        for seq in 1..=3 {
+            b.push(f(seq));
+        }
+        assert_eq!(b.len(), 3, "delayed frames must not be treated as played");
+
+        let played: Vec<u32> = (0..3)
+            .filter_map(|_| match b.tick() {
+                TickAction::Play(fr) => Some(fr.seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(played, vec![1, 2, 3]);
+    }
+
+    /// Buffer depth is latency, and video is synchronised to this stream — so a
+    /// sender whose clock outruns the tick must not be allowed to drag the
+    /// picture back indefinitely.
+    #[test]
+    fn a_fast_sender_cannot_grow_the_buffer_without_bound() {
+        let mut b = JitterBuffer::new();
+        let mut seq = 0;
+        for _ in 0..250 {
+            // Two frames arrive per tick: the buffer can only drain one.
+            b.push(f(seq));
+            b.push(f(seq + 1));
+            seq += 2;
+            let _ = b.tick();
+            assert!(b.len() <= MAX_BUFFERED_FRAMES, "buffer grew to {}", b.len());
+        }
     }
 
     #[test]
@@ -317,9 +530,7 @@ mod tests {
 
     #[test]
     fn a_frame_already_played_is_not_replayed() {
-        let mut b = JitterBuffer::new();
-        b.push(f(0));
-        assert!(matches!(b.tick(), TickAction::Play(_)));
+        let mut b = started_at(0);
         // A late duplicate of seq 0 must not be queued behind the timeline.
         b.push(f(0));
         assert!(b.is_empty());
@@ -330,9 +541,7 @@ mod tests {
     /// video would free-run and jump.
     #[test]
     fn a_gap_conceals_and_still_advances() {
-        let mut b = JitterBuffer::new();
-        b.push(f(0));
-        assert!(matches!(b.tick(), TickAction::Play(_)));
+        let mut b = started_at(0);
 
         // seq 1 never arrives.
         let a = b.tick();
@@ -349,9 +558,7 @@ mod tests {
 
     #[test]
     fn concealed_timestamps_stay_evenly_spaced() {
-        let mut b = JitterBuffer::new();
-        b.push(f(0));
-        let _ = b.tick();
+        let mut b = started_at(0);
 
         let mut stamps = Vec::new();
         for _ in 0..5 {
@@ -369,9 +576,7 @@ mod tests {
     /// depth the stream plays on rather than waiting.
     #[test]
     fn the_buffer_does_not_stall_past_its_depth() {
-        let mut b = JitterBuffer::new();
-        b.push(f(0));
-        let _ = b.tick(); // plays 0, now expecting 1
+        let mut b = started_at(0); // played 0, now expecting 1
 
         // 1 is lost; 2..=5 arrive.
         for seq in 2..=5 {
@@ -389,9 +594,7 @@ mod tests {
     /// A sender that restarted leaves a hole no waiting fills.
     #[test]
     fn a_large_sequence_jump_resynchronises() {
-        let mut b = JitterBuffer::new();
-        b.push(f(0));
-        let _ = b.tick();
+        let mut b = started_at(0);
 
         b.push(f(1_000));
         match b.tick() {
@@ -407,9 +610,7 @@ mod tests {
     /// audio, so nothing to correct it) had every frame dropped as late.
     #[test]
     fn a_stopped_stream_stops_advancing_the_timeline() {
-        let mut b = JitterBuffer::new();
-        b.push(f(0));
-        assert!(matches!(b.tick(), TickAction::Play(_)));
+        let mut b = started_at(0);
 
         let mut concealed = 0;
         for _ in 0..(MAX_CONCEALED_FRAMES + 5) {
@@ -437,13 +638,15 @@ mod tests {
             pts_us: 60_000_000,
             opus: vec![1],
         });
-        let _ = b.tick();
-        for _ in 0..(MAX_CONCEALED_FRAMES + 1) {
+        for _ in 0..(MAX_CONCEALED_FRAMES as usize + JITTER_DEPTH + 2) {
             let _ = b.tick();
         }
 
         // A new session: sequence and timestamps both restart near zero.
         b.push(f(0));
+        for _ in 0..JITTER_DEPTH {
+            let _ = b.tick();
+        }
         match b.tick() {
             TickAction::Play(fr) => {
                 assert_eq!(fr.seq, 0);
@@ -457,17 +660,18 @@ mod tests {
     /// stream test, not a reason to abandon a stream that is merely lossy.
     #[test]
     fn a_short_gap_still_conceals_and_recovers() {
-        let mut b = JitterBuffer::new();
-        b.push(f(0));
-        let _ = b.tick();
+        let mut b = started_at(0);
 
         for _ in 0..3 {
             assert!(matches!(b.tick(), TickAction::Conceal { .. }));
         }
-        // Frame 4 arrives; the stream carries on and the streak is forgotten.
-        b.push(f(4));
+        // The stream resumes; it carries on and the streak is forgotten.
+        for seq in 4..4 + JITTER_DEPTH as u32 {
+            b.push(f(seq));
+        }
         assert!(matches!(b.tick(), TickAction::Play(_)));
-        for _ in 0..MAX_CONCEALED_FRAMES {
+        while let TickAction::Play(_) = b.tick() {}
+        for _ in 0..(MAX_CONCEALED_FRAMES - 1) {
             assert!(
                 matches!(b.tick(), TickAction::Conceal { .. }),
                 "a real frame must reset the concealment budget"
@@ -484,7 +688,7 @@ mod tests {
         p.accept("alice", f(0));
         assert_eq!(p.tracked_peers(), 1);
 
-        for _ in 0..(MAX_CONCEALED_FRAMES + 2) {
+        for _ in 0..(MAX_CONCEALED_FRAMES as usize + JITTER_DEPTH + 3) {
             let _ = p.tick();
         }
         assert_eq!(
@@ -497,8 +701,10 @@ mod tests {
     #[test]
     fn playout_tracks_peers_independently() {
         let mut p = ContentPlayout::new();
-        p.accept("alice", f(0));
-        p.accept("bob", f(100));
+        for seq in 0..JITTER_DEPTH as u32 {
+            p.accept("alice", f(seq));
+            p.accept("bob", f(100 + seq));
+        }
 
         let actions = p.tick();
         assert_eq!(actions.len(), 2);

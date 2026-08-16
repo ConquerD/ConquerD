@@ -211,8 +211,8 @@ pub fn open_default() -> anyhow::Result<Box<dyn ContentAudioSource>> {
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::{
-        downmix_to_mono, resample_linear, CaptureTimeline, ContentAudioSource, ContentFrame,
-        FrameAccumulator,
+        downmix_to_mono, CaptureTimeline, ContentAudioSource, ContentFrame, FrameAccumulator,
+        Resampler,
     };
 
     use std::collections::VecDeque;
@@ -403,6 +403,8 @@ mod windows_impl {
         channels: usize,
         rate: u32,
         kind: SampleKind,
+        /// Held across device reads, not rebuilt per read: see [`Resampler`].
+        resampler: Resampler,
         accumulator: FrameAccumulator,
         timeline: CaptureTimeline,
         ready: VecDeque<ContentFrame>,
@@ -509,6 +511,7 @@ mod windows_impl {
                     channels: CHANNELS as usize,
                     rate: RATE,
                     kind,
+                    resampler: Resampler::new(RATE),
                     accumulator: FrameAccumulator::new(),
                     timeline: CaptureTimeline::new(),
                     ready: VecDeque::new(),
@@ -583,6 +586,7 @@ mod windows_impl {
                     channels,
                     rate,
                     kind: SampleKind::F32,
+                    resampler: Resampler::new(rate),
                     accumulator: FrameAccumulator::new(),
                     timeline: CaptureTimeline::new(),
                     ready: VecDeque::new(),
@@ -656,7 +660,7 @@ mod windows_impl {
                     }
 
                     let mono = downmix_to_mono(&interleaved, self.channels);
-                    let resampled = resample_linear(&mono, self.rate);
+                    let resampled = self.resampler.process(&mono);
                     for samples in self.accumulator.push(&resampled) {
                         let offset_us = self.timeline.next_offset_us();
                         self.timeline.on_frame_emitted();
@@ -739,8 +743,16 @@ pub fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Resample mono `input` from `in_rate` to [`SAMPLE_RATE`] by linear
-/// interpolation.
+/// Linear resampler that carries its phase across calls.
+///
+/// The state is the whole point. A device read is an arbitrary slice of a
+/// continuous signal, so a resampler that restarts at phase 0 for every read —
+/// and interpolates its final sample against a duplicate of the last one,
+/// having no successor to reach for — inserts a step discontinuity at every
+/// buffer boundary. At WASAPI's ~10 ms polling that is a click a hundred times
+/// a second for the entire share, which is heard as continuous distortion
+/// rather than as clicks. Carrying the fractional read position and the
+/// previous chunk's last sample makes the joins seamless.
 ///
 /// Linear rather than windowed-sinc for the same reason the voice path uses it
 /// (see the audio-quality item in `backlog.md`): the artefacts sit far above
@@ -748,25 +760,74 @@ pub fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
 /// replacement later if it ever becomes audible. Content audio is more
 /// demanding than speech here, so this is the more likely of the two to want
 /// upgrading.
+#[derive(Debug, Clone)]
+pub struct Resampler {
+    in_rate: u32,
+    /// Fractional read position in input samples, relative to the start of the
+    /// next chunk. May be negative, meaning "between `prev` and this chunk".
+    pos: f64,
+    /// Last sample of the previous chunk, so interpolation spans the join.
+    prev: Option<f32>,
+}
+
+impl Resampler {
+    /// A resampler converting `in_rate` to [`SAMPLE_RATE`].
+    pub fn new(in_rate: u32) -> Self {
+        Self {
+            in_rate,
+            pos: 0.0,
+            prev: None,
+        }
+    }
+
+    /// Resample one chunk, continuing from where the last call left off.
+    ///
+    /// Returns `input` unchanged when the rates already match, which is the
+    /// common case — most render endpoints run at 48 kHz.
+    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if self.in_rate == SAMPLE_RATE || self.in_rate == 0 || input.is_empty() {
+            return input.to_vec();
+        }
+        let ratio = self.in_rate as f64 / SAMPLE_RATE as f64;
+        let n = input.len();
+        let last = (n - 1) as f64;
+        let prev = self.prev;
+        let tap = |i: isize| -> f32 {
+            if i < 0 {
+                // Only reachable once `prev` exists; on the very first chunk
+                // `pos` starts at 0 and never looks back.
+                prev.unwrap_or(input[0])
+            } else {
+                input[(i as usize).min(n - 1)]
+            }
+        };
+
+        let mut out = Vec::with_capacity((n as f64 / ratio).ceil() as usize + 1);
+        let mut pos = self.pos;
+        while pos <= last {
+            let idx = pos.floor();
+            let frac = (pos - idx) as f32;
+            let a = tap(idx as isize);
+            let b = tap(idx as isize + 1);
+            out.push(a + (b - a) * frac);
+            pos += ratio;
+        }
+        // Rebase onto the next chunk. The remainder is kept exactly, which is
+        // what stops per-chunk rounding from accumulating into rate drift.
+        self.pos = pos - n as f64;
+        self.prev = Some(input[n - 1]);
+        out
+    }
+}
+
+/// Resample mono `input` from `in_rate` to [`SAMPLE_RATE`] in one shot.
 ///
-/// Returns `input` unchanged when the rates already match, which is the common
-/// case — most render endpoints run at 48 kHz.
+/// Convenience wrapper over a fresh [`Resampler`]; correct only for a signal
+/// that begins and ends here. Anything reading a device in chunks must hold a
+/// [`Resampler`] instead — see its documentation for what a reset phase does to
+/// the audio.
 pub fn resample_linear(input: &[f32], in_rate: u32) -> Vec<f32> {
-    if in_rate == SAMPLE_RATE || in_rate == 0 || input.is_empty() {
-        return input.to_vec();
-    }
-    let ratio = in_rate as f64 / SAMPLE_RATE as f64;
-    let out_len = ((input.len() as f64) / ratio).floor() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let pos = i as f64 * ratio;
-        let idx = pos.floor() as usize;
-        let frac = (pos - idx as f64) as f32;
-        let a = input[idx.min(input.len() - 1)];
-        let b = input[(idx + 1).min(input.len() - 1)];
-        out.push(a + (b - a) * frac);
-    }
-    out
+    Resampler::new(in_rate).process(input)
 }
 
 /// Convert `f32` samples in [-1.0, 1.0] to the `i16` the Opus encoder takes.
@@ -1102,9 +1163,58 @@ mod tests {
 
     #[test]
     fn upsampling_lengthens_proportionally() {
-        // 24k -> 48k doubles it.
+        // 24k -> 48k doubles it. One sample of slack: whole output samples are
+        // emitted only where both interpolation taps exist, and the remainder
+        // is carried into the next chunk rather than invented here.
         let input = vec![0.0f32; 240];
-        assert_eq!(resample_linear(&input, 48_000 / 2).len(), 480);
+        let out = resample_linear(&input, 48_000 / 2);
+        assert!((out.len() as i64 - 480).abs() <= 1, "got {}", out.len());
+    }
+
+    /// The defect the resampler's state exists to remove. A continuous signal
+    /// fed in device-sized chunks must come out continuous: restarting the
+    /// interpolation phase at every read inserted a step at every chunk join —
+    /// at WASAPI's ~10 ms polling, a hundred a second for the whole share,
+    /// which is heard as constant distortion rather than as clicks.
+    #[test]
+    fn chunk_boundaries_do_not_reset_the_phase() {
+        let mut r = Resampler::new(44_100);
+        let mut out = Vec::new();
+        let mut n = 0.0f32;
+        for _ in 0..8 {
+            let chunk: Vec<f32> = (0..441)
+                .map(|_| {
+                    n += 1.0;
+                    n
+                })
+                .collect();
+            out.extend(r.process(&chunk));
+        }
+        // A ramp through any correct linear interpolator stays monotonic; a
+        // phase reset shows up as a jump back toward the start of the chunk.
+        for pair in out.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "phase reset at a chunk boundary: {pair:?}"
+            );
+        }
+    }
+
+    /// Carrying the exact fractional remainder is what keeps the *rate* right
+    /// across chunks. Rounding each chunk independently would drift, and since
+    /// video is synchronised to this stream the drift would read as A/V error.
+    #[test]
+    fn the_sustained_rate_is_exact_across_chunks() {
+        let mut r = Resampler::new(44_100);
+        let mut produced = 0usize;
+        for _ in 0..100 {
+            produced += r.process(&vec![0.0f32; 441]).len();
+        }
+        // 100 * 10 ms of 44.1 kHz input is 1 s, so 48 000 output samples.
+        assert!(
+            (produced as i64 - 48_000).abs() <= 2,
+            "rate drifted: {produced}"
+        );
     }
 
     /// A ramp must stay monotonic through resampling — a sign that
