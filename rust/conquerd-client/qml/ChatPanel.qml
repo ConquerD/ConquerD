@@ -13,6 +13,11 @@ Item {
 
     property string selectedPeerId: ""
     property string selectedPeerName: ""
+    /// True while a direct call with `selectedPeerId` is already up. Hides the
+    /// dial button, exactly as Join Voice hides when voice is already in this
+    /// room: the VoiceRail hang-up is the end control, and a second dial would
+    /// only stack another session on the live one.
+    property bool callActiveWithPeer: false
     property var chatModel: null
     property var fileTransferModel: null
     property string typingPeerId: ""
@@ -189,7 +194,7 @@ Item {
                     icon.source: "qrc:/qt/qml/ConquerD/Client/icons/phone.svg"
                     icon.width: 18
                     icon.height: 18
-                    visible: root.selectedPeerId !== ""
+                    visible: root.selectedPeerId !== "" && !root.callActiveWithPeer
                     flat: true
                     onClicked: root.startCall(root.selectedPeerId)
                 }

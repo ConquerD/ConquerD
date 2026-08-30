@@ -2339,6 +2339,21 @@ impl ffi::AppBridge {
         use crate::protocol::{MessageType, SignalingMessage};
 
         let pid = peer_id.to_string();
+
+        // Room voice and a 1:1 must not run at once. Leaving is not just
+        // tidiness: the call controller stays in room mode, so the mic would
+        // keep broadcasting to the SFU and the dialled peer would hear
+        // nothing. Same rule join_room_with_voice applies when switching
+        // rooms — leave the old voice session before entering the new one.
+        let in_voice_room = {
+            let r = self.rust();
+            r.voice_active && !r.voice_room_id.is_empty()
+        };
+        if in_voice_room {
+            // Sends ClearRoomMode + StopAudio and tears the room UI down.
+            self.as_mut().leave_room();
+        }
+
         let sender = self.rust().my_public_id.clone();
 
         if let Some(ref tx) = self.rust().conn_cmd_tx {
@@ -2347,6 +2362,15 @@ impl ffi::AppBridge {
             let _ = tx.try_send(ConnectionCommand::SendMessage(msg));
         }
         if let Some(ref tx) = self.rust().call_cmd_tx {
+            // Open the direct-mode pipeline the call needs: the room's was
+            // just stopped, and InitiatePeer is dropped while the controller
+            // is idle. Ordered on one channel, so this lands after StopAudio.
+            // StartAudio no-ops unless idle, so a call dialled with no room
+            // behind it still opens exactly one pipeline — as accept_call does.
+            let va = read_voice_activation_setting();
+            let _ = tx.try_send(CallCommand::StartAudio {
+                voice_activation: va,
+            });
             let _ = tx.try_send(CallCommand::InitiatePeer {
                 peer_id: pid.clone(),
                 host: None,

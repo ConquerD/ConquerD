@@ -179,6 +179,21 @@ ApplicationWindow {
         root.activeCallPeerId = peerId || ""
     }
 
+    /// Dial `peerId` 1:1, from wherever the user pressed call.
+    ///
+    /// `start_call` leaves any live voice room first — room audio and a direct
+    /// call cannot both run. The expanded tiles and popout windows belong to
+    /// that room's video, so collapse them here, the same housekeeping the
+    /// Leave and End buttons do; the bridge cannot close QML windows.
+    function beginDirectCall(peerId) {
+        if (backend.voice_active && backend.in_room) {
+            root.closeAllVideoPopouts()
+            root.expandedVideoPeers = []
+        }
+        root.trackDirectCall(peerId)
+        backend.startCall(peerId)
+    }
+
     function refreshDirectCallModel() {
         directCallModel.clear()
         var remoteId = root.activeCallPeerId || chatPanel.selectedPeerId
@@ -1740,8 +1755,7 @@ ApplicationWindow {
                         peerModel.setPeerUnread(peerId, 0)
                     }
                     onStartCallRequested: function(peerId) {
-                        root.trackDirectCall(peerId)
-                        backend.startCall(peerId)
+                        root.beginDirectCall(peerId)
                     }
                     onRemovePeerRequested: (peerId) => backend.removePeer(peerId)
                     onCopyPeerIdRequested: (peerId) => backend.copyPeerId(peerId)
@@ -2647,10 +2661,15 @@ ApplicationWindow {
                 settingsModel: settingsModel
                 youtubePreviewEnabled: settingsModel ? settingsModel.youtube_preview_enabled : true
                 youtubeInlineAck: settingsModel ? settingsModel.youtube_inline_ack : false
+                // `call_state` moves only on the direct-call paths — room voice
+                // never touches it — so this is a 1:1 with the selected peer and
+                // not a room they happen to share.
+                callActiveWithPeer: backend.call_state !== "idle"
+                                    && root.activeCallPeerId !== ""
+                                    && root.activeCallPeerId === chatPanel.selectedPeerId
                 onSendMessage: (peerId, msg) => backend.sendChat(peerId, msg)
                 onStartCall: function(peerId) {
-                    root.trackDirectCall(peerId)
-                    backend.startCall(peerId)
+                    root.beginDirectCall(peerId)
                 }
                 onSendFile: (peerId, fileUrl) => backend.sendFile(peerId, fileUrl)
                 onOpenAttachment: (path) => root.showFilePreview(path)
