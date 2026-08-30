@@ -644,6 +644,11 @@ pub mod ffi {
         #[rust_name = "copy_to_clipboard"]
         fn copyToClipboard(self: Pin<&mut AppBridge>, text: &QString);
 
+        /// Reveal a local file in the system file manager (selects the file).
+        #[qinvokable]
+        #[rust_name = "open_containing_folder"]
+        fn openContainingFolder(self: Pin<&mut AppBridge>, path: &QString);
+
         /// Emitted when the unread count for a peer changes.
         #[qsignal]
         #[rust_name = "unread_changed"]
@@ -2589,6 +2594,13 @@ impl ffi::AppBridge {
         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(s.clone())) {
             Ok(_) => debug!("[bridge] Copied {} bytes to clipboard", s.len()),
             Err(e) => warn!("[bridge] Clipboard write failed: {e}"),
+        }
+    }
+
+    fn open_containing_folder(self: Pin<&mut Self>, path: &QString) {
+        let native = parse_local_file_path(&path.to_string());
+        if let Err(e) = crate::platform::open_containing_folder(&native) {
+            warn!("[bridge] open containing folder failed: {e}");
         }
     }
 
@@ -4899,6 +4911,8 @@ impl ffi::AppBridge {
             "attachment_name": rel_path.clone(),
             "attachment_path": path_str.clone(),
             "size_str": size_str.clone(),
+            "supernode_id": sn.clone(),
+            "room_id": rid.clone(),
         })
         .to_string();
         if let Some(ref cs) = chat_store_opt {
@@ -5728,22 +5742,38 @@ fn insert_inbound_file_offer(
         if sn.is_empty() || rid.is_empty() {
             return;
         }
-        let display_sender = room_chat_display_sender(bridge.rust(), "", origin_id);
+        let my_pub = bridge.rust().my_public_id.clone();
+        let my_peer = bridge.rust().my_peer_id.clone();
+        // Room id and supernode id must never become the author. That is what
+        // made every offer in a room look like the same "other" peer on both
+        // sides, whoever actually sent it.
+        let author = if origin_id.is_empty() || origin_id == rid || pub_id_eq(origin_id, &sn) {
+            String::new()
+        } else {
+            origin_id.to_owned()
+        };
+        let mine =
+            !author.is_empty() && (pub_id_eq(&author, &my_pub) || pub_id_eq(&author, &my_peer));
+        let display_sender = if author.is_empty() {
+            String::new()
+        } else {
+            room_chat_display_sender(bridge.rust(), "", &author)
+        };
         let msg_json = serde_json::json!({
             "msg_id": message_id.clone(),
             "sender": display_sender.clone(),
-            "sender_id": origin_id,
+            "sender_id": author.clone(),
             "body": body.clone(),
             "timestamp": now_ts,
             "kind": kind.as_str(),
-            "mine": false,
+            "mine": mine,
             "is_room": true,
             "status": "delivered",
             "attachment_name": rel_path,
             "attachment_path": "",
             "size_str": size_str.clone(),
-            "supernode_id": sn,
-            "room_id": rid,
+            "supernode_id": sn.clone(),
+            "room_id": rid.clone(),
         })
         .to_string();
         if let Some(ref cs) = bridge.rust().chat_store {
@@ -5751,11 +5781,11 @@ fn insert_inbound_file_offer(
             let chat_msg = crate::chat_store::ChatMessage {
                 id: message_id.clone(),
                 peer_id: store_key,
-                sender: origin_id.to_owned(),
+                sender: author.clone(),
                 recipient: rid.clone(),
                 body: body.clone(),
                 timestamp: now_ts,
-                is_self: false,
+                is_self: mine,
                 status: crate::chat_store::MessageStatus::Delivered,
                 kind: kind.clone(),
                 attachment_name: rel_path.to_owned(),
@@ -8776,6 +8806,7 @@ fn dispatch_event(
             let json = serde_json::json!({
                 "transfer_id": transfer_id,
                 "peer_id": peer_id,
+                "origin_id": origin_id,
                 "rel_path": rel_path,
                 "size": size,
                 "purpose": purpose,
@@ -8783,18 +8814,16 @@ fn dispatch_event(
             })
             .to_string();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                if !is_self {
-                    insert_inbound_file_offer(
-                        bridge.as_mut(),
-                        &transfer_id,
-                        &peer_id,
-                        &origin_id,
-                        &rel_path,
-                        size,
-                        &purpose,
-                        &supernode_id,
-                    );
-                }
+                insert_inbound_file_offer(
+                    bridge.as_mut(),
+                    &transfer_id,
+                    &peer_id,
+                    &origin_id,
+                    &rel_path,
+                    size,
+                    &purpose,
+                    &supernode_id,
+                );
                 bridge.as_mut().file_offered(QString::from(json.as_str()));
             });
         }
@@ -8855,10 +8884,14 @@ fn dispatch_event(
                         .map(|m| m.is_some())
                         .unwrap_or(false)
                     {
-                        if let Err(e) =
-                            cs.update_attachment(&message_id, &attachment_path, &size_str)
-                        {
-                            warn!("chat_store update_attachment error: {e}");
+                        // Sender ACK has no new path — keep the local-echo
+                        // attachment rather than wiping it to empty.
+                        if !attachment_path.is_empty() {
+                            if let Err(e) =
+                                cs.update_attachment(&message_id, &attachment_path, &size_str)
+                            {
+                                warn!("chat_store update_attachment error: {e}");
+                            }
                         }
                         bridge.as_mut().file_complete(QString::from(json.as_str()));
                         return;
@@ -8880,20 +8913,36 @@ fn dispatch_event(
                         .resolve_supernode_node_id_str(&sn_raw)
                         .unwrap_or(sn_raw);
                     if !sn.is_empty() && !rid.is_empty() && !attachment_path.is_empty() {
-                        let display_sender = room_chat_display_sender(bridge.rust(), "", &peer_id);
+                        let my_pub = bridge.rust().my_public_id.clone();
+                        let my_peer = bridge.rust().my_peer_id.clone();
+                        let author =
+                            if peer_id.is_empty() || peer_id == rid || pub_id_eq(&peer_id, &sn) {
+                                String::new()
+                            } else {
+                                peer_id.clone()
+                            };
+                        let mine = !author.is_empty()
+                            && (pub_id_eq(&author, &my_pub) || pub_id_eq(&author, &my_peer));
+                        let display_sender = if author.is_empty() {
+                            String::new()
+                        } else {
+                            room_chat_display_sender(bridge.rust(), "", &author)
+                        };
                         let msg_json = serde_json::json!({
                             "msg_id": message_id.clone(),
                             "sender": display_sender.clone(),
-                            "sender_id": peer_id.clone(),
+                            "sender_id": author.clone(),
                             "body": body.clone(),
                             "timestamp": now_ts,
                             "kind": kind.as_str(),
-                            "mine": false,
+                            "mine": mine,
                             "is_room": true,
                             "status": "delivered",
                             "attachment_name": rel_path.clone(),
                             "attachment_path": attachment_path.clone(),
                             "size_str": size_str.clone(),
+                            "supernode_id": sn.clone(),
+                            "room_id": rid.clone(),
                         })
                         .to_string();
                         if let Some(ref cs) = bridge.rust().chat_store {
@@ -8901,11 +8950,11 @@ fn dispatch_event(
                             let chat_msg = crate::chat_store::ChatMessage {
                                 id: message_id.clone(),
                                 peer_id: store_key,
-                                sender: peer_id.clone(),
+                                sender: author.clone(),
                                 recipient: rid.clone(),
                                 body: body.clone(),
                                 timestamp: now_ts,
-                                is_self: false,
+                                is_self: mine,
                                 status: crate::chat_store::MessageStatus::Delivered,
                                 kind: kind.clone(),
                                 attachment_name: rel_path.clone(),

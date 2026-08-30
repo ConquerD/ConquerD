@@ -2126,8 +2126,17 @@ impl ConnectionManager {
             .unwrap_or("")
             .to_owned();
 
+        // Prefer the stamped originator; `msg.sender` is the fallback when an
+        // older peer omitted `origin_id`. Never use the room id as the author.
+        let origin = msg
+            .payload
+            .get("origin_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && *s != room_id.as_str())
+            .unwrap_or(msg.sender.as_str())
+            .to_owned();
         let evs = self.room_file_mgr.on_offer_received_with_room(
-            &msg.sender,
+            &origin,
             &room_id,
             supernode_id,
             &tid,
@@ -2146,6 +2155,31 @@ impl ConnectionManager {
         // every file, which does not scale to a 250 MB video.
         self.dispatch_room_transfer_events(evs, supernode_id, &room_id)
             .await;
+    }
+
+    /// Accept whichever inbound transfer `transfer_id` belongs to.
+    ///
+    /// ChatPanel always calls `AcceptFile` and RoomPanel `AcceptRoomFile`. A
+    /// room offer that was mis-keyed under the room id used to land in the
+    /// 1:1 panel; either command must still start the right stream.
+    pub(super) async fn accept_inbound_file(&mut self, transfer_id: &str) {
+        if self.file_mgr.has_inbound(transfer_id) {
+            let evs = self.file_mgr.accept_transfer(transfer_id);
+            self.dispatch_transfer_events(evs).await;
+            return;
+        }
+        match self.room_file_mgr.inbound_route(transfer_id) {
+            Some((origin, room_id, sn)) => {
+                let sn = if sn.is_empty() {
+                    self.current_supernode_id.clone()
+                } else {
+                    sn
+                };
+                self.accept_room_file(&sn, &room_id, transfer_id, &origin)
+                    .await;
+            }
+            None => warn!("AcceptFile: unknown transfer {transfer_id}"),
+        }
     }
 
     /// The user accepted a room file offer → ask the originator to stream it.
@@ -2204,8 +2238,10 @@ impl ConnectionManager {
         }
         // Only serve a request that names us; the supernode routes by `to`, but
         // a stray copy must not make us stream to the wrong room.
+        // Pad-tolerant: relay-sourced ids are unpadded, handshake ids are not.
         let to = msg.payload.get("to").and_then(Value::as_str).unwrap_or("");
-        if !to.is_empty() && to != self.identity.public_id() {
+        let me = self.identity.public_id();
+        if !to.is_empty() && !same_supernode_pad(to, &me) {
             return;
         }
         // The offer may be gone: revoked when the sender deleted the message,
@@ -2537,6 +2573,12 @@ impl ConnectionManager {
                     }
                     payload.insert("room_id".into(), Value::String(room_id.to_owned()));
                     let sender = self.identity.public_id();
+                    // The signed `sender` is the originator, but room UI used
+                    // to key offers by room id. Stamp the person on the offer
+                    // so receivers never render the room or supernode as author.
+                    if room_msg_type == MessageType::SfuFileOffer {
+                        payload.insert("origin_id".into(), Value::String(sender.clone()));
+                    }
                     // E2E-seal chunk data under real group-key material only
                     // (deterministic fallback is not supernode-opaque). Drop
                     // the chunk until keyed — receiver never gets cleartext.
@@ -2545,6 +2587,10 @@ impl ConnectionManager {
                         let b64 = base64::engine::general_purpose::STANDARD;
                         if !may_send_room_e2e_content(self.group_keys.has_real_key(room_id)) {
                             warn!("[room.file.v1] no real group key yet; dropping outbound chunk");
+                            hold_file_data = true;
+                            if !tid.is_empty() {
+                                *unsent_chunks.entry(tid).or_insert(0) += 1;
+                            }
                             continue;
                         }
                         let transfer_id = payload
@@ -2582,6 +2628,7 @@ impl ConnectionManager {
                                 }
                                 None => {
                                     warn!("[room.file.v1] seal failed; dropping outbound chunk");
+                                    hold_file_data = true;
                                     if !tid.is_empty() {
                                         *unsent_chunks.entry(tid).or_insert(0) += 1;
                                     }
@@ -2617,13 +2664,15 @@ impl ConnectionManager {
                     } else {
                         room_id.to_owned()
                     };
+                    let me = self.identity.public_id();
+                    let is_self = same_supernode_pad(&offered_peer, &me);
                     self.emit_event(ConnectionEvent::FileOffered {
                         transfer_id,
                         peer_id: ui_peer,
                         rel_path,
                         size,
                         purpose,
-                        is_self: false,
+                        is_self,
                         origin_id: offered_peer,
                         supernode_id: supernode_id.to_owned(),
                     });

@@ -46,6 +46,8 @@ pub struct TransferRow {
     pub is_self: bool,
     #[serde(default = "default_purpose")]
     pub purpose: String,
+    #[serde(default)]
+    pub reason: String,
 }
 
 fn default_state() -> String {
@@ -141,6 +143,11 @@ pub mod ffi {
         #[qinvokable]
         #[rust_name = "progress_for"]
         fn progressFor(&self, transfer_id: &QString) -> f64;
+
+        /// Fail reason for a transfer shown inside a chat bubble, or empty.
+        #[qinvokable]
+        #[rust_name = "reason_for"]
+        fn reasonFor(&self, transfer_id: &QString) -> QString;
 
         // ── Qt model lifecycle ────────────────────────────────────────────
         #[inherit]
@@ -269,12 +276,14 @@ impl ffi::FileTransferModel {
         }
     }
 
-    fn mark_failed(mut self: Pin<&mut Self>, transfer_id: &QString, _reason: &QString) {
+    fn mark_failed(mut self: Pin<&mut Self>, transfer_id: &QString, reason: &QString) {
         let tid = transfer_id.to_string();
+        let why = reason.to_string();
         let changed = {
             let rows = &mut self.as_mut().rust_mut().rows;
             if let Some(r) = rows.iter_mut().find(|r| r.transfer_id == tid) {
                 r.state = "failed".to_owned();
+                r.reason = why;
                 true
             } else {
                 false
@@ -314,5 +323,15 @@ impl ffi::FileTransferModel {
             .find(|r| r.transfer_id == tid)
             .map(|r| r.progress)
             .unwrap_or(0.0)
+    }
+
+    fn reason_for(&self, transfer_id: &QString) -> QString {
+        let tid = transfer_id.to_string();
+        self.rust()
+            .rows
+            .iter()
+            .find(|r| r.transfer_id == tid)
+            .map(|r| QString::from(r.reason.as_str()))
+            .unwrap_or_default()
     }
 }

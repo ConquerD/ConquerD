@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
@@ -220,7 +220,10 @@ impl OutboundTransfer {
 pub enum TransferSink {
     Memory(HashMap<usize, Vec<u8>>),
     PartFile {
-        file: File,
+        /// `None` once finalize has closed the writer so the `.part` file can
+        /// be hashed and renamed. Windows will not rename a path that still
+        /// has an open handle in this process.
+        file: Option<File>,
         path: PathBuf,
         /// Per-index arrival flags; length is `total_chunks`.
         received: Vec<bool>,
@@ -259,6 +262,10 @@ pub struct InboundTransfer {
     pub finished_at: Option<f64>,
     /// Where arriving chunks accumulate (memory map, or a sparse `.part` file).
     sink: TransferSink,
+    /// COMPLETE arrived before every chunk did. Finish on the last arrival
+    /// instead of failing the transfer — chunks and COMPLETE can take different
+    /// transports when the QUIC signaling queue is full.
+    complete_requested: bool,
 }
 
 impl InboundTransfer {
@@ -299,6 +306,7 @@ impl InboundTransfer {
             created_at: unix_now_f64(),
             finished_at: None,
             sink,
+            complete_requested: false,
         }
     }
 
@@ -329,6 +337,9 @@ impl InboundTransfer {
                 if received.get(index).copied().unwrap_or(true) {
                     return false; // duplicate, or out of range
                 }
+                let Some(file) = file.as_mut() else {
+                    return false;
+                };
                 // Fixed offset — valid only because streaming transfers are
                 // never compressed (see the module docs).
                 let offset = (index * CHUNK_SIZE) as u64;
@@ -928,14 +939,40 @@ impl FileTransferManager {
     }
 
     pub fn on_transfer_ack(&mut self, transfer_id: &str) -> Vec<TransferEvent> {
-        if let Some(x) = self.outbound.get_mut(transfer_id) {
-            x.state = TransferState::Complete;
-            return vec![TransferEvent::StateChanged {
+        let Some(x) = self.outbound.get_mut(transfer_id) else {
+            return vec![];
+        };
+        x.state = TransferState::Complete;
+        x.finished_at = Some(unix_now_f64());
+        // The sender already has the file. Name it so the bubble can go
+        // "done" without `save_received_file` writing a second copy. An
+        // in-memory source has no path — the UI keeps the local-echo path
+        // when `saved_path` is empty.
+        let payload = match &x.source {
+            TransferSource::FilePath { path, len } => TransferPayload::SavedAt {
+                path: path.to_string_lossy().into_owned(),
+                len: *len as u64,
+            },
+            TransferSource::Inline(d) => TransferPayload::SavedAt {
+                path: String::new(),
+                len: d.len() as u64,
+            },
+        };
+        vec![
+            TransferEvent::Complete {
+                transfer_id: transfer_id.to_owned(),
+                peer_id: x.peer_id.clone(),
+                room_id: String::new(),
+                supernode_id: String::new(),
+                purpose: x.purpose.clone(),
+                payload,
+                rel_path: x.rel_path.clone(),
+            },
+            TransferEvent::StateChanged {
                 transfer_id: transfer_id.to_owned(),
                 state: "complete".into(),
-            }];
-        }
-        vec![]
+            },
+        ]
     }
 
     pub fn on_transfer_error(&mut self, transfer_id: &str, reason: &str) -> Vec<TransferEvent> {
@@ -1049,7 +1086,7 @@ impl FileTransferManager {
         let sink = if size > INLINE_MAX && !compressed && !is_delta {
             match open_part_file(rel_path, transfer_id) {
                 Ok((file, path)) => TransferSink::PartFile {
-                    file,
+                    file: Some(file),
                     path,
                     received: vec![false; total_chunks],
                     count: 0,
@@ -1101,15 +1138,13 @@ impl FileTransferManager {
             sink,
         );
 
-        // UI keys room transfers by room_id so chips filter with the room panel.
-        let offered_peer = if room_id.is_empty() {
-            peer_id.to_owned()
-        } else {
-            room_id.to_owned()
-        };
+        // `peer_id` is the originator. Room dispatch remaps the UI key to
+        // the room id; stuffing the room id in here made every default-room
+        // offer look like it came from a peer named "default", and Accept
+        // then asked that phantom instead of the sender.
         let mut evs = vec![TransferEvent::Offered {
             transfer_id: transfer_id.to_owned(),
-            peer_id: offered_peer,
+            peer_id: peer_id.to_owned(),
             rel_path: rel_path.to_owned(),
             size,
             purpose: purpose.to_owned(),
@@ -1278,31 +1313,61 @@ impl FileTransferManager {
                 &format!("chunk_index {chunk_index} out of range"),
             );
         }
-        let progress = if xfer.store_chunk(chunk_index, chunk) {
-            xfer.progress()
-        } else {
+        let stored = xfer.store_chunk(chunk_index, chunk);
+        if !stored {
             return vec![];
-        };
-        vec![TransferEvent::Progress {
-            transfer_id: transfer_id.to_owned(),
-            progress,
-        }]
+        }
+        let received = xfer.chunks_received();
+        let total = xfer.total_chunks;
+        let should_finish = xfer.complete_requested && received == total;
+        if should_finish {
+            // COMPLETE already arrived; this was the last hole.
+            return self.finish_inbound(transfer_id);
+        }
+        // Same ~1 % throttle as the sender: per-chunk Progress floods the
+        // 256-slot app event channel and can drop FileComplete/FileFailed.
+        if progress_is_reportable(received, total) {
+            vec![TransferEvent::Progress {
+                transfer_id: transfer_id.to_owned(),
+                progress: xfer.progress(),
+            }]
+        } else {
+            vec![]
+        }
     }
 
     pub fn on_complete_received(&mut self, transfer_id: &str) -> Vec<TransferEvent> {
-        // --- Phase 0: completeness check + route by sink kind ---
+        {
+            let xfer = match self.inbound.get_mut(transfer_id) {
+                Some(x) if x.state == TransferState::Transferring => x,
+                _ => return vec![],
+            };
+            if xfer.chunks_received() != xfer.total_chunks {
+                // Chunks and COMPLETE can take different transports when the
+                // QUIC signaling queue is full, so COMPLETE can arrive first.
+                // Wait for the remaining chunks instead of failing a transfer
+                // that is about to finish.
+                xfer.complete_requested = true;
+                debug!(
+                    "COMPLETE for {transfer_id} arrived with {}/{} chunks; waiting",
+                    xfer.chunks_received(),
+                    xfer.total_chunks
+                );
+                return vec![];
+            }
+        }
+        self.finish_inbound(transfer_id)
+    }
+
+    /// All chunks are in — verify and publish.
+    fn finish_inbound(&mut self, transfer_id: &str) -> Vec<TransferEvent> {
         let streaming = {
             let xfer = match self.inbound.get(transfer_id) {
                 Some(x) if x.state == TransferState::Transferring => x,
                 _ => return vec![],
             };
             if xfer.chunks_received() != xfer.total_chunks {
-                let reason = format!(
-                    "missing chunks: got {}/{}",
-                    xfer.chunks_received(),
-                    xfer.total_chunks
-                );
-                return self.fail_inbound_with_error(transfer_id, &reason);
+                return vec![];
             }
             xfer.is_streaming()
         };
@@ -1321,32 +1386,7 @@ impl FileTransferManager {
             };
 
             if xfer.chunks_received() != xfer.total_chunks {
-                let reason = format!(
-                    "missing chunks: got {}/{}",
-                    xfer.chunks_received(),
-                    xfer.total_chunks
-                );
-                xfer.state = TransferState::Failed;
-                let peer_id = xfer.peer_id.clone();
-                warn!("Inbound transfer {transfer_id} failed: {reason}");
-                let mut p = serde_json::Map::new();
-                p.insert("transfer_id".into(), Value::String(transfer_id.to_owned()));
-                p.insert("reason".into(), Value::String(reason.clone()));
-                return vec![
-                    TransferEvent::Failed {
-                        transfer_id: transfer_id.to_owned(),
-                        reason,
-                    },
-                    TransferEvent::StateChanged {
-                        transfer_id: transfer_id.to_owned(),
-                        state: "failed".into(),
-                    },
-                    TransferEvent::SendMessage {
-                        peer_id,
-                        message_type: MessageType::FileTransferError,
-                        payload: p,
-                    },
-                ];
+                return vec![];
             }
 
             xfer.state = TransferState::Verifying;
@@ -1474,15 +1514,23 @@ impl FileTransferManager {
             let TransferSink::PartFile { file, path, .. } = &mut xfer.sink else {
                 return vec![];
             };
+            let Some(mut file) = file.take() else {
+                return vec![];
+            };
             // The last chunk is short; the sparse file may be longer than the
             // payload if a write landed past it. Pin the exact length.
             if let Err(e) = file
                 .set_len(xfer.expected_size as u64)
                 .and_then(|()| file.flush())
             {
+                drop(file);
                 let reason = format!("finalize failed: {e}");
                 return self.fail_inbound(transfer_id, &reason);
             }
+            // Drop the writer before hash/rename. Windows will not rename a
+            // path that still has an open handle in this process; antivirus
+            // scanners also race a just-finished write.
+            drop(file);
             (
                 path.clone(),
                 xfer.expected_sha256.clone(),
@@ -1571,14 +1619,21 @@ impl FileTransferManager {
         ]
     }
 
-    /// Fail an inbound transfer and tell the sender (used for missing chunks).
-    fn fail_inbound_with_error(&mut self, transfer_id: &str, reason: &str) -> Vec<TransferEvent> {
+    fn fail_inbound(&mut self, transfer_id: &str, reason: &str) -> Vec<TransferEvent> {
         let Some(xfer) = self.inbound.get_mut(transfer_id) else {
             return vec![];
         };
         xfer.state = TransferState::Failed;
         xfer.finished_at = Some(unix_now_f64());
         let peer_id = xfer.peer_id.clone();
+        if let TransferSink::PartFile { file, path, .. } = &mut xfer.sink {
+            *file = None;
+            if path.exists() {
+                if let Err(e) = std::fs::remove_file(&*path) {
+                    debug!("[file] could not remove failed {}: {e}", path.display());
+                }
+            }
+        }
         warn!("Inbound transfer {transfer_id} failed: {reason}");
         let mut p = serde_json::Map::new();
         p.insert("transfer_id".into(), Value::String(transfer_id.to_owned()));
@@ -1598,33 +1653,6 @@ impl FileTransferManager {
                 payload: p,
             },
         ]
-    }
-
-    fn fail_inbound(&mut self, transfer_id: &str, reason: &str) -> Vec<TransferEvent> {
-        if let Some(xfer) = self.inbound.get_mut(transfer_id) {
-            xfer.state = TransferState::Failed;
-            let peer_id = xfer.peer_id.clone();
-            warn!("Inbound transfer {transfer_id} failed: {reason}");
-            let mut p = serde_json::Map::new();
-            p.insert("transfer_id".into(), Value::String(transfer_id.to_owned()));
-            p.insert("reason".into(), Value::String(reason.to_owned()));
-            return vec![
-                TransferEvent::Failed {
-                    transfer_id: transfer_id.to_owned(),
-                    reason: reason.to_owned(),
-                },
-                TransferEvent::StateChanged {
-                    transfer_id: transfer_id.to_owned(),
-                    state: "failed".into(),
-                },
-                TransferEvent::SendMessage {
-                    peer_id,
-                    message_type: MessageType::FileTransferError,
-                    payload: p,
-                },
-            ];
-        }
-        vec![]
     }
 }
 
@@ -1778,8 +1806,20 @@ fn promote_part_file(part: &Path, rel_path: &str) -> std::io::Result<PathBuf> {
         .map(Path::to_path_buf)
         .unwrap_or_else(download_dir);
     let dest = unique_dest_path(&dir, &safe_file_name(rel_path));
-    std::fs::rename(part, &dest)?;
-    Ok(dest)
+    // A just-closed write is a favourite of antivirus scanners; a short
+    // retry covers the sharing-violation that otherwise fails a verified
+    // transfer on Windows.
+    let mut delay_ms = 25u64;
+    let mut last = std::fs::rename(part, &dest);
+    for _ in 0..3 {
+        if last.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        delay_ms += 25;
+        last = std::fs::rename(part, &dest);
+    }
+    last.map(|()| dest)
 }
 
 /// First free `name`, `name (1)`, `name (2)`… in `dir`.
@@ -2396,6 +2436,134 @@ mod tests {
         std::fs::write(&first, b"x").unwrap();
         let second = unique_dest_path(dir.path(), "clip.mp4");
         assert_eq!(second.file_name().unwrap(), "clip (1).mp4");
+    }
+
+    /// Room offers used to put the room id (`default`) in `Offered.peer_id`,
+    /// so the bubble looked like it came from a peer named "default".
+    #[test]
+    fn room_offer_names_the_originator_not_the_room() {
+        let mut receiver = FileTransferManager::new();
+        let evs = receiver.on_offer_received_with_room(
+            "sender-peer",
+            "default",
+            "SN-A",
+            "tid-room",
+            "clip.bin",
+            &sha256_hex(b"hello"),
+            5,
+            1,
+            "room_file",
+            false,
+            false,
+            "",
+        );
+        let offered = evs.iter().find_map(|ev| match ev {
+            TransferEvent::Offered { peer_id, .. } => Some(peer_id.as_str()),
+            _ => None,
+        });
+        assert_eq!(offered, Some("sender-peer"));
+        let route = receiver
+            .inbound_route("tid-room")
+            .expect("inbound recorded");
+        assert_eq!(route.0, "sender-peer");
+        assert_eq!(route.1, "default");
+        assert_eq!(route.2, "SN-A");
+    }
+
+    /// COMPLETE used to fail the transfer the moment any chunk was still
+    /// outstanding. Chunks and COMPLETE can take different transports, so
+    /// COMPLETE can arrive first — wait, then finish on the last chunk.
+    #[test]
+    fn complete_before_last_chunk_finishes_when_it_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("late.bin");
+        // Two chunks, uncompressed: `offer_file` would zlib a repeated
+        // pattern down to one chunk and skip the race this covers.
+        let data: Vec<u8> = (0..CHUNK_SIZE + 100).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &data).unwrap();
+        let mut sender = FileTransferManager::new();
+        let (transfer_id, offer_events) = sender
+            .offer_file_from_path("peer-1", "late.bin", &src, "file", false)
+            .expect("offer");
+        let offer = offer_events
+            .iter()
+            .find_map(|ev| match ev {
+                TransferEvent::SendMessage {
+                    message_type: MessageType::FileTransferOffer,
+                    payload,
+                    ..
+                } => Some(payload),
+                _ => None,
+            })
+            .expect("offer event");
+        let sha = offer.get("sha256").and_then(Value::as_str).unwrap();
+        let size = offer.get("size").and_then(Value::as_u64).unwrap() as usize;
+        let total = offer.get("total_chunks").and_then(Value::as_u64).unwrap() as usize;
+        assert!(
+            total >= 2,
+            "need at least two chunks to split COMPLETE from the last one"
+        );
+
+        let mut receiver = FileTransferManager::new();
+        receiver.on_offer_received(
+            "sender-peer",
+            &transfer_id,
+            "late.bin",
+            sha,
+            size,
+            total,
+            "file",
+            false,
+            false,
+            "",
+        );
+        receiver.accept_transfer_locally(&transfer_id);
+
+        let chunk_evs = sender.on_transfer_accepted(&transfer_id);
+        let mut chunks: Vec<(usize, String)> = chunk_evs
+            .iter()
+            .filter_map(|ev| match ev {
+                TransferEvent::SendMessage {
+                    message_type: MessageType::FileTransferChunk,
+                    payload,
+                    ..
+                } => Some((
+                    payload.get("chunk_index").and_then(Value::as_u64).unwrap() as usize,
+                    payload
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap()
+                        .to_owned(),
+                )),
+                _ => None,
+            })
+            .collect();
+        chunks.sort_by_key(|(i, _)| *i);
+        let last = chunks.pop().expect("last chunk");
+        for (idx, data) in &chunks {
+            receiver.on_chunk_received(&transfer_id, *idx, data);
+        }
+
+        let early = receiver.on_complete_received(&transfer_id);
+        assert!(
+            !early
+                .iter()
+                .any(|ev| matches!(ev, TransferEvent::Failed { .. })),
+            "COMPLETE with a hole must wait, not fail: {early:?}"
+        );
+        assert!(
+            !early
+                .iter()
+                .any(|ev| matches!(ev, TransferEvent::Complete { .. })),
+            "must not complete while a chunk is still missing"
+        );
+
+        let late = receiver.on_chunk_received(&transfer_id, last.0, &last.1);
+        assert!(
+            late.iter()
+                .any(|ev| matches!(ev, TransferEvent::Complete { .. })),
+            "last chunk after COMPLETE must finish the transfer: {late:?}"
+        );
     }
 
     /// Quota used to drop chunk frames after `chunks_sent` had already moved,

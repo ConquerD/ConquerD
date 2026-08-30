@@ -545,6 +545,7 @@ Item {
                                 onClicked: root.transferRejectRequested(root.transferId)
                             }
                             ToolButton {
+                                id: openFileBtn
                                 icon.source: "qrc:/qt/qml/ConquerD/Client/icons/folder.svg"
                                 icon.width: 14
                                 icon.height: 14
@@ -553,9 +554,20 @@ Item {
                                 implicitHeight: 24
                                 flat: true
                                 visible: root.attachmentPath !== "" && !root.xferLive
-                                ToolTip.text: qsTr("Open")
+                                ToolTip.text: qsTr("Open…")
                                 ToolTip.visible: hovered
-                                onClicked: root.openAttachmentRequested(root.attachmentPath)
+                                onClicked: openFileMenu.popup()
+                            }
+                            Menu {
+                                id: openFileMenu
+                                MenuItem {
+                                    text: qsTr("Open")
+                                    onTriggered: root.openAttachmentRequested(root.attachmentPath)
+                                }
+                                MenuItem {
+                                    text: qsTr("Open containing folder")
+                                    onTriggered: backend.openContainingFolder(root.attachmentPath)
+                                }
                             }
                         }
 
@@ -579,8 +591,12 @@ Item {
                             var pct = Math.round(root.xferProgress * 100)
                             return (root.sizeStr !== "" ? root.sizeStr + " · " : "") + pct + "%"
                         }
-                        if (root.xferState === "failed")
-                            return qsTr("Failed")
+                        if (root.xferState === "failed") {
+                            var why = (root.fileTransferModel && root.transferId !== "")
+                                      ? ("" + root.fileTransferModel.reasonFor(root.transferId))
+                                      : ""
+                            return why !== "" ? why : qsTr("Failed")
+                        }
                         if (root.xferState === "done")
                             return root.sizeStr !== "" ? root.sizeStr : qsTr("Complete")
                         return root.sizeStr
@@ -993,6 +1009,11 @@ Item {
             text: "Open Attachment"
             visible: root.attachmentPath !== ""
             onTriggered: root.openAttachmentRequested(root.attachmentPath)
+        }
+        MenuItem {
+            text: "Open Containing Folder"
+            visible: root.attachmentPath !== ""
+            onTriggered: backend.openContainingFolder(root.attachmentPath)
         }
         MenuItem {
             text: "Open in System App"

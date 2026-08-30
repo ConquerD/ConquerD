@@ -58,10 +58,16 @@ Item {
                     return
             }
         }
+        // Never show the room or supernode as the author — file offers used
+        // to key the bubble by room id, so both sides rendered the same
+        // identicon whoever actually sent the file.
+        var authorId = msg.sender_id || ""
+        if (authorId === root.roomId || authorId === root.supernodeId)
+            authorId = ""
         roomChatModel.append({
             "msgId": msg.msg_id || "",
             "sender": msg.sender || "",
-            "senderPeerId": msg.sender_id || "",
+            "senderPeerId": authorId,
             "body": msg.body || "",
             "timestamp": msg.timestamp || 0,
             "kind": msg.kind || "text",

@@ -1099,17 +1099,10 @@ impl ConnectionManager {
                             }
                         }
                         ConnectionCommand::AcceptFile { transfer_id } => {
-                            let evs = self.file_mgr.accept_transfer(&transfer_id);
-                            self.dispatch_transfer_events(evs).await;
+                            self.accept_inbound_file(&transfer_id).await;
                         }
                         ConnectionCommand::AcceptRoomFile { transfer_id } => {
-                            match self.room_file_mgr.inbound_route(&transfer_id) {
-                                Some((origin, room_id, sn)) => {
-                                    let sn = if sn.is_empty() { self.current_supernode_id.clone() } else { sn };
-                                    self.accept_room_file(&sn, &room_id, &transfer_id, &origin).await;
-                                }
-                                None => warn!("AcceptRoomFile: unknown transfer {transfer_id}"),
-                            }
+                            self.accept_inbound_file(&transfer_id).await;
                         }
                         ConnectionCommand::RevokeFile { transfer_id } => {
                             // Room files are pulled from our own disk and the

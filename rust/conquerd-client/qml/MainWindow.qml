@@ -1262,8 +1262,10 @@ ApplicationWindow {
                 var o = JSON.parse(json)
                 fileTransferModel.markComplete(o.transfer_id)
                 var mid = "xfer-" + o.transfer_id
-                chatModel.updateAttachment(mid, o.saved_path || "", o.size_str || "")
-                roomPanel.updateAttachment(mid, o.saved_path || "", o.size_str || "")
+                if (o.saved_path)
+                    chatModel.updateAttachment(mid, o.saved_path, o.size_str || "")
+                if (o.saved_path)
+                    roomPanel.updateAttachment(mid, o.saved_path, o.size_str || "")
             } catch(e) {}
         })
         backend.fileFailed.connect(function(json) {

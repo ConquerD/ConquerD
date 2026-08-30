@@ -240,6 +240,69 @@ pub fn clear_taskbar_badge() {
     set_taskbar_badge(0);
 }
 
+/// Reveal `path` in the system file manager, selecting the file when possible.
+///
+/// `path` is a local filesystem path (not a `file://` URL). An empty path is
+/// refused; a missing file still opens its parent directory.
+pub fn open_containing_folder(path: &str) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("empty path".into());
+    }
+    let p = std::path::Path::new(path);
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("explorer");
+        if p.is_file() {
+            cmd.arg(explorer_select_arg(p));
+        } else if p.is_dir() {
+            cmd.arg(p.as_os_str());
+        } else if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            cmd.arg(dir.as_os_str());
+        } else {
+            cmd.arg(p.as_os_str());
+        }
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("could not open folder: {e}"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("open");
+        if p.exists() {
+            cmd.args(["-R", path]);
+        } else if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            cmd.arg(dir.as_os_str());
+        } else {
+            cmd.arg(path);
+        }
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("could not open folder: {e}"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let dir = if p.is_dir() {
+            p
+        } else {
+            p.parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(p)
+        };
+        std::process::Command::new("xdg-open")
+            .arg(dir.as_os_str())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("could not open folder: {e}"))
+    }
+}
+
+/// `explorer /select,PATH` argument — no space after the comma.
+#[cfg(any(test, target_os = "windows"))]
+fn explorer_select_arg(path: &std::path::Path) -> String {
+    format!("/select,{}", path.display())
+}
+
 #[cfg(target_os = "windows")]
 fn set_taskbar_badge_windows(count: u32) {
     use windows::core::PCWSTR;
@@ -820,5 +883,20 @@ mod tests {
     #[test]
     fn parse_uri_invalid_scheme() {
         assert!(parse_uri("https://example.com").is_none());
+    }
+
+    #[test]
+    fn open_containing_folder_rejects_empty() {
+        assert!(open_containing_folder("").is_err());
+        assert!(open_containing_folder("   ").is_err());
+    }
+
+    #[test]
+    fn explorer_select_arg_has_no_space_after_comma() {
+        let p = std::path::Path::new("C:\\Downloads\\clip.bin");
+        let arg = explorer_select_arg(p);
+        assert!(arg.starts_with("/select,"), "{arg}");
+        assert!(!arg.starts_with("/select, "), "{arg}");
+        assert!(arg.ends_with("clip.bin"), "{arg}");
     }
 }
