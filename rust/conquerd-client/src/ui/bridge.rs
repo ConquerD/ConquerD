@@ -8239,7 +8239,21 @@ fn dispatch_event(
                 return;
             }
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                let Some(sn) = bridge.rust().resolve_supernode_node_id_str(&supernode_id) else {
+                // Chat rides whichever multi-homed cluster session wins the
+                // race, and the supernode forwards the frame verbatim, so
+                // `supernode_id` is usually a roster-learned sibling that is
+                // NOT in the peer store. Fold it onto the logical node's row —
+                // the same key the room panel, store, and history use — instead
+                // of dropping the message. `resolve_supernode_node_id_str`
+                // alone returned `None` here and silently swallowed every
+                // sibling-delivered message (the other 3 copies then lost the
+                // replay guard), so a remote peer's room chat never appeared.
+                let Some(sn) = sidebar_supernode_id(bridge.rust(), &supernode_id) else {
+                    warn!(
+                        "[room.chat.v1] inbound message from {} on unknown node {} — dropping",
+                        &sender_id[..8.min(sender_id.len())],
+                        &supernode_id[..12.min(supernode_id.len())],
+                    );
                     return;
                 };
                 // Learn the sender's display name for the room members panel
@@ -8302,8 +8316,7 @@ fn dispatch_event(
                     .push(json.clone());
                 // Only paint into the open room panel — other rooms stay
                 // chat-active for history/store, not the visible list.
-                let show = bridge.rust().current_supernode_id == sn
-                    && bridge.rust().current_room_id == room_id;
+                let show = is_selected_text_room(bridge.rust(), &sn, &room_id);
                 if show {
                     bridge
                         .as_mut()
