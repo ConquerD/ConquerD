@@ -13,8 +13,8 @@ use russh_sftp::protocol::OpenFlags;
 use tokio::io::AsyncWriteExt;
 
 use crate::auth_prompt::{
-    cache_session_password, interactive_allowed, prompt_for_password, read_prompt_responses,
-    resolved_password, SSH_PASSWORD_ENV,
+    cache_session_password, env_name_for_host, interactive_allowed, prompt_for_password,
+    read_prompt_responses, resolved_password, SSH_PASSWORD_ENV,
 };
 use crate::known_hosts::KnownHosts;
 use crate::openssh::shell_escape;
@@ -52,8 +52,14 @@ pub struct EmbeddedTransport {
 
 impl EmbeddedTransport {
     pub fn new(raw_target: impl Into<String>) -> Self {
+        Self::new_for_host(raw_target, None)
+    }
+
+    /// `label` is the inventory host name; it selects that host's entries in
+    /// the secrets file (`SNM_SSH_USER_<HOST>`, `SNM_SSH_PASSWORD_<HOST>`).
+    pub fn new_for_host(raw_target: impl Into<String>, label: Option<&str>) -> Self {
         Self {
-            target: SshTarget::parse(&raw_target.into()),
+            target: SshTarget::parse_for_host(&raw_target.into(), label),
         }
     }
 
@@ -81,8 +87,8 @@ impl EmbeddedTransport {
             .await
             .map_err(|e| TransportError::Other(format!("ssh connect: {e}")))?;
 
-        if !authenticate(&mut session, &self.target.user).await? {
-            return Err(TransportError::Other(auth_failure_message()));
+        if !authenticate(&mut session, &self.target).await? {
+            return Err(TransportError::Other(auth_failure_message(&self.target)));
         }
 
         op(session).await
@@ -107,44 +113,55 @@ impl client::Handler for ClientHandler {
     }
 }
 
-fn auth_failure_message() -> String {
-    if resolved_password().is_some() {
-        "ssh authentication failed (keys, password, and keyboard-interactive were rejected)".into()
+fn auth_failure_message(target: &SshTarget) -> String {
+    let var = env_name_for_host(SSH_PASSWORD_ENV, target.label());
+    if resolved_password(target.label(), &target.cache_key()).is_some() {
+        format!(
+            "ssh authentication failed for {} (keys, password, and keyboard-interactive were rejected; check {var})",
+            target.display()
+        )
     } else if interactive_allowed() {
-        "ssh authentication failed (password rejected or not accepted by server)".into()
+        format!(
+            "ssh authentication failed for {} (password rejected or not accepted by server)",
+            target.display()
+        )
     } else {
         format!(
-            "ssh authentication failed (no accepted key in ~/.ssh; set {SSH_PASSWORD_ENV} or run from a terminal for interactive auth)"
+            "ssh authentication failed for {} (no accepted key in ~/.ssh; set {var} or run from a terminal for interactive auth)",
+            target.display()
         )
     }
 }
 
 async fn authenticate(
     session: &mut client::Handle<ClientHandler>,
-    user: &str,
+    target: &SshTarget,
 ) -> Result<bool, TransportError> {
+    let user = target.user.as_str();
+    let cache_key = target.cache_key();
+
     if try_public_key_auth(session, user).await? {
         return Ok(true);
     }
 
-    let mut password = resolved_password();
+    let mut password = resolved_password(target.label(), &cache_key);
     if password.is_none() && interactive_allowed() {
         password = Some(
-            prompt_for_password()
+            prompt_for_password(target.label(), &cache_key)
                 .await
                 .map_err(|e| TransportError::Other(e))?,
         );
     }
 
     if let Some(ref pw) = password {
-        if try_password_auth(session, user, pw).await? {
+        if try_password_auth(session, user, pw, &cache_key).await? {
             return Ok(true);
         }
-        if try_keyboard_interactive_auth(session, user, Some(pw.clone())).await? {
+        if try_keyboard_interactive_auth(session, user, Some(pw.clone()), &cache_key).await? {
             return Ok(true);
         }
     } else if interactive_allowed() {
-        if try_keyboard_interactive_auth(session, user, None).await? {
+        if try_keyboard_interactive_auth(session, user, None, &cache_key).await? {
             return Ok(true);
         }
     }
@@ -184,13 +201,14 @@ async fn try_password_auth(
     session: &mut client::Handle<ClientHandler>,
     user: &str,
     password: &str,
+    cache_key: &str,
 ) -> Result<bool, TransportError> {
     let auth = session
         .authenticate_password(user, password)
         .await
         .map_err(|e| TransportError::Other(format!("password auth: {e}")))?;
     if auth.success() {
-        cache_session_password(password);
+        cache_session_password(cache_key, password);
         return Ok(true);
     }
     Ok(false)
@@ -200,6 +218,7 @@ async fn try_keyboard_interactive_auth(
     session: &mut client::Handle<ClientHandler>,
     user: &str,
     env_password: Option<String>,
+    cache_key: &str,
 ) -> Result<bool, TransportError> {
     let mut response = session
         .authenticate_keyboard_interactive_start(user, None)
@@ -210,7 +229,7 @@ async fn try_keyboard_interactive_auth(
         match response {
             KeyboardInteractiveAuthResponse::Success => {
                 if let Some(password) = env_password.as_deref() {
-                    cache_session_password(password);
+                    cache_session_password(cache_key, password);
                 }
                 return Ok(true);
             }
@@ -227,7 +246,8 @@ async fn try_keyboard_interactive_auth(
                 }
 
                 let responses =
-                    keyboard_interactive_responses(&prompts, env_password.as_deref()).await?;
+                    keyboard_interactive_responses(&prompts, env_password.as_deref(), cache_key)
+                        .await?;
                 response = session
                     .authenticate_keyboard_interactive_respond(responses)
                     .await
@@ -242,6 +262,7 @@ async fn try_keyboard_interactive_auth(
 async fn keyboard_interactive_responses(
     prompts: &[Prompt],
     env_password: Option<&str>,
+    cache_key: &str,
 ) -> Result<Vec<String>, TransportError> {
     if let Some(password) = env_password.filter(|_| can_auto_fill_password_prompts(prompts)) {
         return Ok(vec![password.to_string(); prompts.len()]);
@@ -255,7 +276,8 @@ async fn keyboard_interactive_responses(
 
     let prompt_specs: Vec<(String, bool)> =
         prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect();
-    tokio::task::spawn_blocking(move || read_prompt_responses(&prompt_specs))
+    let cache_key = cache_key.to_string();
+    tokio::task::spawn_blocking(move || read_prompt_responses(&prompt_specs, Some(&cache_key)))
         .await
         .map_err(|e| TransportError::Other(format!("prompt task: {e}")))?
         .map_err(|e| TransportError::Other(e))

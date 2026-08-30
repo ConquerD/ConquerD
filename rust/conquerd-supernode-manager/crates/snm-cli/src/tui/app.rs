@@ -798,7 +798,8 @@ pub struct App {
     pub remove_confirm: RemoveConfirmState,
     pub uninstall_confirm: UninstallConfirmState,
     /// `(ssh target, label)` — handled on the main thread with terminal suspend.
-    pub connect_pending: Option<(String, String)>,
+    /// Queued SSH connect: (ssh target, inventory host name, display label).
+    pub connect_pending: Option<(String, String, String)>,
     /// Plain-text view for mouse selection (logs/invite panel).
     pub logs_open_pending: Option<String>,
 }
@@ -893,7 +894,7 @@ impl App {
             self.status_line = "no host selected".into();
             return;
         };
-        self.connect_pending = Some((row.ssh.clone(), row.label()));
+        self.connect_pending = Some((row.ssh.clone(), row.host_name.clone(), row.label()));
         self.status_line = format!("connecting to {}…", row.label());
     }
 

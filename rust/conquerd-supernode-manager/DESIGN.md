@@ -139,7 +139,7 @@ Backends:
 
 | Backend | Selection | Notes |
 | --- | --- | --- |
-| Embedded | default, `--ssh-backend embedded` | Pure Rust `russh` plus SFTP. Uses SSH keys, `SNM_SSH_PASSWORD`, and keyboard-interactive auth. |
+| Embedded | default, `--ssh-backend embedded` | Pure Rust `russh` plus SFTP. Uses SSH keys, `SNM_SSH_PASSWORD[_<HOST>]`, and keyboard-interactive auth. |
 | OpenSSH | `--ssh-backend openssh` | Wraps system `ssh` and `scp`; useful for existing SSH config, jump hosts, and agents. |
 
 Host-key verification is not disabled. Embedded SSH reads known-hosts data;
@@ -365,8 +365,12 @@ other host firewalls are out of scope for the current implementation.
 ## Security Properties
 
 - SSH host-key verification remains enabled.
-- SSH password can be provided by `SNM_SSH_PASSWORD`; `launch.ps1` can load it
-  from gitignored `secrets.local.ps1`.
+- SSH password can be provided by `SNM_SSH_PASSWORD`, or per host by
+  `SNM_SSH_PASSWORD_<HOST>` (`<HOST>` = inventory host name, uppercased, with
+  non-alphanumerics as `_`); `SNM_SSH_USER[_<HOST>]` names the login user.
+  `launch.ps1` can load them from gitignored `secrets.local.ps1`.
+- Passwords typed interactively are cached per `user@host:port` for the life of
+  the process, so one server's password is never replayed against another.
 - Release archives are verified against `.sha256`.
 - Running binary hashes are shown so operators can compare deployed bytes.
 - Client identities and trust material are not managed by this tool.

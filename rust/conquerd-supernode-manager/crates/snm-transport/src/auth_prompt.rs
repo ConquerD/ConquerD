@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -6,41 +7,105 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 /// Non-interactive SSH password for the embedded backend.
+///
+/// Per-host overrides use `SNM_SSH_PASSWORD_<HOST>`, where `<HOST>` is the
+/// inventory host name run through [`env_key_suffix`]. The bare variable stays
+/// the fallback for hosts without their own entry.
 pub const SSH_PASSWORD_ENV: &str = "SNM_SSH_PASSWORD";
+
+/// SSH login user. `SNM_SSH_USER_<HOST>` overrides the `user@` in
+/// `inventory.toml`; the bare variable only fills in when the host's `ssh`
+/// string has no `user@` prefix.
+pub const SSH_USER_ENV: &str = "SNM_SSH_USER";
 
 const MASK_CHAR: char = '*';
 
-static SESSION_PASSWORD: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static SESSION_PASSWORDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-fn session_store() -> &'static Mutex<Option<String>> {
-    SESSION_PASSWORD.get_or_init(|| Mutex::new(None))
+fn session_store() -> &'static Mutex<HashMap<String, String>> {
+    SESSION_PASSWORDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn password_from_env() -> Option<String> {
-    match std::env::var(SSH_PASSWORD_ENV) {
+/// Env-var suffix for an inventory host name: uppercased, with every character
+/// outside `A-Z` / `0-9` replaced by `_` (`edge-1-a` becomes `EDGE_1_A`).
+pub fn env_key_suffix(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    match std::env::var(key) {
         Ok(value) if !value.is_empty() => Some(value),
         _ => None,
     }
 }
 
-/// Password from `SNM_SSH_PASSWORD` or a prior interactive connect in this process.
-pub fn resolved_password() -> Option<String> {
-    password_from_env().or_else(|| session_store().lock().ok()?.clone())
+/// Name of the per-host variable for `base`, or `base` itself without a label.
+pub fn env_name_for_host(base: &str, label: Option<&str>) -> String {
+    match label.map(env_key_suffix).filter(|s| !s.is_empty()) {
+        Some(suffix) => format!("{base}_{suffix}"),
+        None => base.to_string(),
+    }
 }
 
-pub fn cache_session_password(password: impl Into<String>) {
+/// `<base>_<HOST>` only — no fallback to the bare variable.
+pub fn per_host_env(base: &str, label: Option<&str>) -> Option<String> {
+    let label = label?;
+    let suffix = env_key_suffix(label);
+    if suffix.is_empty() {
+        return None;
+    }
+    non_empty_env(&format!("{base}_{suffix}"))
+}
+
+/// `<base>_<HOST>`, then the bare `<base>`.
+fn env_for_host(base: &str, label: Option<&str>) -> Option<String> {
+    per_host_env(base, label).or_else(|| non_empty_env(base))
+}
+
+pub fn password_from_env(label: Option<&str>) -> Option<String> {
+    env_for_host(SSH_PASSWORD_ENV, label)
+}
+
+/// Per-host login user (`SNM_SSH_USER_<HOST>`), which outranks `inventory.toml`.
+pub fn per_host_user_from_env(label: Option<&str>) -> Option<String> {
+    per_host_env(SSH_USER_ENV, label)
+}
+
+/// Fallback login user (`SNM_SSH_USER`), used only when nothing else names one.
+pub fn default_user_from_env() -> Option<String> {
+    non_empty_env(SSH_USER_ENV)
+}
+
+/// Password from the environment or from a prior interactive connect to the
+/// same `cache_key` in this process.
+pub fn resolved_password(label: Option<&str>, cache_key: &str) -> Option<String> {
+    password_from_env(label).or_else(|| session_store().lock().ok()?.get(cache_key).cloned())
+}
+
+pub fn cache_session_password(cache_key: &str, password: impl Into<String>) {
     let password = password.into();
-    if password.is_empty() {
+    if password.is_empty() || cache_key.is_empty() {
         return;
     }
-    if let Ok(mut slot) = session_store().lock() {
-        *slot = Some(password);
+    if let Ok(mut store) = session_store().lock() {
+        store.insert(cache_key.to_string(), password);
     }
 }
 
+/// Drop every cached password. Passwords are never shared between hosts, so
+/// this only matters on shutdown.
 pub fn clear_session_password() {
-    if let Ok(mut slot) = session_store().lock() {
-        *slot = None;
+    if let Ok(mut store) = session_store().lock() {
+        store.clear();
     }
 }
 
@@ -147,7 +212,13 @@ fn handle_password_key(password: &mut String, key: KeyEvent) -> Result<PasswordK
     }
 }
 
-pub fn read_prompt_response(prompt: &str, echo: bool) -> Result<String, String> {
+/// `cache_key` scopes a typed password to one `user@host:port`; pass `None` to
+/// leave it uncached.
+pub fn read_prompt_response(
+    prompt: &str,
+    echo: bool,
+    cache_key: Option<&str>,
+) -> Result<String, String> {
     if echo {
         let label = if prompt.is_empty() {
             "Response: ".to_string()
@@ -165,28 +236,36 @@ pub fn read_prompt_response(prompt: &str, echo: bool) -> Result<String, String> 
         Ok(line.trim_end_matches(['\r', '\n']).to_string())
     } else {
         let password = read_masked_password(prompt)?;
-        cache_session_password(&password);
+        if let Some(key) = cache_key {
+            cache_session_password(key, &password);
+        }
         Ok(password)
     }
 }
 
-pub fn read_prompt_responses(prompts: &[(String, bool)]) -> Result<Vec<String>, String> {
+pub fn read_prompt_responses(
+    prompts: &[(String, bool)],
+    cache_key: Option<&str>,
+) -> Result<Vec<String>, String> {
     prompts
         .iter()
-        .map(|(prompt, echo)| read_prompt_response(prompt, *echo))
+        .map(|(prompt, echo)| read_prompt_response(prompt, *echo, cache_key))
         .collect()
 }
 
-pub async fn prompt_for_password() -> Result<String, String> {
+pub async fn prompt_for_password(label: Option<&str>, cache_key: &str) -> Result<String, String> {
     if !interactive_allowed() {
+        let var = env_name_for_host(SSH_PASSWORD_ENV, label);
         return Err(format!(
-            "stdin is not a TTY; set {SSH_PASSWORD_ENV} or use Connect from the TUI"
+            "stdin is not a TTY; set {var} or use Connect from the TUI"
         ));
     }
     eprintln!();
-    let password = tokio::task::spawn_blocking(|| read_prompt_response("Password", false))
-        .await
-        .map_err(|e| format!("prompt task: {e}"))??;
+    let key = cache_key.to_string();
+    let password =
+        tokio::task::spawn_blocking(move || read_prompt_response("Password", false, Some(&key)))
+            .await
+            .map_err(|e| format!("prompt task: {e}"))??;
     Ok(password)
 }
 
@@ -198,8 +277,41 @@ mod tests {
     fn password_from_env_empty_is_none() {
         let key = format!("{SSH_PASSWORD_ENV}_TEST_EMPTY");
         std::env::set_var(&key, "");
-        assert!(std::env::var(&key).unwrap().is_empty());
+        assert!(non_empty_env(&key).is_none());
         std::env::remove_var(&key);
+    }
+
+    #[test]
+    fn builds_env_suffix_from_host_name() {
+        assert_eq!(env_key_suffix("acdc"), "ACDC");
+        assert_eq!(env_key_suffix("ac1"), "AC1");
+        assert_eq!(env_key_suffix("edge-1.a"), "EDGE_1_A");
+        assert_eq!(env_key_suffix(""), "");
+    }
+
+    #[test]
+    fn names_per_host_env_var() {
+        assert_eq!(
+            env_name_for_host(SSH_PASSWORD_ENV, Some("acdc")),
+            "SNM_SSH_PASSWORD_ACDC"
+        );
+        assert_eq!(
+            env_name_for_host(SSH_PASSWORD_ENV, None),
+            "SNM_SSH_PASSWORD"
+        );
+    }
+
+    #[test]
+    fn session_passwords_do_not_leak_across_hosts() {
+        // Asserts on the store directly: `resolved_password` would pick up an
+        // ambient SNM_SSH_PASSWORD from the runner's environment.
+        cache_session_password("root@10.0.0.1:22", "first");
+        let store = session_store().lock().unwrap();
+        assert_eq!(
+            store.get("root@10.0.0.1:22").map(String::as_str),
+            Some("first")
+        );
+        assert!(store.get("root@10.0.0.2:22").is_none());
     }
 
     #[test]

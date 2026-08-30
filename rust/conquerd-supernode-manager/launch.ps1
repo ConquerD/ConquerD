@@ -1,8 +1,9 @@
-# Launch supernode-manager with SNM_SSH_PASSWORD loaded from secrets.local.ps1
+# Launch supernode-manager with SSH credentials loaded from secrets.local.ps1
 #
 # Setup (once):
 #   Copy-Item secrets.local.ps1.example secrets.local.ps1
-#   Edit secrets.local.ps1 and set your SSH password
+#   Edit secrets.local.ps1 and set your SSH password (globally, or per host
+#   with SNM_SSH_PASSWORD_<HOST> / SNM_SSH_USER_<HOST>)
 #
 # Usage:
 #   .\launch.ps1              # opens TUI (default)
@@ -36,12 +37,17 @@ try {
         . $secretsExample
     }
 
-    if (-not $env:SNM_SSH_PASSWORD) {
+    # A per-host-only secrets file is valid, so accept any SNM_SSH_PASSWORD*.
+    $passwordVars = @(Get-ChildItem Env: | Where-Object { $_.Name -like 'SNM_SSH_PASSWORD*' -and $_.Value })
+    if ($passwordVars.Count -eq 0) {
         throw @'
-SNM_SSH_PASSWORD is not set.
+No SSH password is set.
 
-Set your password in secrets.local.ps1:
+Set one in secrets.local.ps1:
   Copy-Item secrets.local.ps1.example secrets.local.ps1
+
+Use SNM_SSH_PASSWORD for all hosts, or SNM_SSH_PASSWORD_<HOST> per host
+(<HOST> is the inventory host name, uppercased, non-alphanumerics as _).
 '@
     }
 

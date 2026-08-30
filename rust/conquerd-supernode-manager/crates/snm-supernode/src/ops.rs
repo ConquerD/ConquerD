@@ -59,8 +59,18 @@ pub async fn install_instance(
     resolved: &ResolvedInstance<'_>,
     local_binary: &Path,
     cluster_roster: Option<&ClusterRoster>,
+    allow_decluster: bool,
 ) -> Result<()> {
-    print_report(install_instance_report(transport, resolved, local_binary, cluster_roster).await?);
+    print_report(
+        install_instance_report(
+            transport,
+            resolved,
+            local_binary,
+            cluster_roster,
+            allow_decluster,
+        )
+        .await?,
+    );
     Ok(())
 }
 
@@ -69,6 +79,7 @@ pub async fn install_instance_report(
     resolved: &ResolvedInstance<'_>,
     local_binary: &Path,
     cluster_roster: Option<&ClusterRoster>,
+    allow_decluster: bool,
 ) -> Result<Vec<String>> {
     if resolved.defaults.privilege == PrivilegeMode::RootlessSystemd {
         bail!("rootless-systemd install is not implemented in the prototype");
@@ -79,6 +90,16 @@ pub async fn install_instance_report(
     let network = NetworkEnv::from_resolved(resolved);
     let label = instance_label(&resolved.host.name, resolved.instance);
     let prefix = privilege_prefix(resolved.defaults.privilege);
+
+    // Before anything is uploaded or restarted.
+    guard_against_declustering(
+        transport,
+        &layout.manifest_path,
+        cluster_roster,
+        &label,
+        allow_decluster,
+    )
+    .await?;
 
     ensure_service_user(transport, prefix, &layout.service_user).await?;
     ensure_directories(transport, prefix, &layout).await?;
@@ -156,6 +177,57 @@ pub async fn install_instance_report(
     Ok(report)
 }
 
+/// Probe for a `[cluster]` section, echoing `yes`/`no`. Anchored to the start
+/// of the line so it matches the section header and not `[[cluster.member]]`,
+/// and reports `no` for a missing file rather than failing.
+fn cluster_probe_command(manifest_path: &str) -> String {
+    let path = shell_escape(manifest_path);
+    format!("if [ -f {path} ] && grep -q '^\\[cluster\\]' {path}; then echo yes; else echo no; fi")
+}
+
+/// True when the instance's deployed `supernode.toml` already carries a
+/// `[cluster]` section. A missing file (fresh install) counts as false.
+async fn remote_has_cluster_section(transport: &SshTransport, manifest_path: &str) -> Result<bool> {
+    let cmd = cluster_probe_command(manifest_path);
+    let output = transport.run(&cmd).await?;
+    if output.exit_code != 0 {
+        bail!(
+            "probe {manifest_path} for a [cluster] section: {}",
+            output.stderr.trim()
+        );
+    }
+    Ok(output.stdout.trim() == "yes")
+}
+
+/// Refuse to overwrite a deployed `[cluster]` section with a cluster-less
+/// manifest.
+///
+/// This fires when an instance's `host/instance` key is missing from every
+/// `[[cluster]]` members list in `inventory.toml`: the roster resolves to
+/// `None`, the rewritten config drops the `[cluster]` section, and the restart
+/// silently brings the node up standalone while its former peers still list it
+/// — a half-formed cluster with no error anywhere.
+async fn guard_against_declustering(
+    transport: &SshTransport,
+    manifest_path: &str,
+    cluster_roster: Option<&ClusterRoster>,
+    label: &str,
+    allow_decluster: bool,
+) -> Result<()> {
+    if cluster_roster.is_some()
+        || allow_decluster
+        || !remote_has_cluster_section(transport, manifest_path).await?
+    {
+        return Ok(());
+    }
+    bail!(
+        "{label} is deployed as a cluster member, but no [[cluster]] in inventory.toml lists it \
+         — writing this config would drop its [cluster] section and restart it standalone.\n\
+         Add {label:?} back to the cluster's members list and run `cluster-sync --cluster <id>`, \
+         or pass --allow-decluster to remove it from the cluster on purpose."
+    );
+}
+
 pub async fn resolve_install_binary(
     transport: &SshTransport,
     resolved: &ResolvedInstance<'_>,
@@ -191,8 +263,18 @@ pub async fn push_config_instance(
     resolved: &ResolvedInstance<'_>,
     restart: bool,
     cluster_roster: Option<&ClusterRoster>,
+    allow_decluster: bool,
 ) -> Result<()> {
-    print_report(push_config_instance_report(transport, resolved, restart, cluster_roster).await?);
+    print_report(
+        push_config_instance_report(
+            transport,
+            resolved,
+            restart,
+            cluster_roster,
+            allow_decluster,
+        )
+        .await?,
+    );
     Ok(())
 }
 
@@ -201,11 +283,21 @@ pub async fn push_config_instance_report(
     resolved: &ResolvedInstance<'_>,
     restart: bool,
     cluster_roster: Option<&ClusterRoster>,
+    allow_decluster: bool,
 ) -> Result<Vec<String>> {
     let layout = InstanceLayout::from_resolved(resolved);
     let network = NetworkEnv::from_resolved(resolved);
     let label = instance_label(&resolved.host.name, resolved.instance);
     let prefix = privilege_prefix(resolved.defaults.privilege);
+
+    guard_against_declustering(
+        transport,
+        &layout.manifest_path,
+        cluster_roster,
+        &label,
+        allow_decluster,
+    )
+    .await?;
 
     let config = resolve_supernode_config(
         resolved.defaults,
@@ -636,7 +728,7 @@ pub async fn cluster_sync_report(
     for resolved in &members {
         let layout = InstanceLayout::from_resolved(resolved);
         let label = instance_label(&resolved.host.name, resolved.instance);
-        let transport = SshTransport::new(&resolved.host.ssh, backend);
+        let transport = SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
         let pub_key = collect_identity_pub(&transport, &layout)
             .await
             .with_context(|| {
@@ -684,7 +776,7 @@ pub async fn cluster_sync_report(
         let network = NetworkEnv::from_resolved(resolved);
         let label = instance_label(&resolved.host.name, resolved.instance);
         let prefix = privilege_prefix(resolved.defaults.privilege);
-        let transport = SshTransport::new(&resolved.host.ssh, backend);
+        let transport = SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
 
         let config = resolve_supernode_config(
             resolved.defaults,
@@ -698,12 +790,17 @@ pub async fn cluster_sync_report(
             .with_context(|| format!("upload supernode.toml for {label}"))?;
 
         // Apply restricted cluster-port firewall rules (from peer IPs only).
-        let peer_ips: Vec<String> = roster_members
+        // Members sharing a machine collapse to one rule.
+        let mut peer_ips: Vec<String> = Vec::new();
+        for m in roster_members
             .iter()
             .filter(|m| m.identity_pub != member_entry.identity_pub)
-            .map(|m| m.relay_addr.split(':').next().unwrap_or("").to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        {
+            let ip = m.relay_addr.split(':').next().unwrap_or("");
+            if !ip.is_empty() && !peer_ips.iter().any(|p| p == ip) {
+                peer_ips.push(ip.to_string());
+            }
+        }
         report.extend(
             apply_cluster_firewall_report(
                 &transport,
@@ -746,6 +843,23 @@ mod tests {
             stderr: String::new(),
             exit_code,
         }
+    }
+
+    #[test]
+    fn cluster_probe_anchors_to_the_section_header() {
+        let cmd = cluster_probe_command("/var/lib/conquerd/a1/supernode.toml");
+        // Anchored so [[cluster.member]] lines cannot satisfy it on their own.
+        assert!(cmd.contains(r"grep -q '^\[cluster\]'"));
+        // A missing file reports "no" instead of failing the command.
+        assert!(cmd.contains("[ -f /var/lib/conquerd/a1/supernode.toml ]"));
+        assert!(cmd.contains("echo yes"));
+        assert!(cmd.contains("echo no"));
+    }
+
+    #[test]
+    fn cluster_probe_quotes_awkward_paths() {
+        let cmd = cluster_probe_command("/var/lib/con quer/supernode.toml");
+        assert!(cmd.contains("'/var/lib/con quer/supernode.toml'"));
     }
 
     #[test]

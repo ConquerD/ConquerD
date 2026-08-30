@@ -4,6 +4,8 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use tokio::process::Command;
 
+use crate::auth_prompt::per_host_user_from_env;
+use crate::target::SshTarget;
 use crate::traits::{Transport, TransportError};
 
 /// Non-interactive SSH defaults. `accept-new` adds unseen host keys to
@@ -31,9 +33,21 @@ pub struct OpenSshTransport {
 
 impl OpenSshTransport {
     pub fn new(target: impl Into<String>) -> Self {
-        Self {
-            target: target.into(),
-        }
+        Self::new_for_host(target, None)
+    }
+
+    /// `label` is the inventory host name. Only `SNM_SSH_USER_<HOST>` applies
+    /// here — passwords are the system `ssh` client's business, so per-host
+    /// passwords in the secrets file are ignored on this backend.
+    pub fn new_for_host(target: impl Into<String>, label: Option<&str>) -> Self {
+        let raw = target.into();
+        // Rewrite only when an override exists, so the default path keeps
+        // handing `ssh` the inventory string verbatim (~/.ssh/config still wins).
+        let target = match per_host_user_from_env(label) {
+            Some(_) => SshTarget::parse_for_host(&raw, label).display(),
+            None => raw,
+        };
+        Self { target }
     }
 
     pub fn target(&self) -> &str {

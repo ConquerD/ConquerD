@@ -103,14 +103,14 @@ pub async fn run(inventory_path: PathBuf, ssh_backend: SshBackend) -> Result<()>
                 input_paused.store(false, Ordering::Relaxed);
             }
             () = std::future::ready(()), if app.connect_pending.is_some() => {
-                let (ssh, label) = app.connect_pending.take().unwrap();
+                let (ssh, host_name, label) = app.connect_pending.take().unwrap();
                 input_paused.store(true, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(150));
                 while event_rx.try_recv().is_ok() {}
                 restore_terminal(&mut terminal)?;
                 eprintln!();
                 eprintln!("SSH connect: {label} ({ssh})");
-                let transport = SshTransport::new(&ssh, ssh_backend);
+                let transport = SshTransport::for_host(&host_name, &ssh, ssh_backend);
                 match connect_host(&transport).await {
                     Ok(()) => {
                         eprintln!("Connected. Password cached for this session.");

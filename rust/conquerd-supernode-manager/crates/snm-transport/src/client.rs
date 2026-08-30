@@ -46,10 +46,24 @@ pub enum SshTransport {
 
 impl SshTransport {
     pub fn new(raw_target: impl Into<String>, backend: SshBackend) -> Self {
+        Self::new_for_host(raw_target, None, backend)
+    }
+
+    /// Transport for an inventory host, tagged with its name so per-host
+    /// credentials (`SNM_SSH_USER_<HOST>`, `SNM_SSH_PASSWORD_<HOST>`) apply.
+    pub fn for_host(host_name: &str, raw_target: impl Into<String>, backend: SshBackend) -> Self {
+        Self::new_for_host(raw_target, Some(host_name), backend)
+    }
+
+    pub fn new_for_host(
+        raw_target: impl Into<String>,
+        label: Option<&str>,
+        backend: SshBackend,
+    ) -> Self {
         let target = raw_target.into();
         match backend {
-            SshBackend::Embedded => Self::Embedded(EmbeddedTransport::new(target)),
-            SshBackend::OpenSsh => Self::OpenSsh(OpenSshTransport::new(target)),
+            SshBackend::Embedded => Self::Embedded(EmbeddedTransport::new_for_host(target, label)),
+            SshBackend::OpenSsh => Self::OpenSsh(OpenSshTransport::new_for_host(target, label)),
         }
     }
 

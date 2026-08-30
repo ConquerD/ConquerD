@@ -256,13 +256,22 @@ pub fn render_cluster_ufw_script(
     if peer_ips.is_empty() {
         return lines.join("\n");
     }
+
+    // Drop this instance's existing cluster rules and rebuild, so peers that
+    // left the cluster and stale ports do not linger. A shared per-instance
+    // comment cannot be used as the add-guard: with members on more than one
+    // machine it matches after the first peer and skips every later IP.
+    let needle = shell_escape(&ufw_comment(host_name, instance_id, "cluster"));
+    lines.push(format!(
+        "{prefix}ufw status numbered 2>/dev/null | grep -F {needle} | sed -E 's/^\\[ *([0-9]+)\\].*/\\1/' | sort -rn | while read -r n; do [ -n \"$n\" ] && {prefix}ufw --force delete \"$n\"; done"
+    ));
+
     for ip in peer_ips {
-        let comment = ufw_comment(host_name, instance_id, "cluster");
+        let comment = format!("{}:{ip}", ufw_comment(host_name, instance_id, "cluster"));
         let comment_escaped = shell_escape(&comment);
         let ip_escaped = shell_escape(ip);
         lines.push(format!(
-            "if ! {prefix}ufw status verbose 2>/dev/null | grep -Fq {comment_escaped}; then \
-             {prefix}ufw allow from {ip_escaped} to any port {cluster_port} proto udp comment {comment_escaped}; fi"
+            "{prefix}ufw allow from {ip_escaped} to any port {cluster_port} proto udp comment {comment_escaped}"
         ));
     }
     lines.join("\n")
@@ -279,6 +288,28 @@ mod tests {
             public_host: "155.138.244.189".into(),
             access_mode: "open".into(),
         }
+    }
+
+    #[test]
+    fn cluster_script_adds_a_rule_per_peer_ip() {
+        let peers = vec!["155.138.244.189".to_string(), "137.220.49.91".to_string()];
+        let script = render_cluster_ufw_script("", "acdc", "a", 4478, &peers);
+        // One rule per peer, each with its own comment needle.
+        assert!(script.contains(
+            "ufw allow from 155.138.244.189 to any port 4478 proto udp comment 'snm:acdc/a:cluster:155.138.244.189'"
+        ));
+        assert!(script.contains(
+            "ufw allow from 137.220.49.91 to any port 4478 proto udp comment 'snm:acdc/a:cluster:137.220.49.91'"
+        ));
+        // Stale cluster rules are wiped first so departed peers do not linger.
+        assert!(script.contains("grep -F 'snm:acdc/a:cluster'"));
+        assert!(!script.contains("if ! "));
+    }
+
+    #[test]
+    fn cluster_script_is_empty_without_peers() {
+        let script = render_cluster_ufw_script("", "acdc", "a", 4478, &[]);
+        assert_eq!(script, "set -e");
     }
 
     #[test]

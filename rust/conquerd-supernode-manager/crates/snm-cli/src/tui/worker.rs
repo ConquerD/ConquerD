@@ -83,7 +83,8 @@ async fn refresh_one(
 ) {
     let result = match resolve_row(inventory, row).await {
         Ok(resolved) => {
-            let transport = SshTransport::new(&resolved.host.ssh, backend);
+            let transport =
+                SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
             status_instance(&transport, &resolved)
                 .await
                 .map_err(|e| e.to_string())
@@ -101,7 +102,8 @@ async fn ping_one(
 ) {
     let result = match resolve_row(inventory, row).await {
         Ok(resolved) => {
-            let transport = SshTransport::new(&resolved.host.ssh, backend);
+            let transport =
+                SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
             ping_host(&transport).await.map_err(|e| e.to_string())
         }
         Err(e) => Err(e.to_string()),
@@ -127,7 +129,8 @@ async fn lifecycle_one(
 
     let result = match resolve_row(inventory, row).await {
         Ok(resolved) => {
-            let transport = SshTransport::new(&resolved.host.ssh, backend);
+            let transport =
+                SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
             lifecycle_report(&transport, &resolved, action).await
         }
         Err(e) => Err(e),
@@ -169,14 +172,15 @@ async fn config_push_one(
 
     let result = match resolve_row(inventory, row).await {
         Ok(resolved) => {
-            let transport = SshTransport::new(&resolved.host.ssh, backend);
+            let transport =
+                SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
             let roster = resolve_worker_roster(
                 inventory,
                 &cache,
                 &resolved.host.name,
                 &resolved.instance.id,
             );
-            push_config_instance_report(&transport, &resolved, true, roster.as_ref()).await
+            push_config_instance_report(&transport, &resolved, true, roster.as_ref(), false).await
         }
         Err(e) => Err(e),
     };
@@ -220,7 +224,8 @@ async fn install_one(
 
     let result = match resolve_row(inventory, row).await {
         Ok(resolved) => {
-            let transport = SshTransport::new(&resolved.host.ssh, backend);
+            let transport =
+                SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
             let cache_path = inventory_path.with_file_name("cluster_cache.toml");
             let cache = ClusterCache::load(&cache_path).unwrap_or_default();
             let roster = resolve_worker_roster(
@@ -236,6 +241,7 @@ async fn install_one(
                         &resolved,
                         &download.binary_path,
                         roster.as_ref(),
+                        false,
                     )
                     .await
                 }
@@ -282,7 +288,8 @@ async fn fetch_logs_one(
 ) {
     let content = match resolve_row(inventory, row).await {
         Ok(resolved) => {
-            let transport = SshTransport::new(&resolved.host.ssh, backend);
+            let transport =
+                SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
             logs_instance_text(&transport, &resolved, false, 200)
                 .await
                 .map_err(|e| e.to_string())
@@ -300,12 +307,12 @@ async fn fetch_invite_one(
 ) {
     let content = match resolve_row(inventory, row).await {
         Ok(resolved) => {
-            let transport = SshTransport::new(&resolved.host.ssh, backend);
+            let transport =
+                SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
             invite_instance(&transport, &resolved)
                 .await
                 .map(|invite| {
-                    let text =
-                        format!("source: {}\n\n{}", invite.source_path, invite.invite_url);
+                    let text = format!("source: {}\n\n{}", invite.source_path, invite.invite_url);
 
                     text
                 })
@@ -339,7 +346,7 @@ async fn uninstall_one(
     let label = format!("{}/{}", resolved.host.name, resolved.instance.id);
 
     let result = {
-        let transport = SshTransport::new(&resolved.host.ssh, backend);
+        let transport = SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
         uninstall_instance_report(&transport, &resolved, purge).await
     };
 
@@ -490,7 +497,8 @@ async fn build_deploy_one(
 
     let result = match resolve_row(inventory, row).await {
         Ok(resolved) => {
-            let transport = SshTransport::new(&resolved.host.ssh, backend);
+            let transport =
+                SshTransport::for_host(&resolved.host.name, &resolved.host.ssh, backend);
             let cache_path = inventory_path.with_file_name("cluster_cache.toml");
             let cache = ClusterCache::load(&cache_path).unwrap_or_default();
             let roster = resolve_worker_roster(
@@ -499,7 +507,8 @@ async fn build_deploy_one(
                 &resolved.host.name,
                 &resolved.instance.id,
             );
-            install_instance_report(&transport, &resolved, &binary_path, roster.as_ref()).await
+            install_instance_report(&transport, &resolved, &binary_path, roster.as_ref(), false)
+                .await
         }
         Err(e) => Err(e),
     };

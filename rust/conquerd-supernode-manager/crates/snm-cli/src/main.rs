@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use snm_core::{
-    resolve_inventory_path, scaffold_inventory, scaffold_secrets_template, Inventory, Selector,
-    DEFAULT_INVENTORY_PATH,
+    resolve_inventory_path, scaffold_inventory, scaffold_secrets_template, Host, Inventory,
+    Selector, DEFAULT_INVENTORY_PATH,
 };
 use snm_supernode::{
     build_local_binary, cluster_sync_report, connect_host, install_instance, invite_instance,
@@ -30,7 +30,8 @@ struct Cli {
     inventory: PathBuf,
 
     /// SSH client backend: `embedded` (pure Rust) or `openssh` (system ssh/scp).
-    /// Embedded auth: `~/.ssh` keys, then `SNM_SSH_PASSWORD`, then interactive keyboard-interactive.
+    /// Embedded auth: `~/.ssh` keys, then `SNM_SSH_PASSWORD_<HOST>` / `SNM_SSH_PASSWORD`,
+    /// then interactive keyboard-interactive.
     #[arg(long, global = true, default_value = "embedded")]
     ssh_backend: String,
 
@@ -59,6 +60,10 @@ enum Command {
     Install {
         #[command(flatten)]
         selector: TargetArgs,
+        /// Allow writing a config with no [cluster] section over a deployed
+        /// cluster member (removes it from its cluster)
+        #[arg(long)]
+        allow_decluster: bool,
     },
     /// Re-render and push supernode.toml (+ systemd drop-in); restarts by default
     ConfigPush {
@@ -67,6 +72,10 @@ enum Command {
         /// Upload config only; do not restart the service
         #[arg(long)]
         no_restart: bool,
+        /// Allow writing a config with no [cluster] section over a deployed
+        /// cluster member (removes it from its cluster)
+        #[arg(long)]
+        allow_decluster: bool,
     },
     Start {
         #[command(flatten)]
@@ -148,6 +157,10 @@ enum Command {
         /// Build front-end: cargo (default), zigbuild, or cross
         #[arg(long, default_value = "cargo")]
         build_tool: String,
+        /// Allow writing a config with no [cluster] section over a deployed
+        /// cluster member (removes it from its cluster)
+        #[arg(long)]
+        allow_decluster: bool,
     },
 }
 
@@ -187,11 +200,24 @@ async fn run() -> Result<()> {
         Command::Init { force } => cmd_init(&inventory, force),
         Command::Connect { selector } => cmd_connect(&inventory, selector, ssh_backend).await,
         Command::Ping { selector } => cmd_ping(&inventory, selector, ssh_backend).await,
-        Command::Install { selector } => cmd_install(&inventory, selector, ssh_backend).await,
+        Command::Install {
+            selector,
+            allow_decluster,
+        } => cmd_install(&inventory, selector, ssh_backend, allow_decluster).await,
         Command::ConfigPush {
             selector,
             no_restart,
-        } => cmd_config_push(&inventory, selector, !no_restart, ssh_backend).await,
+            allow_decluster,
+        } => {
+            cmd_config_push(
+                &inventory,
+                selector,
+                !no_restart,
+                ssh_backend,
+                allow_decluster,
+            )
+            .await
+        }
         Command::Start { selector } => {
             cmd_lifecycle(&inventory, selector, LifecycleAction::Start, ssh_backend).await
         }
@@ -226,6 +252,7 @@ async fn run() -> Result<()> {
             source,
             target,
             build_tool,
+            allow_decluster,
         } => {
             cmd_build_deploy(
                 &inventory,
@@ -234,14 +261,15 @@ async fn run() -> Result<()> {
                 target.as_deref(),
                 &build_tool,
                 ssh_backend,
+                allow_decluster,
             )
             .await
         }
     }
 }
 
-fn ssh_transport(target: &str, backend: SshBackend) -> SshTransport {
-    SshTransport::new(target, backend)
+fn ssh_transport(host: &Host, backend: SshBackend) -> SshTransport {
+    SshTransport::for_host(&host.name, &host.ssh, backend)
 }
 
 fn pause_before_exit() {
@@ -277,7 +305,7 @@ async fn cmd_connect(path: &PathBuf, args: TargetArgs, backend: SshBackend) -> R
     let inv = Inventory::load(path)?;
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         connect_host(&transport).await?;
         println!(
             "{}  ssh={}  connected",
@@ -291,7 +319,7 @@ async fn cmd_ping(path: &PathBuf, args: TargetArgs, backend: SshBackend) -> Resu
     let inv = Inventory::load(path)?;
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         let probe = ping_host(&transport).await?;
         println!(
             "{}  ssh={}  os={}  arch={}  platform={}",
@@ -306,25 +334,38 @@ async fn cmd_config_push(
     args: TargetArgs,
     restart: bool,
     backend: SshBackend,
+    allow_decluster: bool,
 ) -> Result<()> {
     let inv = Inventory::load(path)?;
     let cache = ClusterCache::load(&cache_path_for(path)).unwrap_or_default();
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         let roster =
             resolve_cluster_roster(&inv, &cache, &resolved.host.name, &resolved.instance.id);
-        push_config_instance(&transport, &resolved, restart, roster.as_ref()).await?;
+        push_config_instance(
+            &transport,
+            &resolved,
+            restart,
+            roster.as_ref(),
+            allow_decluster,
+        )
+        .await?;
     }
     Ok(())
 }
 
-async fn cmd_install(path: &PathBuf, args: TargetArgs, backend: SshBackend) -> Result<()> {
+async fn cmd_install(
+    path: &PathBuf,
+    args: TargetArgs,
+    backend: SshBackend,
+    allow_decluster: bool,
+) -> Result<()> {
     let inv = Inventory::load(path)?;
     let cache = ClusterCache::load(&cache_path_for(path)).unwrap_or_default();
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         let download = resolve_install_binary(&transport, &resolved).await?;
         if !download.binary_path.exists() {
             bail!("binary not found: {}", download.binary_path.display());
@@ -336,6 +377,7 @@ async fn cmd_install(path: &PathBuf, args: TargetArgs, backend: SshBackend) -> R
             &resolved,
             &download.binary_path,
             roster.as_ref(),
+            allow_decluster,
         )
         .await?;
     }
@@ -351,7 +393,7 @@ async fn cmd_lifecycle(
     let inv = Inventory::load(path)?;
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         lifecycle(&transport, &resolved, action).await?;
     }
     Ok(())
@@ -361,7 +403,7 @@ async fn cmd_status(path: &PathBuf, args: TargetArgs, backend: SshBackend) -> Re
     let inv = Inventory::load(path)?;
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         let status = status_instance(&transport, &resolved).await?;
         println!(
             "{:<16} active={:<8} state={:<12} {}",
@@ -384,7 +426,7 @@ async fn cmd_logs(
     let inv = Inventory::load(path)?;
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         if selector.host.is_some() || selector.instance.is_some() || inv.host.len() == 1 {
             logs_instance(&transport, &resolved, follow, lines).await?;
         } else {
@@ -399,7 +441,7 @@ async fn cmd_invite(path: &PathBuf, args: TargetArgs, backend: SshBackend) -> Re
     let inv = Inventory::load(path)?;
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         let invite = invite_instance(&transport, &resolved).await?;
         println!("{}", invite.label);
         println!("  source: {}", invite.source_path);
@@ -419,7 +461,7 @@ async fn cmd_exec(
     let inv = Inventory::load(path)?;
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         let output = transport.run(command).await?;
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
@@ -484,7 +526,7 @@ async fn cmd_uninstall(
         .collect::<Result<Vec<_>>>()?;
 
     for resolved in targets {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         uninstall_instance(&transport, &resolved, purge).await?;
     }
 
@@ -550,6 +592,7 @@ async fn cmd_build_deploy(
     target_triple: Option<&str>,
     build_tool_str: &str,
     backend: SshBackend,
+    allow_decluster: bool,
 ) -> Result<()> {
     let tool = LocalBuildTool::parse(build_tool_str).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -566,10 +609,17 @@ async fn cmd_build_deploy(
     let cache = ClusterCache::load(&cache_path_for(path)).unwrap_or_default();
     let selector = selector_from(args);
     for resolved in inv.resolve_instances(&selector)? {
-        let transport = ssh_transport(&resolved.host.ssh, backend);
+        let transport = ssh_transport(resolved.host, backend);
         let roster =
             resolve_cluster_roster(&inv, &cache, &resolved.host.name, &resolved.instance.id);
-        install_instance(&transport, &resolved, &binary, roster.as_ref()).await?;
+        install_instance(
+            &transport,
+            &resolved,
+            &binary,
+            roster.as_ref(),
+            allow_decluster,
+        )
+        .await?;
     }
     Ok(())
 }

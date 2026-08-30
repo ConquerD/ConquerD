@@ -6,7 +6,10 @@ mod openssh;
 mod target;
 mod traits;
 
-pub use auth_prompt::{clear_session_password, SSH_PASSWORD_ENV};
+pub use auth_prompt::{
+    clear_session_password, env_key_suffix, env_name_for_host, password_from_env,
+    per_host_user_from_env, SSH_PASSWORD_ENV, SSH_USER_ENV,
+};
 pub use client::*;
 pub use embedded::EmbeddedTransport;
 pub use openssh::OpenSshTransport;

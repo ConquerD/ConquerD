@@ -107,7 +107,7 @@ flowchart LR
 ConquerD_Manager/
   Cargo.toml                 # workspace
   inventory.toml             # operator fleet definition (not committed secrets)
-  launch.ps1                 # Windows launcher: loads SNM_SSH_PASSWORD, runs TUI/CLI
+  launch.ps1                 # Windows launcher: loads SSH credentials, runs TUI/CLI
   crates/
     snm-cli/                 # clap binary `supernode-manager` + ratatui TUI
     snm-core/                # inventory model, selector, supernode config resolution
@@ -124,10 +124,12 @@ Both backends are implemented behind `snm_transport::SshTransport`:
 
 | Backend | Flag / env | Notes |
 |---|---|---|
-| **Embedded** (default) | `--ssh-backend embedded` | Pure Rust (`russh` + `russh-sftp`). Reads `~/.ssh` keys; falls back to `SNM_SSH_PASSWORD`, then interactive keyboard-interactive. Host keys via `known_hosts`. |
+| **Embedded** (default) | `--ssh-backend embedded` | Pure Rust (`russh` + `russh-sftp`). Reads `~/.ssh` keys; falls back to `SNM_SSH_PASSWORD[_<HOST>]`, then interactive keyboard-interactive. Host keys via `known_hosts`. |
 | **OpenSSH** | `--ssh-backend openssh` | Wraps system `ssh`/`scp`; honors `~/.ssh/config`, agent, jump hosts. |
 
-`SNM_SSH_BACKEND=openssh` also selects OpenSSH. On Windows, `launch.ps1` loads `secrets.local.ps1` → `SNM_SSH_PASSWORD` for password auth.
+`SNM_SSH_BACKEND=openssh` also selects OpenSSH. On Windows, `launch.ps1` loads `secrets.local.ps1` for password auth.
+
+Credentials are resolved per host. `SNM_SSH_PASSWORD_<HOST>` and `SNM_SSH_USER_<HOST>` — where `<HOST>` is the `[[host]].name` from `inventory.toml`, uppercased with non-alphanumerics as `_` — take precedence over the bare `SNM_SSH_PASSWORD` / `SNM_SSH_USER`. `SNM_SSH_USER_<HOST>` also overrides the `user@` in that host's `ssh` string; the bare `SNM_SSH_USER` only fills in when there is none. Typed passwords are cached per `user@host:port` for the process, never shared across hosts. Only the user override reaches the OpenSSH backend — it delegates auth to the system `ssh` client.
 
 Capabilities used today: remote command + exit code, upload bytes/files (SFTP or scp), no streaming log follow over SSH in TUI (fetches journal snapshot).
 
@@ -344,7 +346,7 @@ Implementation: `snm-supernode::binary_probe` — remote `readlink`, `sha256sum`
 ## 11. Security considerations
 
 - **SSH host-key verification** enabled for embedded backend (`known_hosts`); OpenSSH uses system `known_hosts`.
-- **Secrets:** `SNM_SSH_PASSWORD` via gitignored `secrets.local.ps1`; `secrets.toml` template for future access codes — not logged.
+- **Secrets:** `SNM_SSH_PASSWORD[_<HOST>]` / `SNM_SSH_USER[_<HOST>]` via gitignored `secrets.local.ps1`; `secrets.toml` template for future access codes — not logged.
 - **Least privilege:** dedicated service user created on install; `sudo`/`root` for unit installation.
 - **Binary provenance:** SHA-256 sidecar verified on download; running binary SHA shown in status. Signed manifest verification not yet implemented.
 - **Destructive actions:** TUI confirm dialogs for remove/uninstall/purge; CLI `--yes` to skip prompts.

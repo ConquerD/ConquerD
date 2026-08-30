@@ -1676,6 +1676,13 @@ fn sfu_chat_byte_count(msg: &SignalingMessage) -> usize {
 }
 
 /// Payload byte count for `SfuFile*` inbound quota accounting.
+///
+/// Offers and completes are control-plane metadata (filename, advertised
+/// size, sha256) — they must not debit the 8 MB/s `room.file.v1` bucket as
+/// if the whole file had already arrived. Charging `payload.size` dropped
+/// any offer larger than the remaining tokens (typically anything over a
+/// few MB once the bucket was warm), so the recipient never saw the
+/// transfer. Chunks still bill the opaque `data` length.
 fn sfu_file_inbound_byte_count(msg: &SignalingMessage, mt: MessageType) -> usize {
     match mt {
         MessageType::SfuFileChunk => msg
@@ -1684,14 +1691,7 @@ fn sfu_file_inbound_byte_count(msg: &SignalingMessage, mt: MessageType) -> usize
             .and_then(|v| v.as_str())
             .map(str::len)
             .unwrap_or(0),
-        MessageType::SfuFileOffer => msg
-            .payload
-            .get("size")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(0)
-            .max(64),
-        MessageType::SfuFileComplete => 64,
+        MessageType::SfuFileOffer | MessageType::SfuFileComplete => 64,
         _ => 0,
     }
 }
@@ -3790,6 +3790,52 @@ mod access_invite_tests {
         assert!(full(REPLICATED_DIRECT_INVITE_MARKER));
         assert!(full(""));
         assert!(!full(ROOM_GUEST_TRANSCRIPT_MARKER));
+    }
+}
+
+#[cfg(test)]
+mod sfu_file_quota_tests {
+    use super::*;
+
+    #[test]
+    fn sfu_file_offer_counts_control_plane_not_advertised_size() {
+        let large = SignalingMessage::new(
+            MessageType::SfuFileOffer,
+            "sender",
+            serde_json::json!({"size": 50_000_000, "sha256": "abc", "rel_path": "big.bin"}),
+        );
+        assert_eq!(
+            sfu_file_inbound_byte_count(&large, MessageType::SfuFileOffer),
+            64,
+            "advertised size must not debit the inbound file quota"
+        );
+        let tiny = SignalingMessage::new(
+            MessageType::SfuFileOffer,
+            "sender",
+            serde_json::json!({"size": 1}),
+        );
+        assert_eq!(
+            sfu_file_inbound_byte_count(&tiny, MessageType::SfuFileOffer),
+            64
+        );
+        let chunk = SignalingMessage::new(
+            MessageType::SfuFileChunk,
+            "sender",
+            serde_json::json!({"data": "abcd"}),
+        );
+        assert_eq!(
+            sfu_file_inbound_byte_count(&chunk, MessageType::SfuFileChunk),
+            4
+        );
+        let complete = SignalingMessage::new(
+            MessageType::SfuFileComplete,
+            "sender",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            sfu_file_inbound_byte_count(&complete, MessageType::SfuFileComplete),
+            64
+        );
     }
 }
 
