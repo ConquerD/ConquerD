@@ -272,11 +272,17 @@ pub enum ConnectionEvent {
     /// Remote peer sent a file offer.
     FileOffered {
         transfer_id: String,
+        /// Conversation key: 1:1 peer id, or room id for `room_file`.
         peer_id: String,
         rel_path: String,
         size: usize,
         purpose: String,
         is_self: bool,
+        /// Who offered the file. Same as `peer_id` on 1:1; the sender public
+        /// id on a room offer (where `peer_id` is the room).
+        origin_id: String,
+        /// Hosting supernode for room offers; empty on 1:1.
+        supernode_id: String,
     },
     /// Progress update for an active transfer (0.0–1.0).
     FileProgress { transfer_id: String, progress: f64 },

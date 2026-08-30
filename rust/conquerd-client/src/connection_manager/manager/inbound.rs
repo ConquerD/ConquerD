@@ -2408,11 +2408,13 @@ impl ConnectionManager {
                 } => {
                     self.emit_event(ConnectionEvent::FileOffered {
                         transfer_id,
-                        peer_id,
+                        peer_id: peer_id.clone(),
                         rel_path,
                         size,
                         purpose,
                         is_self: false,
+                        origin_id: peer_id,
+                        supernode_id: String::new(),
                     });
                 }
                 TransferEvent::Progress {
@@ -2545,7 +2547,7 @@ impl ConnectionManager {
                     // Prefer explicit room_id from the dispatch context; fall
                     // back to the event peer (already remapped for room offers).
                     let ui_peer = if room_id.is_empty() {
-                        offered_peer
+                        offered_peer.clone()
                     } else {
                         room_id.to_owned()
                     };
@@ -2556,6 +2558,8 @@ impl ConnectionManager {
                         size,
                         purpose,
                         is_self: false,
+                        origin_id: offered_peer,
+                        supernode_id: supernode_id.to_owned(),
                     });
                 }
                 TransferEvent::Progress {

@@ -100,6 +100,16 @@ pub mod ffi {
         #[rust_name = "match_count"]
         fn matchCount(self: Pin<&mut Self>, needle: &QString) -> i32;
 
+        /// Patch the saved path on an existing attachment bubble.
+        #[qinvokable]
+        #[rust_name = "update_attachment"]
+        fn updateAttachment(
+            self: Pin<&mut Self>,
+            msg_id: &QString,
+            path: &QString,
+            size_str: &QString,
+        );
+
         #[inherit]
         #[rust_name = "begin_reset_model"]
         fn beginResetModel(self: Pin<&mut Self>);
@@ -221,6 +231,9 @@ impl ffi::ChatModel {
 
     fn append_message(mut self: Pin<&mut Self>, json: &QString) {
         if let Ok(entry) = parse_chat_entry(&json.to_string()) {
+            if !entry.msg_id.is_empty() && self.messages.iter().any(|m| m.msg_id == entry.msg_id) {
+                return;
+            }
             let row = self.messages.len() as i32;
             let parent = QModelIndex::default();
             self.as_mut().begin_insert_rows(&parent, row, row);
@@ -294,6 +307,26 @@ impl ffi::ChatModel {
             .iter()
             .filter(|m| m.body.to_lowercase().contains(&needle))
             .count() as i32
+    }
+
+    fn update_attachment(
+        mut self: Pin<&mut Self>,
+        msg_id: &QString,
+        path: &QString,
+        size_str: &QString,
+    ) {
+        let id = msg_id.to_string();
+        if let Some(idx) = self.rust().messages.iter().position(|m| m.msg_id == id) {
+            self.as_mut().rust_mut().messages[idx].attachment_path = path.to_string();
+            self.as_mut().rust_mut().messages[idx].size_str = size_str.to_string();
+            let parent = QModelIndex::default();
+            let tl = self.as_ref().index(idx as i32, 0, &parent);
+            let br = tl.clone();
+            let mut roles = cxx_qt_lib::QList::<i32>::default();
+            roles.append(chat_roles::ATTACHMENT_PATH);
+            roles.append(chat_roles::SIZE_STR);
+            self.as_mut().data_changed(&tl, &br, &roles);
+        }
     }
 }
 

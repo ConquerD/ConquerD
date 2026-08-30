@@ -1258,7 +1258,13 @@ ApplicationWindow {
         backend.fileOffered.connect(fileTransferModel.upsertTransfer)
         backend.fileProgress.connect(fileTransferModel.setProgress)
         backend.fileComplete.connect(function(json) {
-            try { fileTransferModel.markComplete(JSON.parse(json).transfer_id) } catch(e) {}
+            try {
+                var o = JSON.parse(json)
+                fileTransferModel.markComplete(o.transfer_id)
+                var mid = "xfer-" + o.transfer_id
+                chatModel.updateAttachment(mid, o.saved_path || "", o.size_str || "")
+                roomPanel.updateAttachment(mid, o.saved_path || "", o.size_str || "")
+            } catch(e) {}
         })
         backend.fileFailed.connect(function(json) {
             try {

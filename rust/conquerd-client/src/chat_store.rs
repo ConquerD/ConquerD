@@ -323,6 +323,24 @@ impl ChatStore {
         Ok(())
     }
 
+    /// Fill in the saved path (and size label) once a transfer finishes.
+    ///
+    /// File offers are inserted as chat rows before anything is downloaded, so
+    /// complete has to patch the existing bubble rather than append a second one.
+    pub fn update_attachment(
+        &self,
+        msg_id: &str,
+        attachment_path: &str,
+        size_str: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE messages SET attachment_path = ?1, size_str = ?2 WHERE id = ?3",
+            params![attachment_path, size_str, msg_id],
+        )?;
+        Ok(())
+    }
+
     // -- read operations ----------------------------------------------------
 
     /// Fetch the most recent `PAGE_SIZE` messages for a peer conversation.
@@ -708,6 +726,24 @@ mod tests {
             .unwrap();
         let loaded = store.get_by_id(&id_str).unwrap().unwrap();
         assert_eq!(loaded.status, MessageStatus::Delivered);
+    }
+
+    #[test]
+    fn update_attachment_patches_path_and_size() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let store = ChatStore::open(&id, Some(&dir.path().join(CHAT_DB_FILENAME))).unwrap();
+        let mut msg = make_msg("peer1", "📎 clip.bin", false);
+        msg.kind = MessageKind::File;
+        msg.attachment_name = "clip.bin".to_owned();
+        let id_str = msg.id.clone();
+        store.insert(&msg).unwrap();
+        store
+            .update_attachment(&id_str, "/tmp/clip.bin", "12 KB")
+            .unwrap();
+        let loaded = store.get_by_id(&id_str).unwrap().unwrap();
+        assert_eq!(loaded.attachment_path, "/tmp/clip.bin");
+        assert_eq!(loaded.size_str, "12 KB");
     }
 
     #[test]

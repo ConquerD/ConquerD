@@ -132,6 +132,16 @@ pub mod ffi {
         #[rust_name = "remove_transfer"]
         fn removeTransfer(self: Pin<&mut Self>, transfer_id: &QString);
 
+        /// Live state for a transfer shown inside a chat bubble, or empty.
+        #[qinvokable]
+        #[rust_name = "state_for"]
+        fn stateFor(&self, transfer_id: &QString) -> QString;
+
+        /// Progress 0–1 for a transfer shown inside a chat bubble.
+        #[qinvokable]
+        #[rust_name = "progress_for"]
+        fn progressFor(&self, transfer_id: &QString) -> f64;
+
         // ── Qt model lifecycle ────────────────────────────────────────────
         #[inherit]
         #[rust_name = "begin_reset_model"]
@@ -284,5 +294,25 @@ impl ffi::FileTransferModel {
             self.as_mut().rust_mut().rows.remove(i);
             self.as_mut().end_reset_model();
         }
+    }
+
+    fn state_for(&self, transfer_id: &QString) -> QString {
+        let tid = transfer_id.to_string();
+        self.rust()
+            .rows
+            .iter()
+            .find(|r| r.transfer_id == tid)
+            .map(|r| QString::from(r.state.as_str()))
+            .unwrap_or_default()
+    }
+
+    fn progress_for(&self, transfer_id: &QString) -> f64 {
+        let tid = transfer_id.to_string();
+        self.rust()
+            .rows
+            .iter()
+            .find(|r| r.transfer_id == tid)
+            .map(|r| r.progress)
+            .unwrap_or(0.0)
     }
 }

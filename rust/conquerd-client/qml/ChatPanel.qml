@@ -350,6 +350,7 @@ Item {
                 attachmentName: model.attachmentName || ""
                 attachmentPath: model.attachmentPath || ""
                 sizeStr: model.sizeStr || ""
+                fileTransferModel: root.fileTransferModel
                 inlinePreviewEnabled: root.youtubePreviewEnabled
                 inlinePreviewAck: root.youtubeInlineAck
                 allowDelete: true
@@ -364,112 +365,8 @@ Item {
                 onDeleteRequested: (id) => backend.deleteMessage(id)
                 onRetryRequested: (id) => backend.retryMessage(id)
                 onOpenAttachmentRequested: (path) => root.openAttachment(path)
-            }
-        }
-
-        Column {
-            id: transferList
-            Layout.fillWidth: true
-            Layout.margins: 8
-            spacing: 4
-            visible: fileTransferRepeater.count > 0
-
-            Repeater {
-                id: fileTransferRepeater
-                model: root.fileTransferModel ? root.fileTransferModel : null
-
-                delegate: Rectangle {
-                    id: chip
-                    required property string transferId
-                    required property string peerId
-                    required property string relPath
-                    required property double progress
-                    required property string state
-                    required property bool isSelf
-
-                    visible: chip.peerId === root.selectedPeerId
-                    width: transferList.width
-                    height: visible ? chipLayout.implicitHeight + 12 : 0
-                    clip: true
-                    color: Theme.bg2
-                    radius: 0
-                    border.color: Theme.bg3
-                    border.width: 1
-
-                    ColumnLayout {
-                        id: chipLayout
-                        anchors { left: parent.left; right: parent.right; margins: 10 }
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 4
-
-                        RowLayout {
-                            spacing: 6
-                            Text {
-                                text: chip.isSelf ? "up" : "down"
-                                color: Theme.muted
-                                font.pixelSize: Theme.fontSizeCaption
-                            }
-                            Text {
-                                text: chip.relPath
-                                color: Theme.text
-                                font.pixelSize: Theme.fontSizeBody
-                                elide: Text.ElideMiddle
-                                Layout.fillWidth: true
-                            }
-                            ToolButton {
-                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/check.svg"
-                                icon.width: 14
-                                icon.height: 14
-                                icon.color: Theme.online
-                                visible: !chip.isSelf && chip.state === "pending"
-                                implicitWidth: 28
-                                implicitHeight: 28
-                                ToolTip.text: "Accept"
-                                ToolTip.visible: hovered
-                                onClicked: backend.acceptFile(chip.transferId)
-                            }
-                            ToolButton {
-                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/x-circle.svg"
-                                icon.width: 14
-                                icon.height: 14
-                                icon.color: Theme.danger
-                                visible: chip.state === "pending" || chip.state === "active"
-                                implicitWidth: 28
-                                implicitHeight: 28
-                                ToolTip.text: chip.isSelf ? "Cancel" : "Reject"
-                                ToolTip.visible: hovered
-                                onClicked: backend.rejectFile(chip.transferId)
-                            }
-                            ToolButton {
-                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
-                                icon.width: 12
-                                icon.height: 12
-                                icon.color: Theme.muted
-                                visible: chip.state === "done" || chip.state === "failed"
-                                implicitWidth: 24
-                                implicitHeight: 24
-                                ToolTip.text: "Dismiss"
-                                ToolTip.visible: hovered
-                                onClicked: root.fileTransferModel && root.fileTransferModel.removeTransfer(chip.transferId)
-                            }
-                        }
-
-                        ProgressBar {
-                            Layout.fillWidth: true
-                            from: 0.0
-                            to: 1.0
-                            value: chip.progress
-                            visible: chip.state === "active"
-                        }
-
-                        Text {
-                            visible: chip.state === "done" || chip.state === "failed"
-                            text: chip.state === "done" ? "Complete" : "Failed"
-                            color: chip.state === "done" ? Theme.online : Theme.danger
-                            font.pixelSize: Theme.fontSizeCaption
-                        }
-                    }
-                }
+                onTransferAcceptRequested: (id) => backend.acceptFile(id)
+                onTransferRejectRequested: (id) => backend.rejectFile(id)
             }
         }
 

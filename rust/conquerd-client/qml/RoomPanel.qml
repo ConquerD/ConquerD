@@ -51,6 +51,13 @@ Item {
             return
         if (msgSn !== "" && root.supernodeId !== "" && msgSn !== root.supernodeId)
             return
+        var incomingId = msg.msg_id || ""
+        if (incomingId !== "") {
+            for (var i = 0; i < roomChatModel.count; i++) {
+                if (roomChatModel.get(i).msgId === incomingId)
+                    return
+            }
+        }
         roomChatModel.append({
             "msgId": msg.msg_id || "",
             "sender": msg.sender || "",
@@ -77,6 +84,19 @@ Item {
         for (var i = 0; i < roomChatModel.count; i++) {
             if (roomChatModel.get(i).msgId === msgId) {
                 roomChatModel.remove(i)
+                return
+            }
+        }
+    }
+
+    function updateAttachment(msgId, path, sizeStr) {
+        if (!msgId)
+            return
+        for (var i = 0; i < roomChatModel.count; i++) {
+            if (roomChatModel.get(i).msgId === msgId) {
+                roomChatModel.setProperty(i, "attachmentPath", path || "")
+                if (sizeStr)
+                    roomChatModel.setProperty(i, "sizeStr", sizeStr)
                 return
             }
         }
@@ -250,6 +270,7 @@ Item {
                 attachmentName: model.attachmentName || ""
                 attachmentPath: model.attachmentPath || ""
                 sizeStr: model.sizeStr || ""
+                fileTransferModel: root.fileTransferModel
                 isRoom: true
                 inlinePreviewEnabled: root.youtubePreviewEnabled
                 inlinePreviewAck: root.youtubeInlineAck
@@ -270,125 +291,8 @@ Item {
                 }
                 onCopyRequested: (text) => backend.copyToClipboard(text)
                 onOpenAttachmentRequested: (path) => root.openAttachment(path)
-            }
-        }
-
-        Column {
-            id: transferList
-            Layout.fillWidth: true
-            Layout.margins: 6
-            spacing: 4
-            visible: fileTransferRepeater.count > 0
-
-            Repeater {
-                id: fileTransferRepeater
-                model: root.fileTransferModel ? root.fileTransferModel : null
-
-                delegate: Rectangle {
-                    id: chip
-                    required property string transferId
-                    required property string peerId
-                    required property string relPath
-                    required property double progress
-                    required property string state
-                    required property bool isSelf
-                    required property string purpose
-
-                    visible: chip.peerId === root.roomId && chip.purpose === "room_file"
-                    width: transferList.width
-                    height: visible ? chipLayout.implicitHeight + 12 : 0
-                    clip: true
-                    color: Theme.bg2
-                    radius: 0
-                    border.color: Theme.bg3
-                    border.width: 1
-
-                    ColumnLayout {
-                        id: chipLayout
-                        anchors { left: parent.left; right: parent.right; margins: 10 }
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 4
-
-                        RowLayout {
-                            spacing: 6
-                            Text {
-                                text: chip.isSelf ? "up" : "down"
-                                color: Theme.muted
-                                font.pixelSize: 11
-                            }
-                            Text {
-                                text: chip.relPath
-                                color: Theme.text
-                                font.pixelSize: 12
-                                elide: Text.ElideMiddle
-                                Layout.fillWidth: true
-                            }
-                            // Room files are advertised, not pushed: nothing
-                            // downloads until this is clicked. Without it every
-                            // member auto-downloaded every file.
-                            ToolButton {
-                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/check.svg"
-                                icon.width: 14
-                                icon.height: 14
-                                icon.color: Theme.online
-                                visible: !chip.isSelf && chip.state === "pending"
-                                flat: true
-                                ToolTip.text: "Download"
-                                ToolTip.visible: hovered
-                                onClicked: backend.acceptRoomFile(chip.transferId)
-                            }
-                            ToolButton {
-                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/x-circle.svg"
-                                icon.width: 14
-                                icon.height: 14
-                                icon.color: Theme.danger
-                                visible: !chip.isSelf && chip.state === "pending"
-                                flat: true
-                                ToolTip.text: "Decline"
-                                ToolTip.visible: hovered
-                                onClicked: backend.declineRoomFile(chip.transferId)
-                            }
-                            ToolButton {
-                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
-                                icon.width: 12
-                                icon.height: 12
-                                icon.color: Theme.muted
-                                visible: chip.state === "done" || chip.state === "failed"
-                                flat: true
-                                onClicked: root.fileTransferModel && root.fileTransferModel.removeTransfer(chip.transferId)
-                            }
-                        }
-
-                        ProgressBar {
-                            Layout.fillWidth: true
-                            from: 0.0
-                            to: 1.0
-                            value: chip.progress
-                            visible: chip.state === "active"
-                        }
-
-                        Text {
-                            visible: chip.state === "pending" && !chip.isSelf
-                            text: "Offered - accept to download"
-                            color: Theme.muted
-                            font.pixelSize: 11
-                        }
-
-                        Text {
-                            visible: chip.state === "pending" && chip.isSelf
-                            text: "Offered to the room"
-                            color: Theme.muted
-                            font.pixelSize: 11
-                        }
-
-                        Text {
-                            visible: chip.state === "done" || chip.state === "failed"
-                            text: chip.state === "done" ? "Complete" : "Failed"
-                            color: chip.state === "done" ? Theme.online : Theme.danger
-                            font.pixelSize: 11
-                        }
-                    }
-                }
+                onTransferAcceptRequested: (id) => backend.acceptRoomFile(id)
+                onTransferRejectRequested: (id) => backend.declineRoomFile(id)
             }
         }
 

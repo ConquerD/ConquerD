@@ -5678,6 +5678,165 @@ fn attachment_body_label(kind: &crate::chat_store::MessageKind, name: &str) -> S
     }
 }
 
+/// Put an inbound file offer into the chat stream so progress lives in the
+/// bubble, not a detached status strip. The sender already echoed their own
+/// `xfer-{id}` row from `send_file` / `send_room_file`.
+fn insert_inbound_file_offer(
+    mut bridge: Pin<&mut ffi::AppBridge>,
+    transfer_id: &str,
+    peer_id: &str,
+    origin_id: &str,
+    rel_path: &str,
+    size: usize,
+    purpose: &str,
+    supernode_id: &str,
+) {
+    let message_id = format!("xfer-{transfer_id}");
+    if let Some(ref cs) = bridge.rust().chat_store {
+        if cs
+            .get_by_id(&message_id)
+            .map(|m| m.is_some())
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+    let kind = crate::chat_store::message_kind_for_path(rel_path);
+    let size_str = crate::chat_store::format_byte_size(size as u64);
+    let body = attachment_body_label(&kind, rel_path);
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let is_room = purpose == "room_file";
+
+    if is_room {
+        let sn_raw = if supernode_id.is_empty() {
+            bridge.rust().current_supernode_id.clone()
+        } else {
+            supernode_id.to_owned()
+        };
+        let rid = if peer_id.is_empty() {
+            bridge.rust().current_room_id.clone()
+        } else {
+            peer_id.to_owned()
+        };
+        let sn = bridge
+            .rust()
+            .resolve_supernode_node_id_str(&sn_raw)
+            .unwrap_or(sn_raw);
+        if sn.is_empty() || rid.is_empty() {
+            return;
+        }
+        let display_sender = room_chat_display_sender(bridge.rust(), "", origin_id);
+        let msg_json = serde_json::json!({
+            "msg_id": message_id.clone(),
+            "sender": display_sender.clone(),
+            "sender_id": origin_id,
+            "body": body.clone(),
+            "timestamp": now_ts,
+            "kind": kind.as_str(),
+            "mine": false,
+            "is_room": true,
+            "status": "delivered",
+            "attachment_name": rel_path,
+            "attachment_path": "",
+            "size_str": size_str.clone(),
+            "supernode_id": sn,
+            "room_id": rid,
+        })
+        .to_string();
+        if let Some(ref cs) = bridge.rust().chat_store {
+            let store_key = room_chat_store_peer_id(&sn, &rid);
+            let chat_msg = crate::chat_store::ChatMessage {
+                id: message_id.clone(),
+                peer_id: store_key,
+                sender: origin_id.to_owned(),
+                recipient: rid.clone(),
+                body: body.clone(),
+                timestamp: now_ts,
+                is_self: false,
+                status: crate::chat_store::MessageStatus::Delivered,
+                kind: kind.clone(),
+                attachment_name: rel_path.to_owned(),
+                attachment_path: String::new(),
+                size_str: size_str.clone(),
+                status_note: String::new(),
+                sender_handle: display_sender,
+            };
+            if let Err(e) = cs.insert(&chat_msg) {
+                warn!("chat_store insert (room file offer) error: {e}");
+            }
+        }
+        let key = room_chat_history_key(&sn, &rid);
+        bridge
+            .as_mut()
+            .rust_mut()
+            .room_chat_history
+            .entry(key)
+            .or_default()
+            .push(msg_json.clone());
+        bridge
+            .as_mut()
+            .room_chat_received(QString::from(msg_json.as_str()));
+        return;
+    }
+
+    let handle = {
+        let r = bridge.rust();
+        r.peer_store
+            .as_ref()
+            .and_then(|ps| {
+                let store = ps.read();
+                store
+                    .get(origin_id)
+                    .or_else(|| store.get_by_identity(origin_id))
+                    .map(|rec| rec.display_name())
+            })
+            .unwrap_or_else(|| origin_id.to_owned())
+    };
+    let list_peer =
+        lookup_list_peer_id(bridge.rust(), origin_id).unwrap_or_else(|| origin_id.to_owned());
+    let chat_msg = crate::chat_store::ChatMessage {
+        id: message_id.clone(),
+        peer_id: list_peer.clone(),
+        sender: handle.clone(),
+        recipient: String::new(),
+        body: body.clone(),
+        timestamp: now_ts,
+        is_self: false,
+        status: crate::chat_store::MessageStatus::Delivered,
+        kind: kind.clone(),
+        attachment_name: rel_path.to_owned(),
+        attachment_path: String::new(),
+        size_str: size_str.clone(),
+        status_note: String::new(),
+        sender_handle: handle.clone(),
+    };
+    if let Some(ref cs) = bridge.rust().chat_store {
+        if let Err(e) = cs.insert(&chat_msg) {
+            warn!("chat_store insert (file offer) error: {e}");
+        }
+    }
+    let msg_json = serde_json::json!({
+        "msg_id": message_id,
+        "peer_id": list_peer,
+        "sender": handle,
+        "body": body,
+        "timestamp": now_ts,
+        "kind": kind.as_str(),
+        "mine": false,
+        "status": "delivered",
+        "attachment_name": rel_path,
+        "attachment_path": "",
+        "size_str": size_str,
+    })
+    .to_string();
+    bridge
+        .as_mut()
+        .chat_message_received(QString::from(msg_json.as_str()));
+}
+
 fn parse_local_file_path(file_url: &str) -> String {
     if let Some(stripped) = file_url.strip_prefix("file:///") {
         stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
@@ -8611,6 +8770,8 @@ fn dispatch_event(
             size,
             purpose,
             is_self,
+            origin_id,
+            supernode_id,
         } => {
             let json = serde_json::json!({
                 "transfer_id": transfer_id,
@@ -8622,6 +8783,18 @@ fn dispatch_event(
             })
             .to_string();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                if !is_self {
+                    insert_inbound_file_offer(
+                        bridge.as_mut(),
+                        &transfer_id,
+                        &peer_id,
+                        &origin_id,
+                        &rel_path,
+                        size,
+                        &purpose,
+                        &supernode_id,
+                    );
+                }
                 bridge.as_mut().file_offered(QString::from(json.as_str()));
             });
         }
@@ -8666,25 +8839,31 @@ fn dispatch_event(
                 "transfer_id": transfer_id,
                 "rel_path": rel_path,
                 "saved_path": saved_path.clone().unwrap_or_default(),
+                "size_str": size_str,
                 "peer_id": peer_id,
                 "room_id": room_id,
                 "purpose": purpose,
             })
             .to_string();
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
-                // Idempotent: same transfer must not produce two bubbles.
+                let attachment_path = saved_path.clone().unwrap_or_default();
+                // Offer already inserted a bubble (xfer-{id}). Patch its path
+                // rather than appending a second message for the same file.
                 if let Some(ref cs) = bridge.rust().chat_store {
                     if cs
                         .get_by_id(&message_id)
                         .map(|m| m.is_some())
                         .unwrap_or(false)
                     {
+                        if let Err(e) =
+                            cs.update_attachment(&message_id, &attachment_path, &size_str)
+                        {
+                            warn!("chat_store update_attachment error: {e}");
+                        }
                         bridge.as_mut().file_complete(QString::from(json.as_str()));
                         return;
                     }
                 }
-
-                let attachment_path = saved_path.clone().unwrap_or_default();
                 if is_room {
                     let sn_raw = if supernode_id.is_empty() {
                         bridge.rust().current_supernode_id.clone()

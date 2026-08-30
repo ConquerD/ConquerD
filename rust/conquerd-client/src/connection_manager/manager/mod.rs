@@ -978,6 +978,8 @@ impl ConnectionManager {
                                         size,
                                         purpose,
                                         is_self: true,
+                                        origin_id: self.identity.public_id(),
+                                        supernode_id: supernode_id.clone(),
                                     });
                                     self.dispatch_room_transfer_events(evs, &supernode_id, &room_id).await;
                                 }
@@ -1088,6 +1090,8 @@ impl ConnectionManager {
                                         size,
                                         purpose,
                                         is_self: true,
+                                        origin_id: self.identity.public_id(),
+                                        supernode_id: String::new(),
                                     });
                                     self.dispatch_transfer_events(evs).await;
                                 }

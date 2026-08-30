@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import ConquerD.Client 1.0
@@ -11,6 +12,8 @@ Item {
     signal retryRequested(string msgId)
     signal inlineAckAccepted()
     signal openAttachmentRequested(string path)
+    signal transferAcceptRequested(string transferId)
+    signal transferRejectRequested(string transferId)
 
     property string msgId: ""
     property string sender: ""
@@ -28,11 +31,47 @@ Item {
     property string attachmentName: ""
     property string attachmentPath: ""
     property string sizeStr: ""
+    /// Live FileTransferModel so progress/accept live in this bubble.
+    property var fileTransferModel: null
 
     readonly property bool isAttachment: root.kind === "image"
         || root.kind === "video"
         || root.kind === "file"
         || root.attachmentPath !== ""
+
+    readonly property string transferId: {
+        var id = root.msgId || ""
+        return id.indexOf("xfer-") === 0 ? id.substring(5) : ""
+    }
+    property string xferState: ""
+    property real xferProgress: 0
+    readonly property bool xferLive: root.xferState === "pending" || root.xferState === "active"
+    readonly property bool mediaPreviewReady: (root.kind === "image" || root.kind === "video")
+        && root.attachmentPath !== ""
+        && !root.xferLive
+
+    function refreshTransfer() {
+        if (!root.fileTransferModel || root.transferId === "") {
+            root.xferState = ""
+            root.xferProgress = 0
+            return
+        }
+        root.xferState = root.fileTransferModel.stateFor(root.transferId)
+        root.xferProgress = root.fileTransferModel.progressFor(root.transferId)
+    }
+
+    onTransferIdChanged: root.refreshTransfer()
+    onFileTransferModelChanged: root.refreshTransfer()
+    Component.onCompleted: root.refreshTransfer()
+
+    Connections {
+        target: root.fileTransferModel
+        ignoreUnknownSignals: true
+        function onModelReset() { root.refreshTransfer() }
+        function onRowsInserted() { root.refreshTransfer() }
+        function onRowsRemoved() { root.refreshTransfer() }
+        function onDataChanged() { root.refreshTransfer() }
+    }
 
     /// Session-local state for invite embeds in this message (not persisted).
     property bool inviteIgnored: false
@@ -337,7 +376,7 @@ Item {
                 // Inline image embed (local file after transfer).
                 Item {
                     id: imageEmbed
-                    visible: root.kind === "image" && root.attachmentPath !== ""
+                    visible: root.kind === "image" && root.mediaPreviewReady
                     width: parent.width
                     height: visible ? Math.min(220, Math.max(120, img.implicitHeight || 160)) : 0
 
@@ -367,7 +406,7 @@ Item {
                 // Inline video card — open full preview on click.
                 Rectangle {
                     id: videoEmbed
-                    visible: root.kind === "video" && root.attachmentPath !== ""
+                    visible: root.kind === "video" && root.mediaPreviewReady
                     width: parent.width
                     height: visible ? 140 : 0
                     radius: Theme.radiusSm
@@ -417,65 +456,130 @@ Item {
                     }
                 }
 
-                // Generic file attachment chip.
+                // File / in-progress transfer card. Images and videos switch
+                // to their embeds once the bytes are on disk; this card holds
+                // progress and accept/reject in the message flow.
                 Rectangle {
                     id: fileChip
-                    visible: root.kind === "file" && root.attachmentPath !== ""
+                    visible: root.isAttachment && !root.mediaPreviewReady
                     width: parent.width
-                    height: visible ? fileChipRow.implicitHeight + 12 : 0
+                    height: visible ? fileChipCol.implicitHeight + 12 : 0
                     radius: Theme.radiusSm
                     color: root.mine ? Qt.rgba(0, 0, 0, 0.12) : Theme.bg1
                     border.color: Theme.bg3
                     border.width: 1
 
-                    RowLayout {
-                        id: fileChipRow
+                    ColumnLayout {
+                        id: fileChipCol
                         anchors {
                             left: parent.left
                             right: parent.right
-                            verticalCenter: parent.verticalCenter
+                            top: parent.top
                             margins: 8
                         }
-                        spacing: 8
+                        spacing: 6
 
-                        Image {
-                            source: "qrc:/qt/qml/ConquerD/Client/icons/attach.svg"
-                            sourceSize.width: 16
-                            sourceSize.height: 16
-                            width: 16
-                            height: 16
-                            Layout.alignment: Qt.AlignVCenter
-                        }
-                        ColumnLayout {
+                        RowLayout {
                             Layout.fillWidth: true
-                            spacing: 1
-                            Text {
-                                text: root.attachmentName || root.body
-                                color: root.mine ? Theme.textInv : Theme.text
-                                font.pixelSize: Theme.fontSizeBody
-                                elide: Text.ElideMiddle
+                            spacing: 8
+
+                            Image {
+                                source: "qrc:/qt/qml/ConquerD/Client/icons/attach.svg"
+                                sourceSize.width: 16
+                                sourceSize.height: 16
+                                width: 16
+                                height: 16
+                                Layout.alignment: Qt.AlignVCenter
+                            }
+                            ColumnLayout {
                                 Layout.fillWidth: true
+                                spacing: 1
+                                Text {
+                                    text: root.attachmentName || root.body
+                                    color: root.mine ? Theme.textInv : Theme.text
+                                    font.pixelSize: Theme.fontSizeBody
+                                    elide: Text.ElideMiddle
+                                    Layout.fillWidth: true
+                                }
+                                Text {
+                                    visible: fileChip.statusLine !== ""
+                                    text: fileChip.statusLine
+                                    color: root.xferState === "failed"
+                                           ? Theme.danger
+                                           : (root.mine ? Theme.textInv : Theme.muted)
+                                    opacity: 0.8
+                                    font.pixelSize: Theme.fontSizeCaption
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
                             }
-                            Text {
-                                visible: root.sizeStr !== ""
-                                text: root.sizeStr
-                                color: root.mine ? Theme.textInv : Theme.muted
-                                opacity: 0.75
-                                font.pixelSize: Theme.fontSizeCaption
+                            ToolButton {
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/check.svg"
+                                icon.width: 14
+                                icon.height: 14
+                                icon.color: Theme.online
+                                implicitWidth: 28
+                                implicitHeight: 24
+                                flat: true
+                                visible: !root.mine && root.xferState === "pending"
+                                ToolTip.text: root.isRoom ? qsTr("Download") : qsTr("Accept")
+                                ToolTip.visible: hovered
+                                onClicked: root.transferAcceptRequested(root.transferId)
+                            }
+                            ToolButton {
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/x-circle.svg"
+                                icon.width: 14
+                                icon.height: 14
+                                icon.color: Theme.danger
+                                implicitWidth: 28
+                                implicitHeight: 24
+                                flat: true
+                                visible: root.xferState === "pending"
+                                         || (root.xferState === "active" && !root.isRoom)
+                                ToolTip.text: root.mine ? qsTr("Cancel") : qsTr("Decline")
+                                ToolTip.visible: hovered
+                                onClicked: root.transferRejectRequested(root.transferId)
+                            }
+                            ToolButton {
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/folder.svg"
+                                icon.width: 14
+                                icon.height: 14
+                                icon.color: root.mine ? Theme.textInv : Theme.muted
+                                implicitWidth: 28
+                                implicitHeight: 24
+                                flat: true
+                                visible: root.attachmentPath !== "" && !root.xferLive
+                                ToolTip.text: qsTr("Open")
+                                ToolTip.visible: hovered
+                                onClicked: root.openAttachmentRequested(root.attachmentPath)
                             }
                         }
-                        ToolButton {
-                            icon.source: "qrc:/qt/qml/ConquerD/Client/icons/folder.svg"
-                            icon.width: 14
-                            icon.height: 14
-                            icon.color: root.mine ? Theme.textInv : Theme.muted
-                            implicitWidth: 28
-                            implicitHeight: 24
-                            flat: true
-                            ToolTip.text: "Open"
-                            ToolTip.visible: hovered
-                            onClicked: root.openAttachmentRequested(root.attachmentPath)
+
+                        ProgressBar {
+                            Layout.fillWidth: true
+                            from: 0.0
+                            to: 1.0
+                            value: root.xferProgress
+                            visible: root.xferState === "active"
                         }
+                    }
+
+                    readonly property string statusLine: {
+                        if (root.xferState === "pending")
+                            return root.mine
+                                   ? qsTr("Waiting for them to accept")
+                                   : (root.sizeStr !== ""
+                                      ? root.sizeStr + " · " + qsTr("Offered")
+                                      : qsTr("Offered"))
+                        if (root.xferState === "active") {
+                            var pct = Math.round(root.xferProgress * 100)
+                            return (root.sizeStr !== "" ? root.sizeStr + " · " : "") + pct + "%"
+                        }
+                        if (root.xferState === "failed")
+                            return qsTr("Failed")
+                        if (root.xferState === "done")
+                            return root.sizeStr !== "" ? root.sizeStr : qsTr("Complete")
+                        return root.sizeStr
                     }
                 }
 
@@ -612,7 +716,7 @@ Item {
                     // replaces the raw URL).
                     visible: {
                         if (root.kind === "image" || root.kind === "video" || root.kind === "file")
-                            return root.attachmentPath === ""
+                            return false
                         if (root.hasInvite && root.bodyWithoutInvite === "")
                             return false
                         return true
