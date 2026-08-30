@@ -1006,9 +1006,7 @@ Rectangle {
 
                     Image {
                         anchors.centerIn: parent
-                        source: root.inRoom
-                            ? "qrc:/qt/qml/ConquerD/Client/icons/stop.svg"
-                            : "qrc:/qt/qml/ConquerD/Client/icons/x-circle.svg"
+                        source: "qrc:/qt/qml/ConquerD/Client/icons/x-circle.svg"
                         width: 18; height: 18
                         smooth: true
                         antialiasing: true
