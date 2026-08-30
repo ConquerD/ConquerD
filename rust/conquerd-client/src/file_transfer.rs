@@ -1724,10 +1724,15 @@ pub fn download_dir() -> PathBuf {
 ///
 /// Taking only the file name is the path-traversal defence: a sender cannot
 /// steer bytes outside the download directory with `../` or an absolute path.
+/// Both `/` and `\` are separators here, regardless of host OS — offers arrive
+/// from every platform, and `Path::file_name` would leave a Windows path
+/// intact on Unix.
 pub fn safe_file_name(rel_path: &str) -> String {
-    Path::new(rel_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
+    rel_path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .map(str::to_string)
         .filter(|n| !n.is_empty() && n != "." && n != "..")
         .unwrap_or_else(|| "received_file".to_owned())
 }
@@ -2441,10 +2446,18 @@ mod tests {
     }
 
     /// Path traversal must not escape the download directory.
+    ///
+    /// Windows-separator cases must hold on Unix too: `Path::file_name` does
+    /// not treat `\` as a separator there, which is how this test (and the
+    /// defence) used to fail on Linux/macOS CI.
     #[test]
     fn safe_file_name_strips_directories() {
         assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_file_name("/etc/shadow"), "shadow");
         assert_eq!(safe_file_name("C:\\Windows\\system32\\a.dll"), "a.dll");
+        assert_eq!(safe_file_name("..\\..\\windows\\a.dll"), "a.dll");
+        assert_eq!(safe_file_name("foo/bar\\baz.txt"), "baz.txt");
         assert_eq!(safe_file_name(""), "received_file");
+        assert_eq!(safe_file_name("///"), "received_file");
     }
 }
