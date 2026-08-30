@@ -158,6 +158,14 @@ pub enum MessageType {
     SfuChat,
     #[serde(rename = "sfu_file_offer")]
     SfuFileOffer,
+    /// A room member accepting an `SfuFileOffer`. Relayed to the originator
+    /// named in `payload.to`; the supernode holds no file state of its own.
+    #[serde(rename = "sfu_file_request")]
+    SfuFileRequest,
+    /// The originator withdrawing a room file offer. Relayed like any other
+    /// `SfuFile*` frame — broadcast, or narrowed by `payload.to`.
+    #[serde(rename = "sfu_file_revoke")]
+    SfuFileRevoke,
     #[serde(rename = "sfu_file_chunk")]
     SfuFileChunk,
     #[serde(rename = "sfu_file_complete")]

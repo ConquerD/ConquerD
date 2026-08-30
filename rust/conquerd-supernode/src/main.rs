@@ -1683,6 +1683,35 @@ fn sfu_chat_byte_count(msg: &SignalingMessage) -> usize {
 /// any offer larger than the remaining tokens (typically anything over a
 /// few MB once the bucket was warm), so the recipient never saw the
 /// transfer. Chunks still bill the opaque `data` length.
+/// Who a `SfuFile*` frame goes to, given the room roster and an optional `to`.
+///
+/// `to` present → exactly that member (room files are pulled, so the chunks
+/// answering one requester go only to them). `to` absent → the whole room minus
+/// the author, which is what offers and older clients rely on.
+///
+/// Returning an empty vec for a `to` that names a non-member is deliberate: an
+/// unknown recipient must drop, never fall back to broadcasting the file to
+/// everyone.
+fn file_frame_recipients<'a>(
+    recipients: &'a [String],
+    sender: &str,
+    to: Option<&str>,
+) -> Vec<&'a String> {
+    match to {
+        Some(to) => recipients
+            .iter()
+            .filter(|p| is_room_frame_author(p, to) && !is_room_frame_author(p, sender))
+            .take(1)
+            .collect(),
+        // Pad-normalizing, like chat and audio: a multi-homed sender whose wire
+        // id is unpadded used to receive its own file frames back.
+        None => recipients
+            .iter()
+            .filter(|p| !is_room_frame_author(p, sender))
+            .collect(),
+    }
+}
+
 fn sfu_file_inbound_byte_count(msg: &SignalingMessage, mt: MessageType) -> usize {
     match mt {
         MessageType::SfuFileChunk => msg
@@ -1691,7 +1720,10 @@ fn sfu_file_inbound_byte_count(msg: &SignalingMessage, mt: MessageType) -> usize
             .and_then(|v| v.as_str())
             .map(str::len)
             .unwrap_or(0),
-        MessageType::SfuFileOffer | MessageType::SfuFileComplete => 64,
+        MessageType::SfuFileOffer
+        | MessageType::SfuFileRequest
+        | MessageType::SfuFileRevoke
+        | MessageType::SfuFileComplete => 64,
         _ => 0,
     }
 }
@@ -1788,6 +1820,8 @@ async fn handle_relay_signaling_stream(
         match msg.msg_type {
             MessageType::SfuChat
             | MessageType::SfuFileOffer
+            | MessageType::SfuFileRequest
+            | MessageType::SfuFileRevoke
             | MessageType::SfuFileChunk
             | MessageType::SfuFileComplete
             // Video rides this connection's datagrams, so the subscription that
@@ -1856,6 +1890,8 @@ impl SignalingHandler for SupernodeHandler {
                 self.handle_sfu_audio_broadcast(&msg, raw);
             }
             MessageType::SfuFileOffer
+            | MessageType::SfuFileRequest
+            | MessageType::SfuFileRevoke
             | MessageType::SfuFileChunk
             | MessageType::SfuFileComplete => {
                 self.handle_sfu_broadcast(&msg, raw, msg.msg_type);
@@ -2474,12 +2510,32 @@ impl SupernodeHandler {
             .get("room_id")
             .and_then(|v| v.as_str())
             .unwrap_or(sfu::DEFAULT_ROOM_ID);
+
+        // Same membership gate chat and video state already apply. Without it a
+        // signed non-member could fan file frames into any room they can name.
+        if !sfu.read().is_chat_sender(room_id, &msg.sender) {
+            tracing::warn!(
+                "[room.file.v1] sender {} is not a member of room {} — dropping file frame",
+                &msg.sender[..12.min(msg.sender.len())],
+                &room_id[..12.min(room_id.len())]
+            );
+            return;
+        }
+
         let recipients = sfu.read().get_chat_recipients(room_id);
         let wire_bytes = raw.len();
-        for peer in &recipients {
-            if peer == &msg.sender {
-                continue;
-            }
+
+        let to = msg.payload.get("to").and_then(|v| v.as_str());
+        let targets = file_frame_recipients(&recipients, &msg.sender, to);
+        if targets.is_empty() && to.is_some() {
+            tracing::debug!(
+                "[room.file.v1] `to` target is not a member of room {} — dropping",
+                &room_id[..12.min(room_id.len())]
+            );
+            return;
+        }
+
+        for peer in targets {
             if self
                 .state
                 .features
@@ -3794,8 +3850,80 @@ mod access_invite_tests {
 }
 
 #[cfg(test)]
-mod sfu_file_quota_tests {
+mod sfu_file_routing_tests {
     use super::*;
+
+    fn roster() -> Vec<String> {
+        vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()]
+    }
+
+    /// Chunks answering one requester must reach only them — the whole point of
+    /// advertise-then-pull is that a 250 MB file is not pushed at the room.
+    #[test]
+    fn to_narrows_delivery_to_one_member() {
+        let r = roster();
+        let got = file_frame_recipients(&r, "alice", Some("bob"));
+        assert_eq!(got, vec![&"bob".to_owned()]);
+    }
+
+    /// Offers (and older clients) carry no `to` and must still broadcast.
+    #[test]
+    fn absent_to_broadcasts_to_room_minus_author() {
+        let r = roster();
+        let got = file_frame_recipients(&r, "alice", None);
+        assert_eq!(got, vec![&"bob".to_owned(), &"carol".to_owned()]);
+    }
+
+    /// An unknown recipient drops — it must never fall back to a broadcast.
+    #[test]
+    fn to_naming_a_non_member_delivers_to_nobody() {
+        let r = roster();
+        assert!(file_frame_recipients(&r, "alice", Some("mallory")).is_empty());
+    }
+
+    /// A sender must not be handed its own frame back, even addressed to self.
+    #[test]
+    fn author_is_never_a_recipient() {
+        let r = roster();
+        assert!(file_frame_recipients(&r, "bob", Some("bob")).is_empty());
+        assert!(!file_frame_recipients(&r, "bob", None).contains(&&"bob".to_owned()));
+    }
+
+    /// Ids differing only by base64 padding are the same peer; the file path
+    /// used raw `==` where chat/audio already normalized, so a multi-homed
+    /// sender received its own file frames back.
+    #[test]
+    fn author_skip_is_padding_insensitive() {
+        use base64::Engine;
+        let key = [7u8; 32];
+        let bare = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let padded = base64::engine::general_purpose::URL_SAFE.encode(key);
+        assert_ne!(bare, padded);
+
+        let r = vec![padded.clone(), "bob".to_owned()];
+        assert_eq!(
+            file_frame_recipients(&r, &bare, None),
+            vec![&"bob".to_owned()],
+            "the padded roster entry is the unpadded sender"
+        );
+        assert!(file_frame_recipients(&r, &bare, Some(&padded)).is_empty());
+    }
+
+    /// Revoke is control-plane like offer/complete — it must not debit the
+    /// 8 MB/s bucket as though a payload had arrived, or a sender who deletes
+    /// a message mid-transfer could have its own revocation dropped.
+    #[test]
+    fn sfu_file_revoke_is_billed_as_control_plane() {
+        let revoke = SignalingMessage::new(
+            MessageType::SfuFileRevoke,
+            "sender",
+            serde_json::json!({"transfer_id": "abc", "room_id": "default"}),
+        );
+        assert_eq!(
+            sfu_file_inbound_byte_count(&revoke, MessageType::SfuFileRevoke),
+            64
+        );
+    }
 
     #[test]
     fn sfu_file_offer_counts_control_plane_not_advertised_size() {

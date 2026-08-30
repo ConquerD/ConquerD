@@ -83,6 +83,8 @@ impl ConnectionManager {
             msg_type,
             MessageType::SfuChat
                 | MessageType::SfuFileOffer
+                | MessageType::SfuFileRequest
+                | MessageType::SfuFileRevoke
                 | MessageType::SfuFileChunk
                 | MessageType::SfuFileComplete
         )
@@ -161,6 +163,8 @@ impl ConnectionManager {
                 | MessageType::FileTransferAck
                 | MessageType::FileTransferError => Some("core.file.v1"),
                 MessageType::SfuFileOffer
+                | MessageType::SfuFileRequest
+                | MessageType::SfuFileRevoke
                 | MessageType::SfuFileChunk
                 | MessageType::SfuFileComplete => Some("room.file.v1"),
                 // room.chat.v1 covers SFU room text chat broadcast.

@@ -248,6 +248,31 @@ Item {
                                 elide: Text.ElideMiddle
                                 Layout.fillWidth: true
                             }
+                            // Room files are advertised, not pushed: nothing
+                            // downloads until this is clicked. Without it every
+                            // member auto-downloaded every file.
+                            ToolButton {
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/check.svg"
+                                icon.width: 14
+                                icon.height: 14
+                                icon.color: Theme.online
+                                visible: !chip.isSelf && chip.state === "pending"
+                                flat: true
+                                ToolTip.text: "Download"
+                                ToolTip.visible: hovered
+                                onClicked: backend.acceptRoomFile(chip.transferId)
+                            }
+                            ToolButton {
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/x-circle.svg"
+                                icon.width: 14
+                                icon.height: 14
+                                icon.color: Theme.danger
+                                visible: !chip.isSelf && chip.state === "pending"
+                                flat: true
+                                ToolTip.text: "Decline"
+                                ToolTip.visible: hovered
+                                onClicked: backend.declineRoomFile(chip.transferId)
+                            }
                             ToolButton {
                                 icon.source: "qrc:/qt/qml/ConquerD/Client/icons/close.svg"
                                 icon.width: 12
@@ -264,7 +289,21 @@ Item {
                             from: 0.0
                             to: 1.0
                             value: chip.progress
-                            visible: chip.state === "active" || chip.state === "pending"
+                            visible: chip.state === "active"
+                        }
+
+                        Text {
+                            visible: chip.state === "pending" && !chip.isSelf
+                            text: "Offered - accept to download"
+                            color: Theme.muted
+                            font.pixelSize: 11
+                        }
+
+                        Text {
+                            visible: chip.state === "pending" && chip.isSelf
+                            text: "Offered to the room"
+                            color: Theme.muted
+                            font.pixelSize: 11
                         }
 
                         Text {

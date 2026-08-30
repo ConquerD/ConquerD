@@ -290,7 +290,12 @@ pub enum ConnectionEvent {
         /// Supernode for room transfers (empty for 1:1).
         supernode_id: String,
         purpose: String,
-        data: Vec<u8>,
+        /// Verified content: inline bytes, or a path for a streamed file.
+        ///
+        /// A streamed file is written and verified on disk by the transfer
+        /// manager, so a 250 MB receive never crosses this bounded channel as
+        /// a `Vec<u8>`.
+        payload: crate::file_transfer::TransferPayload,
         rel_path: String,
     },
     /// Transfer failed or was rejected.
@@ -404,8 +409,16 @@ pub enum ConnectionCommand {
     SendSfuFile {
         supernode_id: String,
         room_id: String,
+        /// Display name for the file (basename only — never a directory).
         rel_path: String,
-        data: Vec<u8>,
+        /// Absolute path on the sender's disk.
+        ///
+        /// The bytes are read lazily, one chunk at a time, so a large file
+        /// neither blocks the UI thread nor sits in RAM waiting for acceptors.
+        path: String,
+        /// Caller-chosen transfer id, so the sender's chat message can be keyed
+        /// `xfer-{transfer_id}` and later found again to revoke the offer.
+        transfer_id: String,
         purpose: String,
     },
     /// Block a peer (prevent further inbound messages; update peer store).
@@ -474,12 +487,32 @@ pub enum ConnectionCommand {
     /// Send a file to a peer.
     SendFile {
         peer_id: String,
+        /// Display name for the file (basename only).
         rel_path: String,
-        data: Vec<u8>,
+        /// Absolute path on the sender's disk; read lazily while streaming.
+        path: String,
+        /// Caller-chosen transfer id, so the sender's chat message can be keyed
+        /// `xfer-{transfer_id}` and later found again to revoke the offer.
+        transfer_id: String,
         purpose: String,
     },
     /// Accept an inbound file offer.
     AcceptFile {
+        transfer_id: String,
+    },
+    /// Accept an inbound **room** file offer, asking the originator to stream
+    /// it. Room offers are advertisements — nothing arrives until this is sent.
+    AcceptRoomFile {
+        transfer_id: String,
+    },
+    /// Decline an inbound room file offer (local only — nothing is sent, the
+    /// originator simply never receives a request).
+    DeclineRoomFile {
+        transfer_id: String,
+    },
+    /// Withdraw a file we offered, so peers who have not downloaded it can no
+    /// longer obtain it. Sent when the user deletes their own file message.
+    RevokeFile {
         transfer_id: String,
     },
     /// Reject an inbound file offer.

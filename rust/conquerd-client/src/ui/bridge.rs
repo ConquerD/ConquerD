@@ -611,6 +611,17 @@ pub mod ffi {
         #[rust_name = "reject_file"]
         fn rejectFile(self: Pin<&mut AppBridge>, transfer_id: &QString);
 
+        /// Accept a room file offer, asking its sender to stream it. Room file
+        /// offers are advertisements — nothing downloads until this is called.
+        #[qinvokable]
+        #[rust_name = "accept_room_file"]
+        fn acceptRoomFile(self: Pin<&mut AppBridge>, transfer_id: &QString);
+
+        /// Decline a room file offer. Purely local; the sender uploads nothing.
+        #[qinvokable]
+        #[rust_name = "decline_room_file"]
+        fn declineRoomFile(self: Pin<&mut AppBridge>, transfer_id: &QString);
+
         /// Send a file at `file_url` (a local file:// URI or absolute path) to `peer_id`.
         /// Reads the file synchronously then dispatches a SendFile command.
         #[qinvokable]
@@ -3390,6 +3401,18 @@ impl ffi::AppBridge {
                 return;
             }
         }
+        // A file message is an offer, not a copy: deleting it withdraws the
+        // share. Peers who have not downloaded yet can no longer obtain the
+        // file from anyone — nothing else holds it. `RevokeFile` no-ops unless
+        // we are the originator, so deleting a *received* file message only
+        // removes our own bubble (the downloaded copy on disk is left alone).
+        if let Some(transfer_id) = id.strip_prefix("xfer-") {
+            if let Some(ref tx) = self.rust().conn_cmd_tx {
+                let _ = tx.try_send(ConnectionCommand::RevokeFile {
+                    transfer_id: transfer_id.to_owned(),
+                });
+            }
+        }
         {
             let buf = &mut self.as_mut().rust_mut().event_log;
             if buf.len() >= 300 {
@@ -4618,6 +4641,23 @@ impl ffi::AppBridge {
         }
     }
 
+    /// Accept a room file offer → ask the originator to stream it.
+    fn accept_room_file(self: Pin<&mut Self>, transfer_id: &QString) {
+        let tid = transfer_id.to_string();
+        if let Some(ref tx) = self.rust().conn_cmd_tx {
+            let _ = tx.try_send(ConnectionCommand::AcceptRoomFile { transfer_id: tid });
+        }
+    }
+
+    /// Decline a room file offer. Local only — nothing is ever requested, so
+    /// the sender never uploads it.
+    fn decline_room_file(self: Pin<&mut Self>, transfer_id: &QString) {
+        let tid = transfer_id.to_string();
+        if let Some(ref tx) = self.rust().conn_cmd_tx {
+            let _ = tx.try_send(ConnectionCommand::DeclineRoomFile { transfer_id: tid });
+        }
+    }
+
     fn send_file(mut self: Pin<&mut Self>, peer_id: &QString, file_url: &QString) {
         let pid = peer_id.to_string();
         let path_str = parse_local_file_path(&file_url.to_string());
@@ -4628,20 +4668,34 @@ impl ffi::AppBridge {
             .unwrap_or("file")
             .to_owned();
         let kind = crate::chat_store::message_kind_for_path(&rel_path);
-        let data = match std::fs::read(path) {
-            Ok(d) => d,
+        // Same as the room path: hand over the path, not the bytes, so a large
+        // file is neither read on the Qt thread nor held in RAM.
+        let byte_len = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
             Err(e) => {
-                warn!("sendFile: cannot read {:?}: {e}", path);
+                warn!("sendFile: cannot stat {:?}: {e}", path);
                 return;
             }
         };
-        let size_str = crate::chat_store::format_byte_size(data.len() as u64);
+        if byte_len > crate::file_transfer::MAX_TRANSFER_SIZE as u64 {
+            warn!(
+                "sendFile: {:?} is {byte_len} bytes, over the {} limit",
+                path,
+                crate::file_transfer::MAX_TRANSFER_SIZE
+            );
+            return;
+        }
+        let size_str = crate::chat_store::format_byte_size(byte_len);
+        // Same as the room path: our own bubble is keyed by the transfer id so
+        // deleting it can revoke the offer before the peer accepts.
+        let transfer_id = uuid::Uuid::new_v4().simple().to_string()[..16].to_owned();
         let sent = match self.rust().conn_cmd_tx {
             Some(ref tx) => tx
                 .try_send(ConnectionCommand::SendFile {
                     peer_id: pid.clone(),
                     rel_path: rel_path.clone(),
-                    data,
+                    path: path_str.clone(),
+                    transfer_id: transfer_id.clone(),
                     purpose: "file".to_owned(),
                 })
                 .is_ok(),
@@ -4650,7 +4704,7 @@ impl ffi::AppBridge {
 
         // Local-echo an attachment bubble so the sender sees the image/video
         // immediately; receiver embeds on FileComplete after download.
-        let message_id = uuid::Uuid::new_v4().to_string();
+        let message_id = format!("xfer-{transfer_id}");
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
@@ -4740,28 +4794,44 @@ impl ffi::AppBridge {
             .unwrap_or("file")
             .to_owned();
         let kind = crate::chat_store::message_kind_for_path(&rel_path);
-        let data = match std::fs::read(path) {
-            Ok(d) => d,
+        // Send the PATH, not the bytes. This runs on the Qt thread, so reading
+        // a 250 MB file here would block the UI (and cost 250 MB) before the
+        // transfer even starts; the manager streams it off-thread instead.
+        let byte_len = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
             Err(e) => {
-                warn!("sendRoomFile: cannot read {:?}: {e}", path);
+                warn!("sendRoomFile: cannot stat {:?}: {e}", path);
                 return;
             }
         };
-        let size_str = crate::chat_store::format_byte_size(data.len() as u64);
+        if byte_len > crate::file_transfer::MAX_TRANSFER_SIZE as u64 {
+            warn!(
+                "sendRoomFile: {:?} is {byte_len} bytes, over the {} limit",
+                path,
+                crate::file_transfer::MAX_TRANSFER_SIZE
+            );
+            return;
+        }
+        let size_str = crate::chat_store::format_byte_size(byte_len);
+        // Choose the transfer id here so our own chat message can be keyed
+        // `xfer-{transfer_id}`, exactly as receivers key theirs. That shared key
+        // is what lets `delete_message` find the offer and revoke it.
+        let transfer_id = uuid::Uuid::new_v4().simple().to_string()[..16].to_owned();
         let sent = match self.rust().conn_cmd_tx {
             Some(ref tx) => tx
                 .try_send(ConnectionCommand::SendSfuFile {
                     supernode_id: sn.clone(),
                     room_id: rid.clone(),
                     rel_path: rel_path.clone(),
-                    data,
+                    path: path_str.clone(),
+                    transfer_id: transfer_id.clone(),
                     purpose: "room_file".to_owned(),
                 })
                 .is_ok(),
             None => false,
         };
 
-        let message_id = uuid::Uuid::new_v4().to_string();
+        let message_id = format!("xfer-{transfer_id}");
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
@@ -5476,16 +5546,22 @@ fn read_jitter_depth_setting() -> usize {
 
 /// Save received file data to the user's Downloads directory.
 /// Returns the saved path on success (as a string).
+///
+/// Used only for inline transfers; streamed files are written chunk-by-chunk
+/// by the transfer manager and arrive already saved.
 fn save_received_file(rel_path: &str, data: &[u8]) -> Option<String> {
-    use std::path::Path;
-    let downloads = dirs::download_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(std::env::temp_dir);
-    let file_name = Path::new(rel_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "received_file".to_owned());
-    let dest = downloads.join(&file_name);
+    use crate::file_transfer::{download_dir, safe_file_name, unique_dest_path};
+    let downloads = download_dir();
+    if let Err(e) = std::fs::create_dir_all(&downloads) {
+        warn!(
+            "Failed to create download directory '{}': {e}",
+            downloads.display()
+        );
+        return None;
+    }
+    // Never clobber an existing file: two peers sending `clip.mp4` used to
+    // overwrite each other silently.
+    let dest = unique_dest_path(&downloads, &safe_file_name(rel_path));
     match std::fs::write(&dest, data) {
         Ok(()) => {
             info!("Received file saved to {}", dest.display());
@@ -8521,12 +8597,18 @@ fn dispatch_event(
             room_id,
             supernode_id,
             purpose,
-            data,
+            payload,
             rel_path,
         } => {
-            // Save the received file to the user's downloads folder.
-            let byte_len = data.len() as u64;
-            let saved_path = save_received_file(&rel_path, &data);
+            use crate::file_transfer::TransferPayload;
+            // Inline transfers hand back bytes to write; a streamed transfer
+            // was already written and verified on disk, so it only names its
+            // final path — never re-serialize a 250 MB file to save it.
+            let byte_len = payload.len();
+            let saved_path = match &payload {
+                TransferPayload::Bytes(bytes) => save_received_file(&rel_path, bytes),
+                TransferPayload::SavedAt { path, .. } => Some(path.clone()),
+            };
             let kind = crate::chat_store::message_kind_for_path(&rel_path);
             let size_str = crate::chat_store::format_byte_size(byte_len);
             let body = attachment_body_label(&kind, &rel_path);

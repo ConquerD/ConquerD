@@ -122,7 +122,9 @@ See `rust/conquerd-supernode/src/manifest.rs` for the full schema. The example a
 ### SFU Rooms (`room.audio.sfu` + `room.chat.v1` + `room.file.v1`)
 - Up to 32 participants per room.
 - Native desktop clients only (in-app portal games do not carry room voice/chat).
-- Room file broadcasts use signed `SfuFile*` frames and are verified by recipients before saving.
+- Room file transfers use signed `SfuFile*` frames and are verified by recipients before saving. They are **advertised, then pulled**: `sfu_file_offer` carries metadata only, and chunks are sent only to members who answer with `sfu_file_request`. The supernode routes those chunks to the single peer named in the frame's `to` field and, as always, stores nothing — a member who accepts late is served by the original sender re-reading the file, not from any relay cache.
+- Files up to 250 MiB are supported; anything over 8 MiB is streamed from and to disk, so neither client holds the file in memory.
+- Because the sender holds the only copy, **deleting a file message revokes the share** (`sfu_file_revoke`): members who have not downloaded it yet can no longer obtain it. Members who already downloaded keep their copy.
 - Room membership is enforced at the capability layer (`room-member` auth tier).
 - Operators can restrict which room types peers may **create** via `room.audio.sfu` manifest params:
   - `allow_public_rooms` (default `false`) — when `false`, new public room materialization is rejected. The built-in **Public Voice/Chat Room** (`room_id = "default"`) is always present on SFU-enabled nodes.

@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::avatar_config::AvatarConfig as PeerAvatarConfig;
 use crate::feature_trust::{FeatureTrustGate, FeatureTrustStore, TrustDecision};
-use crate::file_transfer::{FileTransferManager, TransferEvent};
+use crate::file_transfer::{FileTransferManager, TransferEvent, ROOM_FILE_CHUNK_BUDGET};
 use crate::group_key::{GroupKeySource, SenderKeysGroup};
 use crate::identity::Identity;
 use crate::peer_store::PeerStore;
@@ -851,6 +851,13 @@ impl ConnectionManager {
             MessageType::SfuFileOffer => {
                 let sn = inbound_supernode_id.clone().unwrap_or_default();
                 self.handle_sfu_file_offer(&msg, &sn).await;
+            }
+            MessageType::SfuFileRequest => {
+                let sn = inbound_supernode_id.clone().unwrap_or_default();
+                self.handle_sfu_file_request(&msg, &sn).await;
+            }
+            MessageType::SfuFileRevoke => {
+                self.handle_sfu_file_revoke(&msg).await;
             }
             MessageType::SfuFileChunk => {
                 self.handle_sfu_file_chunk(&msg).await;
@@ -1738,6 +1745,27 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                // The offer may be gone — revoked when we deleted the message.
+                // Say so, or the peer waits forever for chunks that will never
+                // come.
+                if !self.file_mgr.has_outbound(&tid) {
+                    info!(
+                        "[core.file.v1] {} accepted revoked transfer {}; refusing",
+                        &msg.sender[..8.min(msg.sender.len())],
+                        &tid[..8.min(tid.len())]
+                    );
+                    let sender = self.identity.public_id();
+                    let mut err = SignalingMessage::new(MessageType::FileTransferError, sender);
+                    err.target = Some(msg.sender.clone());
+                    err.payload
+                        .insert("transfer_id".to_owned(), Value::String(tid));
+                    err.payload.insert(
+                        "reason".to_owned(),
+                        Value::String("no longer shared".to_owned()),
+                    );
+                    self.dispatch_outbound(err).await;
+                    return;
+                }
                 let evs = self.file_mgr.on_transfer_accepted(&tid);
                 self.dispatch_transfer_events(evs).await;
             }
@@ -2093,7 +2121,7 @@ impl ConnectionManager {
             .unwrap_or("")
             .to_owned();
 
-        let mut evs = self.room_file_mgr.on_offer_received_with_room(
+        let evs = self.room_file_mgr.on_offer_received_with_room(
             &msg.sender,
             &room_id,
             supernode_id,
@@ -2107,9 +2135,162 @@ impl ConnectionManager {
             is_delta,
             &base_sha,
         );
-        evs.extend(self.room_file_mgr.accept_transfer_locally(&tid));
+        // Do NOT auto-accept. Room files are advertised and pulled: the user
+        // decides, and only then does `accept_room_file` send an
+        // SfuFileRequest. Auto-accepting here meant every member downloaded
+        // every file, which does not scale to a 250 MB video.
         self.dispatch_room_transfer_events(evs, supernode_id, &room_id)
             .await;
+    }
+
+    /// The user accepted a room file offer → ask the originator to stream it.
+    pub(super) async fn accept_room_file(
+        &mut self,
+        supernode_id: &str,
+        room_id: &str,
+        transfer_id: &str,
+        origin_peer: &str,
+    ) {
+        let evs = self.room_file_mgr.accept_transfer_locally(transfer_id);
+        self.dispatch_room_transfer_events(evs, supernode_id, room_id)
+            .await;
+
+        let route = self.live_room_route(supernode_id);
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::SfuFileRequest, sender);
+        msg.target = Some(route);
+        msg.payload
+            .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
+        msg.payload.insert(
+            "transfer_id".to_owned(),
+            Value::String(transfer_id.to_owned()),
+        );
+        // `to` names the file's originator; the supernode relays to them alone.
+        msg.payload
+            .insert("to".to_owned(), Value::String(origin_peer.to_owned()));
+        info!(
+            "[room.file.v1] requesting transfer {} from {}",
+            &transfer_id[..8.min(transfer_id.len())],
+            &origin_peer[..8.min(origin_peer.len())]
+        );
+        self.dispatch_outbound(msg).await;
+    }
+
+    /// A room member accepted our offer → start streaming to them.
+    pub(super) async fn handle_sfu_file_request(
+        &mut self,
+        msg: &SignalingMessage,
+        supernode_id: &str,
+    ) {
+        let room_id = msg
+            .payload
+            .get("room_id")
+            .and_then(Value::as_str)
+            .unwrap_or("default")
+            .to_owned();
+        let tid = msg
+            .payload
+            .get("transfer_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if tid.is_empty() {
+            return;
+        }
+        // Only serve a request that names us; the supernode routes by `to`, but
+        // a stray copy must not make us stream to the wrong room.
+        let to = msg.payload.get("to").and_then(Value::as_str).unwrap_or("");
+        if !to.is_empty() && to != self.identity.public_id() {
+            return;
+        }
+        // The offer may be gone: revoked when the sender deleted the message,
+        // or aged out past OFFER_TTL_SECS. Tell the requester so their chip
+        // fails instead of waiting forever for chunks that will never come.
+        if !self.room_file_mgr.has_outbound(&tid) {
+            info!(
+                "[room.file.v1] {} requested revoked/expired transfer {}; refusing",
+                &msg.sender[..8.min(msg.sender.len())],
+                &tid[..8.min(tid.len())]
+            );
+            self.send_file_revoke(supernode_id, &room_id, &tid, Some(&msg.sender))
+                .await;
+            return;
+        }
+        info!(
+            "[room.file.v1] {} requested transfer {}; streaming",
+            &msg.sender[..8.min(msg.sender.len())],
+            &tid[..8.min(tid.len())]
+        );
+        let evs = self
+            .room_file_mgr
+            .start_stream_for(&tid, &msg.sender, ROOM_FILE_CHUNK_BUDGET);
+        self.dispatch_room_transfer_events(evs, supernode_id, &room_id)
+            .await;
+    }
+
+    /// Announce that a room file offer is withdrawn.
+    ///
+    /// `to = None` broadcasts to the room (the sender deleted the message);
+    /// `to = Some(peer)` answers one requester whose offer had already gone.
+    pub(super) async fn send_file_revoke(
+        &mut self,
+        supernode_id: &str,
+        room_id: &str,
+        transfer_id: &str,
+        to: Option<&str>,
+    ) {
+        let route = self.live_room_route(supernode_id);
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::SfuFileRevoke, sender);
+        msg.target = Some(route);
+        msg.payload
+            .insert("room_id".to_owned(), Value::String(room_id.to_owned()));
+        msg.payload.insert(
+            "transfer_id".to_owned(),
+            Value::String(transfer_id.to_owned()),
+        );
+        if let Some(peer) = to {
+            msg.payload
+                .insert("to".to_owned(), Value::String(peer.to_owned()));
+        }
+        self.dispatch_outbound(msg).await;
+    }
+
+    /// The originator withdrew a room file offer.
+    ///
+    /// Only the peer who advertised it may revoke it — otherwise any room
+    /// member could cancel someone else's transfer.
+    pub(super) async fn handle_sfu_file_revoke(&mut self, msg: &SignalingMessage) {
+        let tid = msg
+            .payload
+            .get("transfer_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if tid.is_empty() {
+            return;
+        }
+        match self.room_file_mgr.inbound_route(&tid) {
+            Some((origin, _, _)) if origin == msg.sender => {}
+            Some(_) => {
+                warn!(
+                    "[room.file.v1] {} tried to revoke a transfer it did not offer; ignoring",
+                    &msg.sender[..8.min(msg.sender.len())]
+                );
+                return;
+            }
+            // Unknown transfer: nothing pending, nothing to do.
+            None => return,
+        }
+        info!(
+            "[room.file.v1] transfer {} revoked by sender",
+            &tid[..8.min(tid.len())]
+        );
+        self.room_file_mgr.discard_inbound(&tid);
+        self.emit_event(ConnectionEvent::FileFailed {
+            transfer_id: tid,
+            reason: "no longer shared".to_owned(),
+        });
     }
 
     pub(super) async fn handle_sfu_file_chunk(&mut self, msg: &SignalingMessage) {
@@ -2176,18 +2357,18 @@ impl ConnectionManager {
                 &sealed,
             )
         });
-        let data_owned = match plaintext {
-            Some(p) => b64.encode(p),
-            None => {
-                warn!(
-                    "[room.file.v1] failed to open E2E chunk from {}; dropping",
-                    &msg.sender[..8.min(msg.sender.len())]
-                );
-                return;
-            }
+        let Some(plain) = plaintext else {
+            warn!(
+                "[room.file.v1] failed to open E2E chunk from {}; dropping",
+                &msg.sender[..8.min(msg.sender.len())]
+            );
+            return;
         };
-        let data: &str = data_owned.as_str();
-        let evs = self.room_file_mgr.on_chunk_received(&tid, idx, data);
+        // Hand the manager raw bytes. This used to re-encode the decrypted
+        // chunk to base64 purely so `on_chunk_received` could decode it again —
+        // two allocations and two codec passes per chunk, ~4 000 of them for a
+        // 250 MB file.
+        let evs = self.room_file_mgr.on_chunk_bytes_received(&tid, idx, plain);
         self.dispatch_room_transfer_events(evs, "", "").await;
     }
 
@@ -2249,7 +2430,7 @@ impl ConnectionManager {
                     room_id,
                     supernode_id,
                     purpose,
-                    data,
+                    payload,
                     rel_path,
                 } => {
                     self.emit_event(ConnectionEvent::FileComplete {
@@ -2258,7 +2439,7 @@ impl ConnectionManager {
                         room_id,
                         supernode_id,
                         purpose,
-                        data,
+                        payload,
                         rel_path,
                     });
                 }
@@ -2392,7 +2573,7 @@ impl ConnectionManager {
                     room_id: xfer_room,
                     supernode_id: xfer_sn,
                     purpose,
-                    data,
+                    payload,
                     rel_path,
                 } => {
                     let rid = if xfer_room.is_empty() {
@@ -2411,7 +2592,7 @@ impl ConnectionManager {
                         room_id: rid,
                         supernode_id: sn,
                         purpose,
-                        data,
+                        payload,
                         rel_path,
                     });
                 }

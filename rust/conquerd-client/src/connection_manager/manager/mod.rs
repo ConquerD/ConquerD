@@ -69,6 +69,12 @@ pub(super) const PEER_RECONNECT_TICK_S: u64 = 1;
 pub(super) const PEER_RECONNECT_MAX_BACKOFF_S: u64 = 60;
 /// How often we scan for due `room_absent` join retries.
 pub(super) const ROOM_JOIN_RETRY_TICK_MS: u64 = 250;
+/// How often outbound room file streams emit their next slice of chunks.
+///
+/// 20 ms × `ROOM_FILE_CHUNK_BUDGET` (8) × 64 KiB ≈ 25 MB/s of headroom, well
+/// above the 8 MB/s `room.file.v1` quota — so the quota paces the transfer and
+/// this tick just keeps the relay queue fed without bursting.
+pub(super) const ROOM_FILE_PUMP_TICK_MS: u64 = 20;
 /// Base delay before the first `room_absent` join retry.
 pub(super) const ROOM_JOIN_RETRY_BASE_MS: u64 = 500;
 /// Cap on exponential backoff between `room_absent` join retries.
@@ -749,6 +755,13 @@ impl ConnectionManager {
         let mut room_join_retry_interval =
             tokio::time::interval(Duration::from_millis(ROOM_JOIN_RETRY_TICK_MS));
         room_join_retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Drives outbound room file streaming. `Delay` (not `Burst`) so a slow
+        // turn does not queue up catch-up ticks that would defeat the pacing.
+        let mut file_pump_interval =
+            tokio::time::interval(Duration::from_millis(ROOM_FILE_PUMP_TICK_MS));
+        file_pump_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut transfer_gc_interval = tokio::time::interval(Duration::from_secs(60));
+        transfer_gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -948,11 +961,15 @@ impl ConnectionManager {
                             )
                             .await;
                         }
-                        ConnectionCommand::SendSfuFile { supernode_id, room_id, rel_path, data, purpose } => {
-                            let size = data.len();
-                            let old = self.room_file_mgr.get_old_data(&rel_path);
-                            let old_ref: Option<&[u8]> = old.as_deref();
-                            match self.room_file_mgr.offer_file(&room_id, &rel_path, data, &purpose, old_ref, true) {
+                        ConnectionCommand::SendSfuFile { supernode_id, room_id, rel_path, path, transfer_id, purpose } => {
+                            // Advertisement only: `auto_push = false`. Room files
+                            // used to broadcast every chunk immediately, so every
+                            // member downloaded every file whether they wanted it
+                            // or not. Chunks now flow only to peers who answer the
+                            // offer with an SfuFileRequest, re-read from this path.
+                            let src = std::path::PathBuf::from(&path);
+                            let size = std::fs::metadata(&src).map(|m| m.len() as usize).unwrap_or(0);
+                            match self.room_file_mgr.offer_file_from_path_with_id(&room_id, &rel_path, &src, &purpose, false, Some(&transfer_id)) {
                                 Ok((transfer_id, evs)) => {
                                     self.emit_event(ConnectionEvent::FileOffered {
                                         transfer_id,
@@ -1045,11 +1062,24 @@ impl ConnectionManager {
                                 &space_grant,
                             ));
                         }
-                        ConnectionCommand::SendFile { peer_id, rel_path, data, purpose } => {
-                            let size = data.len();
-                            let old = self.file_mgr.get_old_data(&rel_path);
-                            let old_ref: Option<&[u8]> = old.as_deref();
-                            match self.file_mgr.offer_file(&peer_id, &rel_path, data, &purpose, old_ref, false) {
+                        ConnectionCommand::SendFile { peer_id, rel_path, path, transfer_id, purpose } => {
+                            let src = std::path::PathBuf::from(&path);
+                            let size = std::fs::metadata(&src).map(|m| m.len() as usize).unwrap_or(0);
+                            // Small files keep the in-RAM path so compression and
+                            // delta still apply; large ones stream from disk.
+                            let offered = if size > crate::file_transfer::INLINE_MAX {
+                                self.file_mgr.offer_file_from_path_with_id(&peer_id, &rel_path, &src, &purpose, false, Some(&transfer_id))
+                            } else {
+                                match std::fs::read(&src) {
+                                    Ok(data) => {
+                                        let old = self.file_mgr.get_old_data(&rel_path);
+                                        let old_ref: Option<&[u8]> = old.as_deref();
+                                        self.file_mgr.offer_file_with_id(&peer_id, &rel_path, data, &purpose, old_ref, false, Some(&transfer_id))
+                                    }
+                                    Err(e) => Err(format!("cannot read {}: {e}", src.display())),
+                                }
+                            };
+                            match offered {
                                 Ok((transfer_id, evs)) => {
                                     self.emit_event(ConnectionEvent::FileOffered {
                                         transfer_id,
@@ -1067,6 +1097,44 @@ impl ConnectionManager {
                         ConnectionCommand::AcceptFile { transfer_id } => {
                             let evs = self.file_mgr.accept_transfer(&transfer_id);
                             self.dispatch_transfer_events(evs).await;
+                        }
+                        ConnectionCommand::AcceptRoomFile { transfer_id } => {
+                            match self.room_file_mgr.inbound_route(&transfer_id) {
+                                Some((origin, room_id, sn)) => {
+                                    let sn = if sn.is_empty() { self.current_supernode_id.clone() } else { sn };
+                                    self.accept_room_file(&sn, &room_id, &transfer_id, &origin).await;
+                                }
+                                None => warn!("AcceptRoomFile: unknown transfer {transfer_id}"),
+                            }
+                        }
+                        ConnectionCommand::RevokeFile { transfer_id } => {
+                            // Room files are pulled from our own disk and the
+                            // relay caches nothing, so dropping the offer really
+                            // does revoke it: nobody can obtain the file after
+                            // this. Peers who already downloaded keep their copy.
+                            let room = self.room_file_mgr.outbound_route(&transfer_id).map(|(r, _)| r);
+                            let revoked = self.room_file_mgr.revoke_outbound(&transfer_id)
+                                | self.file_mgr.revoke_outbound(&transfer_id);
+                            if !revoked {
+                                continue;
+                            }
+                            if let Some(room_id) = room {
+                                let sn = self.current_supernode_id.clone();
+                                info!(
+                                    "[room.file.v1] revoking transfer {} — sender deleted the message",
+                                    &transfer_id[..8.min(transfer_id.len())]
+                                );
+                                self.send_file_revoke(&sn, &room_id, &transfer_id, None).await;
+                            }
+                        }
+                        ConnectionCommand::DeclineRoomFile { transfer_id } => {
+                            // Purely local: the originator never gets a request,
+                            // so nothing is streamed and nothing is wasted.
+                            self.room_file_mgr.discard_inbound(&transfer_id);
+                            self.emit_event(ConnectionEvent::FileFailed {
+                                transfer_id,
+                                reason: "declined".to_owned(),
+                            });
                         }
                         ConnectionCommand::RejectFile { transfer_id } => {
                             let evs = self.file_mgr.reject_transfer(&transfer_id, "user_rejected");
@@ -1227,9 +1295,55 @@ impl ConnectionManager {
                 _ = room_join_retry_interval.tick() => {
                     self.retry_pending_room_joins().await;
                 }
+                _ = file_pump_interval.tick() => {
+                    self.pump_room_file_streams().await;
+                }
+                _ = transfer_gc_interval.tick() => {
+                    // Neither map used to be pruned, so every payload ever sent
+                    // or received stayed resident for the process lifetime.
+                    let n = self.room_file_mgr.gc() + self.file_mgr.gc();
+                    if n > 0 {
+                        debug!("[file] evicted {n} finished/stale transfer record(s)");
+                    }
+                }
             }
         }
         info!("ConnectionManager stopped");
+    }
+
+    /// Emit the next slice of every in-flight outbound room file stream.
+    ///
+    /// Chunks are pulled from disk a few at a time rather than all at once, so
+    /// a 250 MB file neither materializes as thousands of base64 frames nor
+    /// swamps the relay's 512-slot signaling queue.
+    async fn pump_room_file_streams(&mut self) {
+        // 1:1 streams (core.file.v1) ride the same pacing.
+        for tid in self.file_mgr.active_outbound_streams() {
+            let (evs, _done) = self
+                .file_mgr
+                .pump_stream(&tid, crate::file_transfer::ROOM_FILE_CHUNK_BUDGET);
+            if !evs.is_empty() {
+                self.dispatch_transfer_events(evs).await;
+            }
+        }
+        for tid in self.room_file_mgr.active_outbound_streams() {
+            let (evs, _done) = self
+                .room_file_mgr
+                .pump_stream(&tid, crate::file_transfer::ROOM_FILE_CHUNK_BUDGET);
+            if evs.is_empty() {
+                continue;
+            }
+            let (room_id, sn) = match self.room_file_mgr.outbound_route(&tid) {
+                Some(v) => v,
+                None => continue,
+            };
+            let sn = if sn.is_empty() {
+                self.current_supernode_id.clone()
+            } else {
+                sn
+            };
+            self.dispatch_room_transfer_events(evs, &sn, &room_id).await;
+        }
     }
 
     /// Deliver an event to the app layer without blocking the manager loop.

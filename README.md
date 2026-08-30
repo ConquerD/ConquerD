@@ -1141,7 +1141,7 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 | SFU / Room | `sfu_join`, `sfu_join_result`, `sfu_leave`, `sfu_members`, `sfu_offer`, `sfu_answer`, `sfu_audio`, `sfu_chat`, `sfu_room_list`, `sfu_peer_joined`, `sfu_peer_left` |
 | SFU Subscription | `sfu_subscribe`, `sfu_unsubscribe` |
 | SFU Room Mgmt | `sfu_room_create`, `sfu_room_created`, `sfu_room_invite`, `sfu_room_invite_result`, `sfu_room_invite_generate` |
-| SFU File Transfer | `sfu_file_offer`, `sfu_file_chunk`, `sfu_file_complete` |
+| SFU File Transfer | `sfu_file_offer` (advertisement), `sfu_file_request` (a member accepting), `sfu_file_revoke` (sender withdrew it), `sfu_file_chunk`, `sfu_file_complete` |
 | SFU Video (control plane only) | `sfu_video_state` (camera on/off + join-time reannounce), `sfu_video_keyframe_request` |
 | SFU Group Key | `sfu_group_key`, `sfu_group_key_ack` (inside `encrypted_signal`) |
 | Space Tree | `space_root_announce` |

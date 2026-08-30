@@ -102,6 +102,16 @@ pub enum MessageType {
     SfuAnswer,
     SfuChat,
     SfuFileOffer,
+    /// A room member accepting an `SfuFileOffer`, asking the originator to
+    /// stream it. Room files are advertised, not pushed: without a request no
+    /// chunk is ever sent. The supernode stores nothing, so a late request
+    /// simply makes the sender re-read the file from disk.
+    SfuFileRequest,
+    /// The originator withdrawing a room file offer — sent broadcast when they
+    /// delete the message, or targeted at one requester whose `SfuFileRequest`
+    /// named an offer that is gone. Recipients drop the pending transfer; those
+    /// who already downloaded keep their copy (bytes cannot be un-sent).
+    SfuFileRevoke,
     SfuFileChunk,
     SfuFileComplete,
     SfuAudio,
@@ -239,6 +249,8 @@ impl MessageType {
             Self::SfuAnswer => "sfu_answer",
             Self::SfuChat => "sfu_chat",
             Self::SfuFileOffer => "sfu_file_offer",
+            Self::SfuFileRequest => "sfu_file_request",
+            Self::SfuFileRevoke => "sfu_file_revoke",
             Self::SfuFileChunk => "sfu_file_chunk",
             Self::SfuFileComplete => "sfu_file_complete",
             Self::SfuAudio => "sfu_audio",
