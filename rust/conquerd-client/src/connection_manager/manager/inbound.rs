@@ -1799,9 +1799,14 @@ impl ConnectionManager {
                 // Chunk size dominates the file feature's byte quota —
                 // base64 expands by ~4/3 so the wire size approximates
                 // `data.len()`.
-                let probe = vec![0u8; data.len()];
-                if !self.gate_through_feature("core.file.v1", &msg.sender, &probe) {
-                    return;
+                // In-flight transfers must not punch holes: quota-dropping a
+                // reliable chunk leaves the receiver unable to complete. New
+                // unknown transfers still pay the gate.
+                if !self.file_mgr.has_inbound(&tid) {
+                    let probe = vec![0u8; data.len()];
+                    if !self.gate_through_feature("core.file.v1", &msg.sender, &probe) {
+                        return;
+                    }
                 }
                 let evs = self.file_mgr.on_chunk_received(&tid, idx, data);
                 self.dispatch_transfer_events(evs).await;
@@ -2310,9 +2315,11 @@ impl ConnectionManager {
             .get("data")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let probe = vec![0u8; raw_data.len()];
-        if !self.gate_through_feature("room.file.v1", &msg.sender, &probe) {
-            return;
+        if !self.room_file_mgr.has_inbound(&tid) {
+            let probe = vec![0u8; raw_data.len()];
+            if !self.gate_through_feature("room.file.v1", &msg.sender, &probe) {
+                return;
+            }
         }
         // Room file chunks are E2E-only: `data` is
         // `base64(nonce ‖ aesgcm(data))` under the room group key
@@ -2386,6 +2393,11 @@ impl ConnectionManager {
     /// Dispatch a batch of [`TransferEvent`]s, routing outbound messages and
     /// emitting the appropriate [`ConnectionEvent`]s upward.
     pub(super) async fn dispatch_transfer_events(&mut self, events: Vec<TransferEvent>) {
+        // Quota can refuse a chunk after `next_chunk_events` already counted
+        // it. Track unsent file-data frames so we rewind and retry next pump
+        // instead of leaving holes the receiver can never fill.
+        let mut hold_file_data = false;
+        let mut unsent_chunks: HashMap<String, usize> = HashMap::new();
         for ev in events {
             match ev {
                 TransferEvent::SendMessage {
@@ -2393,11 +2405,34 @@ impl ConnectionManager {
                     message_type,
                     payload,
                 } => {
+                    let tid = payload
+                        .get("transfer_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let is_chunk = message_type == MessageType::FileTransferChunk;
+                    let is_complete = message_type == MessageType::FileTransferComplete;
+                    if hold_file_data && (is_chunk || is_complete) {
+                        if is_chunk && !tid.is_empty() {
+                            *unsent_chunks.entry(tid).or_insert(0) += 1;
+                        }
+                        continue;
+                    }
                     let sender = self.identity.public_id();
                     let mut msg = SignalingMessage::new(message_type, sender);
                     msg.target = Some(peer_id);
                     msg.payload = payload.into_iter().collect();
-                    self.dispatch_outbound(msg).await;
+                    let sent = self.dispatch_outbound(msg).await;
+                    if is_chunk {
+                        if !sent {
+                            hold_file_data = true;
+                            if !tid.is_empty() {
+                                *unsent_chunks.entry(tid).or_insert(0) += 1;
+                            }
+                        }
+                    } else if is_complete && sent {
+                        self.file_mgr.mark_outbound_complete(&tid);
+                    }
                 }
                 TransferEvent::Offered {
                     transfer_id,
@@ -2459,6 +2494,11 @@ impl ConnectionManager {
                 }
             }
         }
+        for (tid, n) in unsent_chunks {
+            if n > 0 {
+                self.file_mgr.unsend_chunks(&tid, n);
+            }
+        }
     }
 
     pub(super) async fn dispatch_room_transfer_events(
@@ -2467,6 +2507,8 @@ impl ConnectionManager {
         supernode_id: &str,
         room_id: &str,
     ) {
+        let mut hold_file_data = false;
+        let mut unsent_chunks: HashMap<String, usize> = HashMap::new();
         for ev in events {
             match ev {
                 TransferEvent::SendMessage {
@@ -2480,6 +2522,19 @@ impl ConnectionManager {
                         MessageType::FileTransferComplete => MessageType::SfuFileComplete,
                         _ => continue,
                     };
+                    let tid = payload
+                        .get("transfer_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let is_chunk = room_msg_type == MessageType::SfuFileChunk;
+                    let is_complete = room_msg_type == MessageType::SfuFileComplete;
+                    if hold_file_data && (is_chunk || is_complete) {
+                        if is_chunk && !tid.is_empty() {
+                            *unsent_chunks.entry(tid).or_insert(0) += 1;
+                        }
+                        continue;
+                    }
                     payload.insert("room_id".into(), Value::String(room_id.to_owned()));
                     let sender = self.identity.public_id();
                     // E2E-seal chunk data under real group-key material only
@@ -2527,6 +2582,9 @@ impl ConnectionManager {
                                 }
                                 None => {
                                     warn!("[room.file.v1] seal failed; dropping outbound chunk");
+                                    if !tid.is_empty() {
+                                        *unsent_chunks.entry(tid).or_insert(0) += 1;
+                                    }
                                     continue;
                                 }
                             }
@@ -2535,7 +2593,15 @@ impl ConnectionManager {
                     let mut msg = SignalingMessage::new(room_msg_type, sender);
                     msg.target = Some(supernode_id.to_owned());
                     msg.payload = payload.into_iter().collect();
-                    self.dispatch_outbound(msg).await;
+                    let sent = self.dispatch_outbound(msg).await;
+                    if is_chunk && !sent {
+                        hold_file_data = true;
+                        if !tid.is_empty() {
+                            *unsent_chunks.entry(tid).or_insert(0) += 1;
+                        }
+                    } else if is_complete && sent {
+                        self.room_file_mgr.mark_outbound_complete(&tid);
+                    }
                 }
                 TransferEvent::Offered {
                     transfer_id,
@@ -2610,6 +2676,11 @@ impl ConnectionManager {
                     });
                 }
                 TransferEvent::StateChanged { .. } => {}
+            }
+        }
+        for (tid, n) in unsent_chunks {
+            if n > 0 {
+                self.room_file_mgr.unsend_chunks(&tid, n);
             }
         }
     }

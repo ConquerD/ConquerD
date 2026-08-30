@@ -90,10 +90,13 @@ impl ConnectionManager {
         )
     }
 
+    /// Returns `true` when the frame was handed to a transport. `false` means
+    /// it was not sent (quota, no path, serialize error) and a file pump must
+    /// retry rather than skip ahead.
     pub(in crate::connection_manager) async fn dispatch_outbound(
         &mut self,
         mut msg: SignalingMessage,
-    ) {
+    ) -> bool {
         let chat_attempt = if msg.msg_type == MessageType::ChatMessage {
             msg.target.clone().and_then(|peer_id| {
                 msg.payload
@@ -132,7 +135,7 @@ impl ConnectionManager {
                         message_id,
                         reason: "peer is offline".to_owned(),
                     });
-                    return;
+                    return false;
                 }
                 debug!(
                     "No direct session for chat {}; relaying to {} via supernode",
@@ -200,7 +203,7 @@ impl ConnectionManager {
                             reason: "quota exceeded".to_owned(),
                         });
                     }
-                    return;
+                    return false;
                 }
             }
         }
@@ -210,7 +213,7 @@ impl ConnectionManager {
             Ok(b) => b,
             Err(e) => {
                 error!("Failed to canonicalize message for signing: {}", e);
-                return;
+                return false;
             }
         };
         let sig = self.identity.sign(&canonical);
@@ -230,7 +233,7 @@ impl ConnectionManager {
                         reason: "message serialization failed".to_owned(),
                     });
                 }
-                return;
+                return false;
             }
         };
 
@@ -261,7 +264,7 @@ impl ConnectionManager {
                 let tag = Self::channel_tag_for(msg_type.clone());
                 let bytes = channel_frame::encode_frame(tag, json.as_bytes());
                 if out_tx.try_send(PeerOutbound::Reliable(bytes)).is_ok() {
-                    return;
+                    return true;
                 }
                 // Full or closing QUIC channel: fall back to supernode relay
                 // when available so chat / call / file are not stranded.
@@ -283,7 +286,7 @@ impl ConnectionManager {
                             reason: "connection busy".to_owned(),
                         });
                     }
-                    return;
+                    return false;
                 }
             }
         }
@@ -300,7 +303,7 @@ impl ConnectionManager {
                 if Self::is_relay_signaling_type(&msg_type) {
                     if let Some(relay) = self.quic_relays.get(&sn_id).filter(|r| r.is_alive()) {
                         if relay.send_signaling(json.as_bytes()) {
-                            return;
+                            return true;
                         }
                         // Portal-only, dead signaling stream, or back-pressure:
                         // fall through to WebSocket so room chat/file is never
@@ -323,8 +326,9 @@ impl ConnectionManager {
                                     &sn_id[..12.min(sn_id.len())]
                                 );
                             }
+                            return false;
                         }
-                        return;
+                        return true;
                     }
                     _ => {
                         warn!(
@@ -339,7 +343,7 @@ impl ConnectionManager {
                                 reason: "supernode is offline".to_owned(),
                             });
                         }
-                        return;
+                        return false;
                     }
                 }
             }
@@ -382,7 +386,7 @@ impl ConnectionManager {
                 self.note_ws_outbound_drop("peer relay fan-out");
             }
             if delivered_any {
-                return;
+                return true;
             }
             warn!("No connected supernode accepted relay {:?}", msg_type);
             if let Some((peer_id, message_id)) = chat_attempt {
@@ -392,7 +396,7 @@ impl ConnectionManager {
                     reason: "peer is offline".to_owned(),
                 });
             }
-            return;
+            return false;
         }
 
         // Untargeted broadcasts: first connected supernode that accepts.
@@ -405,11 +409,12 @@ impl ConnectionManager {
                     .try_send(WsMessage::Text(relay_json.clone()))
                     .is_ok()
                 {
-                    return;
+                    return true;
                 }
             }
         }
         warn!("No connected path to deliver message {:?}", msg_type);
+        false
     }
 
     /// Wrap a signed, peer-targeted `inner` message in a signed

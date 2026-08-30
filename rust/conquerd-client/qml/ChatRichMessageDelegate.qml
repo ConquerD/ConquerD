@@ -524,7 +524,11 @@ Item {
                                 visible: !root.mine && root.xferState === "pending"
                                 ToolTip.text: root.isRoom ? qsTr("Download") : qsTr("Accept")
                                 ToolTip.visible: hovered
-                                onClicked: root.transferAcceptRequested(root.transferId)
+                                onClicked: {
+                                    root.xferState = "active"
+                                    root.xferProgress = Math.max(root.xferProgress, 0.01)
+                                    root.transferAcceptRequested(root.transferId)
+                                }
                             }
                             ToolButton {
                                 icon.source: "qrc:/qt/qml/ConquerD/Client/icons/x-circle.svg"

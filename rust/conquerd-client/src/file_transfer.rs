@@ -572,15 +572,15 @@ impl FileTransferManager {
         xfer.to = requester.to_owned();
         xfer.state = TransferState::Transferring;
         xfer.finished_at = None;
-        let (evs, done) = next_chunk_events(xfer, budget);
-        if done && xfer.state != TransferState::Failed {
-            xfer.state = TransferState::Complete;
-            xfer.finished_at = Some(unix_now_f64());
-        }
+        let (evs, _done) = next_chunk_events(xfer, budget);
         evs
     }
 
     /// Continue an in-flight outbound stream. Returns `(events, done)`.
+    ///
+    /// Does **not** mark the transfer complete: COMPLETE is only recorded after
+    /// `dispatch_outbound` actually hands the frame to a transport. Marking
+    /// complete here used to skip retry when quota dropped the COMPLETE.
     pub fn pump_stream(&mut self, transfer_id: &str, budget: usize) -> (Vec<TransferEvent>, bool) {
         let Some(xfer) = self.outbound.get_mut(transfer_id) else {
             return (vec![], true);
@@ -588,12 +588,7 @@ impl FileTransferManager {
         if xfer.state != TransferState::Transferring {
             return (vec![], true);
         }
-        let (evs, done) = next_chunk_events(xfer, budget);
-        if done && xfer.state != TransferState::Failed {
-            xfer.state = TransferState::Complete;
-            xfer.finished_at = Some(unix_now_f64());
-        }
-        (evs, done)
+        next_chunk_events(xfer, budget)
     }
 
     /// Route for an inbound offer: `(origin_peer, room_id, supernode_id)`.
@@ -633,6 +628,11 @@ impl FileTransferManager {
         self.outbound.contains_key(transfer_id)
     }
 
+    /// True if we have an inbound transfer in flight (offer accepted or pending).
+    pub fn has_inbound(&self, transfer_id: &str) -> bool {
+        self.inbound.contains_key(transfer_id)
+    }
+
     /// Drop a declined inbound offer, deleting any `.part` file it opened.
     pub fn discard_inbound(&mut self, transfer_id: &str) {
         if let Some(x) = self.inbound.remove(transfer_id) {
@@ -642,15 +642,36 @@ impl FileTransferManager {
         }
     }
 
-    /// Transfer ids with chunks still to send.
+    /// Transfer ids still streaming — including "all chunks counted locally
+    /// but COMPLETE has not been handed to a transport yet", so a quota-blocked
+    /// COMPLETE is retried instead of leaving the receiver hanging.
     pub fn active_outbound_streams(&self) -> Vec<String> {
         self.outbound
             .iter()
-            .filter(|(_, x)| {
-                x.state == TransferState::Transferring && x.chunks_sent < x.total_chunks
-            })
+            .filter(|(_, x)| x.state == TransferState::Transferring)
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Undo `n` locally-counted chunks that were not actually sent (quota /
+    /// no path). The pump will emit them again.
+    pub fn unsend_chunks(&mut self, transfer_id: &str, n: usize) {
+        let Some(x) = self.outbound.get_mut(transfer_id) else {
+            return;
+        };
+        x.chunks_sent = x.chunks_sent.saturating_sub(n);
+        if x.state == TransferState::Complete {
+            x.state = TransferState::Transferring;
+            x.finished_at = None;
+        }
+    }
+
+    /// COMPLETE frame was handed to a transport.
+    pub fn mark_outbound_complete(&mut self, transfer_id: &str) {
+        if let Some(x) = self.outbound.get_mut(transfer_id) {
+            x.state = TransferState::Complete;
+            x.finished_at = Some(unix_now_f64());
+        }
     }
 
     // ── Outbound ─────────────────────────────────────────────────────────
@@ -881,11 +902,7 @@ impl FileTransferManager {
             state: "transferring".into(),
         }];
         if xfer.source.is_streaming() {
-            let (chunk_evs, done) = next_chunk_events(xfer, ROOM_FILE_CHUNK_BUDGET);
-            if done && xfer.state != TransferState::Failed {
-                xfer.state = TransferState::Complete;
-                xfer.finished_at = Some(unix_now_f64());
-            }
+            let (chunk_evs, _done) = next_chunk_events(xfer, ROOM_FILE_CHUNK_BUDGET);
             evs.extend(chunk_evs);
         } else {
             evs.extend(build_chunk_events(xfer));
@@ -2379,6 +2396,32 @@ mod tests {
         std::fs::write(&first, b"x").unwrap();
         let second = unique_dest_path(dir.path(), "clip.mp4");
         assert_eq!(second.file_name().unwrap(), "clip (1).mp4");
+    }
+
+    /// Quota used to drop chunk frames after `chunks_sent` had already moved,
+    /// so the receiver stalled with holes. Rewinding must make those chunks
+    /// eligible for the next pump.
+    #[test]
+    fn unsend_chunks_lets_pump_retry() {
+        let mut mgr = FileTransferManager::new();
+        let data = b"hello world".repeat(80);
+        let (tid, _) = mgr
+            .offer_file("peer-1", "a.bin", data.to_vec(), "file", None, false)
+            .unwrap();
+        let _ = mgr.on_transfer_accepted(&tid);
+        let sent = mgr.outbound.get(&tid).unwrap().chunks_sent;
+        assert!(sent > 0);
+        mgr.unsend_chunks(&tid, sent);
+        assert_eq!(mgr.outbound.get(&tid).unwrap().chunks_sent, 0);
+        assert!(mgr.active_outbound_streams().contains(&tid));
+        let (evs, _) = mgr.pump_stream(&tid, 8);
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TransferEvent::SendMessage {
+                message_type: MessageType::FileTransferChunk,
+                ..
+            }
+        )));
     }
 
     /// Deleting a file message withdraws the share: because the relay caches
