@@ -8,6 +8,9 @@ Item {
 
     signal leaveRoom()
     signal openAttachment(string path)
+    // Start voice for the room currently shown. MainWindow owns the
+    // joinRoomWithVoice call and the voice-rail bookkeeping.
+    signal joinVoiceRequested()
 
     property string roomName: "Room"
     property string roomId: ""
@@ -21,6 +24,10 @@ Item {
 
     // Members sidebar (who is in this text room + their presence).
     property bool membersOpen: true
+
+    // True when voice is already live for *this* room, so the header's Join
+    // Voice control hides instead of re-joining what you are already in.
+    property bool voiceActiveHere: false
 
     onRoomModelChanged: {
         participantCount = roomModel ? roomModel.participantCount() : 0
@@ -57,6 +64,22 @@ Item {
             "attachmentPath": msg.attachment_path || "",
             "sizeStr": msg.size_str || ""
         })
+    }
+
+    /// Drop a message from the visible room history.
+    ///
+    /// Driven by the backend's `messageDeleted` confirmation, so the row only
+    /// disappears once it is actually gone from the store — otherwise a failed
+    /// delete would leave the UI and the history disagreeing.
+    function removeMessage(msgId) {
+        if (!msgId)
+            return
+        for (var i = 0; i < roomChatModel.count; i++) {
+            if (roomChatModel.get(i).msgId === msgId) {
+                roomChatModel.remove(i)
+                return
+            }
+        }
     }
 
     function switchToRoom(name, roomId, supernodeId) {
@@ -106,6 +129,51 @@ Item {
                     font.bold: true
                     Layout.fillWidth: true
                     elide: Text.ElideRight
+                }
+
+                // Join Voice — the in-panel equivalent of double-clicking the
+                // room in the sidebar. Without it, browsing a room's chat gave
+                // you no way to start talking except going back to the sidebar.
+                // Hidden once voice is live here (you are already in), and
+                // while no room is actually open.
+                Rectangle {
+                    id: joinVoiceButton
+                    Layout.alignment: Qt.AlignVCenter
+                    implicitHeight: 28
+                    implicitWidth: joinVoiceRow.implicitWidth + Theme.spacingSm * 2
+                    radius: Theme.radiusPill
+                    color: joinVoiceHover.hovered ? Theme.bg3 : "transparent"
+                    border.color: Theme.bg3
+                    border.width: 1
+                    visible: !root.voiceActiveHere && root.roomId !== "" && root.supernodeId !== ""
+
+                    RowLayout {
+                        id: joinVoiceRow
+                        anchors.centerIn: parent
+                        spacing: Theme.spacingXs
+
+                        Image {
+                            source: "qrc:/qt/qml/ConquerD/Client/icons/phone.svg"
+                            sourceSize.width: 14
+                            sourceSize.height: 14
+                            width: 14
+                            height: 14
+                            fillMode: Image.PreserveAspectFit
+                            opacity: 0.85
+                        }
+
+                        Text {
+                            text: qsTr("Join Voice")
+                            color: Theme.text
+                            font.pixelSize: Theme.fontSizeCaption
+                        }
+                    }
+
+                    HoverHandler { id: joinVoiceHover }
+                    TapHandler { onTapped: root.joinVoiceRequested() }
+
+                    ToolTip.text: qsTr("Join this room's voice channel")
+                    ToolTip.visible: joinVoiceHover.hovered
                 }
 
                 // Members toggle — shows the room population and opens/closes
@@ -185,7 +253,14 @@ Item {
                 isRoom: true
                 inlinePreviewEnabled: root.youtubePreviewEnabled
                 inlinePreviewAck: root.youtubeInlineAck
-                allowDelete: false
+                // Room history is client-side only — the supernode persists no
+                // messages — so this copy is entirely the user's to trim,
+                // exactly as in 1:1 chat. Deliberately not limited to your own
+                // messages: deleting someone else's only removes it from *your*
+                // local history, it does not reach them. For a file you sent,
+                // deleting also revokes the share (see `delete_message`).
+                allowDelete: true
+                onDeleteRequested: (id) => backend.deleteMessage(id)
                 onInlineAckAccepted: {
                     root.youtubeInlineAck = true
                     if (root.settingsModel) {

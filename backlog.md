@@ -317,7 +317,6 @@ change as well as a code change** — that rule now lives in the Documentation A
 
 7. **UX completeness.**
    Camera toggle + settings preview + tiles exist; remaining polish as the path stabilizes:
-   - Clear “video unavailable on this platform / no encoder” messaging (not a silent toggle fail).
    - Screen-share picker UX (monitor/window ids are `monitor:` / `window:` in settings today;
      discovery UI may still be thin) — pair with content-audio toggle from item 4.
    - Multi-tile layout under several active room cameras (layout stress, not a new wire feature).

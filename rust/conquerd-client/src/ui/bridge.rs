@@ -3401,6 +3401,26 @@ impl ffi::AppBridge {
                 return;
             }
         }
+        // Room chat also replays from `room_chat_history` when no chat store is
+        // open, so a deleted room message has to be dropped there too or it
+        // reappears the next time the room is switched to.
+        {
+            let history = &mut self.as_mut().rust_mut().room_chat_history;
+            for msgs in history.values_mut() {
+                msgs.retain(|m| {
+                    // Parse rather than substring-match: a body containing the
+                    // id's text would otherwise delete the wrong message.
+                    serde_json::from_str::<serde_json::Value>(m)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("msg_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|s| s != id)
+                        })
+                        .unwrap_or(true)
+                });
+            }
+        }
         // A file message is an offer, not a copy: deleting it withdraws the
         // share. Peers who have not downloaded yet can no longer obtain the
         // file from anyone — nothing else holds it. `RevokeFile` no-ops unless

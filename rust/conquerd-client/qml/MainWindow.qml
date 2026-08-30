@@ -768,6 +768,10 @@ ApplicationWindow {
     property string voiceRoomName: ""
     // Hosting supernode for the active voice room (paired with voiceRoomName).
     property string voiceSupernodeId: ""
+    // Room id of the active voice room. Names are display strings and can
+    // collide across nodes, so anything deciding "is voice active in *this*
+    // room" must compare the id + supernode, not the name.
+    property string voiceRoomId: ""
     // Remote peer for an active direct P2P voice call.
     property string activeCallPeerId: ""
 
@@ -978,6 +982,40 @@ ApplicationWindow {
     /// `video_input_device` means — the same convention `SourceSpec` reads.
     property var shareCaptureSources: [{ id: "", name: qsTr("Default camera") }]
 
+    /// Whether this build can encode video at all.
+    ///
+    /// A static platform fact (VP8 is vendored everywhere, H.264 is added on
+    /// Windows), so it is resolved once. If it is ever false there is no point
+    /// offering to share — and previously the attempt just failed in silence.
+    property bool videoEncoderAvailable: true
+
+    /// Real capture sources, excluding the synthetic "Default camera" entry
+    /// that `shareCaptureSources` always leads with.
+    readonly property int realCaptureSourceCount: root.shareCaptureSources.length - 1
+
+    /// Why video cannot be shared right now, or "" when it can.
+    ///
+    /// Capture is re-enumerated every time the share menu opens, so a camera
+    /// plugged in after launch is picked up without restarting.
+    readonly property string videoUnavailableReason:
+        !root.videoEncoderAvailable
+            ? qsTr("Video unavailable on this platform — no encoder.")
+            : (root.realCaptureSourceCount <= 0
+                ? qsTr("No camera or screen detected.")
+                : "")
+
+    function refreshVideoEncoderAvailable() {
+        try {
+            var res = JSON.parse(backend.listVideoCodecs())
+            root.videoEncoderAvailable = (res.codecs || []).length > 0
+        } catch (e) {
+            // Assume available: a failed probe must not lock the user out of a
+            // feature that may well work.
+            console.warn("could not list video codecs:", e)
+            root.videoEncoderAvailable = true
+        }
+    }
+
     /// Re-enumerate capture sources for the share menu.
     ///
     /// Cameras, monitors and windows share one list because any of them can be
@@ -1079,6 +1117,7 @@ ApplicationWindow {
     Component.onCompleted: {
         settingsModel.load()
         applyThemePreference(settingsModel.theme)
+        root.refreshVideoEncoderAvailable()
 
         // Announce the (empty) watched set. Not a no-op: the supernode treats
         // "never subscribed" as "forward everything", so this is what starts
@@ -1297,9 +1336,12 @@ ApplicationWindow {
             backend.enablePtt(settingsModel.ptt_key)
         }
 
-        // Wire message deletion: remove from in-memory model when backend confirms
+        // Wire message deletion: remove from in-memory model when backend
+        // confirms. Both panels are told — a message id is unique across the
+        // store, so whichever holds it drops it and the other no-ops.
         backend.messageDeleted.connect(function(msgId) {
             chatModel.removeMessage(msgId)
+            roomPanel.removeMessage(msgId)
         })
         // Wire peer history clear: wipe the in-memory model
         backend.peerHistoryCleared.connect(function(peerId) {
@@ -1439,6 +1481,7 @@ ApplicationWindow {
             backend.joinRoomWithVoice(supernodeId, roomId)
             root.voiceRoomName = roomName
             root.voiceSupernodeId = supernodeId
+            root.voiceRoomId = roomId
             navIndex = 1
             if (roomType === "private" && inviteToken !== "") {
                 // Prefer a self-contained invite URL (embeds the supernode
@@ -1462,6 +1505,7 @@ ApplicationWindow {
             backend.joinRoomWithVoice(supernodeId, roomId)
             root.voiceRoomName = roomName
             root.voiceSupernodeId = supernodeId
+            root.voiceRoomId = roomId
             navIndex = 1
         }
     }
@@ -1492,6 +1536,7 @@ ApplicationWindow {
             backend.joinRoomWithVoice(supernodeId, roomId)
             root.voiceRoomName = roomId
             root.voiceSupernodeId = supernodeId
+            root.voiceRoomId = roomId
             navIndex = 1
         }
     }
@@ -1730,6 +1775,7 @@ ApplicationWindow {
                                     roomContextMenu.targetRoomId)
                                 root.voiceRoomName = roomContextMenu.targetRoomName
                                 root.voiceSupernodeId = roomContextMenu.targetSupernodeId
+                                root.voiceRoomId = roomContextMenu.targetRoomId
                                 navIndex = 1
                             }
                         }
@@ -2074,6 +2120,7 @@ ApplicationWindow {
                                                     roomDelegate.room_id)
                                                 root.voiceRoomName = roomDelegate.name || roomDelegate.room_id
                                                 root.voiceSupernodeId = roomGroup.node_id
+                                                root.voiceRoomId = roomDelegate.room_id
                                                 navIndex = 1
                                             }
 
@@ -2628,11 +2675,25 @@ ApplicationWindow {
                 settingsModel: settingsModel
                 youtubePreviewEnabled: settingsModel ? settingsModel.youtube_preview_enabled : true
                 youtubeInlineAck: settingsModel ? settingsModel.youtube_inline_ack : false
+                // Compare id + supernode, not the display name: two nodes can
+                // host rooms with the same name. Gated on voice_active so the
+                // never-cleared voiceRoomId cannot report a stale match.
+                voiceActiveHere: backend.voice_active && backend.in_room
+                                 && root.voiceRoomId !== ""
+                                 && root.voiceRoomId === roomPanel.roomId
+                                 && root.voiceSupernodeId === roomPanel.supernodeId
                 onLeaveRoom: {
                     root.closeAllVideoPopouts()
                     root.expandedVideoPeers = []
                     backend.leaveRoom()
                     navIndex = 0
+                }
+                onJoinVoiceRequested: {
+                    // Same path as a sidebar double-click.
+                    backend.joinRoomWithVoice(roomPanel.supernodeId, roomPanel.roomId)
+                    root.voiceRoomName = roomPanel.roomName
+                    root.voiceSupernodeId = roomPanel.supernodeId
+                    root.voiceRoomId = roomPanel.roomId
                 }
                 onOpenAttachment: (path) => root.showFilePreview(path)
             }
@@ -2785,6 +2846,9 @@ ApplicationWindow {
             videoSourceId: settingsModel.video_input_device
             videoOverlaysJson: settingsModel.video_overlays_json
             contentAudioMode: settingsModel.content_audio_mode
+
+            videoUnavailableReason: root.videoUnavailableReason
+            videoEncoderMissing: !root.videoEncoderAvailable
 
             onShareOptionsOpened: root.refreshShareCaptureSources()
             // Written straight to settings, so the menu and Settings › Video

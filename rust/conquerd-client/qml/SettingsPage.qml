@@ -499,6 +499,32 @@ Item {
                         ? (backend.video_active || backend.video_preview_active)
                         : false
 
+                    /// Whether this build can encode video at all. Resolved once
+                    /// on load — VP8 is vendored on every platform, so a false
+                    /// here means something is genuinely wrong with the build.
+                    property bool encoderAvailable: true
+
+                    /// Why Preview cannot start, or "" when it can.
+                    readonly property string previewBlockedReason:
+                        !cameraCard.encoderAvailable
+                            ? qsTr("Video unavailable on this platform — no encoder.")
+                            : (cameraCombo.count <= 1
+                                ? qsTr("No camera or capture source detected.")
+                                : "")
+
+                    function refreshEncoderAvailable() {
+                        if (!backend) return
+                        try {
+                            var res = JSON.parse(backend.listVideoCodecs())
+                            cameraCard.encoderAvailable = (res.codecs || []).length > 0
+                        } catch (e) {
+                            // Assume available: a failed probe must not lock the
+                            // user out of a feature that may well work.
+                            console.warn("settings: could not list video codecs:", e)
+                            cameraCard.encoderAvailable = true
+                        }
+                    }
+
                     function startPreview() {
                         if (!backend || !root.settings) return
                         backend.setVideoPreviewEnabled(
@@ -665,14 +691,16 @@ Item {
                         spacing: Theme.spacingMd
 
                         Label {
-                            text: cameraCombo.count <= 1
-                                ? "No capture sources detected."
-                                : (backend && backend.video_active
-                                    ? "Sharing is on."
-                                    : (backend && backend.video_preview_active
-                                        ? "Previewing — nobody else can see this."
-                                        : "Sharing is off."))
-                            color: cameraCombo.count <= 1 ? Theme.warn : Theme.muted
+                            text: !cameraCard.encoderAvailable
+                                ? "Video unavailable on this platform — no encoder."
+                                : (cameraCombo.count <= 1
+                                    ? "No capture sources detected."
+                                    : (backend && backend.video_active
+                                        ? "Sharing is on."
+                                        : (backend && backend.video_preview_active
+                                            ? "Previewing — nobody else can see this."
+                                            : "Sharing is off.")))
+                            color: cameraCard.previewBlockedReason !== "" ? Theme.warn : Theme.muted
                             font.pixelSize: Theme.fontSizeCaption
                         }
 
@@ -681,11 +709,19 @@ Item {
                             // that stream, so stopping it here would mean
                             // stopping the call's camera from the settings page.
                             visible: !(backend && backend.video_active)
+                            // Previously this stayed enabled with no camera and
+                            // no encoder, so pressing it did nothing at all and
+                            // said nothing about why. Stopping is always allowed.
                             enabled: previewLoader.status !== Loader.Error
+                                     && (cameraCard.previewLive
+                                         || cameraCard.previewBlockedReason === "")
                             text: cameraCard.previewLive ? "Stop preview" : "Preview"
                             onClicked: cameraCard.previewLive
                                 ? cameraCard.stopPreview()
                                 : cameraCard.startPreview()
+
+                            ToolTip.text: cameraCard.previewBlockedReason
+                            ToolTip.visible: hovered && cameraCard.previewBlockedReason !== ""
                         }
 
                         StyledButton {
@@ -766,7 +802,10 @@ Item {
                         function onContent_audio_modeChanged() { cameraCard.syncFromSettings() }
                     }
 
-                    Component.onCompleted: cameraCard.reloadCameras()
+                    Component.onCompleted: {
+                        cameraCard.reloadCameras()
+                        cameraCard.refreshEncoderAvailable()
+                    }
                 }
 
                 // Encoding and streaming.

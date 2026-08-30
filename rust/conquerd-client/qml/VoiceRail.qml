@@ -74,6 +74,17 @@ Rectangle {
     /// Picture-in-picture layout, verbatim `video_overlays_json`.
     property string videoOverlaysJson: "[]"
 
+    /// Why video cannot be shared, or "" when it can.
+    ///
+    /// Non-empty greys out the share affordances and is shown verbatim, so
+    /// starting a share can no longer fail with no explanation. An encoder-level
+    /// problem blocks the button outright; a missing camera only blocks the
+    /// commit inside the menu, because opening the menu re-enumerates and is how
+    /// a camera plugged in after launch gets noticed.
+    property string videoUnavailableReason: ""
+    /// True when the failure is the platform/encoder rather than the hardware.
+    property bool videoEncoderMissing: false
+
     /// Audio mode the share menu pre-selects: "auto" | "system" | "off".
     property string contentAudioMode: "auto"
 
@@ -665,6 +676,11 @@ Rectangle {
                     id: shareButton
                     width: 36; height: 36; radius: Theme.radiusPill
                     color: root.videoOn ? Theme.accent : Theme.bg2
+                    // Greyed out when this build cannot encode at all. A missing
+                    // camera does NOT disable it — the menu re-enumerates on
+                    // open, so disabling here would strand anyone who plugs a
+                    // camera in after launch.
+                    opacity: root.videoEncoderMissing ? 0.4 : 1.0
 
                     Behavior on color { ColorAnimation { duration: Theme.animFast } }
 
@@ -713,16 +729,18 @@ Rectangle {
                         onClicked: {
                             if (root.videoOn)
                                 root.stopShareRequested()
-                            else
+                            else if (!root.videoEncoderMissing)
                                 sharePopup.open()
                         }
                     }
 
-                    ToolTip.text: !root.videoOn
-                        ? qsTr("Share video")
-                        : (root.shareAudioOn
-                            ? qsTr("Stop sharing (video and audio)")
-                            : qsTr("Stop sharing (video only)"))
+                    ToolTip.text: root.videoEncoderMissing
+                        ? root.videoUnavailableReason
+                        : (!root.videoOn
+                            ? qsTr("Share video")
+                            : (root.shareAudioOn
+                                ? qsTr("Stop sharing (video and audio)")
+                                : qsTr("Stop sharing (video only)")))
                     ToolTip.visible: shareHover.hovered && !sharePopup.opened
                     HoverHandler { id: shareHover }
 
@@ -982,10 +1000,25 @@ Rectangle {
                                 Layout.topMargin: Theme.spacingXs
                                 spacing: Theme.spacingXs
 
-                                Item { Layout.fillWidth: true }
+                                // Say why the commit is dead rather than letting
+                                // it be pressed and silently do nothing.
+                                Label {
+                                    Layout.fillWidth: true
+                                    visible: root.videoUnavailableReason !== ""
+                                    wrapMode: Text.WordWrap
+                                    text: root.videoUnavailableReason
+                                    color: Theme.warn
+                                    font.pixelSize: Theme.fontSizeMicro
+                                }
+
+                                Item {
+                                    Layout.fillWidth: true
+                                    visible: root.videoUnavailableReason === ""
+                                }
 
                                 StyledButton {
                                     success: true
+                                    enabled: root.videoUnavailableReason === ""
                                     text: qsTr("Start sharing")
                                     onClicked: {
                                         sharePopup.close()
