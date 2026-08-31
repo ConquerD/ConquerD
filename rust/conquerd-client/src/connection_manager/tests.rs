@@ -8,8 +8,31 @@ use super::manager::{
     FailoverPlan, RoomInvitePayload, ROOM_INVITE_SCHEMA,
 };
 use super::ConnectionManager;
+use crate::protocol::MessageType;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+
+#[test]
+fn file_payload_stays_on_one_transport() {
+    assert!(ConnectionManager::is_ordered_file_payload(
+        &MessageType::FileTransferChunk
+    ));
+    assert!(ConnectionManager::is_ordered_file_payload(
+        &MessageType::FileTransferComplete
+    ));
+    assert!(ConnectionManager::is_ordered_file_payload(
+        &MessageType::SfuFileChunk
+    ));
+    assert!(ConnectionManager::is_ordered_file_payload(
+        &MessageType::SfuFileComplete
+    ));
+    assert!(!ConnectionManager::is_ordered_file_payload(
+        &MessageType::SfuFileOffer
+    ));
+    assert!(!ConnectionManager::is_ordered_file_payload(
+        &MessageType::ChatMessage
+    ));
+}
 
 #[test]
 fn parses_saved_quic_endpoints() {

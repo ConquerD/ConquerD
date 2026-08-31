@@ -1712,6 +1712,14 @@ fn file_frame_recipients<'a>(
     }
 }
 
+/// In-flight file bytes already paid the sender's inbound quota. Outbound
+/// must not drop them — `raw.len()` is larger than the billed `data` length,
+/// so the outbound bucket emptied first and the receiver stalled at a few
+/// percent while the sender showed 100%.
+fn file_data_bypasses_outbound_quota(mt: MessageType) -> bool {
+    matches!(mt, MessageType::SfuFileChunk | MessageType::SfuFileComplete)
+}
+
 fn sfu_file_inbound_byte_count(msg: &SignalingMessage, mt: MessageType) -> usize {
     match mt {
         MessageType::SfuFileChunk => msg
@@ -2535,13 +2543,19 @@ impl SupernodeHandler {
             return;
         }
 
+        // Chunks and COMPLETE already paid inbound quota on the sender.
+        // Outbound `raw.len()` is the full JSON (base64 + envelope) so it
+        // burns tokens faster than inbound and used to drop the rest of a
+        // large file after the first burst — sender at 100%, receiver stuck.
+        let file_data = file_data_bypasses_outbound_quota(mt);
         for peer in targets {
-            if self
-                .state
-                .features
-                .gate_through_feature("room.file.v1", peer, wire_bytes)
-            {
-                self.state.signaling.send_to_peer(peer, raw);
+            let allowed = file_data
+                || self
+                    .state
+                    .features
+                    .gate_through_feature("room.file.v1", peer, wire_bytes);
+            if allowed {
+                let _ = self.state.signaling.send_to_peer(peer, raw);
             }
         }
     }
@@ -3964,6 +3978,20 @@ mod sfu_file_routing_tests {
             sfu_file_inbound_byte_count(&complete, MessageType::SfuFileComplete),
             64
         );
+    }
+
+    #[test]
+    fn in_flight_file_bytes_are_not_dropped_by_outbound_quota() {
+        assert!(file_data_bypasses_outbound_quota(MessageType::SfuFileChunk));
+        assert!(file_data_bypasses_outbound_quota(
+            MessageType::SfuFileComplete
+        ));
+        assert!(!file_data_bypasses_outbound_quota(
+            MessageType::SfuFileOffer
+        ));
+        assert!(!file_data_bypasses_outbound_quota(
+            MessageType::SfuFileRequest
+        ));
     }
 }
 

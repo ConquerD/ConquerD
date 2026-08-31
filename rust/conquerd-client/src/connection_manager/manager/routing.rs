@@ -90,6 +90,20 @@ impl ConnectionManager {
         )
     }
 
+    /// Chunks and COMPLETE must stay on one transport. Falling back from a
+    /// full QUIC queue onto WebSocket lets the small COMPLETE overtake the
+    /// payload, so the sender hits 100% while the receiver is still missing
+    /// most of the file.
+    pub(crate) fn is_ordered_file_payload(msg_type: &MessageType) -> bool {
+        matches!(
+            msg_type,
+            MessageType::FileTransferChunk
+                | MessageType::FileTransferComplete
+                | MessageType::SfuFileChunk
+                | MessageType::SfuFileComplete
+        )
+    }
+
     /// Returns `true` when the frame was handed to a transport. `false` means
     /// it was not sent (quota, no path, serialize error) and a file pump must
     /// retry rather than skip ahead.
@@ -266,6 +280,11 @@ impl ConnectionManager {
                 if out_tx.try_send(PeerOutbound::Reliable(bytes)).is_ok() {
                     return true;
                 }
+                if Self::is_ordered_file_payload(&msg_type) {
+                    // Backpressure the pump instead of splitting the transfer
+                    // across QUIC and the supernode WS fallback.
+                    return false;
+                }
                 // Full or closing QUIC channel: fall back to supernode relay
                 // when available so chat / call / file are not stranded.
                 if self.supernodes.values().any(|sn| sn.connected) {
@@ -304,6 +323,12 @@ impl ConnectionManager {
                     if let Some(relay) = self.quic_relays.get(&sn_id).filter(|r| r.is_alive()) {
                         if relay.send_signaling(json.as_bytes()) {
                             return true;
+                        }
+                        if relay.signaling_usable() && Self::is_ordered_file_payload(&msg_type) {
+                            // Stream is up but the 512-frame queue is full.
+                            // Retry here. Do not send COMPLETE over WS while
+                            // chunks are still queued on QUIC.
+                            return false;
                         }
                         // Portal-only, dead signaling stream, or back-pressure:
                         // fall through to WebSocket so room chat/file is never

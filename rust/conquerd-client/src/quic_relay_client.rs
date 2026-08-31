@@ -335,6 +335,17 @@ impl QuicRelayClient {
         self.connection.close_reason().is_none()
     }
 
+    /// Reliable room chat/file stream is open and accepting frames.
+    ///
+    /// Distinct from [`is_alive`]: the QUIC connection can still be up after
+    /// the signaling writer has exited, and portal-only grants never open it.
+    pub fn signaling_usable(&self) -> bool {
+        !self.portal_only
+            && self.is_alive()
+            && self.signal_live.load(Ordering::Acquire)
+            && self.signal_tx.is_some()
+    }
+
     /// Portal-only guest grant (no room chat/file/audio over this relay).
     pub fn is_portal_only(&self) -> bool {
         self.portal_only

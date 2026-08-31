@@ -16,6 +16,25 @@ use crate::crypto::normalize_public_id;
 use crate::protocol::{MessageType, SignalingMessage};
 use conquerd_features::ReplayGuard;
 
+/// Bulk file-payload frames: the chunk stream and its terminating COMPLETE.
+///
+/// These are metered on a separate, much larger per-connection budget than
+/// control traffic. A transfer is inherently thousands of frames, and no layer
+/// retransmits a dropped chunk — losing one strands the receiver forever, so
+/// they must not share the small control-message budget.
+///
+/// Offer / request / accept / reject / revoke frames are deliberately absent:
+/// they are control traffic and stay on the control budget.
+fn is_bulk_file_data(mt: MessageType) -> bool {
+    matches!(
+        mt,
+        MessageType::FileTransferChunk
+            | MessageType::FileTransferComplete
+            | MessageType::SfuFileChunk
+            | MessageType::SfuFileComplete
+    )
+}
+
 /// A connected peer's write channel.
 type PeerTx = mpsc::UnboundedSender<String>;
 
@@ -311,6 +330,20 @@ async fn handle_ws_connection(
     let mut rate_count: u32 = 0;
     let mut rate_window_start = std::time::Instant::now();
 
+    // Bulk file data gets its own, far larger budget. A file transfer is a
+    // burst of `size / CHUNK_SIZE` frames (a 250 MB file is ~4 000 at the
+    // client's 64 KiB chunk size), so charging chunks to the 60/10 s control
+    // budget dropped everything past the first ~60 — and nothing retransmits,
+    // so the sender reached 100 % while the receiver stalled at ~1 %.
+    //
+    // 2 000 frames / 10 s is ~200 chunks/s ~= 12.8 MB/s, comfortably above the
+    // 8 MB/s `room.file.v1` byte quota that is the intended throttle for room
+    // files, while still bounding the peer-targeted `FileTransfer*` relay path
+    // (which signaling.rs forwards without a byte quota).
+    const FILE_RATE_MAX: u32 = 2_000;
+    let mut file_rate_count: u32 = 0;
+    let mut file_rate_window_start = std::time::Instant::now();
+
     // Read loop
     while let Some(msg) = ws_rx.next().await {
         let msg = match msg {
@@ -339,7 +372,22 @@ async fn handle_ws_connection(
         // Per-connection rate limit for control messages.
         // SFU audio frames arrive at up to 50 Hz and must not be counted
         // against the control-message budget — they get their own budget.
-        if parsed.msg_type != MessageType::SfuAudio {
+        // Bulk file data is likewise metered separately (see FILE_RATE_MAX):
+        // a multi-thousand-frame transfer is normal traffic, not a flood.
+        if is_bulk_file_data(parsed.msg_type) {
+            if file_rate_window_start.elapsed().as_secs() >= RATE_WINDOW_SECS {
+                file_rate_window_start = std::time::Instant::now();
+                file_rate_count = 0;
+            }
+            file_rate_count += 1;
+            if file_rate_count > FILE_RATE_MAX {
+                warn!(
+                    "File data rate limit exceeded from {} — dropping {:?}",
+                    addr, parsed.msg_type
+                );
+                continue;
+            }
+        } else if parsed.msg_type != MessageType::SfuAudio {
             if rate_window_start.elapsed().as_secs() >= RATE_WINDOW_SECS {
                 rate_window_start = std::time::Instant::now();
                 rate_count = 0;
@@ -646,5 +694,21 @@ mod tests {
             srv.accept_signed(&raw).is_none(),
             "replay of the same signed frame must be dropped"
         );
+    }
+
+    #[test]
+    fn file_payload_frames_are_not_on_the_control_budget() {
+        // The chunk stream and its COMPLETE ride the large file budget.
+        assert!(is_bulk_file_data(MessageType::FileTransferChunk));
+        assert!(is_bulk_file_data(MessageType::FileTransferComplete));
+        assert!(is_bulk_file_data(MessageType::SfuFileChunk));
+        assert!(is_bulk_file_data(MessageType::SfuFileComplete));
+
+        // Control frames stay metered at 60 / 10 s.
+        assert!(!is_bulk_file_data(MessageType::FileTransferOffer));
+        assert!(!is_bulk_file_data(MessageType::FileTransferAccept));
+        assert!(!is_bulk_file_data(MessageType::SfuFileOffer));
+        assert!(!is_bulk_file_data(MessageType::SfuFileRequest));
+        assert!(!is_bulk_file_data(MessageType::ChatMessage));
     }
 }

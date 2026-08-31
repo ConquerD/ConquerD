@@ -386,7 +386,7 @@ impl ConnectionManager {
         mpsc::Receiver<ConnectionEvent>,
         Self,
     ) {
-        let (event_tx, event_rx) = mpsc::channel::<ConnectionEvent>(256);
+        let (event_tx, event_rx) = mpsc::channel::<ConnectionEvent>(1024);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnectionCommand>(64);
         let (internal_tx, internal_rx) = mpsc::channel::<InternalEvent>(128);
         let (relay_signaling_tx, relay_signaling_rx) =
