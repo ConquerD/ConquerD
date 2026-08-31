@@ -1712,11 +1712,24 @@ fn file_frame_recipients<'a>(
     }
 }
 
-/// In-flight file bytes already paid the sender's inbound quota. Outbound
-/// must not drop them — `raw.len()` is larger than the billed `data` length,
-/// so the outbound bucket emptied first and the receiver stalled at a few
-/// percent while the sender showed 100%.
-fn file_data_bypasses_outbound_quota(mt: MessageType) -> bool {
+/// File payload frames must never be *dropped* by a byte quota.
+///
+/// Chunks are fire-and-forget: nothing retransmits, and the receiver has no way
+/// to ask for a hole to be refilled, so a single refused chunk strands the
+/// transfer forever. That is safe only because every hop underneath is a
+/// reliable ordered stream (WS/TCP or a QUIC signaling stream, both fed through
+/// unbounded channels) — the supernode's own admission gates are the only
+/// place a chunk can be lost.
+///
+/// Dropping two chunks out of ~2 550 is exactly what left a 167 MB transfer
+/// sitting at 99 % with the sender showing 100 %.
+///
+/// Quota is still *charged* for these frames, so the bucket keeps reflecting
+/// real usage and control traffic is still throttled normally; only the
+/// drop decision is bypassed. Bandwidth stays bounded by the per-connection
+/// file-frame budget (`FILE_RATE_MAX` in `signaling.rs`) and the 256 KiB
+/// per-message cap.
+fn file_payload_bypasses_quota(mt: MessageType) -> bool {
     matches!(mt, MessageType::SfuFileChunk | MessageType::SfuFileComplete)
 }
 
@@ -2501,16 +2514,27 @@ impl SupernodeHandler {
         if payload_bytes == 0 {
             return;
         }
-        if !self.state.features.gate_inbound_through_feature(
+        // Charge the bucket either way; only *honor* a refusal for control
+        // frames. Refusing a chunk loses it permanently (see
+        // `file_payload_bypasses_quota`).
+        let within_quota = self.state.features.gate_inbound_through_feature(
             "room.file.v1",
             &msg.sender,
             payload_bytes,
-        ) {
+        );
+        if !within_quota {
+            if !file_payload_bypasses_quota(mt) {
+                tracing::debug!(
+                    "[room.file.v1] inbound quota exceeded for {}; dropping relay",
+                    &msg.sender[..12.min(msg.sender.len())]
+                );
+                return;
+            }
             tracing::debug!(
-                "[room.file.v1] inbound quota exceeded for {}; dropping relay",
-                &msg.sender[..12.min(msg.sender.len())]
+                "[room.file.v1] inbound quota exceeded for {} on {:?}; forwarding anyway (dropping file payload would strand the transfer)",
+                &msg.sender[..12.min(msg.sender.len())],
+                mt
             );
-            return;
         }
 
         let room_id = msg
@@ -2547,7 +2571,7 @@ impl SupernodeHandler {
         // Outbound `raw.len()` is the full JSON (base64 + envelope) so it
         // burns tokens faster than inbound and used to drop the rest of a
         // large file after the first burst — sender at 100%, receiver stuck.
-        let file_data = file_data_bypasses_outbound_quota(mt);
+        let file_data = file_payload_bypasses_quota(mt);
         for peer in targets {
             let allowed = file_data
                 || self
@@ -3981,17 +4005,14 @@ mod sfu_file_routing_tests {
     }
 
     #[test]
-    fn in_flight_file_bytes_are_not_dropped_by_outbound_quota() {
-        assert!(file_data_bypasses_outbound_quota(MessageType::SfuFileChunk));
-        assert!(file_data_bypasses_outbound_quota(
-            MessageType::SfuFileComplete
-        ));
-        assert!(!file_data_bypasses_outbound_quota(
-            MessageType::SfuFileOffer
-        ));
-        assert!(!file_data_bypasses_outbound_quota(
-            MessageType::SfuFileRequest
-        ));
+    fn in_flight_file_bytes_are_not_dropped_by_quota() {
+        // Payload frames: a quota refusal must never drop these.
+        assert!(file_payload_bypasses_quota(MessageType::SfuFileChunk));
+        assert!(file_payload_bypasses_quota(MessageType::SfuFileComplete));
+        // Control frames stay fully quota-enforced.
+        assert!(!file_payload_bypasses_quota(MessageType::SfuFileOffer));
+        assert!(!file_payload_bypasses_quota(MessageType::SfuFileRequest));
+        assert!(!file_payload_bypasses_quota(MessageType::SfuFileRevoke));
     }
 }
 
