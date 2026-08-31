@@ -336,10 +336,11 @@ async fn handle_ws_connection(
     // budget dropped everything past the first ~60 — and nothing retransmits,
     // so the sender reached 100 % while the receiver stalled at ~1 %.
     //
-    // 2 000 frames / 10 s is ~200 chunks/s ~= 12.8 MB/s, comfortably above the
-    // 8 MB/s `room.file.v1` byte quota that is the intended throttle for room
-    // files, while still bounding the peer-targeted `FileTransfer*` relay path
-    // (which signaling.rs forwards without a byte quota).
+    // 2 000 frames / 10 s is ~200 chunks/s ~= 12.8 MB/s. Exceeding it pauses
+    // the read loop until the window rolls over rather than dropping, so this
+    // is a true bandwidth ceiling and never a source of loss — including on
+    // the peer-targeted `FileTransfer*` relay path, which signaling.rs
+    // forwards without any byte quota.
     const FILE_RATE_MAX: u32 = 2_000;
     let mut file_rate_count: u32 = 0;
     let mut file_rate_window_start = std::time::Instant::now();
@@ -381,11 +382,22 @@ async fn handle_ws_connection(
             }
             file_rate_count += 1;
             if file_rate_count > FILE_RATE_MAX {
-                warn!(
-                    "File data rate limit exceeded from {} — dropping {:?}",
-                    addr, parsed.msg_type
-                );
-                continue;
+                // Throttle by *waiting*, never by dropping. Nothing
+                // retransmits a file chunk, so a dropped frame strands the
+                // transfer forever. Stalling this connection's read loop
+                // instead lets TCP backpressure pace the sender, which is what
+                // a bandwidth cap is supposed to do.
+                let window = std::time::Duration::from_secs(RATE_WINDOW_SECS);
+                let wait = window.saturating_sub(file_rate_window_start.elapsed());
+                if !wait.is_zero() {
+                    debug!(
+                        "File data budget spent for {} — pausing {:?} instead of dropping",
+                        addr, wait
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+                file_rate_window_start = std::time::Instant::now();
+                file_rate_count = 1;
             }
         } else if parsed.msg_type != MessageType::SfuAudio {
             if rate_window_start.elapsed().as_secs() >= RATE_WINDOW_SECS {
