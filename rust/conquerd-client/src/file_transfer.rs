@@ -77,6 +77,18 @@ const TRANSFER_RETAIN_SECS: f64 = 300.0;
 /// still exceeds the 8 MB/s `room.file.v1` quota, so the quota — not this
 /// number — is what actually paces the transfer.
 pub const ROOM_FILE_CHUNK_BUDGET: usize = 8;
+/// First backoff step after a pump turn that reached no transport, in seconds.
+const STALL_BACKOFF_BASE_SECS: f64 = 0.1;
+/// Ceiling on the backoff between retries of a stalled outbound stream.
+const STALL_BACKOFF_MAX_SECS: f64 = 5.0;
+/// How long an outbound stream may reach no transport before it is failed.
+///
+/// Nothing else moves an outbound transfer out of `Transferring` when its
+/// route disappears — losing the supernode mid-send leaves it live — so
+/// without this the pump retries it every tick until [`OFFER_TTL_SECS`]
+/// collects it an hour later.
+const STALL_GIVE_UP_SECS: f64 = 120.0;
+
 /// How long an outbound offer stays answerable by a late `SfuFileRequest`.
 ///
 /// The supernode caches nothing, so this is the entire window in which a room
@@ -194,6 +206,17 @@ pub struct OutboundTransfer {
     pub to: String,
     /// Terminal-state timestamp, for eviction. `None` while still active.
     pub finished_at: Option<f64>,
+    /// Consecutive pump turns whose frames reached no transport.
+    ///
+    /// Retrying a stranded stream at the pump's 20 ms tick re-reads and
+    /// re-encodes the same chunks ~50 times a second for as long as the route
+    /// stays down — ~25 MB/s of disk for a budget of 8 chunks. Backing off
+    /// keeps a lost supernode cheap; see [`STALL_GIVE_UP_SECS`].
+    pub stall_count: u32,
+    /// When the current stalled run began. `None` while making progress.
+    pub stalled_since: Option<f64>,
+    /// Earliest time the pump should touch this stream again.
+    pub retry_after: f64,
 }
 
 impl OutboundTransfer {
@@ -657,11 +680,43 @@ impl FileTransferManager {
     /// but COMPLETE has not been handed to a transport yet", so a quota-blocked
     /// COMPLETE is retried instead of leaving the receiver hanging.
     pub fn active_outbound_streams(&self) -> Vec<String> {
+        let now = unix_now_f64();
         self.outbound
             .iter()
-            .filter(|(_, x)| x.state == TransferState::Transferring)
+            .filter(|(_, x)| x.state == TransferState::Transferring && x.retry_after <= now)
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Record a pump turn whose frames reached no transport.
+    ///
+    /// Returns a failure reason once the stream has made no progress for
+    /// [`STALL_GIVE_UP_SECS`], at which point it is marked `Failed` and the
+    /// caller should surface it; until then it just backs the pump off.
+    pub fn note_send_stalled(&mut self, transfer_id: &str) -> Option<String> {
+        let now = unix_now_f64();
+        let x = self.outbound.get_mut(transfer_id)?;
+        let since = *x.stalled_since.get_or_insert(now);
+        x.stall_count = x.stall_count.saturating_add(1);
+        if now - since >= STALL_GIVE_UP_SECS {
+            x.state = TransferState::Failed;
+            x.finished_at = Some(now);
+            return Some("no transport available to send on".to_owned());
+        }
+        // 100 ms doubling, capped — `min(16)` keeps the shift in range.
+        let steps = x.stall_count.min(16).saturating_sub(1) as i32;
+        let backoff = (STALL_BACKOFF_BASE_SECS * 2f64.powi(steps)).min(STALL_BACKOFF_MAX_SECS);
+        x.retry_after = now + backoff;
+        None
+    }
+
+    /// A frame went out: clear any backoff so the stream resumes full pace.
+    pub fn note_send_progress(&mut self, transfer_id: &str) {
+        if let Some(x) = self.outbound.get_mut(transfer_id) {
+            x.stall_count = 0;
+            x.stalled_since = None;
+            x.retry_after = 0.0;
+        }
     }
 
     /// Undo `n` locally-counted chunks that were not actually sent (quota /
@@ -862,6 +917,9 @@ impl FileTransferManager {
             created_at: unix_now_f64(),
             to: String::new(),
             finished_at: None,
+            stall_count: 0,
+            stalled_since: None,
+            retry_after: 0.0,
         };
 
         let mut events = Vec::new();
@@ -1773,13 +1831,44 @@ pub fn download_dir() -> PathBuf {
 /// from every platform, and `Path::file_name` would leave a Windows path
 /// intact on Unix.
 pub fn safe_file_name(rel_path: &str) -> String {
-    rel_path
+    let base = rel_path
         .trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
         .next()
-        .map(str::to_string)
-        .filter(|n| !n.is_empty() && n != "." && n != "..")
-        .unwrap_or_else(|| "received_file".to_owned())
+        .unwrap_or_default();
+
+    // Cut at the first colon. On Windows `report.txt:hidden` names an
+    // alternate data stream on `report.txt`, so a sender could put bytes
+    // somewhere the user never sees under a name they never chose. Nothing
+    // escapes the download directory either way, but what is written should
+    // be the file the UI shows.
+    let base = base.split(':').next().unwrap_or_default();
+
+    // Windows silently strips trailing dots and spaces, so `evil.exe.` would
+    // land as `evil.exe` — a name the sanitiser never actually approved.
+    let base = base.trim_end_matches(['.', ' ']);
+
+    if base.is_empty() || base == "." || base == ".." {
+        return "received_file".to_owned();
+    }
+
+    // Reserved DOS device names resolve to the device, not a file, whatever
+    // extension follows. Prefix rather than reject so the name stays legible.
+    let stem = base.split('.').next().unwrap_or_default();
+    if is_reserved_device_name(stem) {
+        return format!("_{base}");
+    }
+    base.to_owned()
+}
+
+/// Legacy DOS device names, which Windows still resolves ahead of any file of
+/// the same stem in any directory.
+fn is_reserved_device_name(stem: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r))
 }
 
 /// Create the sparse `.part` file a streaming transfer writes into.
@@ -2592,6 +2681,100 @@ mod tests {
         )));
     }
 
+    /// A stream whose transport went away must drop out of the pump between
+    /// retries. Without this it re-reads and re-encodes its whole chunk budget
+    /// every 20 ms for as long as the route stays down.
+    #[test]
+    fn stalled_stream_backs_off_the_pump() {
+        let mut mgr = FileTransferManager::new();
+        let (tid, _) = mgr
+            .offer_file("peer-1", "a.bin", vec![7u8; 4096], "file", None, false)
+            .unwrap();
+        let _ = mgr.on_transfer_accepted(&tid);
+        mgr.unsend_chunks(&tid, mgr.outbound.get(&tid).unwrap().chunks_sent);
+        assert!(mgr.active_outbound_streams().contains(&tid));
+
+        assert!(mgr.note_send_stalled(&tid).is_none(), "must not fail yet");
+        assert!(
+            !mgr.active_outbound_streams().contains(&tid),
+            "a stalled stream must not be pumped again immediately"
+        );
+        // The transfer is still live — backing off is not giving up.
+        assert_eq!(
+            mgr.outbound.get(&tid).unwrap().state,
+            TransferState::Transferring
+        );
+    }
+
+    /// Backoff grows while a stream keeps failing, and is capped.
+    #[test]
+    fn stall_backoff_grows_and_is_capped() {
+        let mut mgr = FileTransferManager::new();
+        let (tid, _) = mgr
+            .offer_file("peer-1", "a.bin", vec![7u8; 4096], "file", None, false)
+            .unwrap();
+        let _ = mgr.on_transfer_accepted(&tid);
+
+        let mut last = 0.0f64;
+        for _ in 0..4 {
+            assert!(mgr.note_send_stalled(&tid).is_none());
+            let x = mgr.outbound.get(&tid).unwrap();
+            let delay = x.retry_after - unix_now_f64();
+            assert!(delay > last, "backoff must grow: {delay} <= {last}");
+            last = delay;
+        }
+        for _ in 0..20 {
+            assert!(mgr.note_send_stalled(&tid).is_none());
+        }
+        let delay = mgr.outbound.get(&tid).unwrap().retry_after - unix_now_f64();
+        assert!(
+            delay <= STALL_BACKOFF_MAX_SECS + 0.5,
+            "backoff must be capped, was {delay}"
+        );
+    }
+
+    /// One frame going out clears the backoff so the stream resumes full pace.
+    #[test]
+    fn progress_clears_the_backoff() {
+        let mut mgr = FileTransferManager::new();
+        let (tid, _) = mgr
+            .offer_file("peer-1", "a.bin", vec![7u8; 4096], "file", None, false)
+            .unwrap();
+        let _ = mgr.on_transfer_accepted(&tid);
+        mgr.unsend_chunks(&tid, mgr.outbound.get(&tid).unwrap().chunks_sent);
+
+        assert!(mgr.note_send_stalled(&tid).is_none());
+        assert!(!mgr.active_outbound_streams().contains(&tid));
+        mgr.note_send_progress(&tid);
+        assert!(mgr.active_outbound_streams().contains(&tid));
+        assert_eq!(mgr.outbound.get(&tid).unwrap().stall_count, 0);
+    }
+
+    /// Past the give-up window the transfer fails outright. Nothing else moves
+    /// an outbound stream out of `Transferring` when its route disappears, so
+    /// without this it would sit live until the hour-long offer TTL.
+    #[test]
+    fn permanently_stalled_stream_eventually_fails() {
+        let mut mgr = FileTransferManager::new();
+        let (tid, _) = mgr
+            .offer_file("peer-1", "a.bin", vec![7u8; 4096], "file", None, false)
+            .unwrap();
+        let _ = mgr.on_transfer_accepted(&tid);
+
+        assert!(mgr.note_send_stalled(&tid).is_none());
+        // Backdate the run rather than waiting out STALL_GIVE_UP_SECS.
+        mgr.outbound.get_mut(&tid).unwrap().stalled_since =
+            Some(unix_now_f64() - STALL_GIVE_UP_SECS - 1.0);
+
+        let reason = mgr
+            .note_send_stalled(&tid)
+            .expect("must give up once the window has passed");
+        assert!(!reason.is_empty());
+        assert_eq!(mgr.outbound.get(&tid).unwrap().state, TransferState::Failed);
+        assert!(mgr.outbound.get(&tid).unwrap().finished_at.is_some());
+        assert!(!mgr.active_outbound_streams().contains(&tid));
+    }
+
     /// Deleting a file message withdraws the share: because the relay caches
     /// nothing and the sender holds the only copy, a peer who has not
     /// downloaded yet can no longer get the file from anyone.
@@ -2670,5 +2853,37 @@ mod tests {
         assert_eq!(safe_file_name("foo/bar\\baz.txt"), "baz.txt");
         assert_eq!(safe_file_name(""), "received_file");
         assert_eq!(safe_file_name("///"), "received_file");
+    }
+
+    /// A sender-chosen name must not be able to open an NTFS alternate data
+    /// stream: the bytes would land on a different file than the UI shows.
+    #[test]
+    fn safe_file_name_strips_alternate_data_streams() {
+        assert_eq!(safe_file_name("report.txt:hidden.exe"), "report.txt");
+        assert_eq!(safe_file_name("a/b/report.txt:$DATA"), "report.txt");
+        assert_eq!(safe_file_name("C:\\tmp\\x.bin"), "x.bin");
+        assert_eq!(safe_file_name(":evil"), "received_file");
+    }
+
+    /// Windows drops trailing dots and spaces, so they must not survive the
+    /// sanitiser and reappear as a different name on disk.
+    #[test]
+    fn safe_file_name_strips_trailing_dots_and_spaces() {
+        assert_eq!(safe_file_name("evil.exe."), "evil.exe");
+        assert_eq!(safe_file_name("evil.exe   "), "evil.exe");
+        assert_eq!(safe_file_name("evil.exe . . "), "evil.exe");
+        assert_eq!(safe_file_name(".."), "received_file");
+        assert_eq!(safe_file_name("..."), "received_file");
+    }
+
+    /// Reserved DOS device names resolve to the device rather than a file.
+    #[test]
+    fn safe_file_name_defuses_reserved_device_names() {
+        assert_eq!(safe_file_name("CON"), "_CON");
+        assert_eq!(safe_file_name("nul.txt"), "_nul.txt");
+        assert_eq!(safe_file_name("COM1.tar.gz"), "_COM1.tar.gz");
+        // Not reserved: only the exact stems are.
+        assert_eq!(safe_file_name("console.log"), "console.log");
+        assert_eq!(safe_file_name("com10.bin"), "com10.bin");
     }
 }

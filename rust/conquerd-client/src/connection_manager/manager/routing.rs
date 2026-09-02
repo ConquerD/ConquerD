@@ -90,10 +90,19 @@ impl ConnectionManager {
         )
     }
 
-    /// Chunks and COMPLETE must stay on one transport. Falling back from a
-    /// full QUIC queue onto WebSocket lets the small COMPLETE overtake the
-    /// payload, so the sender hits 100% while the receiver is still missing
-    /// most of the file.
+    /// The bulk file payload class: chunks and their terminating COMPLETE.
+    ///
+    /// Two rules key off it, and they share one list so they cannot drift
+    /// apart:
+    ///
+    ///  * **Transport.** These must stay on one transport. Falling back from a
+    ///    full QUIC queue onto WebSocket lets the small COMPLETE overtake the
+    ///    payload, so the sender hits 100% while the receiver is still missing
+    ///    most of the file.
+    ///  * **Replay dedup.** They are exempt from it, like `SfuAudio`. Both are
+    ///    idempotent at the receiver, and `ReplayGuard` fails closed once a
+    ///    sender fills its window — which a sustained transfer does in under
+    ///    three minutes, taking that peer's chat and call control down with it.
     pub(crate) fn is_ordered_file_payload(msg_type: &MessageType) -> bool {
         matches!(
             msg_type,

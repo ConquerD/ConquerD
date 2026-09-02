@@ -177,12 +177,21 @@ impl ConnectionManager {
         }
         // Sliding-window replay guard: reject re-delivery of an already-seen
         // signed message within the freshness window. Runs only after the
-        // signature + freshness checks above have passed. Real-time audio
-        // frames (SfuAudio, ~50 Hz) are exempt from signature dedup only —
-        // they are ephemeral, already protected by the freshness window +
-        // jitter buffer, and would otherwise flood the per-sender window.
-        // Per-feature byte quotas still apply on the transport relay path.
-        if msg.msg_type != MessageType::SfuAudio && !self.check_replay(&msg) {
+        // signature + freshness checks above have passed.
+        //
+        // Exempt from signature dedup *only* — signature verification,
+        // freshness and the per-feature byte quotas all still apply:
+        //
+        //  * Real-time audio (SfuAudio, ~50 Hz): ephemeral, already covered by
+        //    the freshness window and the jitter buffer.
+        //  * Bulk file payload: idempotent at the receiver (a duplicate chunk
+        //    index is discarded, and COMPLETE only acts on a transfer still
+        //    `Transferring`), and high-rate enough to fill the per-sender
+        //    window — which `ReplayGuard` fails closed on, taking this peer's
+        //    chat and call control down with the transfer.
+        let dedup_exempt =
+            msg.msg_type == MessageType::SfuAudio || Self::is_ordered_file_payload(&msg.msg_type);
+        if !dedup_exempt && !self.check_replay(&msg) {
             warn!(
                 "[signaling] dropping {:?} from {} — replayed message",
                 msg.msg_type,
@@ -2434,6 +2443,10 @@ impl ConnectionManager {
         // instead of leaving holes the receiver can never fill.
         let mut hold_file_data = false;
         let mut unsent_chunks: HashMap<String, usize> = HashMap::new();
+        // Streams that reached no transport this turn get backed off, so a
+        // lost route costs one retry every few seconds instead of 50 a second.
+        let mut stalled: HashSet<String> = HashSet::new();
+        let mut progressed: HashSet<String> = HashSet::new();
         for ev in events {
             match ev {
                 TransferEvent::SendMessage {
@@ -2449,8 +2462,11 @@ impl ConnectionManager {
                     let is_chunk = message_type == MessageType::FileTransferChunk;
                     let is_complete = message_type == MessageType::FileTransferComplete;
                     if hold_file_data && (is_chunk || is_complete) {
-                        if is_chunk && !tid.is_empty() {
-                            *unsent_chunks.entry(tid).or_insert(0) += 1;
+                        if !tid.is_empty() {
+                            stalled.insert(tid.clone());
+                            if is_chunk {
+                                *unsent_chunks.entry(tid).or_insert(0) += 1;
+                            }
                         }
                         continue;
                     }
@@ -2463,11 +2479,21 @@ impl ConnectionManager {
                         if !sent {
                             hold_file_data = true;
                             if !tid.is_empty() {
-                                *unsent_chunks.entry(tid).or_insert(0) += 1;
+                                *unsent_chunks.entry(tid.clone()).or_insert(0) += 1;
+                                stalled.insert(tid);
                             }
+                        } else if !tid.is_empty() {
+                            progressed.insert(tid);
                         }
-                    } else if is_complete && sent {
-                        self.file_mgr.mark_outbound_complete(&tid);
+                    } else if is_complete {
+                        if sent {
+                            self.file_mgr.mark_outbound_complete(&tid);
+                        } else if !tid.is_empty() {
+                            // COMPLETE is the whole batch once every chunk is
+                            // out, so a failure here is the case that would
+                            // otherwise re-sign it 50 times a second forever.
+                            stalled.insert(tid);
+                        }
                     }
                 }
                 TransferEvent::Offered {
@@ -2535,6 +2561,17 @@ impl ConnectionManager {
                 self.file_mgr.unsend_chunks(&tid, n);
             }
         }
+        for tid in progressed.difference(&stalled) {
+            self.file_mgr.note_send_progress(tid);
+        }
+        for tid in stalled {
+            if let Some(reason) = self.file_mgr.note_send_stalled(&tid) {
+                self.emit_event(ConnectionEvent::FileFailed {
+                    transfer_id: tid,
+                    reason,
+                });
+            }
+        }
     }
 
     pub(super) async fn dispatch_room_transfer_events(
@@ -2545,6 +2582,8 @@ impl ConnectionManager {
     ) {
         let mut hold_file_data = false;
         let mut unsent_chunks: HashMap<String, usize> = HashMap::new();
+        let mut stalled: HashSet<String> = HashSet::new();
+        let mut progressed: HashSet<String> = HashSet::new();
         for ev in events {
             match ev {
                 TransferEvent::SendMessage {
@@ -2566,8 +2605,11 @@ impl ConnectionManager {
                     let is_chunk = room_msg_type == MessageType::SfuFileChunk;
                     let is_complete = room_msg_type == MessageType::SfuFileComplete;
                     if hold_file_data && (is_chunk || is_complete) {
-                        if is_chunk && !tid.is_empty() {
-                            *unsent_chunks.entry(tid).or_insert(0) += 1;
+                        if !tid.is_empty() {
+                            stalled.insert(tid.clone());
+                            if is_chunk {
+                                *unsent_chunks.entry(tid).or_insert(0) += 1;
+                            }
                         }
                         continue;
                     }
@@ -2589,7 +2631,8 @@ impl ConnectionManager {
                             warn!("[room.file.v1] no real group key yet; dropping outbound chunk");
                             hold_file_data = true;
                             if !tid.is_empty() {
-                                *unsent_chunks.entry(tid).or_insert(0) += 1;
+                                *unsent_chunks.entry(tid.clone()).or_insert(0) += 1;
+                                stalled.insert(tid);
                             }
                             continue;
                         }
@@ -2630,7 +2673,8 @@ impl ConnectionManager {
                                     warn!("[room.file.v1] seal failed; dropping outbound chunk");
                                     hold_file_data = true;
                                     if !tid.is_empty() {
-                                        *unsent_chunks.entry(tid).or_insert(0) += 1;
+                                        *unsent_chunks.entry(tid.clone()).or_insert(0) += 1;
+                                        stalled.insert(tid);
                                     }
                                     continue;
                                 }
@@ -2641,13 +2685,22 @@ impl ConnectionManager {
                     msg.target = Some(supernode_id.to_owned());
                     msg.payload = payload.into_iter().collect();
                     let sent = self.dispatch_outbound(msg).await;
-                    if is_chunk && !sent {
-                        hold_file_data = true;
-                        if !tid.is_empty() {
-                            *unsent_chunks.entry(tid).or_insert(0) += 1;
+                    if is_chunk {
+                        if !sent {
+                            hold_file_data = true;
+                            if !tid.is_empty() {
+                                *unsent_chunks.entry(tid.clone()).or_insert(0) += 1;
+                                stalled.insert(tid);
+                            }
+                        } else if !tid.is_empty() {
+                            progressed.insert(tid);
                         }
-                    } else if is_complete && sent {
-                        self.room_file_mgr.mark_outbound_complete(&tid);
+                    } else if is_complete {
+                        if sent {
+                            self.room_file_mgr.mark_outbound_complete(&tid);
+                        } else if !tid.is_empty() {
+                            stalled.insert(tid);
+                        }
                     }
                 }
                 TransferEvent::Offered {
@@ -2730,6 +2783,17 @@ impl ConnectionManager {
         for (tid, n) in unsent_chunks {
             if n > 0 {
                 self.room_file_mgr.unsend_chunks(&tid, n);
+            }
+        }
+        for tid in progressed.difference(&stalled) {
+            self.room_file_mgr.note_send_progress(tid);
+        }
+        for tid in stalled {
+            if let Some(reason) = self.room_file_mgr.note_send_stalled(&tid) {
+                self.emit_event(ConnectionEvent::FileFailed {
+                    transfer_id: tid,
+                    reason,
+                });
             }
         }
     }

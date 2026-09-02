@@ -5867,14 +5867,61 @@ fn insert_inbound_file_offer(
         .chat_message_received(QString::from(msg_json.as_str()));
 }
 
+/// Convert a `file://` URL — the form QML's `FileDialog` hands back — into a
+/// native path. Anything without the scheme is returned unchanged, since this
+/// is also called with paths the client stored itself.
+///
+/// The leading slash of `file:///` belongs to the path on Unix and to nothing
+/// on Windows, where a drive letter follows it. Stripping it unconditionally
+/// turned every Unix file pick into a path relative to the process working
+/// directory.
 fn parse_local_file_path(file_url: &str) -> String {
-    if let Some(stripped) = file_url.strip_prefix("file:///") {
-        stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
-    } else if let Some(stripped) = file_url.strip_prefix("file://") {
-        stripped.replace('/', std::path::MAIN_SEPARATOR_STR)
-    } else {
-        file_url.to_owned()
+    let Some(rest) = file_url.strip_prefix("file://") else {
+        return file_url.to_owned();
+    };
+    let decoded = percent_decode_path(rest);
+    let path = match decoded.strip_prefix('/') {
+        // `file:///C:/Users/x` -> `C:/Users/x`
+        Some(after) if starts_with_drive_letter(after) => after,
+        // `file:///home/user/x` -> `/home/user/x`
+        _ => &decoded,
+    };
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// A Windows drive prefix (`C:`) at the head of `s`.
+fn starts_with_drive_letter(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(c), Some(':')) if c.is_ascii_alphabetic()
+    )
+}
+
+/// Decode `%XX` escapes in a URL path. A malformed escape is left as written,
+/// and so is a sequence that would not be valid UTF-8, so this can only ever
+/// return something at least as usable as its input.
+fn percent_decode_path(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_owned();
     }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
 }
 
 fn room_chat_display_sender(
@@ -9509,5 +9556,68 @@ mod video_encoder_settings_tests {
                 "{codec:?} is offered in the picker but does not round-trip as a preference"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod local_file_path_tests {
+    use super::*;
+
+    /// The leading slash of `file:///` is the Unix root. Dropping it made every
+    /// picked file resolve against the process working directory instead.
+    #[test]
+    fn unix_url_keeps_its_root() {
+        let want = format!("{0}home{0}me{0}a.bin", std::path::MAIN_SEPARATOR);
+        assert_eq!(parse_local_file_path("file:///home/me/a.bin"), want);
+    }
+
+    /// On Windows that same slash precedes a drive letter and is not part of
+    /// the path.
+    #[test]
+    fn windows_url_drops_the_slash_before_the_drive() {
+        let want = format!("C:{0}Users{0}me{0}a.bin", std::path::MAIN_SEPARATOR);
+        assert_eq!(parse_local_file_path("file:///C:/Users/me/a.bin"), want);
+    }
+
+    #[test]
+    fn percent_escapes_are_decoded() {
+        let got = parse_local_file_path("file:///home/me/my%20file%2Bv2.bin");
+        assert!(got.ends_with("my file+v2.bin"), "{got}");
+    }
+
+    /// A malformed or partial escape must survive as written rather than
+    /// mangling the name or dropping bytes.
+    #[test]
+    fn malformed_escapes_survive_unchanged() {
+        for (url, tail) in [
+            ("file:///tmp/100%25.bin", "100%.bin"),
+            ("file:///tmp/50%off.bin", "50%off.bin"),
+            ("file:///tmp/trailing%2", "trailing%2"),
+            ("file:///tmp/bare%.bin", "bare%.bin"),
+        ] {
+            let got = parse_local_file_path(url);
+            assert!(got.ends_with(tail), "{url} -> {got}, wanted tail {tail}");
+        }
+    }
+
+    /// The bridge is also called with paths the client stored itself.
+    #[test]
+    fn a_plain_path_is_returned_unchanged() {
+        assert_eq!(parse_local_file_path("/home/me/a.bin"), "/home/me/a.bin");
+        assert_eq!(
+            parse_local_file_path(r"C:\Users\me\a.bin"),
+            r"C:\Users\me\a.bin"
+        );
+        assert_eq!(parse_local_file_path(""), "");
+    }
+
+    #[test]
+    fn drive_letter_detection_is_narrow() {
+        assert!(starts_with_drive_letter("C:/x"));
+        assert!(starts_with_drive_letter("z:"));
+        assert!(!starts_with_drive_letter("home/x"));
+        assert!(!starts_with_drive_letter("/C:/x"));
+        assert!(!starts_with_drive_letter("1:/x"));
+        assert!(!starts_with_drive_letter(""));
     }
 }
