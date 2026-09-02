@@ -1724,11 +1724,18 @@ fn file_frame_recipients<'a>(
 /// Dropping two chunks out of ~2 550 is exactly what left a 167 MB transfer
 /// sitting at 99 % with the sender showing 100 %.
 ///
-/// Quota is still *charged* for these frames, so the bucket keeps reflecting
-/// real usage and control traffic is still throttled normally; only the
-/// drop decision is bypassed. Bandwidth stays bounded by the per-connection
-/// file-frame budget (`FILE_RATE_MAX` in `signaling.rs`) and the 256 KiB
-/// per-message cap.
+/// Payload frames are neither charged nor refused: `gate_*` leaves the bucket
+/// untouched when it says no, so past that point these bytes are simply not
+/// metered. That is deliberate, and keeping them out of the bucket is what
+/// leaves room for the control frames sharing it — metering a 250 MB fan-out
+/// through the same 8 MB/s budget would hold it at empty for the whole
+/// transfer and drop the offers and revokes travelling alongside.
+///
+/// So the byte quota is not what bounds this traffic. Three things that cannot
+/// strand a transfer do: the per-connection `FileFrameLimiter` (on the WS read
+/// loop *and* the QUIC relay signaling stream), the 256 KiB per-message cap,
+/// and `PEER_QUEUE_MAX_BYTES` on each recipient's write queue. Control frames
+/// stay fully gated on `room.file.v1`.
 fn file_payload_bypasses_quota(mt: MessageType) -> bool {
     matches!(mt, MessageType::SfuFileChunk | MessageType::SfuFileComplete)
 }
@@ -1783,10 +1790,12 @@ async fn handle_relay_signaling_stream(
 
     // Outbound: `send_to_peer` pushes JSON into this channel; the writer task
     // frames it onto the QUIC stream as `[u32 BE len][json]`.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = signaling::peer_channel();
     state.signaling.register_quic_sender(&peer_id, tx.clone());
 
     let writer = tokio::spawn(async move {
+        // `None` is disconnect *or* an overrun of PEER_QUEUE_MAX_BYTES; both
+        // mean tear the stream down rather than buffer without bound.
         while let Some(json) = rx.recv().await {
             let body = json.as_bytes();
             if body.len() > MAX_FRAME {
@@ -1810,7 +1819,18 @@ async fn handle_relay_signaling_stream(
         state: state.clone(),
     };
 
+    // This stream — not the WS fallback — is where room file chunks actually
+    // ride, so the bulk-file pacing has to live here too. Without it the only
+    // remaining ceiling on the file path is MAX_FRAME, since chunks are
+    // deliberately exempt from the byte quota's drop decision.
+    let mut file_limiter = signaling::FileFrameLimiter::new();
+
     loop {
+        // Writer gone (stream closed, or this peer overran the queue ceiling):
+        // stop draining the read half as well.
+        if writer.is_finished() {
+            break;
+        }
         let mut len_buf = [0u8; 4];
         if recv.read_exact(&mut len_buf).await.is_err() {
             break;
@@ -1837,6 +1857,9 @@ async fn handle_relay_signaling_stream(
                 msg.msg_type,
             );
             continue;
+        }
+        if signaling::is_bulk_file_data(msg.msg_type) {
+            file_limiter.admit().await;
         }
         match msg.msg_type {
             MessageType::SfuChat
@@ -2514,9 +2537,8 @@ impl SupernodeHandler {
         if payload_bytes == 0 {
             return;
         }
-        // Charge the bucket either way; only *honor* a refusal for control
-        // frames. Refusing a chunk loses it permanently (see
-        // `file_payload_bypasses_quota`).
+        // Metered for control frames only; a refusal must never drop payload
+        // (see `file_payload_bypasses_quota`).
         let within_quota = self.state.features.gate_inbound_through_feature(
             "room.file.v1",
             &msg.sender,
@@ -2573,13 +2595,22 @@ impl SupernodeHandler {
         // large file after the first burst — sender at 100%, receiver stuck.
         let file_data = file_payload_bypasses_quota(mt);
         for peer in targets {
+            // Short-circuits for payload, so a chunk fan-out never drains the
+            // bucket the offers and revokes to this peer depend on.
             let allowed = file_data
                 || self
                     .state
                     .features
                     .gate_through_feature("room.file.v1", peer, wire_bytes);
-            if allowed {
-                let _ = self.state.signaling.send_to_peer(peer, raw);
+            if !allowed {
+                continue;
+            }
+            if !self.state.signaling.send_to_peer(peer, raw) {
+                tracing::debug!(
+                    "[room.file.v1] {} is gone or too far behind for {:?}",
+                    &peer[..12.min(peer.len())],
+                    mt
+                );
             }
         }
     }

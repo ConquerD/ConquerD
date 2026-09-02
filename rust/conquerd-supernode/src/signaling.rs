@@ -25,7 +25,7 @@ use conquerd_features::ReplayGuard;
 ///
 /// Offer / request / accept / reject / revoke frames are deliberately absent:
 /// they are control traffic and stay on the control budget.
-fn is_bulk_file_data(mt: MessageType) -> bool {
+pub(crate) fn is_bulk_file_data(mt: MessageType) -> bool {
     matches!(
         mt,
         MessageType::FileTransferChunk
@@ -35,8 +35,174 @@ fn is_bulk_file_data(mt: MessageType) -> bool {
     )
 }
 
-/// A connected peer's write channel.
-type PeerTx = mpsc::UnboundedSender<String>;
+/// Steady-state ceiling on bulk file frames from one connection, in frames
+/// per second. At the client's 64 KiB chunk size this is ~12.8 MB/s.
+const FILE_FRAMES_PER_SEC: f64 = 200.0;
+
+/// Frames a connection may burst before pacing starts.
+const FILE_FRAME_BURST: f64 = 400.0;
+
+/// Paces bulk file frames without stranding them and without stalling the
+/// connection they share.
+///
+/// Two properties pull against each other here. Nothing retransmits a file
+/// chunk, so this must never *drop* — it has to push back on the sender, and
+/// the only backpressure available is declining to read. But the read loop it
+/// sits in also carries that peer's `SfuAudio`, `SfuChat`, call control and
+/// room membership, so parking it until a rate window rolls over silently
+/// breaks voice and chat for as long as the stall lasts.
+///
+/// A token bucket squares the two: over budget it waits out the deficit for
+/// the single frame in hand — at most `1 / FILE_FRAMES_PER_SEC`, i.e. ~5 ms —
+/// rather than sleeping off the remainder of a window. Bandwidth is capped
+/// just the same; collateral delay on everything else stays in milliseconds.
+pub(crate) struct FileFrameLimiter {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl Default for FileFrameLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FileFrameLimiter {
+    pub(crate) fn new() -> Self {
+        Self {
+            tokens: FILE_FRAME_BURST,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    /// Account for one file frame, waiting out any deficit first.
+    pub(crate) async fn admit(&mut self) {
+        self.refill();
+        if self.tokens < 1.0 {
+            let wait =
+                std::time::Duration::from_secs_f64((1.0 - self.tokens) / FILE_FRAMES_PER_SEC);
+            tokio::time::sleep(wait).await;
+            self.refill();
+        }
+        self.tokens = (self.tokens - 1.0).max(0.0);
+    }
+
+    fn refill(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * FILE_FRAMES_PER_SEC).min(FILE_FRAME_BURST);
+    }
+}
+
+/// Hard ceiling on bytes queued for one peer's writer task.
+///
+/// The queue stays unbounded — `send_to_peer` runs under a read lock in sync
+/// context and cannot await — so this counter is what actually bounds memory.
+/// It has to: file payload frames are deliberately never dropped by a quota
+/// (see `file_payload_bypasses_quota` in `main.rs`), which leaves a receiver on
+/// a slower link than the sender as the only thing between this process and
+/// unbounded growth. A 250 MB transfer is ~340 MB of base64 JSON, per lagging
+/// recipient, per room member.
+///
+/// Past this mark the peer's transport is closed rather than the frame
+/// dropped: the peer reconnects and re-requests, which is recoverable, where a
+/// silent drop strands the transfer forever with no NACK to recover it.
+pub(crate) const PEER_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// A connected peer's write channel, bounded by queued bytes.
+#[derive(Clone)]
+pub struct PeerTx {
+    tx: mpsc::UnboundedSender<String>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    overflow: Arc<tokio::sync::Notify>,
+}
+
+/// Receiving half of a [`PeerTx`]. Draining it releases the queued-byte
+/// accounting, and it reports end-of-stream once the ceiling has been breached.
+pub struct PeerRx {
+    rx: mpsc::UnboundedReceiver<String>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    overflow: Arc<tokio::sync::Notify>,
+}
+
+/// Create a byte-bounded peer write channel.
+pub(crate) fn peer_channel() -> (PeerTx, PeerRx) {
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let overflow = Arc::new(tokio::sync::Notify::new());
+    (
+        PeerTx {
+            tx,
+            queued: queued.clone(),
+            overflow: overflow.clone(),
+        },
+        PeerRx {
+            rx,
+            queued,
+            overflow,
+        },
+    )
+}
+
+impl PeerTx {
+    /// Queue `json` for delivery.
+    ///
+    /// `false` means the peer is gone, or is too far behind to keep up and its
+    /// transport is being torn down — never a silent drop of a frame the
+    /// caller believed was delivered.
+    pub fn send(&self, json: &str) -> bool {
+        use std::sync::atomic::Ordering;
+        let len = json.len();
+        if self.queued.fetch_add(len, Ordering::AcqRel) + len > PEER_QUEUE_MAX_BYTES {
+            self.queued.fetch_sub(len, Ordering::AcqRel);
+            // Wakes the writer task, which then closes the transport. A stored
+            // permit covers the case where it is not parked yet.
+            self.overflow.notify_one();
+            return false;
+        }
+        if self.tx.send(json.to_owned()).is_err() {
+            self.queued.fetch_sub(len, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    /// True when both handles belong to the same underlying channel.
+    pub fn same_channel(&self, other: &PeerTx) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+}
+
+impl PeerRx {
+    /// Next queued frame, or `None` once the peer disconnected or overran
+    /// [`PEER_QUEUE_MAX_BYTES`].
+    pub async fn recv(&mut self) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        let PeerRx {
+            rx,
+            queued,
+            overflow,
+        } = self;
+        tokio::select! {
+            biased;
+            _ = overflow.notified() => None,
+            msg = rx.recv() => {
+                let json = msg?;
+                queued.fetch_sub(json.len(), Ordering::AcqRel);
+                Some(json)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        let json = self.rx.try_recv().ok()?;
+        self.queued.fetch_sub(json.len(), Ordering::AcqRel);
+        Some(json)
+    }
+}
 
 /// Candidate map keys for an identity (exact, padded, bare) so pad variants
 /// of the same Ed25519 public_id resolve to one live socket.
@@ -135,12 +301,17 @@ impl SignalingServer {
         let st = self.state.read();
         for key in identity_key_variants(identity_pub) {
             if let Some(tx) = st.quic_senders.get(&key) {
-                if tx.send(json.to_string()).is_ok() {
+                if tx.send(json) {
                     return true;
                 }
             }
+            // Fall through on failure rather than returning: a stale socket
+            // left under one padding variant must not mask a live one under
+            // another. (The QUIC branch above always did; this one did not.)
             if let Some(tx) = st.peer_sockets.get(&key) {
-                return tx.send(json.to_string()).is_ok();
+                if tx.send(json) {
+                    return true;
+                }
             }
         }
         false
@@ -291,7 +462,7 @@ async fn handle_ws_connection(
     let ws = accept_async(stream).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = peer_channel();
 
     // Writer task: forward queued messages to WebSocket. On graceful shutdown
     // send a proper Close frame (1001 "going away") so the client takes its
@@ -299,6 +470,8 @@ async fn handle_ws_connection(
     let write_task = tokio::spawn(async move {
         loop {
             tokio::select! {
+                // `None` is disconnect *or* an overrun of
+                // PEER_QUEUE_MAX_BYTES; both mean close the socket.
                 msg = rx.recv() => match msg {
                     Some(msg) => {
                         if ws_tx.send(Message::Text(msg)).await.is_err() {
@@ -330,23 +503,26 @@ async fn handle_ws_connection(
     let mut rate_count: u32 = 0;
     let mut rate_window_start = std::time::Instant::now();
 
-    // Bulk file data gets its own, far larger budget. A file transfer is a
-    // burst of `size / CHUNK_SIZE` frames (a 250 MB file is ~4 000 at the
-    // client's 64 KiB chunk size), so charging chunks to the 60/10 s control
-    // budget dropped everything past the first ~60 — and nothing retransmits,
-    // so the sender reached 100 % while the receiver stalled at ~1 %.
+    // Bulk file data gets its own budget. A file transfer is a burst of
+    // `size / CHUNK_SIZE` frames (a 250 MB file is ~4 000 at the client's
+    // 64 KiB chunk size), so charging chunks to the 60/10 s control budget
+    // dropped everything past the first ~60 — and nothing retransmits, so the
+    // sender reached 100 % while the receiver stalled at ~1 %.
     //
-    // 2 000 frames / 10 s is ~200 chunks/s ~= 12.8 MB/s. Exceeding it pauses
-    // the read loop until the window rolls over rather than dropping, so this
-    // is a true bandwidth ceiling and never a source of loss — including on
-    // the peer-targeted `FileTransfer*` relay path, which signaling.rs
-    // forwards without any byte quota.
-    const FILE_RATE_MAX: u32 = 2_000;
-    let mut file_rate_count: u32 = 0;
-    let mut file_rate_window_start = std::time::Instant::now();
+    // Paced, never dropped, and in millisecond slices so the rest of this
+    // connection's traffic is not held up behind it. See [`FileFrameLimiter`].
+    let mut file_limiter = FileFrameLimiter::new();
 
     // Read loop
     while let Some(msg) = ws_rx.next().await {
+        // The writer is gone: either the socket died or this peer overran
+        // PEER_QUEUE_MAX_BYTES. Splitting the stream means dropping the write
+        // half alone does not close the connection, so stop reading too —
+        // otherwise the peer keeps talking into a socket that answers nothing.
+        if write_task.is_finished() {
+            debug!("Writer for {} exited — closing read side", addr);
+            break;
+        }
         let msg = match msg {
             Ok(Message::Text(t)) => t.to_string(),
             Ok(Message::Close(_)) => break,
@@ -376,29 +552,7 @@ async fn handle_ws_connection(
         // Bulk file data is likewise metered separately (see FILE_RATE_MAX):
         // a multi-thousand-frame transfer is normal traffic, not a flood.
         if is_bulk_file_data(parsed.msg_type) {
-            if file_rate_window_start.elapsed().as_secs() >= RATE_WINDOW_SECS {
-                file_rate_window_start = std::time::Instant::now();
-                file_rate_count = 0;
-            }
-            file_rate_count += 1;
-            if file_rate_count > FILE_RATE_MAX {
-                // Throttle by *waiting*, never by dropping. Nothing
-                // retransmits a file chunk, so a dropped frame strands the
-                // transfer forever. Stalling this connection's read loop
-                // instead lets TCP backpressure pace the sender, which is what
-                // a bandwidth cap is supposed to do.
-                let window = std::time::Duration::from_secs(RATE_WINDOW_SECS);
-                let wait = window.saturating_sub(file_rate_window_start.elapsed());
-                if !wait.is_zero() {
-                    debug!(
-                        "File data budget spent for {} — pausing {:?} instead of dropping",
-                        addr, wait
-                    );
-                    tokio::time::sleep(wait).await;
-                }
-                file_rate_window_start = std::time::Instant::now();
-                file_rate_count = 1;
-            }
+            file_limiter.admit().await;
         } else if parsed.msg_type != MessageType::SfuAudio {
             if rate_window_start.elapsed().as_secs() >= RATE_WINDOW_SECS {
                 rate_window_start = std::time::Instant::now();
@@ -437,10 +591,25 @@ async fn handle_ws_connection(
         }
 
         // Sliding-window replay guard: drop re-delivery of an already-seen
-        // signed message within the freshness window. Real-time SFU audio is
-        // exempt (high rate, ephemeral, already covered by the freshness
-        // window) so it cannot flood the per-sender window.
-        if parsed.msg_type != MessageType::SfuAudio {
+        // signed message within the freshness window.
+        //
+        // Two classes are exempt, for the same reason: they are high-rate and
+        // idempotent, so deduplicating them buys nothing while filling the
+        // per-sender window would cost everything. `ReplayGuard` caps a sender
+        // at MAX_ENTRIES_PER_SENDER signatures and *fails closed* past that —
+        // so a sender who fills it stops being able to send anything at all,
+        // chat and call control included, until entries age out.
+        //
+        //  * Real-time SFU audio (~50 Hz), covered by the freshness window and
+        //    the jitter buffer.
+        //  * Bulk file payload. At the client's ~96 chunks/s pacing a sustained
+        //    transfer fills 16 384 entries in under three minutes — roughly a
+        //    gigabyte — and blacked the peer out for the ~2 minutes it took the
+        //    oldest entries to expire. Chunks are idempotent by
+        //    (transfer_id, chunk_index) and COMPLETE only acts on a transfer
+        //    still `Transferring`, so a replay is a no-op at the receiver. Both
+        //    still carry signature verification and the freshness window.
+        if !is_bulk_file_data(parsed.msg_type) && parsed.msg_type != MessageType::SfuAudio {
             let fresh = parsed
                 .signature
                 .as_deref()
@@ -484,13 +653,21 @@ async fn handle_ws_connection(
             if target != our_id {
                 let st = state.read();
                 if let Some(target_tx) = st.peer_sockets.get(target) {
-                    let _ = target_tx.send(msg.clone());
-                    debug!(
-                        "Relayed {:?} from {} → {}",
-                        parsed.msg_type,
-                        &parsed.sender[..12.min(parsed.sender.len())],
-                        &target[..12.min(target.len())],
-                    );
+                    if target_tx.send(&msg) {
+                        debug!(
+                            "Relayed {:?} from {} → {}",
+                            parsed.msg_type,
+                            &parsed.sender[..12.min(parsed.sender.len())],
+                            &target[..12.min(target.len())],
+                        );
+                    } else {
+                        warn!(
+                            "Relay target {} is closed or backed up past {} bytes — dropping {:?}",
+                            &target[..12.min(target.len())],
+                            PEER_QUEUE_MAX_BYTES,
+                            parsed.msg_type,
+                        );
+                    }
                 } else {
                     debug!(
                         "Relay target {} not connected — dropping {:?} from {}",
@@ -542,7 +719,6 @@ async fn handle_ws_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
 
     // ── SignalingState ──────────────────────────────────────────────────────
 
@@ -583,7 +759,7 @@ mod tests {
     #[test]
     fn is_peer_connected_returns_true_after_manual_register() {
         let srv = SignalingServer::new("supernode-id".into());
-        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let (tx, _rx) = peer_channel();
         {
             let mut st = srv.state.write();
             st.peer_sockets.insert("peer-a".into(), tx);
@@ -596,7 +772,7 @@ mod tests {
     #[test]
     fn send_to_peer_returns_true_while_channel_is_open() {
         let srv = SignalingServer::new("supernode-id".into());
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = peer_channel();
         {
             let mut st = srv.state.write();
             st.peer_sockets.insert("peer-a".into(), tx);
@@ -611,7 +787,7 @@ mod tests {
     #[test]
     fn send_to_peer_returns_false_after_receiver_dropped() {
         let srv = SignalingServer::new("supernode-id".into());
-        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let (tx, rx) = peer_channel();
         {
             let mut st = srv.state.write();
             st.peer_sockets.insert("peer-a".into(), tx);
@@ -623,8 +799,8 @@ mod tests {
     #[test]
     fn connected_peer_ids_lists_all_registered_peers() {
         let srv = SignalingServer::new("supernode-id".into());
-        let (tx1, _rx1) = mpsc::unbounded_channel::<String>();
-        let (tx2, _rx2) = mpsc::unbounded_channel::<String>();
+        let (tx1, _rx1) = peer_channel();
+        let (tx2, _rx2) = peer_channel();
         {
             let mut st = srv.state.write();
             st.peer_sockets.insert("peer-a".into(), tx1);
@@ -640,8 +816,8 @@ mod tests {
     #[test]
     fn send_to_peer_prefers_quic_sender_over_websocket() {
         let srv = SignalingServer::new("supernode-id".into());
-        let (quic_tx, mut quic_rx) = mpsc::unbounded_channel::<String>();
-        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
+        let (quic_tx, mut quic_rx) = peer_channel();
+        let (ws_tx, mut ws_rx) = peer_channel();
         {
             let mut st = srv.state.write();
             st.quic_senders.insert("peer-a".into(), quic_tx);
@@ -653,7 +829,7 @@ mod tests {
             r#"{"type":"ping"}"#
         );
         assert!(
-            ws_rx.try_recv().is_err(),
+            ws_rx.try_recv().is_none(),
             "must not also fan out to WebSocket when QUIC succeeds"
         );
     }
@@ -662,8 +838,8 @@ mod tests {
     #[test]
     fn send_to_peer_falls_back_to_ws_when_quic_closed() {
         let srv = SignalingServer::new("supernode-id".into());
-        let (quic_tx, quic_rx) = mpsc::unbounded_channel::<String>();
-        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
+        let (quic_tx, quic_rx) = peer_channel();
+        let (ws_tx, mut ws_rx) = peer_channel();
         drop(quic_rx);
         {
             let mut st = srv.state.write();
@@ -672,6 +848,98 @@ mod tests {
         }
         assert!(srv.send_to_peer("peer-a", r#"{"type":"ping"}"#));
         assert_eq!(ws_rx.try_recv().expect("WS fallback"), r#"{"type":"ping"}"#);
+    }
+
+    /// A peer that stops draining is cut off at the byte ceiling rather than
+    /// being allowed to grow the queue without bound. File payload is never
+    /// dropped by a quota, so this counter is the only thing bounding memory.
+    #[test]
+    fn peer_queue_is_bounded_by_bytes() {
+        let (tx, _rx) = peer_channel();
+        let frame = "x".repeat(64 * 1024);
+        let mut queued = 0usize;
+        while tx.send(&frame) {
+            queued += frame.len();
+            assert!(
+                queued <= PEER_QUEUE_MAX_BYTES,
+                "queue grew past the ceiling: {queued}"
+            );
+        }
+        assert!(
+            queued > PEER_QUEUE_MAX_BYTES - 2 * frame.len(),
+            "cut off far too early at {queued}"
+        );
+    }
+
+    /// Draining releases the accounting, so a peer that keeps up can send far
+    /// more than the ceiling in total.
+    #[test]
+    fn draining_frees_queue_budget() {
+        let (tx, mut rx) = peer_channel();
+        let frame = "y".repeat(1024 * 1024);
+        for _ in 0..64 {
+            assert!(tx.send(&frame), "steady drain must never hit the ceiling");
+            assert!(rx.try_recv().is_some());
+        }
+    }
+
+    /// Overrunning the ceiling closes the peer out: `recv` reports
+    /// end-of-stream so the writer task tears the transport down, rather than
+    /// silently dropping a chunk nothing would ever retransmit.
+    #[tokio::test]
+    async fn queue_overflow_closes_the_peer() {
+        let (tx, mut rx) = peer_channel();
+        let frame = "z".repeat(64 * 1024);
+        while tx.send(&frame) {}
+        assert!(rx.recv().await.is_none(), "overflow must close the stream");
+    }
+
+    /// A stale socket parked under one padding variant must not hide a live
+    /// one under another.
+    #[test]
+    fn send_to_peer_tries_remaining_key_variants_after_a_dead_socket() {
+        let srv = SignalingServer::new("supernode-id".into());
+        let padded = "AAAA=";
+        let bare = "AAAA";
+        let (dead_tx, dead_rx) = peer_channel();
+        let (live_tx, mut live_rx) = peer_channel();
+        drop(dead_rx);
+        {
+            let mut st = srv.state.write();
+            st.peer_sockets.insert(padded.into(), dead_tx);
+            st.peer_sockets.insert(bare.into(), live_tx);
+        }
+        assert!(srv.send_to_peer(padded, r#"{"type":"ping"}"#));
+        assert_eq!(
+            live_rx
+                .try_recv()
+                .expect("delivered on the bare-key socket"),
+            r#"{"type":"ping"}"#
+        );
+    }
+
+    /// The file limiter caps throughput without ever parking the connection
+    /// long enough to stall the voice and control traffic sharing it.
+    #[tokio::test(start_paused = true)]
+    async fn file_limiter_paces_without_long_stalls() {
+        let mut lim = FileFrameLimiter::new();
+        let start = tokio::time::Instant::now();
+        // Drain the burst allowance, then keep going well past it.
+        for _ in 0..(FILE_FRAME_BURST as usize + 400) {
+            let before = tokio::time::Instant::now();
+            lim.admit().await;
+            assert!(
+                before.elapsed() <= std::time::Duration::from_millis(10),
+                "single-frame wait must stay in milliseconds, was {:?}",
+                before.elapsed()
+            );
+        }
+        // 800 frames with a 400 burst leaves 400 to pace at 200/s => ~2 s.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1_800),
+            "rate ceiling not enforced: {elapsed:?}"
+        );
     }
 
     /// accept_signed: unsigned / malformed frames are dropped (security).

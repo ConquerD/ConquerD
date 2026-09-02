@@ -252,7 +252,7 @@ pub fn open_containing_folder(path: &str) -> Result<(), String> {
     let p = std::path::Path::new(path);
     #[cfg(target_os = "windows")]
     {
-        let mut cmd = std::process::Command::new("explorer");
+        let mut cmd = std::process::Command::new(system_file_manager());
         if p.is_file() {
             cmd.arg(explorer_select_arg(p));
         } else if p.is_dir() {
@@ -268,7 +268,9 @@ pub fn open_containing_folder(path: &str) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let mut cmd = std::process::Command::new("open");
+        // Absolute: CreateProcess-style PATH lookup is not a concern here, but
+        // pinning the system binary costs nothing and removes the question.
+        let mut cmd = std::process::Command::new("/usr/bin/open");
         if p.exists() {
             cmd.args(["-R", path]);
         } else if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -301,6 +303,21 @@ pub fn open_containing_folder(path: &str) -> Result<(), String> {
 #[cfg(any(test, target_os = "windows"))]
 fn explorer_select_arg(path: &std::path::Path) -> String {
     format!("/select,{}", path.display())
+}
+
+/// Absolute path to Explorer.
+///
+/// `Command::new("explorer")` goes through `CreateProcessW`, whose search
+/// order includes the current directory — so an `explorer.exe` dropped in
+/// whatever directory the app happens to be running from would win. Resolve it
+/// under `%SystemRoot%` instead, falling back to the bare name only if the
+/// environment has no usable `SystemRoot`.
+#[cfg(any(test, target_os = "windows"))]
+fn system_file_manager() -> std::path::PathBuf {
+    match std::env::var_os("SystemRoot").filter(|r| !r.is_empty()) {
+        Some(root) => std::path::Path::new(&root).join("explorer.exe"),
+        None => std::path::PathBuf::from("explorer.exe"),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -889,6 +906,17 @@ mod tests {
     fn open_containing_folder_rejects_empty() {
         assert!(open_containing_folder("").is_err());
         assert!(open_containing_folder("   ").is_err());
+    }
+
+    /// Explorer must be resolved absolutely: `CreateProcessW` searches the
+    /// current directory, so a bare name is a binary-planting target.
+    #[test]
+    fn system_file_manager_is_absolute_under_system_root() {
+        let mgr = system_file_manager();
+        if std::env::var_os("SystemRoot").is_some_and(|r| !r.is_empty()) {
+            assert!(mgr.is_absolute(), "{}", mgr.display());
+        }
+        assert!(mgr.ends_with("explorer.exe"), "{}", mgr.display());
     }
 
     #[test]
