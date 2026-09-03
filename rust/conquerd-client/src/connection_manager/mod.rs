@@ -12,7 +12,7 @@
 
 mod events;
 mod internal;
-mod manager;
+pub mod manager;
 mod quic;
 mod ws;
 

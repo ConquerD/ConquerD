@@ -68,6 +68,12 @@ pub use linux_impl::{list_devices, V4l2Camera};
 #[cfg(target_os = "macos")]
 pub use macos_impl::{list_devices, AvfCamera};
 
+// Keep the Objective-C boundary reachable when another host cross-lints it.
+// The aliases avoid colliding with that host's native camera exports.
+#[cfg(all(feature = "lint-macos", not(target_os = "macos")))]
+#[doc(hidden)]
+pub use macos_impl::{list_devices as lint_macos_list_devices, AvfCamera as LintMacosCamera};
+
 /// Enumerate cameras. Always empty where capture is unimplemented.
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub fn list_devices() -> Vec<CameraDevice> {
@@ -94,7 +100,7 @@ mod windows_impl {
     use crate::video::frame::RawFrame;
     use crate::video::nv12;
 
-    use windows::core::{Interface, PWSTR};
+    use windows::core::PWSTR;
     use windows::Win32::Media::MediaFoundation::*;
 
     /// Enumerate video capture devices.
@@ -648,7 +654,6 @@ mod linux_impl {
 // this module; see that feature's comment in Cargo.toml. Dead there, because
 // the re-export above stays macOS-only.
 #[cfg(any(target_os = "macos", feature = "lint-macos"))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod macos_impl {
     use super::{CameraDevice, CameraSource};
     use crate::video::frame::RawFrame;

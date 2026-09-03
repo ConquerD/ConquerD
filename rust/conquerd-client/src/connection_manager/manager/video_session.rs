@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 use super::ConnectionManager;
 use crate::connection_manager::events::ConnectionEvent;
 use crate::identity::Identity;
+#[cfg(test)]
 use crate::video::fragment::SIGNATURE_LEN;
 
 /// Recover the 32-byte Ed25519 public key a base64url `public_id` encodes.

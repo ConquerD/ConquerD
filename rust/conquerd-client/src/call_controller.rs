@@ -2942,9 +2942,8 @@ mod tests {
     /// Skips advisory events (e.g. `CaptureError` when no audio device is available in tests).
     async fn next_state(rx: &mut mpsc::Receiver<CallEvent>) -> CallState {
         loop {
-            match rx.recv().await.expect("event channel closed") {
-                CallEvent::StateChanged(s) => return s,
-                _ => {} // skip advisory events
+            if let CallEvent::StateChanged(s) = rx.recv().await.expect("event channel closed") {
+                return s;
             }
         }
     }

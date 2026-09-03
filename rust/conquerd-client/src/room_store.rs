@@ -1283,7 +1283,7 @@ mod tests {
                 "public",
                 "",
                 1,
-                &sign,
+                sign,
             )
             .unwrap();
         assert_eq!(
@@ -1301,7 +1301,7 @@ mod tests {
                 "private",
                 "parent-room",
                 2,
-                &sign,
+                sign,
             )
             .unwrap();
         let child = store.get("sn-a", "child-room").unwrap();

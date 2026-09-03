@@ -1219,10 +1219,6 @@ pub struct AppBridgeRust {
     my_peer_id: String,
     /// Our own public_id (base64url Ed25519 pubkey) — used as `sender` in signaling messages.
     my_public_id: String,
-    /// Embedded build identifier (short git sha or CI-provided reproducible build ID).
-    /// Peers exchange this via build attestation so you can verify they are on a
-    /// reproducible build from the same source as you (or an official release).
-    my_build_id: String,
 
     /// The Ed25519 identity — held after unlock so invite generation works.
     identity: Option<Arc<crate::identity::Identity>>,
@@ -1564,7 +1560,6 @@ impl Default for AppBridgeRust {
             updater_cmd_tx: None,
             my_peer_id: String::new(),
             my_public_id: String::new(),
-            my_build_id: env!("CONQUERD_BUILD_ID").to_owned(),
             identity: None,
             pending_release: None,
             rt_thread: None,

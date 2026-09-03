@@ -38,20 +38,18 @@ use crate::quic_relay_client::{
     QuicRelayClient, RelayContentAudioInbound, RelayGameInbound, RelaySignalingInbound,
     RelayVideoInbound,
 };
-use crate::quic_tls;
 use crate::web_app_client::{self, WebAppResponse};
 
 use super::events::{ConnectionCommand, ConnectionEvent};
+#[cfg(test)]
+use super::internal::PeerOutbound;
 use super::internal::{
-    InternalEvent, PeerConnection, PeerConnectionState, PeerOutbound, PeerTransportStats,
-    PendingInvite, SupernodePingTracker, SupernodeSession, INVITE_TTL,
+    InternalEvent, PeerConnection, PeerConnectionState, PeerTransportStats, PendingInvite,
+    SupernodePingTracker, SupernodeSession, INVITE_TTL,
 };
 use super::ws::supernode_ws_task;
 
-use crate::connection_fallback::{
-    build_ws_candidates_from_hints, DirectFallbackCoordinator, PendingFallback,
-};
-use crate::session_state::{PeerSessionState, VoiceMode};
+use crate::connection_fallback::{build_ws_candidates_from_hints, DirectFallbackCoordinator};
 
 use peer_session::load_direct_p2p_settings;
 use room_session::RoomCreateRequest;

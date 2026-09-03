@@ -30,7 +30,6 @@ use windows::core::Interface;
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Graphics::SizeInt32;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
@@ -271,7 +270,6 @@ pub enum CaptureTarget {
 // Geometry helpers (`fit_within`) live in [`super::scale`] so the letterbox
 // path compiles on non-Windows CI. Re-export for any Windows-only caller that
 // still expects the name on this module.
-pub use super::scale::fit_within;
 
 /// One thing the user can pick in the source list.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,42 +1,21 @@
 //! Direct QUIC peer sessions: connect, aliases, reconnect, audio datagrams.
 
-use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use conquerd_features::{
-    channel_frame::{self, FrameClass},
-    wellknown, AuthTier, CapabilityDescriptor, FeatureRegistry, InvocationContext, ReplayGuard,
-};
-use parking_lot::RwLock;
 use serde_json::Value;
-use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 
-use crate::avatar_config::AvatarConfig as PeerAvatarConfig;
-use crate::feature_trust::{FeatureTrustGate, FeatureTrustStore, TrustDecision};
-use crate::file_transfer::{FileTransferManager, TransferEvent};
-use crate::group_key::{GroupKeySource, SenderKeysGroup};
 use crate::identity::Identity;
-use crate::peer_store::PeerStore;
-use crate::protocol::{MessageType, SignalingMessage};
-use crate::quic_relay_client::{QuicRelayClient, RelayGameInbound, RelaySignalingInbound};
 use crate::quic_tls;
-use crate::web_app_client::{self, WebAppResponse};
 
-use super::super::events::{ConnectionCommand, ConnectionEvent};
-use super::super::internal::{
-    InternalEvent, PeerConnection, PeerConnectionState, PeerOutbound, PeerTransportStats,
-    PendingInvite, SupernodePingTracker, SupernodeSession, INVITE_TTL,
-};
+use super::super::events::ConnectionEvent;
+use super::super::internal::{InternalEvent, PeerConnection, PeerConnectionState, PeerOutbound};
 use super::super::quic::run_quic_peer_session;
-use super::super::ws::supernode_ws_task;
 use super::ConnectionManager;
 
 use super::{
-    unix_now_f64, AUDIO_CHANNEL_TAG, CONTENT_AUDIO_CHANNEL_TAG, DEFAULT_QUIC_LISTENER_PORT,
+    AUDIO_CHANNEL_TAG, CONTENT_AUDIO_CHANNEL_TAG, DEFAULT_QUIC_LISTENER_PORT,
     PEER_RECONNECT_MAX_BACKOFF_S, QUIC_PORT_FILE, QUIC_PORT_SEARCH_LIMIT, VIDEO_CHANNEL_TAG,
 };
 

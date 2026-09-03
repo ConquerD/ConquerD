@@ -1,6 +1,6 @@
 # supernode-manager
 
-A standalone Rust CLI + TUI for deploying and operating fleets of `conquerd-supernode` instances over SSH. Lives in this repo (`ConquerD_Manager`); independent of the ConquerD application crates but targets the same supernode release artifacts.
+A standalone Rust CLI + TUI for deploying and operating fleets of `conquerd-supernode` instances over SSH. It lives at `rust/conquerd-supernode-manager/` in the ConquerD repository, in its own Cargo workspace; it is independent of the application crates but targets the same supernode release artifacts.
 
 > **Status (v0.1.0):** Production-tested. Linux remote hosts with systemd are supported end-to-end; cluster provisioning is operational (acdc a/b/c three-node cluster used for live integration testing). Default entry point is an interactive TUI; all operations are also available as CLI subcommands. Remote targets are **Linux + systemd only** — no launchd or Windows-service backends yet.
 
@@ -42,17 +42,19 @@ Resolved from `CONQUERD_HOME` (manager sets this per instance). Default layout: 
 | `supernode.toml` | Typed feature manifest (`schema_version = 1`) | Manager renders and pushes via `install` / `config-push` |
 | `identity.json` | Ed25519 node identity (first run) | **Persistent — never clobber** |
 | `peers.json` | Known peers | Persistent |
-| `sfu_rooms.json` | Room persistence (when SFU not ephemeral) | Persistent; restart behavior depends on supernode build |
 | `supernode_endpoints.json` | Endpoint mailbox | Persistent |
 | `reusable_invite.json` | Invite payload | Read by `invite` command |
 | `web/`, `games/<slug>/` | In-app portal assets | Seeded by supernode binary; not synced by manager yet |
 | `trusted_module_keys.txt` | Plugin signer keys | Not pushed by manager yet |
+
+There is deliberately no `sfu_rooms.json`: room definitions are encrypted, client-owned state, while supernodes host SFU rooms in memory and idle-GC them. The manager must never add room persistence to a supernode deployment.
 
 ### Configuration surface
 
 - **Preferred:** `<data_dir>/supernode.toml` — manager generates per instance via `snm-supernode::manifest::render_supernode_toml`.
 - **SFU room policy:** `[defaults.supernode]` / per-instance overrides for `allow_public_rooms` / `allow_private_rooms` are emitted as **inline** `params = { … }` on the `room.audio.sfu` feature row (not a separate `[feature.params]` table).
 - **Legacy env vars** (still written in systemd drop-ins): `supernode_host`, `supernode_port`, `supernode_signaling_port`. Manifest fields (`listen_addr`, `ws_listen_addr`) are authoritative in `supernode.toml`. The in-app portal uses QUIC (`web.host.app.v1`) — no public HTTP port.
+- **Current runtime limitation:** the manager also serializes `identity_file` and `access_mode`, but `conquerd-supernode::manifest::apply_to_config` does not currently apply either field. The runtime always loads `<data_dir>/identity.json`, and access control comes from `supernode_access_mode` plus its related environment variables. The generated systemd drop-in does not set those access variables, so manager inventory values other than the default open mode are descriptive only until that implementation gap is closed. Do not rely on them to enforce a gate.
 - **Clustering:** an optional `[cluster]` section (with `[[cluster.member]]` rows) links several supernodes into one logical node. Additive to `schema_version = 1` — the manager renders and pushes the shared roster to every member. Full contract, provisioning flow, and firewalling in §8.
 - `CONQUERD_BUILD_ID` is compiled into the binary; status probes it via `strings` when present.
 
@@ -92,19 +94,19 @@ flowchart LR
     OP -- SSH --> H1[Host A\nlinux-x86_64]
     OP -- SSH --> H2[Host B\nlinux-aarch64]
     subgraph H1
-      S1A[supernode@a\n:3478/:34935/:8433]
-      S1B[supernode@b\n:3579/:35036/:8544]
+      S1A[supernode@a\nrelay :3478 / WS :34935 / cluster :4478]
+      S1B[supernode@b\nrelay :3578 / WS :35035 / cluster :4578]
     end
 ```
 
 - **Control plane:** operator machine. Holds inventory + SSH credentials. Stateless beyond local config and a release download cache under the system temp dir.
 - **Transport:** SSH (port 22). Two backends behind `SshTransport` (see §4).
-- **Per host:** one or more instances — shared versioned binary, separate data dir, systemd unit instance, port triple.
+- **Per host:** one or more instances — shared versioned binary, separate data dir, systemd unit instance, relay/WS ports, and an additional cluster port when clustered.
 
 **Crate layout:**
 
 ```
-ConquerD_Manager/
+rust/conquerd-supernode-manager/
   Cargo.toml                 # workspace
   inventory.toml             # operator fleet definition (not committed secrets)
   launch.ps1                 # Windows launcher: loads SSH credentials, runs TUI/CLI
@@ -174,11 +176,11 @@ Rules:
 
 - `(host.name, instance.id)` is the unique deployment key.
 - `[[host.instance]]` in TOML deserializes to `host.instances` in Rust.
-- Per-instance overrides: `listen_bind`, `access_mode`, `identity_file`, `allow_public_rooms`, `allow_private_rooms`.
+- Effective per-instance overrides: `listen_bind`, `allow_public_rooms`, and `allow_private_rooms`. The schema also accepts `access_mode` and `identity_file`, but the current supernode runtime does not apply those generated manifest fields; see the runtime limitation in §2.
 - Features accept bare strings or `{ id, enabled, params }` objects.
 - `init` scaffolds `inventory.toml` and a `secrets.toml` template; live SSH passwords typically live in gitignored `secrets.local.ps1` on Windows.
 
-**Clusters (proposed model, §8):** group instances that should act as one logical supernode.
+**Clusters (implemented model, §8):** group instances that should act as one logical supernode.
 
 ```toml
 [[cluster]]
@@ -205,8 +207,8 @@ Global:
   init [--force]
   connect [--host …] [--instance …] [--all]
   ping    [--host …] [--instance …] [--all]
-  install [--host …] [--instance …] [--all]
-  config-push [--host …] [--instance …] [--all] [--no-restart]
+  install [--host …] [--instance …] [--all] [--allow-decluster]
+  config-push [--host …] [--instance …] [--all] [--no-restart] [--allow-decluster]
   start | stop | restart
   status  [--host …] [--instance …] [--all]
   logs    [--host …] [--instance …] [--all] [-f] [-n lines]
@@ -214,10 +216,16 @@ Global:
   exec    [--host …] [--instance …] <remote shell command>
   remove  [--host …] [--instance …] [--yes]   # local inventory only
   uninstall [--host …] [--instance …] [--purge] [--yes]
+  cluster-sync [--cluster <id>]
+  build-deploy [--host …] [--instance …] [--all] --source <package-dir>
+               [--target <triple>] [--build-tool <cargo|zigbuild|cross>]
+               [--allow-decluster]
   tui
 ```
 
-**TUI** (ratatui): fleet table, node add/edit, per-node supernode config editor (features + SFU policy), settings (version/repo/privilege/firewall), install/start/stop/restart, config push, logs viewer, invite copy, uninstall with purge confirmation, auto-refresh.
+**TUI** (ratatui): fleet table, node add/edit, per-node supernode config editor (features + SFU policy), settings (version/repo/privilege/firewall/build source), install/start/stop/restart, build and deploy, cluster sync, config push, logs viewer, invite copy, uninstall with purge confirmation, auto-refresh.
+
+`build-deploy` requires `--source` in CLI mode even when `defaults.build_source` is configured; the TUI reads `defaults.build_source` directly.
 
 **Not implemented yet:** `plan` (dry-run diff), dedicated `update` (stage + symlink flip + health check + rollback), signed `releases_manifest.json` verification, audit log, HTTP metrics scrape.
 
@@ -233,7 +241,7 @@ Each instance is independent:
 | Binary | Shared `{install_root}/bin/conquerd-supernode-{version}` + `current` symlink |
 | Unit | `conquerd-supernode@{id}.service` from template `conquerd-supernode@.service` |
 | Drop-in | `/etc/systemd/system/conquerd-supernode@{id}.service.d/override.conf` — `CONQUERD_HOME`, `supernode_host`, legacy port env vars |
-| Manifest | `{data_root}/{id}/supernode.toml` — listen addrs, access mode, features |
+| Manifest | `{data_root}/{id}/supernode.toml` — listen addresses, features, and optional cluster roster; generated access/identity fields are currently not applied by the runtime (see §2) |
 
 Install flow (`snm-supernode::ops::install_instance`): ensure service user + dirs → upload binary → symlink `current` → push `supernode.toml` → push unit template + drop-in → `daemon-reload` → optional ufw rules → `enable` + `start`.
 
@@ -291,7 +299,7 @@ Adding or removing a member re-renders and re-pushes the roster to the whole clu
 
 ### Firewall
 
-The `cluster_addr` UDP port must be reachable **between cluster members only**, never the public. The manager's ufw integration should open the cluster port **restricted to the member source IPs** (not `0.0.0.0`), tagged like the other rules for clean uninstall. Client-facing ports (relay/ws/web) stay publicly open as today.
+The `cluster_addr` UDP port must be reachable **between cluster members only**, never the public. The manager's ufw integration should open the cluster port **restricted to the member source IPs** (not `0.0.0.0`), tagged like the other rules for clean uninstall. Client-facing relay and WS ports stay publicly open as today; there is no public web port.
 
 ### Manager work (complete)
 
@@ -365,6 +373,7 @@ Implementation: `snm-supernode::binary_probe` — remote `readlink`, `sha256sum`
 | Embedded + OpenSSH transport | Done |
 | GitHub release fetch + sha256 | Done |
 | `config-push` + SFU inline params | Done |
+| Manager-generated `access_mode` / `identity_file` runtime application | Gap — fields are serialized but not applied by `conquerd-supernode` |
 | ufw firewall tagging | Done |
 | Binary identity in status/TUI | Done |
 | Supernode clustering (chat/ACL/trust replication + client failover) | Done — supernode + client sides |
@@ -376,7 +385,7 @@ Implementation: `snm-supernode::binary_probe` — remote `readlink`, `sha256sum`
 | macOS/Windows remote supervisors | Not started |
 | Plugin keys / asset sync | Not started |
 
-**Suggested next work:** dedicated `update` with symlink flip + health poll + rollback; `plan` diff; persist auto-allocated ports; rootless systemd; signed release verification.
+**Suggested next work:** apply or remove the manager-generated `access_mode` / `identity_file` fields; dedicated `update` with symlink flip + health poll + rollback; `plan` diff; persist auto-allocated ports; rootless systemd; signed release verification.
 
 ---
 
@@ -410,7 +419,7 @@ The manager is the primary integration-testing tool for the ConquerD supernode. 
 # 1. Install all nodes (or build + deploy from source)
 .\launch.ps1 install --host acdc --all         # download nightly
 # or
-.\launch.ps1 build-deploy --host acdc --all    # compile local source
+.\launch.ps1 build-deploy --host acdc --all --source ..\conquerd-supernode    # compile local source
 
 # 2. Provision cluster — collect identity keys, push shared roster, restart
 .\launch.ps1 cluster-sync
@@ -448,7 +457,7 @@ The manager is the primary integration-testing tool for the ConquerD supernode. 
 
 ```powershell
 # Build and redeploy — cluster section is preserved, service restarted
-.\launch.ps1 build-deploy --host acdc --all
+.\launch.ps1 build-deploy --host acdc --all --source ..\conquerd-supernode
 
 # Spot-check cluster config survived
 .\launch.ps1 exec --host acdc --instance a "grep cluster_id /var/lib/conquerd/a/supernode.toml"
@@ -473,6 +482,3 @@ Prints the reusable invite URL. Paste the invite into the ConquerD client to joi
 - macOS as a remote target (launchd) — needed?
 - Firewall: keep ufw-only, or add firewalld/cloud SG reporting?
 - Long-running reconciliation daemon vs strict invocation-based CLI?
-- Clusters: auto-collect member identities and re-push the roster on every membership change, or gate it behind an explicit `cluster sync` command?
-- Cluster port: restrict the ufw rule to member source IPs automatically, or leave the scoping to the operator?
-- Roster source of truth: derive it entirely from inventory each push, or persist the resolved roster (with collected identities) in a sidecar to avoid re-reading `identity.json` every time?

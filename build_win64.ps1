@@ -220,8 +220,13 @@ if (-not (Test-Path $INSTALLER_EXE)) {
 
 # ── Prepare dist folder ───────────────────────────────────────────────────────
 Write-Host "`n==> Preparing dist\ConquerD\..."
+$resolvedRoot = [System.IO.Path]::GetFullPath($ROOT).TrimEnd('\') + '\'
+$resolvedBundle = [System.IO.Path]::GetFullPath($BUNDLE)
+if (-not $resolvedBundle.StartsWith($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Write-Error "Refusing to clean bundle path outside the workspace: $resolvedBundle"
+}
 if (Test-Path $BUNDLE) {
-    cmd /c "rmdir /s /q `"$BUNDLE`""
+    Remove-Item -LiteralPath $resolvedBundle -Recurse -Force
     if (Test-Path $BUNDLE) {
         Write-Error "Failed to remove $BUNDLE -- close any running ConquerD processes and retry."
     }

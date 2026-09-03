@@ -501,6 +501,12 @@ pub struct FileTransferManager {
     old_data_store: HashMap<String, Vec<u8>>,
 }
 
+impl Default for FileTransferManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileTransferManager {
     pub fn new() -> Self {
         Self {
@@ -1817,10 +1823,18 @@ fn progress_is_reportable(sent: usize, total: usize) -> bool {
 // ── Received-file storage ─────────────────────────────────────────────────────
 
 /// Directory received files land in. Mirrors `ui::bridge::save_received_file`.
+#[cfg(not(test))]
 pub fn download_dir() -> PathBuf {
     dirs::download_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Keep unit tests out of the user's real Downloads directory and make them
+/// runnable in restricted CI sandboxes that cannot write to the user profile.
+#[cfg(test)]
+pub fn download_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("conquerd-test-downloads-{}", std::process::id()))
 }
 
 /// Basename of `rel_path`, or a safe fallback.

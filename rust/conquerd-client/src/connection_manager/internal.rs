@@ -131,6 +131,7 @@ pub(super) struct SupernodeSession {
     pub(super) ws_task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(test)]
 pub(super) fn host_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split("://").last().unwrap_or(url);
     let authority = after_scheme
@@ -153,6 +154,7 @@ pub(super) fn host_from_url(url: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn is_loopback_or_wildcard(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "::")
 }

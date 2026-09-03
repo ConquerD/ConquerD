@@ -401,7 +401,6 @@ mod windows_impl {
         client: IAudioClient,
         capture: IAudioCaptureClient,
         channels: usize,
-        rate: u32,
         kind: SampleKind,
         /// Held across device reads, not rebuilt per read: see [`Resampler`].
         resampler: Resampler,
@@ -509,7 +508,6 @@ mod windows_impl {
                     client,
                     capture,
                     channels: CHANNELS as usize,
-                    rate: RATE,
                     kind,
                     resampler: Resampler::new(RATE),
                     accumulator: FrameAccumulator::new(),
@@ -584,7 +582,6 @@ mod windows_impl {
                     client,
                     capture,
                     channels,
-                    rate,
                     kind: SampleKind::F32,
                     resampler: Resampler::new(rate),
                     accumulator: FrameAccumulator::new(),

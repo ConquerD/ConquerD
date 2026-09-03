@@ -25,8 +25,8 @@ powershell -ExecutionPolicy Bypass -File scripts/fetch_opus_weights.ps1
 bash scripts/fetch_opus_weights.sh
 ```
 
-The scripts are idempotent: they skip the download if the sentinel file
-`opus/dnn/lace_data.c` is already present.
+The scripts are idempotent: they read the archive's `tar_list.txt` and skip the
+download only when every listed DNN source file is already present.
 
 ### Building without DNN
 

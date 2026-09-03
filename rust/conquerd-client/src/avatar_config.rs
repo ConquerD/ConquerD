@@ -942,7 +942,7 @@ mod tests {
             !svg.contains("fill=\"hsl("),
             "Qt-compatible SVG output should use hex colours, not CSS hsl()"
         );
-        assert!(fill_count.len() >= 1);
+        assert!(!fill_count.is_empty());
     }
 
     #[test]

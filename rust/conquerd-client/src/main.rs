@@ -10,80 +10,44 @@
 
 // Suppress the Windows console window unless the `console` feature is enabled.
 #![cfg_attr(all(windows, not(feature = "console")), windows_subsystem = "windows")]
-// The client crate has multiple entry surfaces: Qt/QML production UI, headless
-// integration mode, and framework modules that are activated by negotiated
-// features. Rust cannot see QML/runtime entrypoints, so keep these warnings out
-// of local and release builds while preserving the public module surface.
-#![allow(dead_code, unused_imports)]
+// Shared by both entry points.
+use conquerd_client::{logging, platform};
+use tracing::{error, info};
 
-mod aec;
-mod avatar_config;
 #[cfg(feature = "qt-ui")]
-mod banner;
-mod call_controller;
-mod chat_store;
-mod cluster;
-mod connection_fallback;
-mod connection_manager;
-mod content_audio;
-mod content_capture;
-mod content_playout;
-mod content_sender;
-mod crypto;
-mod error;
-mod feature_trust;
-mod file_transfer;
-mod github_updater;
-mod group_key;
-mod identity;
-mod logging;
-mod media_clock;
-mod media_sync;
-#[cfg(feature = "qt-ui")]
-mod metrics;
-mod network_monitor;
-mod ollama_module;
-mod peer_store;
-mod platform;
-#[cfg(feature = "qt-ui")]
-mod plugin_manager;
-#[cfg(feature = "qt-ui")]
-mod plugin_runtime;
-mod protocol;
-mod quic_relay_client;
-mod quic_tls;
-mod ringtone;
-mod room_manager;
-mod room_store;
-mod session_state;
-mod sfu_client;
-mod space;
-#[cfg(feature = "qt-ui")]
-mod taskbar_badge;
-#[cfg(feature = "qt-ui")]
-mod ui;
-mod upnp;
-mod uri_scheme;
-mod video;
-mod web_app_client;
+use conquerd_client::{ui, video};
 
+// Headless-only. Under `qt-ui` all of this is driven by AppBridge instead, so
+// gate it to keep the Qt build free of dead code.
+#[cfg(not(feature = "qt-ui"))]
 use std::collections::{HashMap, HashSet};
+#[cfg(not(feature = "qt-ui"))]
 use std::sync::Arc;
 
+#[cfg(not(feature = "qt-ui"))]
+use conquerd_client::{
+    call_controller::{self, CallController},
+    chat_store::{self, ChatStore},
+    connection_manager::{ConnectionCommand, ConnectionEvent, ConnectionManager},
+    crypto, error, github_updater,
+    identity::{self, Identity},
+    ollama_module,
+    peer_store::PeerStore,
+    protocol,
+    room_store::RoomStore,
+    sfu_client::SfuClient,
+    upnp,
+};
+#[cfg(not(feature = "qt-ui"))]
 use parking_lot::RwLock;
+#[cfg(not(feature = "qt-ui"))]
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
-
-use crate::call_controller::CallController;
-use crate::chat_store::ChatStore;
-use crate::connection_manager::{ConnectionCommand, ConnectionEvent, ConnectionManager};
-use crate::identity::Identity;
-use crate::peer_store::PeerStore;
-use crate::room_store::RoomStore;
-use crate::sfu_client::SfuClient;
+#[cfg(not(feature = "qt-ui"))]
+use tracing::warn;
 
 /// Where a headless Ollama auto-reply should be posted.
 #[derive(Debug, Clone)]
+#[cfg(not(feature = "qt-ui"))]
 enum HeadlessAutoTarget {
     Direct {
         peer_id: String,
@@ -102,7 +66,7 @@ enum HeadlessAutoTarget {
 ///
 /// Only applied when the caller has not already set `QT_SCALE_FACTOR`.
 /// Override with e.g. `set QT_SCALE_FACTOR=1.0` to disable.
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "qt-ui", target_os = "windows"))]
 fn maybe_apply_hidpi_scale() {
     if std::env::var("QT_SCALE_FACTOR").is_ok() {
         return;
@@ -122,7 +86,7 @@ fn maybe_apply_hidpi_scale() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(feature = "qt-ui", not(target_os = "windows")))]
 fn maybe_apply_hidpi_scale() {}
 
 #[cfg(feature = "qt-ui")]
@@ -155,7 +119,7 @@ fn run_qt_ui() {
     // BrowserPanel handed a URL to the OS via its external-protocol
     // fallback), exit silently before any window is created.  The running
     // instance keeps everything in-process.
-    if crate::platform::should_exit_as_duplicate_instance() {
+    if platform::should_exit_as_duplicate_instance() {
         std::process::exit(0);
     }
 
@@ -426,6 +390,7 @@ async fn headless_main() {
 }
 
 /// Unlock or create a new identity.
+#[cfg(not(feature = "qt-ui"))]
 fn unlock_identity(key_dir: &std::path::Path) -> error::Result<Identity> {
     // Try v2 encrypted identity
     let dat = key_dir.join(identity::IDENTITY_FILENAME);
@@ -435,7 +400,7 @@ fn unlock_identity(key_dir: &std::path::Path) -> error::Result<Identity> {
         let env_pass = std::env::var("CONQUERD_PASSPHRASE").unwrap_or_default();
         let env_file = std::env::var("CONQUERD_PASSPHRASE_FILE").unwrap_or_default();
         if !env_pass.is_empty() || !env_file.is_empty() {
-            let material = crate::crypto::build_passphrase_material(&env_pass, &env_file)?;
+            let material = crypto::build_passphrase_material(&env_pass, &env_file)?;
             return Identity::load_with_passphrase(&material, key_dir);
         }
         // Try OS keyring (silent)
@@ -457,6 +422,7 @@ fn unlock_identity(key_dir: &std::path::Path) -> error::Result<Identity> {
 }
 
 /// Interactive first-launch setup: generate a new identity and encrypt it.
+#[cfg(not(feature = "qt-ui"))]
 fn first_launch_setup(key_dir: &std::path::Path) -> error::Result<Identity> {
     eprintln!("\nWelcome to ConquerD!");
     eprintln!("No identity found. A new one will be generated now.");
@@ -495,6 +461,7 @@ fn first_launch_setup(key_dir: &std::path::Path) -> error::Result<Identity> {
 
 /// Read a line from stdin with a visible prompt (does not echo — use for
 /// passphrases in a real terminal; no TTY suppression needed in headless mode).
+#[cfg(not(feature = "qt-ui"))]
 fn stdin_prompt(prompt: &str) -> String {
     eprint!("{prompt}");
     let mut line = String::new();
@@ -612,6 +579,7 @@ async fn ollama_only_auto_reply_test() {
 
 /// Headless event loop — processes `ConnectionEvent`s until shutdown.
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "qt-ui"))]
 async fn run_headless(
     cmd_tx: mpsc::Sender<ConnectionCommand>,
     mut event_rx: mpsc::Receiver<ConnectionEvent>,
@@ -753,6 +721,7 @@ async fn run_headless(
     }
 }
 
+#[cfg(not(feature = "qt-ui"))]
 fn read_local_handle_setting() -> String {
     let path = Identity::default_key_dir().join("settings.json");
     std::fs::read_to_string(path)
@@ -768,6 +737,7 @@ fn read_local_handle_setting() -> String {
 
 /// Rematerialize client-owned rooms onto a live supernode and subscribe to chat
 /// (including the built-in `default` room). Mirrors the GUI bridge path.
+#[cfg(not(feature = "qt-ui"))]
 fn headless_rematerialize_and_subscribe(
     room_store: &RoomStore,
     peer_store: &PeerStore,
@@ -871,6 +841,7 @@ fn headless_rematerialize_and_subscribe(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "qt-ui"))]
 async fn handle_event(
     ev: ConnectionEvent,
     chat_store: &ChatStore,
@@ -1277,6 +1248,7 @@ async fn handle_event(
 }
 
 /// Start an auto-reply when settings allow it (direct or room).
+#[cfg(not(feature = "qt-ui"))]
 async fn headless_maybe_auto_reply(
     ollama_cmd_tx: &mpsc::Sender<ollama_module::OllamaCommand>,
     auto_pending: &mut HashMap<String, HeadlessAutoTarget>,
@@ -1379,6 +1351,7 @@ async fn headless_maybe_auto_reply(
 
 /// Handle Ollama stream events in headless mode.
 /// Returns `true` when a simulation auto-reply finishes (for exit hook).
+#[cfg(not(feature = "qt-ui"))]
 async fn handle_ollama_event(
     ev: ollama_module::OllamaEvent,
     cmd_tx: &mpsc::Sender<ConnectionCommand>,

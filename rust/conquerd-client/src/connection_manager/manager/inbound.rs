@@ -1,49 +1,27 @@
 //! Inbound signaling verification and message dispatch.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use conquerd_features::{
-    channel_frame::{self, FrameClass},
-    wellknown, AuthTier, CapabilityDescriptor, FeatureRegistry, InvocationContext, ReplayGuard,
-};
+use conquerd_features::{AuthTier, CapabilityDescriptor, InvocationContext};
 use parking_lot::RwLock;
 use serde_json::Value;
-use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::avatar_config::AvatarConfig as PeerAvatarConfig;
-use crate::feature_trust::{FeatureTrustGate, FeatureTrustStore, TrustDecision};
-use crate::file_transfer::{FileTransferManager, TransferEvent, ROOM_FILE_CHUNK_BUDGET};
-use crate::group_key::{GroupKeySource, SenderKeysGroup};
-use crate::identity::Identity;
+use crate::feature_trust::{FeatureTrustGate, TrustDecision};
+use crate::file_transfer::{TransferEvent, ROOM_FILE_CHUNK_BUDGET};
 use crate::peer_store::PeerStore;
 use crate::protocol::{MessageType, SignalingMessage};
-use crate::quic_relay_client::{QuicRelayClient, RelayGameInbound, RelaySignalingInbound};
-use crate::quic_tls;
-use crate::web_app_client::{self, WebAppResponse};
 
-use super::super::events::{ConnectionCommand, ConnectionEvent};
-use super::super::internal::{
-    InternalEvent, PeerConnection, PeerConnectionState, PeerOutbound, PeerTransportStats,
-    PendingInvite, SupernodePingTracker, SupernodeSession, INVITE_TTL,
-};
-use super::super::quic::run_quic_peer_session;
-use super::super::ws::supernode_ws_task;
+use super::super::events::ConnectionEvent;
+use super::super::internal::PeerConnectionState;
 use super::ConnectionManager;
 
 use super::{
-    accept_group_key_epoch, is_elected_keyer, may_send_room_e2e_content, parse_quic_lan_hint,
-    room_scope_key, should_auto_join_on_room_created, should_mint_first_room_key,
-    should_track_pending_materialize, should_use_private_room_invite, union_members_for_room,
-    unix_now_f64, PendingGroupKeyAck, PendingRoomJoinRetry, ROOM_INVITE_SCHEMA,
+    may_send_room_e2e_content, parse_quic_lan_hint, room_scope_key,
+    should_auto_join_on_room_created, unix_now_f64, PendingRoomJoinRetry,
 };
-// Re-exported pure helpers live on manager; also pull invite helpers used in match arms.
-use super::invite::{build_room_invite_url, parse_room_invite, RoomInviteEntry, RoomInvitePayload};
-use super::room_session::{plan_cluster_failover, FailoverPlan, RoomCreateRequest};
 
 /// Pad-tolerant supernode id compare (URL-safe base64 with/without `=`).
 fn same_supernode_pad(a: &str, b: &str) -> bool {
@@ -144,6 +122,7 @@ impl ConnectionManager {
             .await;
     }
 
+    #[cfg(test)]
     pub(in crate::connection_manager) async fn handle_inbound(&mut self, msg: SignalingMessage) {
         self.handle_inbound_inner(msg, None, None).await;
     }

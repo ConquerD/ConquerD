@@ -222,7 +222,7 @@ xdg-mime default conquerd.desktop x-scheme-handler/conquerd
 
 ### Language Boundaries
 
-Conquerd is pure Rust.
+Conquerd is Rust-first, with deliberate native and UI boundaries: Qt Quick screens are QML, CXX-Qt uses small C++ shims, the macOS camera backend has an Objective-C AVFoundation shim, portal/game code uses JavaScript, and the Opus/VP8 wrappers compile vendored C libraries. Identity, transport, feature negotiation, application state, cryptography, and media orchestration remain in Rust.
 
 | Layer | Crate / Runtime |
 |---|---|
@@ -259,10 +259,10 @@ CPAL capture
   → VoiceActivityDetector → speaking_changed signal → UI level meter
   → OpusEncoder (20ms frames, 48 kHz mono)
   → ConnectionManager.send_audio_datagram() → quinn QUIC datagram
-  → QUIC unreliable datagram [2-byte seq][opus payload]
+  → QUIC unreliable datagram [AUDIO_TAG][peer-id length][peer id][Opus payload]
   ──────────────────────────────── (network) ────────────────────────────────
   → quinn on_audio_datagram callback
-  → JitterBuffer.push(seq, opus)   ← 3-frame / 60ms reorder buffer
+  → Per-sender jitter queue        ← configurable playout depth
   → OpusDecoder.decode() → PCM
   → AudioEngine playback mix (CPAL)
 ```
@@ -293,7 +293,7 @@ Chat history                 → stays on each peer's device (ChatStore / sessio
 ```
 User types → ChatManager.send_message()
   → SQLite (status = SENDING)
-  → ConnectionManager → QUIC stream 0 or WebSocket
+  → ConnectionManager → long-lived QUIC unidirectional signaling stream or WebSocket
     (Ed25519-signed + AES-GCM encrypted with session cipher)
   → Peer verifies signature → sends CHAT_ACK
   → ChatManager updates status → DELIVERED
@@ -627,7 +627,7 @@ The invite link is also persisted in `~/.conquerd/reusable_invite.json` and surv
 
 ### Supernode Configuration
 
-Runtime ports and access settings are read from environment variables; hosted feature capabilities are preferably declared in `<data_dir>/supernode.toml`.
+Runtime access and portal-presentation settings are read from environment variables. Listener ports come from `supernode_port` / `supernode_signaling_port` unless `listen_addr` / `ws_listen_addr` in `<data_dir>/supernode.toml` override them; hosted feature capabilities are preferably declared in that manifest.
 
 #### Core Settings
 
@@ -663,6 +663,7 @@ The in-app portal is served over QUIC (`web.host.app.v1`) — there is **no** pu
 | `supernode_ad_duration` | `30` | Countdown seconds (only used when mode is `ad`) |
 | `supernode_ad_content` | *(empty)* | HTML content for the ad/timer waiting area |
 | `supernode_tos_text` | *(built-in)* | Custom TOS text (or override `portal/tos.html`) |
+| `supernode_demo_links` | `false` | Show bundled game/demo links in portal metadata (`1` to enable) |
 
 ### Firewall and Port Forwarding
 
@@ -811,12 +812,12 @@ Access settings via the gear icon in Conquerd.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | Direct P2P | `true` | Accept direct peer QUIC sessions (`direct_p2p_enabled`) |
-| Direct P2P port | `0` (auto) | Fixed listening port when you need a firewall rule (`direct_p2p_port`) |
+| Direct P2P port | `61045` | Fixed listening port when you need a firewall rule (`direct_p2p_port`) |
 | UPnP port mapping | `true` | Auto port-mapping on the router (`upnp_enabled`) |
 | Relay port | (auto) | Local port used for supernode relay sessions (`relay_port`) |
 | Allow gated supernodes | `true` | Allow supernodes that require portal access (`relay_allow_gated`) |
 | Auto-renew relay tickets | `true` | Keep relay access alive without a reconnect (`relay_auto_renew`) |
-| Auto-connect | `true` | Reconnect trusted peers on startup (`auto_connect`) |
+| Auto-connect | `false` | Reconnect trusted peers on startup (`auto_connect`) |
 
 ### Audio
 
@@ -934,7 +935,7 @@ cargo build --release -p conquerd-installer
 
 ### Run Tests
 ```powershell
-# Outer workspace (features + supernode + installer + Opus)
+# Outer workspace (features + supernode + installer + Opus + VP8)
 cd rust
 cargo test --workspace
 
@@ -1068,13 +1069,14 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 
 ```
 ├── rust/
-│   ├── Cargo.toml                 # Outer workspace: features + supernode + installer + Opus
+│   ├── Cargo.toml                 # Outer workspace: features + supernode + installer + Opus + VP8
 │   ├── conquerd-client/           # Native desktop binary (own workspace; Qt 6 / QML via CXX-Qt)
 │   │   ├── Cargo.toml             # features: qt-ui, webengine, console
 │   │   ├── build.rs               # CXX-Qt codegen + windres icon embedding
 │   │   ├── assets.qrc / icons.qrc # Qt resource bundles (QML + icons)
 │   │   ├── qml/                   # MainWindow, ChatPanel, CallPanel, RoomPanel, SettingsPage, …
 │   │   └── src/
+│   │       ├── lib.rs             # Reusable client framework modules and feature-gated UI services
 │   │       ├── main.rs            # Entry point: identity init, QGuiApplication, QML engine
 │   │       ├── identity.rs        # Ed25519 keypair, keyring AES key, passphrase handling
 │   │       ├── connection_manager/ # Invite handshake, signaling, peer tracking
@@ -1091,18 +1093,16 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 │   │       ├── group_key.rs       # Per-room sender keys (E2E seal for room chat/voice/file/video)
 │   │       ├── space.rs           # Space Merkle tree (signed roots, inclusion proofs, grants)
 │   │       ├── sfu_client.rs      # SFU membership (join/leave/member list)
-│   │       ├── room_manager.rs    # Per-participant room state
 │   │       ├── room_store.rs      # Encrypted client-owned room definitions (my_rooms.dat)
 │   │       ├── cluster.rs         # Verified cluster roster from SUPERNODE_INFO; member failover
 │   │       ├── quic_relay_client.rs # QUIC relay client (room audio + signaling fallback)
 │   │       ├── quic_tls.rs        # rustls config for QUIC peer/relay sessions
-│   │       ├── metrics.rs / network_monitor.rs # Per-peer QUIC stats → ConnectionQuality
 │   │       ├── peer_store.rs      # Trusted peer persistence (incl. AvatarConfig)
 │   │       ├── avatar_config.rs   # Deterministic SVG identicon generator
 │   │       ├── feature_trust.rs   # FeatureTrustStore + user-consent gate for bespoke namespaces
 │   │       ├── plugin_manager.rs / plugin_runtime.rs / ollama_module.rs # Plug-in host + AI plugin
 │   │       ├── github_updater.rs  # GitHub Releases API poll + installer spawn
-│   │       ├── ringtone.rs / taskbar_badge.rs / upnp.rs / uri_scheme.rs / web_app_client.rs
+│   │       ├── platform.rs / taskbar_badge.rs / upnp.rs / uri_scheme.rs / web_app_client.rs
 │   │       └── ui/                # AppBridge QObject + QML models (Peer/Chat/Call/Room/Settings/FileTransfer)
 │   ├── conquerd-features/         # rlib: capability registry, FeatureModule trait, quota enforcement
 │   ├── conquerd-supernode/        # Standalone binary: QUIC relay, ephemeral SFU, WS signaling, in-app portal
@@ -1142,7 +1142,7 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 | SFU Subscription | `sfu_subscribe`, `sfu_unsubscribe` |
 | SFU Room Mgmt | `sfu_room_create`, `sfu_room_created`, `sfu_room_invite`, `sfu_room_invite_result`, `sfu_room_invite_generate` |
 | SFU File Transfer | `sfu_file_offer` (advertisement), `sfu_file_request` (a member accepting), `sfu_file_revoke` (sender withdrew it), `sfu_file_chunk`, `sfu_file_complete` |
-| SFU Video (control plane only) | `sfu_video_state` (camera on/off + join-time reannounce), `sfu_video_keyframe_request` |
+| SFU Video (control plane only) | `sfu_video_state` (camera on/off + join-time reannounce), `sfu_video_subscribe`, `sfu_video_keyframe_request` |
 | SFU Group Key | `sfu_group_key`, `sfu_group_key_ack` (inside `encrypted_signal`) |
 | Space Tree | `space_root_announce` |
 | File Transfer | `file_transfer_offer`, `file_transfer_accept`, `file_transfer_reject`, `file_transfer_chunk`, `file_transfer_complete`, `file_transfer_ack`, `file_transfer_error` |
@@ -1170,8 +1170,8 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 | Video codecs | `conquerd-vpx` — first-party VP8 wrapper over a vendored libvpx submodule, built without libvpx's own `configure`/`make` (needs **perl** for RTCD codegen). Available on every platform. Media Foundation H.264 on Windows via the `windows` crate, using the codec licence the OS already holds. |
 | DSP | `rustfft` (spectral-gate noise suppression), in-house VAD + jitter buffer |
 | Cryptography | `ed25519-dalek`, `x25519-dalek`, `aes-gcm`, `argon2`, `hkdf` |
-| Signaling serialisation | JSON over WebSocket (`tokio-tungstenite`) and QUIC bidirectional streams |
-| Local storage | SQLite (`rusqlite`) for chat history; JSON for settings/peers/rooms |
+| Signaling serialisation | JSON over WebSocket (`tokio-tungstenite`) and length-prefixed QUIC streams |
+| Local storage | SQLite (`rusqlite`) for chat history; JSON settings; encrypted JSON envelopes for trusted peers (`peers.dat`) and client-owned room definitions (`my_rooms.dat`) |
 | Testing | `cargo test` |
 | Packaging | `cargo`, `windeployqt6`, 7-Zip (Windows); AppImage (Linux); `.dmg` (macOS) |
 
@@ -1234,7 +1234,7 @@ The following network contacts occur automatically or on user action (see [PRIVA
 | **UPnP port mapping** | Your local router only (LAN multicast) | On startup when *Enable UPnP port mapping* is on (default) | Uncheck UPnP in Settings (`upnp_enabled` in `settings.json`) |
 | **GitHub update check** | GitHub Releases API (`api.github.com/repos/vbawol/ConquerD/releases/latest`) | Once per client launch | Block `api.github.com`, or avoid running the client on restricted networks. The *Check for updates* toggle is saved in `settings.json` but not yet enforced in 1.0.0 |
 | **YouTube / Vimeo inline preview** | Video host CDNs (e.g. `youtube.com`, `googlevideo.com`, `vimeo.com`) | Only when you expand an inline player or open a preview link — Qt WebEngine embed, not yt-dlp | Uncheck *Show YouTube preview cards in chat* in Settings |
-| **Ollama assistant** (optional) | Your configured Ollama URL (default `http://localhost:11434`) | When the AI plugin is enabled and you use it | Turn off *Enable AI assistant* in Settings |
+| **Ollama assistant** (optional) | Your configured Ollama URL (default `http://127.0.0.1:11434`) | When the AI plugin is enabled and you use it | Turn off *Enable AI assistant* in Settings |
 | **Supernode portal / gated relay** | The supernode operator you chose | When you open their portal or complete an access gate | Do not connect to that supernode |
 | **Installer download** | GitHub release assets + `releases_manifest.json` | When you apply an in-app update | Do not apply updates |
 

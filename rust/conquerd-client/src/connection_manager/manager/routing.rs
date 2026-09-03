@@ -1,41 +1,15 @@
 //! Outbound routing: path pick, multi-supernode fan-out, EncryptedSignal wrap.
 
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use conquerd_features::{
-    channel_frame::{self, FrameClass},
-    wellknown, AuthTier, CapabilityDescriptor, FeatureRegistry, InvocationContext, ReplayGuard,
-};
-use parking_lot::RwLock;
+use conquerd_features::channel_frame;
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 
-use crate::avatar_config::AvatarConfig as PeerAvatarConfig;
-use crate::feature_trust::{FeatureTrustGate, FeatureTrustStore, TrustDecision};
-use crate::file_transfer::{FileTransferManager, TransferEvent};
-use crate::group_key::{GroupKeySource, SenderKeysGroup};
-use crate::identity::Identity;
-use crate::peer_store::PeerStore;
 use crate::protocol::{MessageType, SignalingMessage};
-use crate::quic_relay_client::{QuicRelayClient, RelayGameInbound, RelaySignalingInbound};
-use crate::quic_tls;
-use crate::web_app_client::{self, WebAppResponse};
 
-use super::super::events::{ConnectionCommand, ConnectionEvent};
-use super::super::internal::{
-    InternalEvent, PeerConnection, PeerConnectionState, PeerOutbound, PeerTransportStats,
-    PendingInvite, SupernodePingTracker, SupernodeSession, INVITE_TTL,
-};
-use super::super::quic::run_quic_peer_session;
-use super::super::ws::supernode_ws_task;
+use super::super::events::ConnectionEvent;
+use super::super::internal::{PeerConnectionState, PeerOutbound};
 use super::ConnectionManager;
-
-use super::unix_now_f64;
 
 /// Whether a signed, peer-targeted message that missed direct QUIC should fan
 /// out across every connected supernode WS session.
