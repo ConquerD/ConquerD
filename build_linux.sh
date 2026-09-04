@@ -16,8 +16,17 @@
 #   4. cmake on PATH.
 #
 # System packages (Debian/Ubuntu):
-#   sudo apt install build-essential cmake libgl-dev libxkbcommon-dev \
+#   sudo apt install build-essential cmake lld libgl-dev libxkbcommon-dev \
 #                    libdbus-1-dev libpulse-dev libminiupnpc-dev fuse
+#
+#   `lld` is not optional on a machine that also has GNU gold. cxx-qt's
+#   qt-build-utils picks a linker itself when the system `ld` is bfd, in the
+#   order lld > gold > mold, and appends `-fuse-ld=` to the link line. Gold
+#   extracts archive members only during its one sequential scan, and rustc
+#   places the rlib defining `cxx_qt_init_*` before the --whole-archive
+#   call-init archives that reference them, so gold ends the link with
+#   "undefined reference to 'cxx_qt_init_crate_conquerd_client'". lld keeps
+#   archive members as lazy symbols and resolves them whatever the order.
 #
 # Usage:
 #   ./build_linux.sh             # debug build
