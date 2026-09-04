@@ -941,11 +941,17 @@ mod tests {
     /// [`choose_format`] in isolation. Ignored for the same reasons: CI has no
     /// webcam, and on a workstation it turns the capture light on.
     ///
-    /// Under WSL the camera arrives over USB/IP, which is worth knowing when
-    /// this fails with "no video capture devices found" on a machine that
-    /// plainly has a webcam: the device has to be attached to the running
-    /// distribution (`usbipd attach --wsl --busid N-M`) and the user has to be
-    /// in the `video` group before `/dev/video0` can be opened.
+    /// **Not runnable under WSL**, and the way it fails is subtle enough to be
+    /// worth recording. `usbipd attach --wsl` really does hand the
+    /// distribution a working `/dev/video0`: enumeration, format negotiation
+    /// and `set_format` all succeed against the real `uvcvideo` driver, so
+    /// everything above the first buffer looks healthy. But UVC streams over
+    /// *isochronous* endpoints, and `vhci_hcd` does not implement them — the
+    /// kernel says as much (`vhci_get_frame_number: Not yet implemented`) and
+    /// this test then blocks in `next_frame` forever rather than failing.
+    /// The WSL kernel has no `vivid` test driver to stand in either
+    /// (`CONFIG_V4L_TEST_DRIVERS is not set`), so frame delivery, stride
+    /// handling and starvation behaviour need real Linux.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires a physical camera"]
