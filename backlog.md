@@ -229,12 +229,12 @@ change as well as a code change** — that rule now lives in the Documentation A
    - VP8 already covers encode everywhere, so a new backend only has to produce `RawFrame`
      (tightly-packed I420) and the existing pipeline handles the rest.
 
-2. **Verify the platform backends on real hardware — nothing outside Windows has run against a camera.**
+2. **Verify the platform backends on real hardware — nothing outside Windows has captured a frame.**
 
    | Backend | Compiles | Logic tested | Run against a camera |
    |---|---|---|---|
    | Windows `MfCamera` | ✅ | ✅ | ✅ (dev machine) |
-   | Linux `V4l2Camera` | ✅ (WSL + CI) | ✅ format choice | ❌ WSL has no `/dev/video*` |
+   | Linux `V4l2Camera` | ✅ (WSL + CI) | ✅ format choice | ⚠️ opens + negotiates, never streams — see below |
    | macOS `AvfCamera` | ✅ Rust half (verified 2026-08-07) | — | ❌ no Mac on the team |
 
    The macOS Rust now type-checks clean under `-D warnings` via the `lint-macos` feature, which
@@ -248,14 +248,30 @@ change as well as a code change** — that rule now lives in the Documentation A
    link** — the `test-macos` CI job is the only thing exercising it, so treat a green run there
    as the real signal, not a local clippy pass.
 
-   Unverified on Linux specifically: format negotiation against a real driver (V4L2 substitutes
-   silently), stride handling in each of the three accepted formats, buffer starvation under
-   load, and unplug-mid-call. On macOS additionally: the TCC camera prompt, and whether the
-   chosen `AVCaptureSessionPreset` yields the requested size.
+   **Linux, partially answered on 2026-09-03** against a Logitech C270 passed into WSL with
+   `usbipd attach --wsl`. Enumeration and format negotiation now have a real driver behind
+   them: the camera advertises `["YUYV", "MJPG"]`, `choose_format` correctly refuses MJPG and
+   takes YUYV, and `set_format` returned exactly the requested 640x360 with no silent
+   substitution.
 
-   The `#[ignore]`d `captures_a_frame_from_the_default_camera` test is the intended harness;
-   give it Linux and macOS siblings and run all three on hardware before calling any platform
-   done.
+   Frame delivery did **not** get answered, and cannot be from WSL. UVC streams over
+   *isochronous* endpoints, which USB/IP's `vhci_hcd` does not implement — the kernel says
+   so (`vhci_get_frame_number: Not yet implemented`) and `next_frame` then blocks forever
+   rather than failing, which is a nastier failure than an error would be. The WSL kernel has
+   no `vivid` test driver to stand in either (`CONFIG_V4L_TEST_DRIVERS is not set`). So stride
+   handling across the three accepted formats, buffer starvation under load, and
+   unplug-mid-call still need real Linux: a machine, a VM with true USB passthrough, or a
+   custom WSL kernel built with `CONFIG_VIDEO_VIVID=m` — vivid offers YU12/NV12/YUYV, so it
+   would exercise all three converter branches, which the C270 cannot since it offers only
+   YUYV.
+
+   On macOS still unverified: the TCC camera prompt, and whether the chosen
+   `AVCaptureSessionPreset` yields the requested size.
+
+   The `#[ignore]`d `captures_a_frame_from_the_default_camera` now has a Linux sibling (added
+   2026-09-03), which also prints what the driver offers against what `choose_format` picked,
+   since that answer is a property of the device rather than of the code. macOS still needs
+   one. Run all three on hardware before calling any platform done.
 
 3. **End-to-end product validation (2-client + room).**
    Transport unit tests cover tags, fragmentation, absent-peer drop, and `SfuVideoState` replay;
