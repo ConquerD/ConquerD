@@ -935,4 +935,74 @@ mod tests {
         assert!(frame.is_consistent());
         assert_eq!((frame.width, frame.height), (w, h));
     }
+
+    /// The Linux sibling of the test above, and the only thing that exercises
+    /// [`V4l2Camera`] against a real driver rather than against
+    /// [`choose_format`] in isolation. Ignored for the same reasons: CI has no
+    /// webcam, and on a workstation it turns the capture light on.
+    ///
+    /// Under WSL the camera arrives over USB/IP, which is worth knowing when
+    /// this fails with "no video capture devices found" on a machine that
+    /// plainly has a webcam: the device has to be attached to the running
+    /// distribution (`usbipd attach --wsl --busid N-M`) and the user has to be
+    /// in the `video` group before `/dev/video0` can be opened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a physical camera"]
+    fn captures_a_frame_from_the_default_camera() {
+        use crate::video::camera::linux_impl::choose_format;
+        use v4l::video::Capture;
+
+        let devices = list_devices();
+        println!("cameras: {devices:?}");
+        assert!(!devices.is_empty(), "no camera attached");
+
+        // What the driver actually offers is printed rather than asserted:
+        // the reason to run this on hardware is to learn which branch of
+        // `choose_format` real cameras take, and that answer is a property of
+        // the device. The only claim made here is that one of them is usable —
+        // an MJPEG-only camera is a legitimate failure this should report
+        // loudly rather than a bug in the chooser.
+        let probe = v4l::Device::with_path(&devices[0].id).expect("open device node");
+        let offered: Vec<[u8; 4]> = Capture::enum_formats(&probe)
+            .expect("enumerate formats")
+            .into_iter()
+            .map(|f| f.fourcc.repr)
+            .collect();
+        let name = |f: &[u8; 4]| String::from_utf8_lossy(f).to_string();
+        println!("offers: {:?}", offered.iter().map(name).collect::<Vec<_>>());
+        let picked = choose_format(&offered);
+        println!("chose:  {:?}", picked.as_ref().map(name));
+        assert!(picked.is_some(), "a real camera offers no supported format");
+        // Released before `V4l2Camera::open` reopens the node: the probe holds
+        // its own fd, and some drivers refuse a second streaming open.
+        drop(probe);
+
+        let mut cam = V4l2Camera::open(None, 640, 360).expect("open camera");
+        let (w, h) = cam.dimensions();
+        println!("negotiated {w}x{h}");
+
+        // The first reads often return "nothing yet" while the device starts.
+        let mut frame = None;
+        for _ in 0..60 {
+            if let Ok(f) = cam.next_frame() {
+                frame = Some(f);
+                break;
+            }
+        }
+        let frame = frame.expect("camera produced no frame");
+        assert!(frame.is_consistent());
+        assert_eq!((frame.width, frame.height), (w, h));
+
+        // A frame of one flat value is what an unstarted sensor or a buffer
+        // that was never filled produces, and it passes every check above —
+        // the plane lengths are right either way. Light through a lens always
+        // varies somewhere, so this is what separates "captured a picture"
+        // from "captured the right number of bytes".
+        let first = frame.y[0];
+        assert!(
+            frame.y.iter().any(|&p| p != first),
+            "luma plane is a single flat value — capture produced no picture"
+        );
+    }
 }
