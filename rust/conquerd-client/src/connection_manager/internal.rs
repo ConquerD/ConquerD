@@ -91,6 +91,24 @@ pub(super) enum InternalEvent {
         supernode_id: String,
         client: Option<Arc<QuicRelayClient>>,
     },
+
+    /// The coordinated moment to dial a peer for NAT hole punching has
+    /// arrived. Posted by the timer task spawned when `PUNCH_READY` lands,
+    /// because the punch is only useful if both sides send their first packet
+    /// at roughly the same time — a dial issued when the message arrives would
+    /// be too early for whichever peer the supernode reached first.
+    PunchNow {
+        peer_id: String,
+        host: String,
+        port: u16,
+    },
+
+    /// A UPnP gateway told us the router's external address. Only a hint:
+    /// behind carrier-grade NAT this is still a private address, so it is
+    /// used until something that observes us from outside disagrees.
+    UpnpGateway {
+        external_ip: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

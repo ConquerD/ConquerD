@@ -7,6 +7,7 @@ use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
 use crate::identity::Identity;
+use crate::protocol::{MessageType, SignalingMessage};
 use crate::quic_tls;
 
 use super::super::events::ConnectionEvent;
@@ -18,6 +19,33 @@ use super::{
     AUDIO_CHANNEL_TAG, CONTENT_AUDIO_CHANNEL_TAG, DEFAULT_QUIC_LISTENER_PORT,
     PEER_RECONNECT_MAX_BACKOFF_S, QUIC_PORT_FILE, QUIC_PORT_SEARCH_LIMIT, VIDEO_CHANNEL_TAG,
 };
+
+/// How long a hole-punch registration is assumed to still be live at the
+/// supernode. Matches the 30s the supernode keeps an unpaired registration
+/// before sweeping it, so a retry is only sent once the old one is gone.
+const PUNCH_REGISTRATION_TTL: Duration = Duration::from_secs(30);
+
+/// Ceiling on how long a `PUNCH_READY` may ask us to wait before dialing.
+/// The supernode picks ~500ms; anything much larger is clock skew or a bad
+/// value, and parking a dial on it would strand the connection attempt.
+const PUNCH_MAX_DELAY_S: f64 = 5.0;
+
+/// Parse a `host:port` endpoint from punch coordination into a dialable
+/// address, refusing the ones that would make the client a probe.
+///
+/// Unspecified and loopback addresses are rejected because a punch toward
+/// them is either meaningless or aimed back at this machine; multicast
+/// because a NAT punch has exactly one intended recipient.
+fn parse_punch_endpoint(raw: &str) -> Option<SocketAddr> {
+    let addr: SocketAddr = raw.trim().parse().ok()?;
+    if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_loopback() {
+        return None;
+    }
+    if addr.ip().is_multicast() {
+        return None;
+    }
+    Some(addr)
+}
 
 pub fn parse_quic_lan_hint(hint: &str) -> Option<(String, u16)> {
     let trimmed = hint.trim();
@@ -165,11 +193,47 @@ pub(super) fn read_local_avatar_config() -> String {
 }
 
 pub fn peer_quic_endpoint(record: &crate::peer_store::PeerRecord) -> Option<(String, u16)> {
-    record
-        .relay_hints
-        .iter()
-        .find_map(|hint| parse_quic_lan_hint(hint))
-        .or_else(|| (record.quic_port != 0).then(|| ("127.0.0.1".to_owned(), record.quic_port)))
+    peer_quic_endpoints(record).into_iter().next()
+}
+
+/// Every address worth dialing for `record`, best first.
+///
+/// A peer may be reachable at more than one address and which one works is not
+/// knowable in advance: the LAN hint wins whenever both peers are on the same
+/// network (no NAT in the path at all), while a public hint — learned from a
+/// UPnP mapping or from what a supernode observed — is the only thing that
+/// works from anywhere else. Both are kept, in that order.
+///
+/// The loopback entry is last and deliberate: it is what makes two profiles on
+/// one machine connect directly, and it is useless anywhere else, so it must
+/// never crowd out a real address the way it did when it was the sole
+/// fallback.
+pub fn peer_quic_endpoints(record: &crate::peer_store::PeerRecord) -> Vec<(String, u16)> {
+    let mut out: Vec<(String, u16)> = Vec::new();
+    let mut push = |cand: (String, u16)| {
+        if !out.contains(&cand) {
+            out.push(cand);
+        }
+    };
+    for hint in &record.relay_hints {
+        if let Some(cand) = parse_quic_lan_hint(hint) {
+            push(cand);
+        }
+    }
+    if record.quic_port != 0 {
+        push(("127.0.0.1".to_owned(), record.quic_port));
+    }
+    out
+}
+
+/// Whether `host` is only meaningful on this machine.
+///
+/// Used to decide that a peer has nothing dialable from here, which is the
+/// signal that a hole punch is worth the round trip.
+pub fn is_local_only_host(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback() || ip.is_unspecified())
+        .unwrap_or(false)
 }
 
 impl ConnectionManager {
@@ -197,6 +261,23 @@ impl ConnectionManager {
                     );
                     save_quic_port(candidate);
                     self.quic_endpoint = Some(ep);
+                    // Ask the router to forward this exact port. It is the
+                    // listener peers dial, which is the only mapping that
+                    // buys a direct session — mapping an outbound relay port
+                    // achieves nothing, because that connection is already
+                    // established from this side.
+                    //
+                    // Same port inside and out so the advertised hint stays
+                    // true if the mapping is later dropped and the peer falls
+                    // back to a punched address.
+                    if let Some(tx) = &self.upnp_cmd {
+                        let _ = tx.try_send(crate::upnp::UpnpCommand::AddMapping {
+                            internal_port: candidate,
+                            external_port: candidate,
+                            protocol: crate::upnp::Protocol::Udp,
+                            description: "ConquerD QUIC".to_string(),
+                        });
+                    }
                     return true;
                 }
                 Err(e) => {
@@ -394,6 +475,40 @@ impl ConnectionManager {
                 pending.next_at = Instant::now() + peer_reconnect_backoff(pending.attempts);
             }
             self.connect_direct_quic(&peer_id, &host, port).await;
+        }
+
+        // Peers with nothing dialable never enter the reconnect schedule at
+        // all — there is no address to retry — so without this they would get
+        // one hole-punch attempt at startup and never another. A peer that
+        // came online later, or moved networks, would stay unreachable for the
+        // life of the process.
+        //
+        // Registering is cheap and self-limiting: `request_hole_punch` refuses
+        // to re-register inside the supernode's own 30s rendezvous window, so
+        // this tick contributes at most one message per peer per window.
+        let stranded: Vec<String> = {
+            let store = self.peer_store.read();
+            store
+                .auto_connect_peers()
+                .into_iter()
+                .filter(|record| !record.is_supernode)
+                .filter(|record| {
+                    !peer_quic_endpoints(record)
+                        .iter()
+                        .any(|(host, _)| !is_local_only_host(host))
+                })
+                .map(|record| record.peer_id.clone())
+                .collect()
+        };
+        for peer_id in stranded {
+            let connected = self
+                .peers
+                .get(&peer_id)
+                .map(|p| p.state != PeerConnectionState::Disconnected)
+                .unwrap_or(false);
+            if !connected {
+                self.request_hole_punch(&peer_id).await;
+            }
         }
     }
 
@@ -764,5 +879,281 @@ impl ConnectionManager {
             crate::session_state::VoiceMode::None,
         );
         self.emit_event(ConnectionEvent::SessionStateUpdate(state));
+    }
+    // -----------------------------------------------------------------------
+    // NAT hole punching
+    // -----------------------------------------------------------------------
+
+    /// Ask a trusted supernode to coordinate a hole punch with `peer_id`.
+    ///
+    /// This is what makes a direct session possible between two peers who are
+    /// both behind NAT and neither of whom has forwarded a port — the common
+    /// case, and one that no amount of address advertising fixes on its own,
+    /// because neither side has a mapping the other can reach until both send
+    /// outward at roughly the same time.
+    ///
+    /// Registering is a rendezvous rather than a request: the supernode holds
+    /// it for 30s waiting for the other side, then hands both peers each
+    /// other's observed address and a shared `punch_at`. So it is worth doing
+    /// early and exactly once per attempt, which `punch_registered` enforces.
+    ///
+    /// The endpoint offered here is a best guess. The supernode is expected to
+    /// prefer the address it actually observes for us, which is the only one
+    /// that is correct behind carrier-grade NAT — there, the router's own
+    /// "external" address is itself private. Offering the LAN hint when
+    /// nothing better is known still helps two peers on one network.
+    pub(in crate::connection_manager) async fn request_hole_punch(&mut self, peer_id: &str) {
+        if peer_id.is_empty() || peer_id == self.identity.public_id() {
+            return;
+        }
+        // A registration already in flight has not expired at the supernode
+        // yet, so re-sending would only churn its pair table.
+        if let Some(at) = self.punch_registered.get(peer_id) {
+            if at.elapsed() < PUNCH_REGISTRATION_TTL {
+                return;
+            }
+        }
+
+        let connected: std::collections::HashSet<String> = self
+            .supernodes
+            .iter()
+            .filter(|(_, sn)| sn.connected)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let trusted: Vec<String> = {
+            let store = self.peer_store.read();
+            store
+                .supernodes()
+                .iter()
+                .map(|r| r.identity_pub.clone())
+                .collect()
+        };
+        let supernode_id = crate::connection_fallback::DirectFallbackCoordinator::pick_supernode(
+            trusted.iter().map(String::as_str),
+            &connected,
+        );
+        if supernode_id.is_empty() {
+            debug!(
+                "[punch] no trusted supernode to coordinate with for {}",
+                &peer_id[..8.min(peer_id.len())]
+            );
+            return;
+        }
+
+        // Prefer whatever the outside world has already told us about us.
+        let sender_endpoint = self
+            .public_quic_hint
+            .clone()
+            .or_else(|| self.local_quic_hint())
+            .and_then(|hint| parse_quic_lan_hint(&hint).map(|(h, p)| format!("{h}:{p}")));
+        let Some(sender_endpoint) = sender_endpoint else {
+            debug!("[punch] no local endpoint to offer yet");
+            return;
+        };
+
+        let mut msg = SignalingMessage::new(MessageType::PunchRegister, self.identity.public_id());
+        msg.target = Some(supernode_id.clone());
+        msg.payload
+            .insert("target_peer".into(), Value::String(peer_id.to_owned()));
+        msg.payload
+            .insert("sender_endpoint".into(), Value::String(sender_endpoint));
+
+        info!(
+            "[punch] registering with {} to reach {}",
+            &supernode_id[..12.min(supernode_id.len())],
+            &peer_id[..8.min(peer_id.len())]
+        );
+        self.punch_registered
+            .insert(peer_id.to_owned(), Instant::now());
+        self.dispatch_outbound(msg).await;
+    }
+
+    /// Both peers registered, so the supernode has handed us the other side's
+    /// observed address and a moment to dial it.
+    ///
+    /// Nothing is dialed here. The entire value of the exchange is that both
+    /// peers transmit at nearly the same time, so the dial is deferred to
+    /// `punch_at` through [`InternalEvent::PunchNow`].
+    pub(in crate::connection_manager) fn handle_punch_ready(&mut self, msg: &SignalingMessage) {
+        // Only a supernode we hold a live session with may steer our UDP
+        // traffic. Without this, one signed message would be enough to point
+        // the client at an arbitrary host and use it as a probe.
+        if !self
+            .supernodes
+            .get(&msg.sender)
+            .map(|sn| sn.connected)
+            .unwrap_or(false)
+        {
+            warn!(
+                "[punch] PUNCH_READY from non-session sender {} — ignored",
+                &msg.sender[..12.min(msg.sender.len())]
+            );
+            return;
+        }
+
+        let peer_id = msg
+            .payload
+            .get("peer_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if peer_id.is_empty() {
+            return;
+        }
+        // Punching toward someone we have never heard of is not a connection
+        // we were trying to make.
+        if !self.peer_store.read().contains(&peer_id) {
+            warn!(
+                "[punch] PUNCH_READY names unknown peer {} — ignored",
+                &peer_id[..8.min(peer_id.len())]
+            );
+            return;
+        }
+
+        // Our own mapping as the supernode observes it. This is the only
+        // address that is correct behind carrier-grade NAT, so it outranks
+        // anything a UPnP gateway reported about itself.
+        if let Some(addr) = msg
+            .payload
+            .get("your_endpoint")
+            .and_then(Value::as_str)
+            .and_then(parse_punch_endpoint)
+        {
+            let hint = format!("quic://{}:{}", addr.ip(), addr.port());
+            if self.public_quic_hint.as_deref() != Some(hint.as_str()) {
+                info!("[punch] observed public address {hint}");
+                self.public_quic_hint = Some(hint);
+            }
+        }
+
+        let Some(target) = msg
+            .payload
+            .get("peer_endpoint")
+            .and_then(Value::as_str)
+            .and_then(parse_punch_endpoint)
+        else {
+            warn!("[punch] PUNCH_READY carried no dialable peer endpoint");
+            return;
+        };
+
+        // `punch_at` is absolute unix seconds decided by the supernode.
+        // Trusting it blindly would let clock skew — or a hostile value — park
+        // a dial far in the future, so the wait is clamped.
+        let now = super::unix_now_f64();
+        let punch_at = msg
+            .payload
+            .get("punch_at")
+            .and_then(Value::as_f64)
+            .unwrap_or(now);
+        let delay = Duration::from_secs_f64((punch_at - now).clamp(0.0, PUNCH_MAX_DELAY_S));
+
+        let internal_tx = self.internal_tx.clone();
+        let host = target.ip().to_string();
+        let port = target.port();
+        let peer_for_task = peer_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = internal_tx
+                .send(InternalEvent::PunchNow {
+                    peer_id: peer_for_task,
+                    host,
+                    port,
+                })
+                .await;
+        });
+        debug!(
+            "[punch] {} scheduled in {:.0}ms",
+            &peer_id[..8.min(peer_id.len())],
+            delay.as_secs_f64() * 1000.0
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_local_only_host, parse_punch_endpoint, peer_quic_endpoints};
+    use crate::peer_store::PeerRecord;
+
+    fn record(hints: &[&str], quic_port: u16) -> PeerRecord {
+        PeerRecord {
+            peer_id: "peer".to_owned(),
+            relay_hints: hints.iter().map(|h| (*h).to_owned()).collect(),
+            quic_port,
+            ..Default::default()
+        }
+    }
+
+    /// The regression this ordering exists for: loopback used to be the sole
+    /// fallback, so a peer with a real address but no parseable hint was
+    /// dialed at 127.0.0.1 forever.
+    #[test]
+    fn a_real_address_outranks_loopback() {
+        let rec = record(&["quic://203.0.113.7:9000"], 9000);
+        let got = peer_quic_endpoints(&rec);
+        assert_eq!(got.first(), Some(&("203.0.113.7".to_owned(), 9000)));
+        assert_eq!(
+            got.last(),
+            Some(&("127.0.0.1".to_owned(), 9000)),
+            "loopback stays available for two profiles on one machine"
+        );
+    }
+
+    /// Both hints are kept: which one works depends on where the dial is made
+    /// from, and that is not knowable here.
+    #[test]
+    fn lan_and_public_hints_are_both_offered_lan_first() {
+        let rec = record(
+            &["quic://192.168.1.5:9000", "quic://203.0.113.7:9000"],
+            9000,
+        );
+        let got = peer_quic_endpoints(&rec);
+        assert_eq!(
+            got[..2],
+            [
+                ("192.168.1.5".to_owned(), 9000),
+                ("203.0.113.7".to_owned(), 9000)
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_hints_are_collapsed() {
+        let rec = record(&["quic://192.168.1.5:9000", "quic://192.168.1.5:9000"], 0);
+        assert_eq!(peer_quic_endpoints(&rec).len(), 1);
+    }
+
+    #[test]
+    fn a_peer_with_nothing_known_offers_nothing() {
+        assert!(peer_quic_endpoints(&record(&[], 0)).is_empty());
+    }
+
+    /// Drives the "should we spend a hole punch?" decision, so a wrong answer
+    /// here either wastes a round trip or strands the peer forever.
+    #[test]
+    fn only_loopback_and_wildcard_count_as_local_only() {
+        assert!(is_local_only_host("127.0.0.1"));
+        assert!(is_local_only_host("0.0.0.0"));
+        assert!(is_local_only_host("::1"));
+        assert!(!is_local_only_host("192.168.1.5"));
+        assert!(!is_local_only_host("203.0.113.7"));
+        // Not an IP at all — a hostname is something we can still dial.
+        assert!(!is_local_only_host("peer.example"));
+    }
+
+    #[test]
+    fn punch_endpoints_that_would_make_us_a_probe_are_refused() {
+        assert!(parse_punch_endpoint("127.0.0.1:9000").is_none());
+        assert!(parse_punch_endpoint("0.0.0.0:9000").is_none());
+        assert!(parse_punch_endpoint("203.0.113.7:0").is_none());
+        assert!(parse_punch_endpoint("239.1.1.1:9000").is_none());
+        assert!(parse_punch_endpoint("not-an-address").is_none());
+        assert!(parse_punch_endpoint("").is_none());
+    }
+
+    #[test]
+    fn an_ordinary_punch_endpoint_parses() {
+        let got = parse_punch_endpoint(" 203.0.113.7:9000 ").expect("valid");
+        assert_eq!(got.ip().to_string(), "203.0.113.7");
+        assert_eq!(got.port(), 9000);
     }
 }

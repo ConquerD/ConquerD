@@ -36,7 +36,6 @@ use conquerd_client::{
     protocol,
     room_store::RoomStore,
     sfu_client::SfuClient,
-    upnp,
 };
 #[cfg(not(feature = "qt-ui"))]
 use parking_lot::RwLock;
@@ -333,12 +332,6 @@ async fn headless_main() {
     tokio::spawn(updater_fut);
 
     // ------------------------------------------------------------------
-    // UPnP manager
-    // ------------------------------------------------------------------
-    let (upnp_cmd_tx, _upnp_event_rx, upnp_fut) = upnp::UPnPManager::split();
-    tokio::spawn(upnp_fut);
-
-    // ------------------------------------------------------------------
     // Ollama AI module (settings-driven; same flags as the Qt UI)
     // ------------------------------------------------------------------
     let ollama_settings = ollama_module::read_assistant_settings();
@@ -380,7 +373,6 @@ async fn headless_main() {
         peer_store,
         room_store,
         Arc::clone(&identity),
-        upnp_cmd_tx,
         updater_cmd_tx,
         ollama_cmd_tx,
         ollama_event_rx,
@@ -587,7 +579,6 @@ async fn run_headless(
     peer_store: Arc<RwLock<PeerStore>>,
     room_store: Arc<RwLock<RoomStore>>,
     identity: Arc<Identity>,
-    upnp_cmd_tx: mpsc::Sender<upnp::UpnpCommand>,
     updater_cmd_tx: mpsc::Sender<github_updater::UpdaterCommand>,
     ollama_cmd_tx: mpsc::Sender<ollama_module::OllamaCommand>,
     mut ollama_event_rx: mpsc::Receiver<ollama_module::OllamaEvent>,
@@ -677,7 +668,6 @@ async fn run_headless(
             _ = &mut ctrl_c => {
                 info!("Shutdown signal received");
                 let _ = cmd_tx.send(ConnectionCommand::Shutdown).await;
-                let _ = upnp_cmd_tx.send(upnp::UpnpCommand::Shutdown).await;
                 let _ = updater_cmd_tx.send(github_updater::UpdaterCommand::Shutdown).await;
                 let _ = ollama_cmd_tx.send(ollama_module::OllamaCommand::Shutdown).await;
                 break;
@@ -690,7 +680,6 @@ async fn run_headless(
                     &room_store,
                     &identity,
                     &cmd_tx,
-                    &upnp_cmd_tx,
                     &call_cmd_tx,
                     &ollama_cmd_tx,
                     &mut auto_pending,
@@ -849,7 +838,6 @@ async fn handle_event(
     room_store: &RwLock<RoomStore>,
     identity: &Identity,
     cmd_tx: &mpsc::Sender<ConnectionCommand>,
-    upnp_cmd_tx: &mpsc::Sender<upnp::UpnpCommand>,
     call_cmd_tx: &mpsc::Sender<call_controller::CallCommand>,
     ollama_cmd_tx: &mpsc::Sender<ollama_module::OllamaCommand>,
     auto_pending: &mut HashMap<String, HeadlessAutoTarget>,
@@ -1106,13 +1094,6 @@ async fn handle_event(
                 "Relay granted by {} at {}:{}",
                 supernode_id, relay_host, relay_port
             );
-            // Request UPnP mapping for the relay port so peers can reach us
-            let _ = upnp_cmd_tx.try_send(upnp::UpnpCommand::AddMapping {
-                internal_port: relay_port,
-                external_port: relay_port,
-                protocol: upnp::Protocol::Udp,
-                description: "ConquerD QUIC relay".to_string(),
-            });
         }
         ConnectionEvent::RoomChatMessage {
             supernode_id,

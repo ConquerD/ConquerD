@@ -1330,15 +1330,32 @@ impl SupernodeState {
                 endpoints: HashMap::new(),
             });
 
+        // What the peer claims about itself is a guess; what we observe is a
+        // measurement. Prefer the measurement.
+        //
+        // The client dials peers from the same UDP socket it uses for this
+        // supernode's QUIC relay, so the source address on that connection is
+        // exactly the NAT mapping the other peer has to aim at. The peer
+        // cannot discover that address by itself -- behind carrier-grade NAT
+        // even its router's "external" address is private -- which is what
+        // makes a self-reported endpoint unusable on precisely the networks
+        // that need punching most.
+        let effective_endpoint = self
+            .relay
+            .as_ref()
+            .and_then(|relay| relay.get_peer_remote_addr(sender))
+            .map(|addr| format!("{}:{}", addr.ip(), addr.port()))
+            .unwrap_or_else(|| sender_endpoint.to_string());
+
         entry
             .endpoints
-            .insert(sender.to_string(), sender_endpoint.to_string());
+            .insert(sender.to_string(), effective_endpoint.clone());
 
         info!(
             "[punch] Registration from {} → {} (endpoint={})",
             &sender[..12.min(sender.len())],
             &target_peer[..12.min(target_peer.len())],
-            sender_endpoint,
+            effective_endpoint,
         );
 
         // Check if both peers have registered

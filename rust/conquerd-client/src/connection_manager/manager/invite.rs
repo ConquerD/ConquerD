@@ -309,6 +309,14 @@ impl ConnectionManager {
             msg.payload
                 .insert("joiner_lan_hint".into(), Value::String(hint));
         }
+        // Sent alongside the LAN hint rather than instead of it: the two are
+        // right in different places, and the peer keeps both. Older builds
+        // that do not read this field simply fall back to the LAN hint, which
+        // is what they did before it existed.
+        if let Some(hint) = self.public_quic_hint.clone() {
+            msg.payload
+                .insert("joiner_public_hint".into(), Value::String(hint));
+        }
         msg
     }
 
@@ -733,6 +741,14 @@ impl ConnectionManager {
         if let Some(hint) = self.local_quic_hint() {
             msg.payload
                 .insert("joiner_lan_hint".into(), Value::String(hint));
+        }
+        // Sent alongside the LAN hint rather than instead of it: the two are
+        // right in different places, and the peer keeps both. Older builds
+        // that do not read this field simply fall back to the LAN hint, which
+        // is what they did before it existed.
+        if let Some(hint) = self.public_quic_hint.clone() {
+            msg.payload
+                .insert("joiner_public_hint".into(), Value::String(hint));
         }
 
         if let Ok(canonical) = msg.canonical_bytes() {

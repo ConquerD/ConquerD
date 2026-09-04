@@ -287,6 +287,9 @@ impl ConnectionManager {
                 debug!("Pong from {}", msg.sender);
                 self.record_supernode_pong(&msg.sender);
             }
+            MessageType::PunchReady => {
+                self.handle_punch_ready(&msg);
+            }
             MessageType::ChatMessage => {
                 let sender_peer_id = self.canonical_peer_id_for_sender(&msg.sender);
                 // Approximate payload size for the chat-feature quota.
@@ -1425,6 +1428,17 @@ impl ConnectionManager {
                     .filter(|hint| parse_quic_lan_hint(hint).is_some())
                     .unwrap_or("")
                     .to_owned();
+                // The joiner's address as reachable from outside their NAT,
+                // when they know one. Stored next to the LAN hint because
+                // which of the two works depends on where we are dialing
+                // from, and that is decided at dial time, not here.
+                let joiner_public_hint = msg
+                    .payload
+                    .get("joiner_public_hint")
+                    .and_then(Value::as_str)
+                    .filter(|hint| parse_quic_lan_hint(hint).is_some())
+                    .unwrap_or("")
+                    .to_owned();
                 if let Some(ref transport_peer_id) = quic_peer_id {
                     self.relabel_quic_peer_session(transport_peer_id, &joiner_peer_id);
                 }
@@ -1453,16 +1467,21 @@ impl ConnectionManager {
                         {
                             record.relay_hints.push(joiner_lan_hint.clone());
                         }
+                        if !joiner_public_hint.is_empty()
+                            && !record.relay_hints.contains(&joiner_public_hint)
+                        {
+                            record.relay_hints.push(joiner_public_hint.clone());
+                        }
                     } else {
                         store.upsert(crate::peer_store::PeerRecord {
                             peer_id: joiner_peer_id.clone(),
                             identity_pub: joiner_identity_pub.clone(),
                             handle: joiner_handle.clone(),
-                            relay_hints: if joiner_lan_hint.is_empty() {
-                                vec![]
-                            } else {
-                                vec![joiner_lan_hint.clone()]
-                            },
+                            relay_hints: [&joiner_lan_hint, &joiner_public_hint]
+                                .into_iter()
+                                .filter(|h| !h.is_empty())
+                                .cloned()
+                                .collect(),
                             auto_connect: true,
                             quic_port: joiner_quic_port,
                             created_at: unix_now_f64(),

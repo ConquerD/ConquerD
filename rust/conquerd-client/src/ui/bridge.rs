@@ -1965,7 +1965,6 @@ impl ffi::AppBridge {
             crate::call_controller::CallController::split(Some(conn_cmd_tx.clone()));
         let (sfu_cmd_tx, _sfu_event_rx, sfu_fut) =
             crate::sfu_client::SfuClient::split(Some(conn_cmd_tx.clone()));
-        let (_upnp_cmd_tx, _upnp_event_rx, upnp_fut) = crate::upnp::UPnPManager::split();
         let installer_path = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("conquerd-installer.exe")));
@@ -2101,7 +2100,6 @@ impl ffi::AppBridge {
                     tokio::spawn(conn_fut);
                     tokio::spawn(call_fut);
                     tokio::spawn(sfu_fut);
-                    tokio::spawn(upnp_fut);
                     tokio::spawn(updater_fut);
 
                     // Spawn Ollama task if the plugin is enabled.

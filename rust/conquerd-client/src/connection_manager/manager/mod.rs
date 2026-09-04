@@ -293,6 +293,29 @@ pub struct ConnectionManager {
     pending_peer_reconnects: HashMap<String, peer_session::PendingPeerReconnect>,
     /// Direct-call → temporary private SFU room fallback state machine.
     direct_fallback: DirectFallbackCoordinator,
+
+    /// Our own QUIC address as seen from outside this NAT, once something has
+    /// told us: a supernode's `PUNCH_READY` (`your_endpoint`) or a UPnP
+    /// gateway mapping. Advertised to peers alongside the LAN hint so they
+    /// have something dialable from another network.
+    ///
+    /// Learned rather than configured because the two sources disagree about
+    /// which is authoritative: UPnP knows the router's external address, while
+    /// the supernode reports the mapping it actually observes — and only the
+    /// latter is correct behind carrier-grade NAT, where the router's
+    /// "external" address is itself private.
+    public_quic_hint: Option<String>,
+    /// Peers we have registered for a hole punch, with when. Registration is
+    /// a rendezvous: the supernode holds it for 30s waiting for the other
+    /// side, so re-sending on every reconnect tick would churn its table
+    /// without making a punch any more likely.
+    punch_registered: HashMap<String, Instant>,
+    /// Command channel to the UPnP port-mapping task, once `run_inner` has
+    /// started it. Owned here rather than by the entry points because the
+    /// port worth mapping is the QUIC listener's, which this manager binds —
+    /// and both the Qt and headless front ends would otherwise have to
+    /// duplicate the wiring and keep it in step.
+    upnp_cmd: Option<mpsc::Sender<crate::upnp::UpnpCommand>>,
     /// Callee accepted our call but no direct QUIC session exists yet: peer →
     /// deadline after which [`Self::start_direct_call_fallback`] fires. Checked
     /// on the 1 s reconnect tick; cleared on QUIC connect or call end.
@@ -451,6 +474,9 @@ impl ConnectionManager {
             pending_group_key_acks: HashMap::new(),
             pending_peer_reconnects: HashMap::new(),
             direct_fallback: DirectFallbackCoordinator::new(),
+            public_quic_hint: None,
+            punch_registered: HashMap::new(),
+            upnp_cmd: None,
             pending_call_fallback_checks: HashMap::new(),
             pending_room_join_retries: HashMap::new(),
         };
@@ -686,6 +712,37 @@ impl ConnectionManager {
     pub(super) async fn run_inner(mut self) {
         info!("ConnectionManager started");
 
+        // Started before the QUIC endpoint is bound so a gateway is usually
+        // discovered by the time there is a port worth mapping. Discovery is
+        // best effort in every sense: a router with UPnP disabled, or an ISP
+        // running carrier-grade NAT, simply never produces a usable mapping,
+        // and the hole-punch path carries those networks instead.
+        {
+            let (upnp_cmd, mut upnp_events, upnp_fut) = crate::upnp::UPnPManager::split();
+            tokio::spawn(upnp_fut);
+            let internal_tx = self.internal_tx.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = upnp_events.recv().await {
+                    match ev {
+                        crate::upnp::UpnpEvent::GatewayDiscovered { external_ip } => {
+                            let _ = internal_tx
+                                .send(InternalEvent::UpnpGateway { external_ip })
+                                .await;
+                        }
+                        crate::upnp::UpnpEvent::MappingAdded { external_port, .. } => {
+                            info!("[upnp] mapped external port {external_port}");
+                        }
+                        crate::upnp::UpnpEvent::Unavailable => {
+                            debug!("[upnp] no gateway on this network");
+                        }
+                        crate::upnp::UpnpEvent::Error(e) => debug!("[upnp] {e}"),
+                        crate::upnp::UpnpEvent::MappingRemoved { .. } => {}
+                    }
+                }
+            });
+            self.upnp_cmd = Some(upnp_cmd);
+        }
+
         // Every direct-P2P profile keeps a stable listener port when possible.
         // Multiple local profiles naturally occupy consecutive ports.
         let (direct_p2p_enabled, direct_p2p_port) = load_direct_p2p_settings();
@@ -697,20 +754,34 @@ impl ConnectionManager {
 
         // Reconnect trusted direct peers that were accepted with an endpoint.
         if direct_p2p_enabled {
-            let direct_peers: Vec<(String, String, u16)> = {
+            let direct_peers: Vec<(String, Vec<(String, u16)>)> = {
                 let store = self.peer_store.read();
                 store
                     .auto_connect_peers()
                     .into_iter()
                     .filter(|record| !record.is_supernode)
-                    .filter_map(|record| {
-                        let (host, port) = peer_session::peer_quic_endpoint(record)?;
-                        Some((record.peer_id.clone(), host, port))
+                    .map(|record| {
+                        (
+                            record.peer_id.clone(),
+                            peer_session::peer_quic_endpoints(record),
+                        )
                     })
                     .collect()
             };
-            for (peer_id, host, port) in direct_peers {
-                self.connect_direct_quic(&peer_id, &host, port).await;
+            for (peer_id, candidates) in direct_peers {
+                // A peer whose only known address is loopback is not reachable
+                // from here at all: dialing it would fail on every reconnect
+                // tick and never improve. That is exactly the case a hole
+                // punch exists for, so spend the round trip instead.
+                let reachable = candidates
+                    .iter()
+                    .any(|(host, _)| !peer_session::is_local_only_host(host));
+                if !reachable {
+                    self.request_hole_punch(&peer_id).await;
+                }
+                if let Some((host, port)) = candidates.into_iter().next() {
+                    self.connect_direct_quic(&peer_id, &host, port).await;
+                }
             }
         }
 
@@ -768,6 +839,11 @@ impl ConnectionManager {
                     match cmd {
                         ConnectionCommand::Shutdown => {
                             info!("ConnectionManager shutting down");
+                            // Leaving a mapping behind would hold a hole open
+                            // in the user's router until its lease expires.
+                            if let Some(tx) = &self.upnp_cmd {
+                                let _ = tx.try_send(crate::upnp::UpnpCommand::RemoveAll);
+                            }
                             if let Some(ep) = &self.quic_endpoint {
                                 ep.close(0u32.into(), b"shutdown");
                             }
@@ -1779,6 +1855,45 @@ impl ConnectionManager {
                         self.quic_relays.remove(&supernode_id);
                     }
                 }
+            }
+            InternalEvent::UpnpGateway { external_ip } => {
+                // Never overwrites an address a supernode observed for us:
+                // that one is measured from outside, while this is only what
+                // the local router believes about itself.
+                let Some(port) = self
+                    .quic_endpoint
+                    .as_ref()
+                    .and_then(|ep| ep.local_addr().ok())
+                    .map(|addr| addr.port())
+                else {
+                    return;
+                };
+                let hint = format!("quic://{external_ip}:{port}");
+                if self.public_quic_hint.is_none() {
+                    info!("[upnp] external address {hint}");
+                    self.public_quic_hint = Some(hint);
+                }
+            }
+            InternalEvent::PunchNow {
+                peer_id,
+                host,
+                port,
+            } => {
+                // Both sides fire within a few tens of milliseconds of each
+                // other, so whichever packet leaves first opens the local NAT
+                // mapping that lets the other one in. Nothing here needs to
+                // know which of the two connections wins: `connect_direct_quic`
+                // already refuses to stack a second dial on a peer that is
+                // connecting or connected, and an inbound QUIC session that
+                // beats us to it takes that guard.
+                info!(
+                    "[punch] dialing {}:{} for peer {}",
+                    host,
+                    port,
+                    &peer_id[..8.min(peer_id.len())]
+                );
+                self.connect_direct_quic(&peer_id, &host, port).await;
+                self.emit_peer_session_state(&peer_id);
             }
         }
     }
