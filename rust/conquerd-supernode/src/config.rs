@@ -14,11 +14,6 @@ pub struct Config {
     pub chat_enabled: bool,
     pub files_enabled: bool,
     pub sfu_enabled: bool,
-    #[allow(dead_code)]
-    pub updates_enabled: bool,
-    #[allow(dead_code)]
-    pub auto_restart: bool,
-
     // Invite
     pub invite_ttl_seconds: i64, // -1 = never expires
 
@@ -72,8 +67,6 @@ impl Config {
             chat_enabled: env_bool("supernode_chat", true),
             files_enabled: env_bool("supernode_files", true),
             sfu_enabled: env_bool("supernode_sfu", true),
-            updates_enabled: env_bool("supernode_updates", true),
-            auto_restart: env_bool("supernode_auto_restart", true),
             invite_ttl_seconds,
             web_title: env::var("supernode_web_title").unwrap_or_else(|_| "Relay Node".into()),
             access_mode: match env::var("supernode_access_mode")

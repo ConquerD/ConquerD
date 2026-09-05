@@ -6937,19 +6937,6 @@ fn enrich_room_voice_participants(
             known.sort();
 
             let unknown = voice_count.saturating_sub(known.len());
-            // TEMP DIAGNOSTIC (voice tooltip Known/Unknown) — remove after triage.
-            if voice_count > 0 {
-                info!(
-                    "[voice-tooltip] room={} has_id_list={} voice_count={} my_pub={} pids={:?} known={:?} unknown={}",
-                    obj.get("room_id").and_then(|v| v.as_str()).unwrap_or("?"),
-                    has_id_list,
-                    voice_count,
-                    my_public_id,
-                    participant_ids,
-                    known,
-                    unknown,
-                );
-            }
             obj.insert(
                 "known_peers".to_owned(),
                 serde_json::Value::Array(

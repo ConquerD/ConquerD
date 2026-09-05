@@ -140,7 +140,7 @@ impl InvitePayload {
     }
 
     /// Verify the signature.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn verify(&self) -> bool {
         let Some(ref sig_b64) = self.signature else {
             return false;
@@ -163,13 +163,11 @@ impl InvitePayload {
     }
 }
 
-/// State for a pending handshake (one per invite_id).
-#[allow(dead_code)]
+/// State for a pending handshake (one per invite_id), keyed by `invite_id`
+/// in `HandshakeManager::pending`.
 pub struct PendingInvite {
-    pub invite_id: String,
     pub ephemeral_secret: x25519_dalek::StaticSecret,
     pub ephemeral_public: x25519_dalek::PublicKey,
-    pub created_at: f64,
     /// Unix timestamp after which this invite is no longer valid.
     pub expires_at: i64,
 }
@@ -239,10 +237,8 @@ impl HandshakeManager {
         self.pending.insert(
             invite_id.clone(),
             PendingInvite {
-                invite_id,
                 ephemeral_secret: secret,
                 ephemeral_public: public,
-                created_at: now as f64,
                 expires_at,
             },
         );
@@ -430,17 +426,11 @@ impl HandshakeManager {
     ) {
         let secret = x25519_dalek::StaticSecret::from(ephemeral_secret_bytes);
         let public = x25519_dalek::PublicKey::from(&secret);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
         self.pending.insert(
-            invite_id.clone(),
+            invite_id,
             PendingInvite {
-                invite_id,
                 ephemeral_secret: secret,
                 ephemeral_public: public,
-                created_at: now,
                 expires_at,
             },
         );

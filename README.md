@@ -648,8 +648,6 @@ Prefer `supernode.toml` for capability advertisement (see [Enabling Features on 
 | `supernode_chat` | `1` | Report chat as enabled in stats (`0` to hide) |
 | `supernode_files` | `1` | Report files as enabled in stats (`0` to hide) |
 | `supernode_sfu` | `1` | Start the in-process SFU room manager (`0` to disable) |
-| `supernode_updates` | `1` | Enable P2P auto-update distribution (`0` to disable) |
-| `supernode_auto_restart` | `1` | Auto-restart after applying an update (`0` to disable) |
 
 #### Portal / Access Control Settings
 

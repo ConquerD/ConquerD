@@ -718,8 +718,6 @@ mod tests {
             chat_enabled: true,
             files_enabled: true,
             sfu_enabled: true,
-            updates_enabled: false,
-            auto_restart: false,
             invite_ttl_seconds: -1,
             web_title: String::new(),
             access_mode: crate::config::AccessMode::Open,

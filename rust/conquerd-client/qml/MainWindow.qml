@@ -362,16 +362,29 @@ ApplicationWindow {
         return room.chat_count !== undefined && room.chat_count !== null
     }
 
-    function roomKnownPeers(room) {
-        if (!room.known_peers || !Array.isArray(room.known_peers))
+    // Normalize a list of peer names that may arrive either as a real JS array
+    // (JSON.parse of a room patch) or as a delegate `var` role. A QVariantList
+    // reaches QML as a sequence wrapper: it indexes and has `.length`, but
+    // `Array.isArray()` is false for it, so testing with Array.isArray() silently
+    // discards a perfectly good roster. Walk `.length` instead.
+    function nameList(value) {
+        if (value === undefined || value === null)
+            return []
+        if (typeof value === "string")
+            return value.trim() === "" ? [] : [value.trim()]
+        if (typeof value.length !== "number")
             return []
         var out = []
-        for (var i = 0; i < room.known_peers.length; i++) {
-            var name = String(room.known_peers[i] || "").trim()
+        for (var i = 0; i < value.length; i++) {
+            var name = String(value[i] || "").trim()
             if (name !== "")
                 out.push(name)
         }
         return out
+    }
+
+    function roomKnownPeers(room) {
+        return root.nameList(room.known_peers)
     }
 
     function roomUnknownPeerCount(room, voiceCount, knownPeers) {
@@ -2064,10 +2077,11 @@ ApplicationWindow {
                                             required property bool chat_count_known
                                             required property var known_peers
                                             required property int unknown_peers
+                                            // Model roles carry the roster as a
+                                            // QVariantList sequence, not a JS Array —
+                                            // normalize rather than type-test it.
                                             readonly property var knownPeers:
-                                                Array.isArray(roomDelegate.known_peers)
-                                                    ? roomDelegate.known_peers
-                                                    : []
+                                                root.nameList(roomDelegate.known_peers)
                                             // Derive Unknown from the same voice_count the badge shows
                                             // (minus the named/known peers) so the tooltip can never
                                             // disagree with the number on the bubble — named peers +
@@ -2318,17 +2332,6 @@ ApplicationWindow {
                                                             id: roomVoicePopup
                                                             parent: roomVoiceBubble
                                                             visible: roomStatsHover.hovered
-                                                            // TEMP DIAGNOSTIC — dump what the delegate actually
-                                                            // received for this room. Remove after triage.
-                                                            onVisibleChanged: if (visible) backend.logEvent(
-                                                                "[qml-tooltip] room=" + roomDelegate.room_id
-                                                                + " vc=" + roomDelegate.voice_count
-                                                                + " kp_typeof=" + (typeof roomDelegate.known_peers)
-                                                                + " kp_isArr=" + Array.isArray(roomDelegate.known_peers)
-                                                                + " kp=" + JSON.stringify(roomDelegate.known_peers)
-                                                                + " up_role=" + roomDelegate.unknown_peers
-                                                                + " knownPeersLen=" + roomDelegate.knownPeers.length
-                                                                + " unknownPeers=" + roomDelegate.unknownPeers)
                                                             modal: false
                                                             focus: false
                                                             closePolicy: Popup.NoAutoClose

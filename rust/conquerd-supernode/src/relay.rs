@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -27,14 +27,12 @@ const MAX_PEERS: usize = 255;
 /// Peer cleanup interval.
 const CLEANUP_INTERVAL_S: u64 = 60;
 
-/// State for a connected relay peer.
-#[allow(dead_code)]
+/// State for a connected relay peer, keyed by `identity_pub` in
+/// [`RelayState::peers`].
 struct RelayPeer {
-    peer_id: String, // identity_pub (base64url)
-    peer_index: u8,  // 1-byte index (1-254)
+    peer_index: u8, // 1-byte index (1-254)
     connection: quinn::Connection,
     room_id: Option<String>,
-    connected_at: Instant,
     bytes_relayed: u64,
     remote_addr: SocketAddr,
 }
@@ -661,11 +659,9 @@ async fn handle_connection(
         st.peers.insert(
             peer_id.clone(),
             RelayPeer {
-                peer_id: peer_id.clone(),
                 peer_index: idx,
                 connection: connection.clone(),
                 room_id: existing_room,
-                connected_at: Instant::now(),
                 bytes_relayed: 0,
                 remote_addr,
             },

@@ -98,8 +98,6 @@ pub struct SFURoom {
     allowed: std::collections::HashSet<String>,
     /// Invite tokens: token → InviteToken
     invite_tokens: HashMap<String, InviteToken>,
-    #[allow(dead_code)]
-    pub created_at: f64,
     /// When the room last had zero voice participants and zero chat subscribers.
     /// `None` while the room is in use. Used for idle GC of peer-materialized rooms.
     empty_since: Option<f64>,
@@ -108,7 +106,10 @@ pub struct SFURoom {
 
 #[derive(Debug, Clone)]
 struct InviteToken {
-    #[allow(dead_code)]
+    /// Identity that minted this token. Retained as invite provenance and
+    /// threaded through `generate_invite_token` / `reregister_invite_token`;
+    /// no audit consumer reads it yet.
+    #[expect(dead_code, reason = "invite provenance, no reader yet")]
     created_by: String,
     uses: u32,
     max_uses: u32,
@@ -140,10 +141,6 @@ impl SFURoom {
             subscribers: std::collections::HashSet::new(),
             allowed: std::collections::HashSet::new(),
             invite_tokens: HashMap::new(),
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64(),
             empty_since: None,
             next_index: 1,
         }

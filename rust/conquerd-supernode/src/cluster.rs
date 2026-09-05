@@ -136,20 +136,18 @@ impl ClusterMembership {
     }
 
     /// Whether `identity_pub` is a member (authn gate for an inbound peer link).
-    #[allow(dead_code)] // intra-cluster link authentication (B.2)
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn is_member(&self, identity_pub: &str) -> bool {
         self.config.contains(identity_pub)
     }
 
     /// Whether `identity_pub` is *another* member (not this node).
-    #[allow(dead_code)] // intra-cluster link authentication (B.2)
     pub fn is_peer_member(&self, identity_pub: &str) -> bool {
         let id = norm(identity_pub);
         id != self.self_id && self.config.contains(id)
     }
 
     /// The other members this node should open replication links to.
-    #[allow(dead_code)] // dialed when intra-cluster links are established (B.2)
     pub fn peers(&self) -> impl Iterator<Item = &ClusterMember> {
         let self_id = self.self_id.clone();
         self.config
@@ -159,7 +157,6 @@ impl ClusterMembership {
     }
 
     /// This node's own entry in the roster, if listed.
-    #[allow(dead_code)] // used to resolve the local cluster_addr (B.2)
     pub fn self_member(&self) -> Option<&ClusterMember> {
         self.config
             .members
@@ -218,7 +215,7 @@ impl SignedClusterDescriptor {
     /// Verify the signature binds this roster to `signer`. This is the
     /// canonical, tested verifier; the supernode only ever *signs*, so the
     /// check is exercised by clients (and these tests) rather than the bin.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn verify(&self) -> bool {
         let membership = ClusterMembership::new(
             ClusterConfig {

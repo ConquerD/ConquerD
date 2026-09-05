@@ -339,7 +339,7 @@ impl ClusterLink {
     }
 
     /// Stop all background loops and close the cluster endpoint. Idempotent.
-    #[allow(dead_code)] // called on supernode shutdown / by integration tests
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn shutdown(&self) {
         self.shutdown.notify_waiters();
         if let Some(ep) = self.server_endpoint.read().clone() {
@@ -402,12 +402,6 @@ impl ClusterLink {
         for link in st.peers.values() {
             let _ = link.tx.send(frame.to_vec());
         }
-    }
-
-    /// Number of peer members with a live link (for stats/tests).
-    #[allow(dead_code)] // stats accessor / cross-member integration tests (B.6)
-    pub fn connected_peer_count(&self) -> usize {
-        self.state.read().peers.len()
     }
 
     /// IDs of peer members with a live link, used by the portal cluster stats.

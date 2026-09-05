@@ -9,6 +9,9 @@
 //!
 //! The cross-crate KAT ([`tests::kat_canonical_leaf_and_root_hashes`]) asserts
 //! the SAME hashes as the client's copy — the guard against silent divergence.
+// Supernode-side Space Merkle helpers. Exercised by this module's unit
+// tests but not yet constructed by the running binary — the authenticated
+// room tree is currently driven entirely from the client.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;

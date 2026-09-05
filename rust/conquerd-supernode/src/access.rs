@@ -17,11 +17,9 @@ pub trait AccessController: Send + Sync {
     fn check_access(&self, peer_id: &str) -> bool;
 
     /// Called after access is granted via portal.
-    #[allow(dead_code)]
     fn on_peer_granted(&self, _peer_id: &str) {}
 
     /// The portal entry path for this access mode.
-    #[allow(dead_code)]
     fn portal_entry_path(&self) -> &str {
         "/access.html"
     }
@@ -133,7 +131,7 @@ impl AccessController for AdGateAccessController {
 
 /// Requires entering an access code via web portal.
 pub struct CodeGateAccessController {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     code: String,
     granted: parking_lot::RwLock<HashSet<String>>,
 }
@@ -146,7 +144,7 @@ impl CodeGateAccessController {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn check_code(&self, submitted: &str) -> bool {
         submitted == self.code
     }

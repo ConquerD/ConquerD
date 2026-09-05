@@ -70,7 +70,7 @@ pub fn ed25519_verify(public_key_bytes: &[u8], signature_bytes: &[u8], data: &[u
 
 /// Sign `data` with a 32-byte Ed25519 seed, returning the 64-byte signature.
 /// `None` if `seed` is not 32 bytes. Used by `space.rs` tests (owner signing).
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
 pub fn ed25519_sign(seed: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     use ed25519_dalek::{Signer, SigningKey};
     let arr: [u8; 32] = seed.try_into().ok()?;

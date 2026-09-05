@@ -66,7 +66,7 @@ impl RelayTicket {
     }
 
     /// Verify ticket signature against the supernode's public key.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn verify(&self, verifying_key: &VerifyingKey) -> bool {
         if self.signature.len() != 64 {
             return false;
@@ -80,7 +80,7 @@ impl RelayTicket {
     }
 
     /// Check if ticket has expired.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn is_expired(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -90,7 +90,7 @@ impl RelayTicket {
     }
 
     /// Check if ticket needs renewal (within RENEWAL_WINDOW_S of expiry).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn needs_renewal(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

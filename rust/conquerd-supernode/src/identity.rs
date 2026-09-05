@@ -101,7 +101,6 @@ impl Identity {
     }
 
     /// Raw public key bytes.
-    #[allow(dead_code)]
     pub fn public_key_bytes(&self) -> &[u8; 32] {
         self.verifying_key.as_bytes()
     }

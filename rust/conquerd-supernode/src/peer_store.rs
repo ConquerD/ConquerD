@@ -139,7 +139,10 @@ impl PeerStore {
     }
 
     /// Revoke a peer.
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "only reachable via the unwired on_peer_revoked")
+    )]
     pub fn revoke_peer(&mut self, identity_pub: &str) {
         if let Some(key) = self.resolve_key(identity_pub) {
             if let Some(peer) = self.peers.get_mut(&key) {
@@ -149,7 +152,7 @@ impl PeerStore {
     }
 
     /// Remove a peer entirely.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn remove_peer(&mut self, identity_pub: &str) {
         if let Some(key) = self.resolve_key(identity_pub) {
             self.peers.remove(&key);
@@ -178,7 +181,7 @@ impl PeerStore {
     }
 
     /// Total number of peers (including revoked).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by unit tests only"))]
     pub fn total_count(&self) -> usize {
         self.peers.len()
     }
@@ -192,7 +195,6 @@ impl PeerStore {
     }
 
     /// Get all peer records.
-    #[allow(dead_code)]
     pub fn all_peers(&self) -> impl Iterator<Item = &PeerRecord> {
         self.peers.values()
     }

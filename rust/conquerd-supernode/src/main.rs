@@ -1139,7 +1139,12 @@ impl SupernodeState {
     }
 
     /// Revoke a peer's relay access.
-    #[allow(dead_code)]
+    ///
+    /// UNREACHABLE: nothing calls this, so `PeerRecord::revoked` can never
+    /// become true at runtime even though trust checks all honour it
+    /// (`is_trusted`, `active_peers`). Revocation is unimplemented, not
+    /// dead — wire this to an operator/admin command rather than deleting it.
+    #[expect(dead_code, reason = "revocation entry point is not wired up yet")]
     fn on_peer_revoked(&self, identity_pub: &str) {
         info!(
             "Trust revoked for {}",
@@ -4369,8 +4374,6 @@ mod build_feature_registry_tests {
             chat_enabled: true,
             files_enabled: true,
             sfu_enabled: true,
-            updates_enabled: false,
-            auto_restart: false,
             invite_ttl_seconds: -1,
             web_title: String::new(),
             access_mode: crate::config::AccessMode::Open,

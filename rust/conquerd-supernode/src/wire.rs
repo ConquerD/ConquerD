@@ -1,19 +1,8 @@
 // ConquerD Supernode — wire.rs
 // Datagram and stream wire formats for QUIC relay forwarding.
 
-/// Max datagram payload.
-#[allow(dead_code)]
-pub const MAX_DATAGRAM_SIZE: usize = 1200;
-
 /// Broadcast target index (all room members).
-#[allow(dead_code)]
 pub const BROADCAST_INDEX: u8 = 0xFF;
-
-/// Stream IDs.
-#[allow(dead_code)]
-pub const SIGNALING_STREAM_ID: u64 = 0;
-#[allow(dead_code)]
-pub const RELAY_CMD_STREAM_ID: u64 = 1;
 
 /// Encode a relay command as length-prefixed JSON for stream 1.
 pub fn encode_relay_cmd(cmd: &serde_json::Value) -> Vec<u8> {
@@ -26,7 +15,13 @@ pub fn encode_relay_cmd(cmd: &serde_json::Value) -> Vec<u8> {
 
 /// Decode one length-prefixed JSON message from a buffer.
 /// Returns (parsed_value, bytes_consumed) or None if not enough data.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "round-trip partner of encode_relay_cmd; tests only"
+    )
+)]
 pub fn decode_relay_cmd(buf: &[u8]) -> Option<(serde_json::Value, usize)> {
     if buf.len() < 4 {
         return None;
@@ -52,15 +47,6 @@ pub fn build_forwarded_datagram(sender_index: u8, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(sender_index);
     buf.extend_from_slice(payload);
-    buf
-}
-
-/// Encode a signaling-stream message (length-prefixed JSON on stream 0).
-#[allow(dead_code)]
-pub fn encode_signaling(json_bytes: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + json_bytes.len());
-    buf.extend_from_slice(&(json_bytes.len() as u32).to_be_bytes());
-    buf.extend_from_slice(json_bytes);
     buf
 }
 
