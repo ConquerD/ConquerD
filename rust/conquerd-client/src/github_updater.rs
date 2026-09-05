@@ -16,6 +16,26 @@ pub const DEFAULT_REPO: &str = "vbawol/ConquerD";
 /// Minimum interval between auto-checks.
 pub const CHECK_INTERVAL_SECS: u64 = 3600;
 
+fn default_automatic_checks_enabled() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct UpdateSettings {
+    #[serde(default = "default_automatic_checks_enabled")]
+    update_check_enabled: bool,
+}
+
+/// Read the persisted automatic-update preference without requiring the Qt UI.
+/// Missing, older, or malformed settings retain the default-enabled behavior.
+pub fn automatic_checks_enabled(settings_path: &Path) -> bool {
+    std::fs::read_to_string(settings_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<UpdateSettings>(&json).ok())
+        .map(|settings| settings.update_check_enabled)
+        .unwrap_or_else(default_automatic_checks_enabled)
+}
+
 /// Resolve the updater installed beside the running client.
 pub fn installed_installer_path() -> Option<PathBuf> {
     std::env::current_exe()
@@ -114,6 +134,7 @@ pub struct Updater {
     current_version: String,
     repo: String,
     installer_path: Option<PathBuf>,
+    automatic_checks_enabled: bool,
 
     event_tx: mpsc::Sender<UpdateEvent>,
     cmd_rx: mpsc::Receiver<UpdaterCommand>,
@@ -123,6 +144,8 @@ pub struct Updater {
 pub enum UpdaterCommand {
     /// Trigger an immediate check.
     Check,
+    /// Enable or disable startup and hourly automatic checks.
+    SetAutomaticChecks(bool),
     /// Apply the given release by launching the installer.
     ApplyUpdate(ReleaseInfo),
     Shutdown,
@@ -133,6 +156,7 @@ impl Updater {
         current_version: impl Into<String>,
         repo: impl Into<String>,
         installer_path: Option<PathBuf>,
+        automatic_checks_enabled: bool,
     ) -> (
         mpsc::Sender<UpdaterCommand>,
         mpsc::Receiver<UpdateEvent>,
@@ -144,6 +168,7 @@ impl Updater {
             current_version: current_version.into(),
             repo: repo.into(),
             installer_path,
+            automatic_checks_enabled,
             event_tx,
             cmd_rx,
         };
@@ -176,33 +201,46 @@ impl Updater {
         Ok(Some(release))
     }
 
+    async fn check_and_publish(&self) {
+        let event = match self.check_github().await {
+            Ok(Some(release)) if is_newer(&self.current_version, release.version()) => {
+                UpdateEvent::UpdateAvailable(release)
+            }
+            Ok(_) => UpdateEvent::AlreadyLatest,
+            Err(error) => UpdateEvent::CheckError(error),
+        };
+        let _ = self.event_tx.send(event).await;
+    }
+
     async fn run(mut self) {
         info!("Updater started (current: {})", self.current_version);
-        let mut interval = tokio::time::interval(Duration::from_secs(CHECK_INTERVAL_SECS));
+        let check_interval = Duration::from_secs(CHECK_INTERVAL_SECS);
+        let first_check = if self.automatic_checks_enabled {
+            tokio::time::Instant::now()
+        } else {
+            tokio::time::Instant::now() + check_interval
+        };
+        let mut interval = tokio::time::interval_at(first_check, check_interval);
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Auto-check on interval
+                    if self.automatic_checks_enabled {
+                        self.check_and_publish().await;
+                    }
                 }
                 Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         UpdaterCommand::Shutdown => break,
                         UpdaterCommand::Check => {
-                            match self.check_github().await {
-                                Ok(Some(rel)) => {
-                                    if is_newer(&self.current_version, rel.version()) {
-                                        let _ = self.event_tx.send(UpdateEvent::UpdateAvailable(rel)).await;
-                                    } else {
-                                        let _ = self.event_tx.send(UpdateEvent::AlreadyLatest).await;
-                                    }
-                                }
-                                Ok(None) => {
-                                    let _ = self.event_tx.send(UpdateEvent::AlreadyLatest).await;
-                                }
-                                Err(e) => {
-                                    let _ = self.event_tx.send(UpdateEvent::CheckError(e)).await;
-                                }
+                            self.check_and_publish().await;
+                        }
+                        UpdaterCommand::SetAutomaticChecks(enabled) => {
+                            let newly_enabled = enabled && !self.automatic_checks_enabled;
+                            self.automatic_checks_enabled = enabled;
+                            if newly_enabled {
+                                self.check_and_publish().await;
+                                interval.reset_after(check_interval);
                             }
                         }
                         UpdaterCommand::ApplyUpdate(_rel) => {
@@ -280,5 +318,48 @@ mod tests {
             ]
             .map(OsString::from)
         );
+    }
+
+    #[test]
+    fn automatic_checks_default_on_for_missing_or_older_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        assert!(automatic_checks_enabled(&settings));
+
+        std::fs::write(&settings, r#"{"theme":"dark"}"#).unwrap();
+        assert!(automatic_checks_enabled(&settings));
+
+        std::fs::write(&settings, "not valid JSON").unwrap();
+        assert!(automatic_checks_enabled(&settings));
+    }
+
+    #[test]
+    fn automatic_checks_follow_the_persisted_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+
+        std::fs::write(&settings, r#"{"update_check_enabled":false}"#).unwrap();
+        assert!(!automatic_checks_enabled(&settings));
+
+        std::fs::write(&settings, r#"{"update_check_enabled":true}"#).unwrap();
+        assert!(automatic_checks_enabled(&settings));
+    }
+
+    #[tokio::test]
+    async fn disabled_automatic_checks_make_no_startup_request() {
+        let (commands, mut events, updater) =
+            Updater::split("1.0.0", "invalid/repository", None, false);
+        let task = tokio::spawn(updater);
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        commands.send(UpdaterCommand::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("disabled updater must remain responsive")
+            .unwrap();
     }
 }

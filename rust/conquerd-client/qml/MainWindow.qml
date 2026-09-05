@@ -1190,6 +1190,9 @@ ApplicationWindow {
         function onAvatar_config_jsonChanged() {
             backend.setAvatarConfigJson(settingsModel.avatar_config_json)
         }
+        function onUpdate_check_enabledChanged() {
+            backend.setAutomaticUpdateChecks(settingsModel.update_check_enabled)
+        }
     }
 
     Connections {
@@ -1214,6 +1217,7 @@ ApplicationWindow {
 
     Component.onCompleted: {
         settingsModel.load()
+        backend.setAutomaticUpdateChecks(settingsModel.update_check_enabled)
         applyThemePreference(settingsModel.theme)
         root.refreshVideoEncoderAvailable()
 

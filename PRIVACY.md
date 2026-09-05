@@ -1,6 +1,6 @@
 # ConquerD Privacy Policy
 
-**Effective date:** 2026-08-07
+**Effective date:** 2026-09-05
 
 ConquerD is a local-first, invite-only peer-to-peer application. Voice, video,
 chat, and file transfer travel directly between clients you connect to, or
@@ -47,10 +47,9 @@ are sent in these paths.
 
 ### Update check (GitHub Releases API)
 
-**What:** On each client launch, the desktop client polls the GitHub Releases
-API once to see whether a newer version is available. (A one-hour polling
-interval is defined in code but not yet wired to repeat checks while the app
-stays open.)
+**What:** When *Check for updates automatically* is enabled (the default), the
+desktop client polls the GitHub Releases API at startup and once per hour while
+the app remains open to see whether a newer version is available.
 
 **Endpoint:** `https://api.github.com/repos/vbawol/ConquerD/releases/latest`
 
@@ -60,15 +59,15 @@ conquerd-client/{version}` (for example `conquerd-client/1.0.0`) and accepts
 `application/vnd.github+json`. GitHub may log this alongside your IP. No
 personal information beyond what any HTTPS request carries is sent.
 
-**Settings note:** A *Check for updates automatically* toggle is shown in
-Settings and persisted as `update_check_enabled` in `settings.json`, but
-background checks are not yet gated on that preference in 1.0.0 — a GitHub
-API request still occurs on each launch.
+**Settings note:** The preference is persisted as `update_check_enabled` in
+`settings.json` and takes effect immediately. Turning it off prevents both the
+startup request and subsequent hourly checks. It does not hide an update that
+was already discovered or prevent you from applying that update manually.
 
-**How to limit:** Block outbound HTTPS to `api.github.com`, or do not run the
-client on networks where that contact is unacceptable. When you choose to apply
-an update, `conquerd-installer` additionally downloads release archives,
-checksums, and (when published) `releases_manifest.json` from GitHub.
+**How to limit:** Turn off *Check for updates automatically* in Settings. You
+can additionally block outbound HTTPS to `api.github.com`. When you choose to
+apply an update, `conquerd-installer` downloads release archives, checksums, and
+(when published) `releases_manifest.json` from GitHub.
 
 ### UPnP port mapping
 

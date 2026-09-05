@@ -797,13 +797,19 @@ Conquerd checks the GitHub Releases API in the background and offers in-app upgr
 
 - Before replacing files, the installer verifies the project Ed25519 release manifest and the archive SHA-256 recorded in it. Platform signatures (Windows SignPath / macOS Apple Developer ID) and Sigstore attestations are additional distribution checks when available.
 - `VERSION_ANNOUNCE` is still exchanged between peers so each side can show the other peer's version in the event log, but application code is **not** pushed peer-to-peer — a connected peer running an older build is informational only.
-- The *Check for updates* setting is persisted but background checks are not yet gated on that preference in 1.0.0; block `api.github.com` or run on a restricted network to prevent the startup check.
+- *Check for updates automatically* is on by default. When enabled, ConquerD checks at startup and once per hour while it remains open. Turning it off takes effect immediately and prevents automatic GitHub requests; an update already shown in the title bar can still be applied manually.
 
 ---
 
 ## Settings Reference
 
 Access settings via the gear icon in Conquerd.
+
+### Application
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Check for updates automatically | `true` | Check GitHub at startup and hourly while ConquerD is open (`update_check_enabled`) |
 
 ### Network
 
@@ -1230,7 +1236,7 @@ The following network contacts occur automatically or on user action (see [PRIVA
 | Feature | External service contacted | When | How to disable |
 |---|---|---|---|
 | **UPnP port mapping** | Your local router only (LAN multicast) | On startup when *Enable UPnP port mapping* is on (default) | Uncheck UPnP in Settings (`upnp_enabled` in `settings.json`) |
-| **GitHub update check** | GitHub Releases API (`api.github.com/repos/vbawol/ConquerD/releases/latest`) | Once per client launch | Block `api.github.com`, or avoid running the client on restricted networks. The *Check for updates* toggle is saved in `settings.json` but not yet enforced in 1.0.0 |
+| **GitHub update check** | GitHub Releases API (`api.github.com/repos/vbawol/ConquerD/releases/latest`) | At startup and hourly, only while *Check for updates automatically* is enabled | Turn off *Check for updates automatically* in Settings (`update_check_enabled` in `settings.json`) |
 | **YouTube / Vimeo inline preview** | Video host CDNs (e.g. `youtube.com`, `googlevideo.com`, `vimeo.com`) | Only when you expand an inline player or open a preview link — Qt WebEngine embed, not yt-dlp | Uncheck *Show YouTube preview cards in chat* in Settings |
 | **Ollama assistant** (optional) | Your configured Ollama URL (default `http://127.0.0.1:11434`) | When the AI plugin is enabled and you use it | Turn off *Enable AI assistant* in Settings |
 | **Supernode portal / gated relay** | The supernode operator you chose | When you open their portal or complete an access gate | Do not connect to that supernode |

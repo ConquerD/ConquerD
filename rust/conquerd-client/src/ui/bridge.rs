@@ -395,6 +395,12 @@ pub mod ffi {
         #[rust_name = "apply_update"]
         fn applyUpdate(self: Pin<&mut AppBridge>);
 
+        /// Apply the live automatic-update preference. Enabling it triggers an
+        /// immediate check; disabling it prevents startup and hourly checks.
+        #[qinvokable]
+        #[rust_name = "set_automatic_update_checks"]
+        fn setAutomaticUpdateChecks(self: Pin<&mut AppBridge>, enabled: bool);
+
         /// Mute or unmute the local microphone.
         #[qinvokable]
         #[rust_name = "set_muted"]
@@ -1220,6 +1226,7 @@ pub struct AppBridgeRust {
     video_preview: Option<crate::video::sender::VideoSender>,
     sfu_cmd_tx: Option<mpsc::Sender<SfuCommand>>,
     updater_cmd_tx: Option<mpsc::Sender<crate::github_updater::UpdaterCommand>>,
+    automatic_update_checks_enabled: bool,
 
     /// Our own peer_id (hex SHA-256 of public key) — used for peer_store lookups.
     my_peer_id: String,
@@ -1564,6 +1571,7 @@ impl Default for AppBridgeRust {
             video_preview: None,
             sfu_cmd_tx: None,
             updater_cmd_tx: None,
+            automatic_update_checks_enabled: true,
             my_peer_id: String::new(),
             my_public_id: String::new(),
             identity: None,
@@ -1976,6 +1984,7 @@ impl ffi::AppBridge {
             env!("CARGO_PKG_VERSION"),
             crate::github_updater::DEFAULT_REPO,
             installer_path,
+            self.rust().automatic_update_checks_enabled,
         );
 
         // ── Plugin runtime: load enabled bespoke modules from settings ───
@@ -2113,10 +2122,6 @@ impl ffi::AppBridge {
                     }
 
                     crate::platform::register_uri_scheme();
-
-                    let _ = updater_cmd_tx
-                        .send(crate::github_updater::UpdaterCommand::Check)
-                        .await;
 
                     // Drive connection events, updater events, and Ollama events.
                     let mut ev_rx = conn_event_rx;
@@ -4233,6 +4238,17 @@ impl ffi::AppBridge {
         if let Err(message) = result {
             warn!("apply_update: {message}");
             self.update_install_failed(QString::from(message.as_str()));
+        }
+    }
+
+    fn set_automatic_update_checks(mut self: Pin<&mut Self>, enabled: bool) {
+        self.as_mut().rust_mut().automatic_update_checks_enabled = enabled;
+        if let Some(tx) = self.rust().updater_cmd_tx.clone() {
+            if let Err(error) = tx.try_send(
+                crate::github_updater::UpdaterCommand::SetAutomaticChecks(enabled),
+            ) {
+                warn!("Could not apply automatic update preference: {error}");
+            }
         }
     }
 

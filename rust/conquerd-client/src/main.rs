@@ -324,10 +324,14 @@ async fn headless_main() {
     // GitHub updater
     // ------------------------------------------------------------------
     let installer_path = github_updater::installed_installer_path();
+    let update_checks_enabled = github_updater::automatic_checks_enabled(
+        &Identity::default_key_dir().join("settings.json"),
+    );
     let (updater_cmd_tx, _updater_event_rx, updater_fut) = github_updater::Updater::split(
         env!("CARGO_PKG_VERSION"),
         github_updater::DEFAULT_REPO,
         installer_path,
+        update_checks_enabled,
     );
     tokio::spawn(updater_fut);
 
@@ -600,9 +604,6 @@ async fn run_headless(
 
     // Register URI scheme handler so `conquerd://` links open this process.
     platform::register_uri_scheme();
-
-    // Trigger an immediate update check at startup
-    let _ = updater_cmd_tx.try_send(github_updater::UpdaterCommand::Check);
 
     // Optional auto-reply smoke test without a second peer:
     //   CONQUERD_SIMULATE_INBOUND_CHAT="hello, reply with pong only"
