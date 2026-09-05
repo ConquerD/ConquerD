@@ -1,5 +1,5 @@
 ﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none">
-  <line x1="10" y1="3" x2="10" y2="14" stroke="#C8C8C8" stroke-width="1.5"/>
-  <polyline points="5,9 10,14 15,9" stroke="#C8C8C8" stroke-width="1.5" stroke-linejoin="miter"/>
-  <line x1="4" y1="17" x2="16" y2="17" stroke="#C8C8C8" stroke-width="1.5"/>
+  <line x1="10" y1="3" x2="10" y2="14" stroke="#FFFFFF" stroke-width="1.5"/>
+  <polyline points="5,9 10,14 15,9" stroke="#FFFFFF" stroke-width="1.5" stroke-linejoin="miter"/>
+  <line x1="4" y1="17" x2="16" y2="17" stroke="#FFFFFF" stroke-width="1.5"/>
 </svg>

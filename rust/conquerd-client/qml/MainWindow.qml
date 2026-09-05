@@ -603,7 +603,7 @@ ApplicationWindow {
         id: customTitleBar
         z: 200
         anchors {
-            top: updateBanner.visible ? updateBanner.bottom : parent.top
+            top: parent.top
             left: parent.left
             right: parent.right
         }
@@ -764,6 +764,76 @@ ApplicationWindow {
         }
 
         Item { Layout.fillWidth: true }
+
+        // Discord-style update affordance: present but unobtrusive until a
+        // release is ready. The installer owns shutdown, install, and relaunch.
+        ToolButton {
+            id: updateIndicator
+            visible: tag !== ""
+            Layout.preferredWidth: 30
+            Layout.preferredHeight: 30
+            Layout.alignment: Qt.AlignVCenter
+            padding: 6
+
+            property string tag: ""
+            property bool installing: false
+            property string errorMessage: ""
+
+            icon.source: "qrc:/qt/qml/ConquerD/Client/icons/download.svg"
+            icon.width: 18
+            icon.height: 18
+            icon.color: Theme.textInv
+
+            background: Rectangle {
+                radius: Theme.radiusPill
+                color: updateIndicator.errorMessage !== ""
+                    ? Theme.danger
+                    : Theme.online
+                opacity: updateIndicator.down
+                    ? 0.75
+                    : (updateIndicator.hovered ? 0.9 : 1.0)
+                Behavior on opacity {
+                    NumberAnimation { duration: Theme.animMicro }
+                }
+            }
+
+            contentItem: Item {
+                Image {
+                    anchors.centerIn: parent
+                    visible: !updateIndicator.installing
+                    source: updateIndicator.icon.source
+                    sourceSize.width: 18
+                    sourceSize.height: 18
+                    width: 18
+                    height: 18
+                    fillMode: Image.PreserveAspectFit
+                }
+                BusyIndicator {
+                    anchors.centerIn: parent
+                    width: 20
+                    height: 20
+                    visible: updateIndicator.installing
+                    running: visible
+                    Material.accent: Theme.textInv
+                }
+            }
+
+            ToolTip.visible: hovered
+            ToolTip.delay: 300
+            ToolTip.text: errorMessage !== ""
+                ? "Update failed to start: " + errorMessage + "\nClick to retry"
+                : (installing
+                    ? "Installing " + tag + "\u2026 ConquerD will restart"
+                    : "Update " + tag + " ready \u2014 click to update and restart")
+
+            onClicked: {
+                if (installing)
+                    return
+                errorMessage = ""
+                installing = true
+                backend.applyUpdate()
+            }
+        }
 
         // Own avatar — tooltip shows peer ID; click opens Avatar settings tab
         Avatar {
@@ -1302,9 +1372,13 @@ ApplicationWindow {
             incomingCallDialog.show(peerId)
         })
         backend.updateAvailable.connect(function(tag, url) {
-            updateBanner.tag = tag
-            updateBanner.url = url
-            updateBanner.visible = true
+            updateIndicator.tag = tag
+            updateIndicator.installing = false
+            updateIndicator.errorMessage = ""
+        })
+        backend.updateInstallFailed.connect(function(message) {
+            updateIndicator.installing = false
+            updateIndicator.errorMessage = message
         })
 
         // Merge room list updates per supernode into grouped sidebar model.
@@ -1582,47 +1656,6 @@ ApplicationWindow {
         anchors.centerIn: parent
         z: 100
         nodeListModel: nodeListModel
-    }
-
-    // ── Update available banner ───────────────────────────────────────────
-    Rectangle {
-        id: updateBanner
-        visible: false
-        property string tag: ""
-        property string url: ""
-        z: 90
-        anchors { top: customTitleBar.bottom; left: parent.left; right: parent.right }
-        height: 36
-        color: Theme.accent
-
-        RowLayout {
-            anchors.fill: parent
-            anchors.leftMargin: 12
-            anchors.rightMargin: 8
-            spacing: 8
-
-            Label {
-                Layout.fillWidth: true
-                text: "Update " + updateBanner.tag + " is available!"
-                color: Theme.textInv
-                font.pixelSize: Theme.fontSizeBody
-            }
-            Button {
-                text: "Install"
-                flat: true
-                Material.foreground: Theme.textInv
-                onClicked: {
-                    backend.applyUpdate()
-                    updateBanner.visible = false
-                }
-            }
-            Button {
-                text: "\u00D7"
-                flat: true
-                Material.foreground: Theme.textInv
-                onClicked: updateBanner.visible = false
-            }
-        }
     }
 
     // ── Topbar removed: logo + invite field now live inside the TitleBar ─

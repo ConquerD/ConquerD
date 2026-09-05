@@ -3,7 +3,8 @@
 //! Checks the GitHub Releases API for newer versions and spawns the
 //! `conquerd-installer` binary to apply updates.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -14,6 +15,35 @@ pub const GITHUB_API: &str = "https://api.github.com";
 pub const DEFAULT_REPO: &str = "vbawol/ConquerD";
 /// Minimum interval between auto-checks.
 pub const CHECK_INTERVAL_SECS: u64 = 3600;
+
+/// Resolve the updater installed beside the running client.
+pub fn installed_installer_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| sibling_installer_path(&path))
+}
+
+fn sibling_installer_path(client_path: &Path) -> Option<PathBuf> {
+    client_path.parent().map(|directory| {
+        directory.join(format!(
+            "conquerd-installer{}",
+            std::env::consts::EXE_SUFFIX
+        ))
+    })
+}
+
+fn installer_arguments(repo: &str) -> Vec<OsString> {
+    [
+        "--update-and-relaunch",
+        "--silent",
+        "--kill",
+        "--repo",
+        repo,
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -178,9 +208,7 @@ impl Updater {
                         UpdaterCommand::ApplyUpdate(_rel) => {
                             if let Some(path) = &self.installer_path {
                                 match std::process::Command::new(path)
-                                    .arg("--update-and-relaunch")
-                                    .arg("--silent")
-                                    .arg("--kill")
+                                    .args(installer_arguments(&self.repo))
                                     .spawn()
                                 {
                                     Ok(_) => {
@@ -226,5 +254,31 @@ mod tests {
     fn version_strips_v_prefix() {
         assert!(is_newer("v1.0.0", "v1.0.1"));
         assert!(is_newer("1.0.0", "v1.0.1"));
+    }
+
+    #[test]
+    fn installer_is_resolved_beside_client_for_this_platform() {
+        let client = Path::new("install").join(format!("ConquerD{}", std::env::consts::EXE_SUFFIX));
+        let expected = Path::new("install").join(format!(
+            "conquerd-installer{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+
+        assert_eq!(sibling_installer_path(&client), Some(expected));
+    }
+
+    #[test]
+    fn update_handoff_reuses_checked_repository() {
+        assert_eq!(
+            installer_arguments("owner/project"),
+            [
+                "--update-and-relaunch",
+                "--silent",
+                "--kill",
+                "--repo",
+                "owner/project",
+            ]
+            .map(OsString::from)
+        );
     }
 }

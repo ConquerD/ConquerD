@@ -14,8 +14,10 @@
 use conquerd_client::{logging, platform};
 use tracing::{error, info};
 
+#[cfg(feature = "webengine")]
+use conquerd_client::ui;
 #[cfg(feature = "qt-ui")]
-use conquerd_client::{ui, video};
+use conquerd_client::video;
 
 // Headless-only. Under `qt-ui` all of this is driven by AppBridge instead, so
 // gate it to keep the Qt build free of dead code.
@@ -321,9 +323,7 @@ async fn headless_main() {
     // ------------------------------------------------------------------
     // GitHub updater
     // ------------------------------------------------------------------
-    let installer_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("conquerd-installer.exe")));
+    let installer_path = github_updater::installed_installer_path();
     let (updater_cmd_tx, _updater_event_rx, updater_fut) = github_updater::Updater::split(
         env!("CARGO_PKG_VERSION"),
         github_updater::DEFAULT_REPO,

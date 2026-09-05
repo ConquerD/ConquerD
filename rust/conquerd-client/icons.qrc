@@ -44,5 +44,6 @@
         <file alias="icons/clipboard.svg">qml/icons/clipboard.svg</file>
         <file alias="icons/connect.svg">qml/icons/connect.svg</file>
         <file alias="icons/warning.svg">qml/icons/warning.svg</file>
+        <file alias="icons/download.svg">qml/icons/download.svg</file>
     </qresource>
 </RCC>

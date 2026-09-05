@@ -424,6 +424,12 @@ pub mod ffi {
         #[rust_name = "update_available"]
         fn updateAvailable(self: Pin<&mut AppBridge>, tag: QString, url: QString);
 
+        /// Emitted when the updater could not be started. The update remains
+        /// pending so the user can retry from the title-bar indicator.
+        #[qsignal]
+        #[rust_name = "update_install_failed"]
+        fn updateInstallFailed(self: Pin<&mut AppBridge>, message: QString);
+
         /// Clear the unread message count (call when the user views chat).
         #[qinvokable]
         #[rust_name = "clear_unread"]
@@ -1965,9 +1971,7 @@ impl ffi::AppBridge {
             crate::call_controller::CallController::split(Some(conn_cmd_tx.clone()));
         let (sfu_cmd_tx, _sfu_event_rx, sfu_fut) =
             crate::sfu_client::SfuClient::split(Some(conn_cmd_tx.clone()));
-        let installer_path = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("conquerd-installer.exe")));
+        let installer_path = crate::github_updater::installed_installer_path();
         let (updater_cmd_tx, updater_event_rx, updater_fut) = crate::github_updater::Updater::split(
             env!("CARGO_PKG_VERSION"),
             crate::github_updater::DEFAULT_REPO,
@@ -4211,15 +4215,24 @@ impl ffi::AppBridge {
     }
 
     fn apply_update(self: Pin<&mut Self>) {
-        if let Some(ref release) = self.rust().pending_release {
-            if let Some(ref tx) = self.rust().updater_cmd_tx {
-                let _ = tx.try_send(crate::github_updater::UpdaterCommand::ApplyUpdate(
+        let release = self.rust().pending_release.clone();
+        let updater = self.rust().updater_cmd_tx.clone();
+        let result = match (release, updater) {
+            (Some(release), Some(tx)) => tx
+                .try_send(crate::github_updater::UpdaterCommand::ApplyUpdate(
                     release.clone(),
-                ));
-                info!("Applying update to {}", release.tag_name);
-            }
-        } else {
-            warn!("apply_update: no pending release");
+                ))
+                .map(|()| {
+                    info!("Applying update to {}", release.tag_name);
+                })
+                .map_err(|error| format!("Could not start the updater: {error}")),
+            (None, _) => Err("No update is pending".to_string()),
+            (_, None) => Err("The updater is not available".to_string()),
+        };
+
+        if let Err(message) = result {
+            warn!("apply_update: {message}");
+            self.update_install_failed(QString::from(message.as_str()));
         }
     }
 
@@ -9142,7 +9155,14 @@ fn dispatch_update_event(
         }
         UpdateEvent::CheckError(e) => warn!("Update check error: {e}"),
         UpdateEvent::InstallerStarted => info!("Installer launched"),
-        UpdateEvent::InstallerError(e) => warn!("Installer error: {e}"),
+        UpdateEvent::InstallerError(e) => {
+            warn!("Installer error: {e}");
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                bridge
+                    .as_mut()
+                    .update_install_failed(QString::from(e.as_str()));
+            });
+        }
         UpdateEvent::AlreadyLatest => info!("Already on latest version"),
     }
 }
