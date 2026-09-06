@@ -301,6 +301,8 @@ Adding or removing a member re-renders and re-pushes the roster to the whole clu
 
 The `cluster_addr` UDP port must be reachable **between cluster members only**, never the public. The manager's ufw integration should open the cluster port **restricted to the member source IPs** (not `0.0.0.0`), tagged like the other rules for clean uninstall. Client-facing relay and WS ports stay publicly open as today; there is no public web port.
 
+`install` / `build-deploy` firewall cleanup must preserve `snm:<host>/<instance>:cluster` rules. Only `cluster-sync` refreshes those restricted rules; reinstalling client-facing relay/WS rules must not remove them. Match the instance tag with its trailing colon so `a` does not match `a1`. Uninstall still removes all rules for the instance.
+
 ### Manager work (complete)
 
 | Capability | Notes |

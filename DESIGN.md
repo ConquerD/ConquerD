@@ -51,8 +51,11 @@ Use layers strictly in order for visual hierarchy.
 | Token       | Hex       | Role                                      |
 |-------------|-----------|-------------------------------------------|
 | `text`      | `#DCDDDE` | Primary body / labels                     |
-| `muted`     | `#72767D` | Secondary, captions, placeholders         |
+| `muted`     | `#A6A9B0` | Secondary, captions, placeholders         |
 | `textInv`   | `#FFFFFF` | Text on accent / semantic colored bg      |
+
+Light-mode secondary text uses `#5B5F68`. Both secondary-text colors meet
+4.5:1 contrast against every solid background layer (`bg0` through `bg3`).
 
 #### Semantic
 | Token       | Hex       | Role                                      |
@@ -107,6 +110,28 @@ All `Behavior` blocks must reference a `Theme.anim*` token — never a raw integ
 
 ### TitleBar
 44px frameless custom bar (`bg0`). Hosts drag-to-move, double-click-to-maximize, and three window-control buttons (minimize, maximize/restore, close) via an internal `TitleBarButton` component. Button hover fills: `bg3` for minimize/maximize, `danger` for close. Default slot between logo and buttons accepts arbitrary `contentChildren` via `Layout.*`.
+
+The main window invite field and actions use `StyledTextField` and
+`StyledButton`: aligned 32px controls, 20px action icons, accessible names,
+keyboard activation, and tooltips on hover or keyboard focus. Peers/Rooms
+tabs use body-size labels and the shared theme accent.
+
+### Shared Controls
+`StyledButton` keeps its background at the full control height without Material
+insets or Material's 14px vertical padding, so icon and label stay centered in
+the 32px control. Labels elide within constrained widths; icon-only actions stay centered.
+Neutral actions use the selected fill when pressed. Keyboard focus has a 2px
+text-color border, visible on both neutral and filled buttons.
+
+`StyledTextField` uses a `bg2` surface, a divider border, standard horizontal
+padding, and a 2px accent focus border. Hover strengthens the border; disabled
+fields use `bg1` and muted text. Text selection uses the theme accent.
+
+Run `scripts/test_qml_controls.ps1` on Windows with Qt installed (override
+`-QtBin` for another installation). It stages production components into a
+temporary QML module and tests contrast, constrained labels, icon alignment,
+pressed feedback, keyboard focus/activation, and disabled field states without
+loading a client identity or connecting to peers.
 
 ### SessionBanner
 32px status strip below TitleBar. Left edge: 3px accent bar tinted by connection mode color. Row: 7px circular status dot + mode label (`connectionModeColor`) + optional `bannerText`. Background is `Qt.tint(bg1, connectionModeTint(mode))`. All color transitions use `animSlow`.

@@ -619,25 +619,14 @@ ApplicationWindow {
         }
 
         // Invite / peer-ID paste field
-        TextField {
+        StyledTextField {
             id: inviteField
             Layout.preferredWidth: 220
             Layout.preferredHeight: Theme.controlHeight
+            Layout.maximumHeight: Theme.controlHeight
             Layout.alignment: Qt.AlignVCenter
-            implicitHeight: Theme.controlHeight
             placeholderText: "Paste invite\u2026"
-            color: Theme.text
-            placeholderTextColor: Theme.muted
-            font.pixelSize: Theme.fontSizeBody
-            leftPadding: Theme.spacingSm
-            rightPadding: Theme.spacingSm
-            background: Rectangle {
-                color: Theme.bg3
-                radius: Theme.radiusMd
-                border.color: inviteField.activeFocus ? Theme.accent : Theme.bg3
-                border.width: 1
-                Behavior on border.color { ColorAnimation { duration: Theme.animFast } }
-            }
+            Accessible.name: "Invite link or peer ID"
             Keys.onReturnPressed: {
                 if (text.trim().length > 0) {
                     backend.pasteInvite(text.trim())
@@ -647,41 +636,18 @@ ApplicationWindow {
         }
 
         // Connect button (→)
-        Rectangle {
+        StyledButton {
             id: connectBtn
-            signal clicked()
-            property bool hovered: connectMouse.containsMouse
-            property bool down: connectMouse.pressed
             enabled: inviteField.text.trim().length > 0
-            implicitWidth: 36
-            implicitHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
-            Layout.preferredWidth: 36
-            Layout.preferredHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
-            Layout.minimumHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
-            Layout.maximumHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
+            Layout.preferredWidth: Theme.touchTarget
+            Layout.preferredHeight: Theme.controlHeight
+            Layout.maximumHeight: Theme.controlHeight
             Layout.alignment: Qt.AlignVCenter
-
-            radius: Theme.radiusMd
-            color: connectBtn.down
-                ? Theme.selectedFill()
-                : connectBtn.hovered
-                    ? Theme.bg3
-                    : Theme.bg2
-            border.color: connectBtn.enabled ? Theme.divider : Theme.bg3
-            border.width: 1
-
-            Image {
-                anchors.centerIn: parent
-                source: "qrc:/qt/qml/ConquerD/Client/icons/invite-submit.svg"
-                sourceSize.width: 32
-                sourceSize.height: 32
-                width: 32
-                height: 32
-                fillMode: Image.PreserveAspectFit
-                opacity: connectBtn.enabled ? 1.0 : 0.45
-            }
+            icon.source: "qrc:/qt/qml/ConquerD/Client/icons/invite-submit.svg"
+            Accessible.name: "Accept invite"
             ToolTip.text: "Connect to peer / accept invite"
-            ToolTip.visible: connectBtn.hovered
+            ToolTip.visible: hovered || visualFocus
+            ToolTip.delay: Theme.animSlow
             onClicked: {
                 var u = inviteField.text.trim()
                 if (u.length > 0) {
@@ -689,73 +655,24 @@ ApplicationWindow {
                     inviteField.text = ""
                 }
             }
-
-            MouseArea {
-                id: connectMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: connectBtn.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                onClicked: if (connectBtn.enabled) connectBtn.clicked()
-            }
         }
 
         // New Invite button
-        Rectangle {
+        StyledButton {
             id: newInviteBtn
-            signal clicked()
-            property string text: "Invite"
-            property bool hovered: newInviteMouse.containsMouse
-            property bool down: newInviteMouse.pressed
-            implicitHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
-            implicitWidth: 82
-            Layout.preferredWidth: 82
-            Layout.preferredHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
-            Layout.minimumHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
-            Layout.maximumHeight: inviteField.height > 0 ? inviteField.height : Theme.controlHeight
+            text: "Invite"
+            primary: true
+            icon.source: "qrc:/qt/qml/ConquerD/Client/icons/invite.svg"
+            Layout.preferredHeight: Theme.controlHeight
+            Layout.maximumHeight: Theme.controlHeight
             Layout.alignment: Qt.AlignVCenter
-
-            radius: Theme.radiusMd
-            color: newInviteBtn.down
-                ? Qt.darker(Theme.accent, 1.15)
-                : newInviteBtn.hovered
-                    ? Qt.lighter(Theme.accent, 1.08)
-                    : Theme.accent
-
-            Row {
-                anchors.centerIn: parent
-                spacing: Theme.spacingXs
-
-                Image {
-                    source: "qrc:/qt/qml/ConquerD/Client/icons/invite.svg"
-                    sourceSize.width: 30
-                    sourceSize.height: 30
-                    width: 30
-                    height: 30
-                    anchors.verticalCenter: parent.verticalCenter
-                    fillMode: Image.PreserveAspectFit
-                }
-
-                Text {
-                    text: newInviteBtn.text
-                    color: Theme.textInv
-                    font.pixelSize: Theme.fontSizeBody
-                    font.weight: Font.DemiBold
-                    anchors.verticalCenter: parent.verticalCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-            }
+            Accessible.name: "Copy new invite link"
             ToolTip.text: "Copy new invite link to clipboard (Ctrl+N)"
-            ToolTip.visible: newInviteBtn.hovered
+            ToolTip.visible: hovered || visualFocus
+            ToolTip.delay: Theme.animSlow
             onClicked: {
                 backend.copyInvite()
                 invitePopup.visible = true
-            }
-            MouseArea {
-                id: newInviteMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: newInviteBtn.clicked()
             }
             Shortcut {
                 sequence: "Ctrl+N"
@@ -1774,19 +1691,21 @@ ApplicationWindow {
                 Layout.preferredHeight: sidebarTabHeight
                 implicitHeight: sidebarTabHeight
                 visible: navIndex !== 2
-                Material.accent: Material.Blue
+                Material.accent: Theme.accent
+                Material.foreground: Theme.text
+                Material.background: Theme.bg1
 
                 readonly property int sidebarTabHeight: Theme.controlHeight + 4
 
                 TabButton {
                     text: "Peers"
-                    font.pixelSize: Theme.fontSizeCaption
+                    font.pixelSize: Theme.fontSizeBody
                     font.bold: sidebarTabBar.currentIndex === 0
                     implicitHeight: sidebarTabBar.sidebarTabHeight
                 }
                 TabButton {
                     text: "Rooms"
-                    font.pixelSize: Theme.fontSizeCaption
+                    font.pixelSize: Theme.fontSizeBody
                     font.bold: sidebarTabBar.currentIndex === 1
                     implicitHeight: sidebarTabBar.sidebarTabHeight
                 }

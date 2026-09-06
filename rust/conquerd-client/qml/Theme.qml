@@ -17,12 +17,12 @@ QtObject {
     function _applyPalette() {
         if (isDark) {
             bg0 = "#111214"; bg1 = "#1E1F22"; bg2 = "#2B2D31"; bg3 = "#383A40"
-            text = "#DCDDDE"; muted = "#72767D"; textInv = "#FFFFFF"
+            text = "#DCDDDE"; muted = "#A6A9B0"; textInv = "#FFFFFF"
             border = "#1E1F22"; divider = "#383A40"
             linkMine = "#DCE0FF"; linkPeer = "#8EA7FF"
         } else {
             bg0 = "#F2F3F5"; bg1 = "#FFFFFF"; bg2 = "#E9EAEC"; bg3 = "#D8D9DD"
-            text = "#2E3338"; muted = "#6D6F78"; textInv = "#FFFFFF"
+            text = "#2E3338"; muted = "#5B5F68"; textInv = "#FFFFFF"
             border = "#E3E5E8"; divider = "#C8C9CC"
             linkMine = "#3C45A5"; linkPeer = "#5865F2"
         }
@@ -36,7 +36,7 @@ QtObject {
 
     // ── Text ─────────────────────────────────────────────────────────────────
     property color text:    "#DCDDDE"
-    property color muted:   "#72767D"
+    property color muted:   "#A6A9B0"
     property color textInv: "#FFFFFF"
 
     // ── Semantic colours (same in both modes) ─────────────────────────────────

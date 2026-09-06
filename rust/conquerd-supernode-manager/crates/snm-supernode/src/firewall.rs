@@ -44,17 +44,16 @@ pub fn render_ufw_ensure_script(
     instance_id: &str,
     network: &NetworkEnv,
 ) -> String {
-    let instance_needle = shell_escape(&format!("snm:{host_name}/{instance_id}"));
+    let instance_needle = shell_escape(&format!("snm:{host_name}/{instance_id}:"));
+    let cluster_needle = shell_escape(&ufw_comment(host_name, instance_id, "cluster"));
     let mut lines = vec![
         "set -e".into(),
         format!(
             "if ! command -v ufw >/dev/null 2>&1; then echo 'ufw not installed; open ports: {}'; exit 0; fi",
             format_port_list(network)
         ),
-        // Remove any stale rules for this instance (e.g. from a previous
-        // install when ports were different) before adding fresh ones.
         format!(
-            "{prefix}ufw status numbered 2>/dev/null | grep -F {instance_needle} | sed -E 's/^\\[ *([0-9]+)\\].*/\\1/' | sort -rn | while read -r n; do [ -n \"$n\" ] && {prefix}ufw --force delete \"$n\"; done"
+            "{prefix}ufw status numbered 2>/dev/null | grep -F {instance_needle} | grep -Fv {cluster_needle} | sed -E 's/^\\[ *([0-9]+)\\].*/\\1/' | sort -rn | while read -r n; do [ -n \"$n\" ] && {prefix}ufw --force delete \"$n\"; done"
         ),
     ];
 
@@ -325,11 +324,19 @@ mod tests {
     #[test]
     fn ensure_script_is_idempotent_and_tagged() {
         let script = render_ufw_ensure_script("", "acdc", "a", &sample_network());
-        // Stale instance rules are wiped by comment needle, then re-added.
-        assert!(script.contains("grep -F 'snm:acdc/a'"));
+        assert!(script.contains("grep -F 'snm:acdc/a:'"));
         assert!(script.contains("ufw allow 3578/udp comment 'snm:acdc/a:relay'"));
         assert!(!script.contains("web-tcp"));
         assert!(!script.contains("web-udp"));
+    }
+
+    #[test]
+    fn install_preserves_cluster_rules_and_other_instances() {
+        let script = render_ufw_ensure_script("sudo ", "acdc", "a", &sample_network());
+        assert!(script.contains("grep -F 'snm:acdc/a:' | grep -Fv 'snm:acdc/a:cluster' | sed"));
+        assert!(!script.contains("grep -F 'snm:acdc/a'"));
+        assert!(script.contains("sudo ufw --force delete"));
+        assert!(script.contains("sudo ufw allow 35035/tcp comment 'snm:acdc/a:ws'"));
     }
 
     #[test]

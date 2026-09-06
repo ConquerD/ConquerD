@@ -502,6 +502,7 @@ Update `agents.md` (this section) in the same change as any signing-related work
 
 ### Process
 
+- Cluster firewall repair on 2026-09-06: manager install cleanup removed restricted cluster UDP rules during redeploy, isolating ac1/a1 despite all services being active. The missing member-IP-restricted rules were restored without service restarts; install cleanup now preserves cluster rules and matches instance tags with a trailing colon.
 - Reconnect fixes on 2026-09-06 cover stale-relay bootstrap routing and nonblocking portal fetch readiness. Local CI passed; the server fix is deployed to acdc/a, acdc/b, acdc/c, and ac1/a1, and the Windows client package is rebuilt. Live close/reopen validation remains required without cluster resync, which restarts nodes and can temporarily mask stale-session failures.
 - Update this section in the same change as any work that shifts status or adds risk.
 - Before touching quotas, dispatch, signaling, or capability paths: run the relay/SFU/room tests + a manual 2-client check.
