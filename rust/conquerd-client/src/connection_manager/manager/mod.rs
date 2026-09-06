@@ -180,6 +180,7 @@ pub struct ConnectionManager {
     /// background connect succeeds. Used by [`ConnectionCommand::FetchWebApp`]
     /// to open `web.host.app.v1` streams.
     quic_relays: HashMap<String, Arc<QuicRelayClient>>,
+    pending_portal_relays: HashMap<String, Vec<PortalRelayReply>>,
     /// Sliding-window replay guard for inbound signaling. Complements the
     /// timestamp freshness window by rejecting re-delivery of an already-seen
     /// signed message *within* that window.
@@ -343,6 +344,8 @@ pub(super) struct PendingRoomJoinRetry {
     pub(super) attempts: u8,
 }
 
+type PortalRelayReply = tokio::sync::oneshot::Sender<Option<Arc<QuicRelayClient>>>;
+
 impl ConnectionManager {
     /// Freshness window for post-handshake signaling (seconds).
     pub(super) const MAX_MESSAGE_AGE_SECS: f64 = 300.0;
@@ -443,6 +446,7 @@ impl ConnectionManager {
             current_supernode_id: String::new(),
             chat_active_rooms: HashSet::new(),
             quic_relays: HashMap::new(),
+            pending_portal_relays: HashMap::new(),
             replay_guard: ReplayGuard::new(Self::MAX_MESSAGE_AGE_SECS),
             transport_stats: HashMap::new(),
             supernode_ping: HashMap::new(),
@@ -1841,6 +1845,11 @@ impl ConnectionManager {
                 supernode_id,
                 client,
             } => {
+                if let Some(waiters) = self.pending_portal_relays.remove(&supernode_id) {
+                    for waiter in waiters {
+                        let _ = waiter.send(client.clone());
+                    }
+                }
                 match client {
                     Some(c) => {
                         info!(
@@ -2060,43 +2069,50 @@ impl ConnectionManager {
         query: Option<String>,
         reply_tx: tokio::sync::oneshot::Sender<std::result::Result<WebAppResponse, String>>,
     ) {
-        // `open_node_portal` navigates immediately while RequestRelay is still
-        // in flight. Wait briefly (same budget as portal game open) so the
-        // first page load does not fail with "Portal unavailable" before the
-        // QUIC relay is ready.
-        if !self
+        let relay = self
             .quic_relays
             .get(&supernode_id)
-            .is_some_and(|r| r.is_alive())
-        {
-            self.request_relay(&supernode_id).await;
-            for _ in 0..40 {
-                if self
-                    .quic_relays
-                    .get(&supernode_id)
-                    .is_some_and(|r| r.is_alive())
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-        let Some(relay) = self.quic_relays.get(&supernode_id).cloned() else {
-            let _ = reply_tx.send(Err(format!(
-                "no QUIC relay connection for supernode {}",
-                &supernode_id[..12.min(supernode_id.len())]
-            )));
-            return;
-        };
-        if !relay.is_alive() {
+            .filter(|relay| relay.is_alive())
+            .cloned();
+        let pending = if relay.is_none() {
             self.quic_relays.remove(&supernode_id);
-            let _ = reply_tx.send(Err("relay connection closed".to_owned()));
-            return;
-        }
-        // Run the fetch in its own task so a slow / hung supernode can't
-        // block the manager's event loop. The relay handle is an `Arc` so
-        // the spawned task keeps it alive even if the manager drops it.
+            self.pending_portal_relays.retain(|_, waiters| {
+                waiters.retain(|waiter| !waiter.is_closed());
+                !waiters.is_empty()
+            });
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let waiters = self
+                .pending_portal_relays
+                .entry(supernode_id.clone())
+                .or_default();
+            let request_needed = waiters.is_empty();
+            waiters.push(ready_tx);
+            if request_needed {
+                self.request_relay(&supernode_id).await;
+            }
+            Some(ready_rx)
+        } else {
+            None
+        };
         tokio::spawn(async move {
+            let relay = match (relay, pending) {
+                (Some(relay), _) => relay,
+                (_, Some(pending)) => {
+                    match tokio::time::timeout(Duration::from_secs(2), pending).await {
+                        Ok(Ok(Some(relay))) => relay,
+                        Ok(_) => {
+                            let _ = reply_tx.send(Err("relay connection failed".to_owned()));
+                            return;
+                        }
+                        Err(_) => {
+                            let _ =
+                                reply_tx.send(Err("timed out waiting for QUIC relay".to_owned()));
+                            return;
+                        }
+                    }
+                }
+                _ => return,
+            };
             let result = web_app_client::fetch(relay.connection(), &path, query.as_deref())
                 .await
                 .map_err(|e| format!("{e:#}"));

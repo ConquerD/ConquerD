@@ -12,6 +12,71 @@ use crate::protocol::MessageType;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+#[tokio::test]
+async fn portal_fetch_wait_does_not_block_relay_events() {
+    let mut context = harness::test_cm();
+    let mut outbound = context.cm.test_add_supernode_session("supernode");
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        context
+            .cm
+            .handle_fetch_web_app("supernode".into(), "/index.html".into(), None, reply_tx),
+    )
+    .await
+    .expect("portal fetch must yield the manager to process RelayGranted and RelayClientReady");
+    assert!(outbound.try_recv().is_ok());
+    assert!(matches!(
+        reply_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+    context
+        .cm
+        .handle_fetch_web_app("supernode".into(), "/index.html".into(), None, second_tx)
+        .await;
+    assert!(
+        outbound.try_recv().is_err(),
+        "concurrent fetches share one relay request"
+    );
+    context
+        .cm
+        .handle_internal_event(super::internal::InternalEvent::RelayClientReady {
+            supernode_id: "supernode".into(),
+            client: None,
+        })
+        .await;
+    assert_eq!(
+        reply_rx.await.unwrap().unwrap_err(),
+        "relay connection failed"
+    );
+    assert_eq!(
+        second_rx.await.unwrap().unwrap_err(),
+        "relay connection failed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn portal_fetch_timeout_allows_retry() {
+    let mut context = harness::test_cm();
+    let mut outbound = context.cm.test_add_supernode_session("supernode");
+    for _ in 0..2 {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        context
+            .cm
+            .handle_fetch_web_app("supernode".into(), "/index.html".into(), None, reply_tx)
+            .await;
+        assert!(
+            outbound.try_recv().is_ok(),
+            "expired waiter must not suppress retry"
+        );
+        assert_eq!(
+            reply_rx.await.unwrap().unwrap_err(),
+            "timed out waiting for QUIC relay"
+        );
+    }
+}
+
 #[test]
 fn file_payload_stays_on_one_transport() {
     assert!(ConnectionManager::is_ordered_file_payload(

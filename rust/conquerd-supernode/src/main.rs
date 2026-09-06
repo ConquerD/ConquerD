@@ -875,10 +875,19 @@ impl SupernodeState {
 
     /// Send a signed message to a peer via signaling.
     fn send_signed(&self, target: &str, msg_type: MessageType, payload: serde_json::Value) {
+        let bootstrap = matches!(
+            msg_type,
+            MessageType::RelayGranted | MessageType::SupernodeInfo
+        );
         let msg = SignalingMessage::new(msg_type, &self.identity.public_id(), payload)
             .with_target(target)
             .sign(&self.identity);
-        self.signaling.send_to_peer(target, &msg.to_json());
+        if bootstrap {
+            self.signaling
+                .send_bootstrap_to_peer(target, &msg.to_json());
+        } else {
+            self.signaling.send_to_peer(target, &msg.to_json());
+        }
     }
 
     /// Broadcast a room's authoritative rosters to every chat recipient (voice

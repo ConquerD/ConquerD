@@ -317,6 +317,20 @@ impl SignalingServer {
         false
     }
 
+    pub fn send_bootstrap_to_peer(&self, identity_pub: &str, json: &str) -> bool {
+        {
+            let state = self.state.read();
+            for key in identity_key_variants(identity_pub) {
+                if let Some(sender) = state.peer_sockets.get(&key) {
+                    if sender.send(json) {
+                        return true;
+                    }
+                }
+            }
+        }
+        self.send_to_peer(identity_pub, json)
+    }
+
     /// Register a peer's reliable QUIC relay signaling-stream sender. Called
     /// by the relay signaling hook when a peer opens its signaling stream.
     pub fn register_quic_sender(&self, identity_pub: &str, tx: PeerTx) {
@@ -848,6 +862,41 @@ mod tests {
         }
         assert!(srv.send_to_peer("peer-a", r#"{"type":"ping"}"#));
         assert_eq!(ws_rx.try_recv().expect("WS fallback"), r#"{"type":"ping"}"#);
+    }
+
+    #[test]
+    fn bootstrap_bypasses_stale_quic_sender_after_client_restart() {
+        let server = SignalingServer::new("supernode-id".into());
+        let padded = crate::identity::Identity::generate().public_id();
+        let unpadded = padded.trim_end_matches('=');
+        let (quic_tx, mut quic_rx) = peer_channel();
+        let (ws_tx, mut ws_rx) = peer_channel();
+        {
+            let mut state = server.state.write();
+            state.quic_senders.insert(unpadded.into(), quic_tx);
+            state.peer_sockets.insert(padded.clone(), ws_tx);
+        }
+        let grant = r#"{"type":"relay_granted"}"#;
+        assert!(server.send_bootstrap_to_peer(unpadded, grant));
+        assert_eq!(ws_rx.try_recv().as_deref(), Some(grant));
+        assert!(quic_rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn bootstrap_falls_back_to_quic_without_live_websocket() {
+        let server = SignalingServer::new("supernode-id".into());
+        let (quic_tx, mut quic_rx) = peer_channel();
+        let (ws_tx, ws_rx) = peer_channel();
+        drop(ws_rx);
+        {
+            let mut state = server.state.write();
+            state.quic_senders.insert("peer-a".into(), quic_tx);
+            state.peer_sockets.insert("peer-a".into(), ws_tx);
+        }
+        let grant = r#"{"type":"relay_granted"}"#;
+        assert!(server.send_bootstrap_to_peer("peer-a", grant));
+        assert_eq!(quic_rx.try_recv().as_deref(), Some(grant));
+        assert!(!server.send_bootstrap_to_peer("unknown", grant));
     }
 
     /// A peer that stops draining is cut off at the byte ceiling rather than

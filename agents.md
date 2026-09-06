@@ -190,6 +190,8 @@ This section captures implementation locations and invariants that agents must r
 
 **CXX-Qt qproperty rule**: every `#[qproperty(T, name)]` in a `#[cxx_qt::bridge]` block must have a matching field in the Rust state struct (`AppBridgeRust` etc.) and be initialised in `impl Default`. Missing fields are silent in headless mode but fail at runtime/Qt meta-object construction.
 
+**Relay reconnect bootstrap rule**: supernode `RelayGranted` and `SupernodeInfo` replies prefer the live WebSocket via `send_bootstrap_to_peer`, with QUIC fallback only when WebSocket delivery fails. A prior client process's QUIC signaling queue can remain open until transport timeout; sending bootstrap replies there strands the new process even though its WebSocket is connected. Ordinary signaling retains QUIC preference. Client portal fetches wait for `RelayClientReady` outside the manager event loop, with a bounded timeout; never sleep inside the manager waiting for state that its own event handler must install.
+
 **Replay / freshness rule**: post-handshake signaling uses Ed25519 signatures + 5-minute freshness window (`MAX_MESSAGE_AGE_SECS` on the client; `is_fresh(300.0)` on the supernode WS path) + per-sender `ReplayGuard` (keyed on signature) inside the freshness window. `SfuAudio` and ordered bulk-file payloads (`FileTransferChunk` / `FileTransferComplete` and `SfuFileChunk` / `SfuFileComplete`) skip signature deduplication but never signature verification or freshness checks. File chunks are idempotent by chunk index and completion only acts on a transfer still in progress; this prevents a legitimate sustained transfer from filling the replay window and blacking out the sender. `ReplayGuard` replay negative-path tests are in `replay.rs`; client stale/future timestamp rejection is covered in `protocol.rs` and `connection_manager::tests`.
 
 **Supernode detection invariant** (client UI + transport):
@@ -500,6 +502,7 @@ Update `agents.md` (this section) in the same change as any signing-related work
 
 ### Process
 
+- Reconnect fixes on 2026-09-06 cover stale-relay bootstrap routing and nonblocking portal fetch readiness. Local CI passed; the server fix is deployed to acdc/a, acdc/b, acdc/c, and ac1/a1, and the Windows client package is rebuilt. Live close/reopen validation remains required without cluster resync, which restarts nodes and can temporarily mask stale-session failures.
 - Update this section in the same change as any work that shifts status or adds risk.
 - Before touching quotas, dispatch, signaling, or capability paths: run the relay/SFU/room tests + a manual 2-client check.
 - Use the 8 Agent Roles above as the per-release checklist; PM keeps updates short (done / in progress / risks).
