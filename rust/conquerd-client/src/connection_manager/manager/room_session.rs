@@ -28,7 +28,26 @@ use super::{
 /// fixed "creator" required (see [`ConnectionManager::sync_room_membership`]
 /// and `backlog.md` "Crypto — group key reliability").
 pub fn is_elected_keyer(members: &[String], me: &str) -> bool {
-    members.iter().any(|m| m == me) && !members.iter().any(|m| m.as_str() < me)
+    // Compare on the un-padded form. Membership is a union of snapshots from
+    // several sources, and the relay path carries `public_id` without base64
+    // padding while SFU/signaling carry it with — so the same identity can
+    // appear as both `A…sg` and `A…sg=`. Compared raw, the un-padded copy
+    // sorts *before* the padded one (a prefix is lexicographically smaller),
+    // so a node sees "someone earlier than me" that is actually itself, or a
+    // receiver rejects the rightful keyer's key as "not elected". The result
+    // is a split-brain election: each side keeps its own epoch and every
+    // inbound frame fails to open.
+    //
+    // Safe to normalise: an Ed25519 `public_id` is always 43 base64url chars
+    // (44 padded), so no two *distinct* identities can be prefixes of one
+    // another. Trimming only ever collapses the two spellings of one identity.
+    // A nested fn rather than a closure: a closure returning a borrow of its
+    // argument cannot express that the output lives as long as the input.
+    fn bare(id: &str) -> &str {
+        id.trim_end_matches('=')
+    }
+    let me_bare = bare(me);
+    members.iter().any(|m| bare(m) == me_bare) && !members.iter().any(|m| bare(m) < me_bare)
 }
 
 /// Epoch acceptance once the sender is known to be the elected keyer.
@@ -484,6 +503,21 @@ impl ConnectionManager {
             present.push(sender.to_owned());
         }
         if !is_elected_keyer(&present, sender) {
+            // Say *why*. A rejection here is indistinguishable from a hostile
+            // key push unless the membership snapshot is visible, and the
+            // usual cause is a benign disagreement about who is in the room.
+            let mut sorted: Vec<&str> = present.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            warn!(
+                "[group-key] not electing {} for room {}: membership snapshot is [{}]",
+                &sender[..12.min(sender.len())],
+                room_id,
+                sorted
+                    .iter()
+                    .map(|id| &id[..12.min(id.len())])
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             return false;
         }
         let has_real = self.group_keys.has_real_key(room_id);

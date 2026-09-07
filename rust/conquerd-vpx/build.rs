@@ -256,7 +256,11 @@ fn main() {
     if unix {
         // libvpx's threading uses pthreads directly.
         build.flag_if_supported("-pthread");
-        println!("cargo:rustc-link-lib=pthread");
+        // Bionic implements pthreads inside libc and ships no libpthread at
+        // all, so asking for one is a hard link error rather than a no-op.
+        if target_os != "android" {
+            println!("cargo:rustc-link-lib=pthread");
+        }
         // The vendored C is not warning-clean under our lint settings and is
         // not ours to fix.
         build.flag_if_supported("-Wno-unused-but-set-variable");

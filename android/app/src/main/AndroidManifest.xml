@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- QUIC to peers and supernodes. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+      The core has to outlive the visible activity: a peer-to-peer client that
+      dies when the screen turns off cannot hold a session or receive a
+      message. FOREGROUND_SERVICE_DATA_SYNC is the type that matches keeping a
+      transport connection open.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      Voice calls. From Android 14 a foreground service that captures audio
+      must declare the `microphone` type as well, and the service may only
+      claim that type once RECORD_AUDIO has actually been granted - so the
+      service starts as `dataSync` and upgrades when a call begins.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- Video calls. Camera capture is opt-in per call, same as the mic. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ConquerD"
+        android:extractNativeLibs="false">
+
+        <!--
+          allowBackup is off deliberately: the identity key and the chat
+          database are on-device secrets, and cloud backup would copy them off
+          the device the whole trust model says they never leave.
+        -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Invite links open straight into the app. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="conquerd" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".CoreService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync|microphone|camera" />
+    </application>
+</manifest>

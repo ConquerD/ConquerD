@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  A shield enclosing a "C". 108x108 canvas with the mark inside the 72dp
+  safe zone, so no launcher mask crops it.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,26 L76,34 L76,54 C76,68 66,78 54,83 C42,78 32,68 32,54 L32,34 Z" />
+
+    <path
+        android:fillColor="#FF3B82F6"
+        android:pathData="M62,46 C59,43 55,42 52,44 C48,46 46,50 46,54 C46,58 48,62 52,64 C55,66 59,65 62,62 L58,58 C56,60 54,60 53,59 C51,58 50,56 50,54 C50,52 51,50 53,49 C54,48 56,48 58,50 Z" />
+</vector>

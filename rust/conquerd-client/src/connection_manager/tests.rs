@@ -689,6 +689,40 @@ fn sfu_group_key_inner_must_be_signed_to_install() {
 
 /// Elected-keyer gate rejects group keys from non-keyer room members.
 #[test]
+fn elected_keyer_ignores_base64_padding() {
+    // The same identity reaching the roster from two sources: the relay path
+    // strips base64 padding, SFU/signaling keep it.
+    let padded = "GHy8U9mJvdrk9ozKF35f42xNz3mQIc0T-0U1A4pSPsg=".to_owned();
+    let unpadded = padded.trim_end_matches('=').to_owned();
+    let other = "VkR20VqcIw23mCzMdsqj9FP_SjdbIIdx642dzdGJQJ8=".to_owned();
+
+    // Compared raw, `unpadded` sorts before `padded` and the rightful keyer
+    // would conclude it is not elected — and a receiver holding both forms
+    // would reject its key.
+    let members = vec![padded.clone(), unpadded, other.clone()];
+    assert!(
+        is_elected_keyer(&members, &padded),
+        "the lexicographically smallest identity must be elected regardless of padding",
+    );
+    assert!(
+        !is_elected_keyer(&members, &other),
+        "a later identity must not consider itself elected",
+    );
+}
+
+#[test]
+fn elected_keyer_agrees_across_padding_spellings() {
+    // Both spellings of the same identity must reach the same verdict, which
+    // is what stops two peers electing different keyers.
+    let padded = "AAAA1111bbbbCCCCddddEEEEffffGGGGhhhhIIIIjjj=".to_owned();
+    let other = "ZZZZ9999yyyyXXXXwwwwVVVVuuuuTTTTssssRRRRqqq=".to_owned();
+    let members = vec![padded.clone(), other];
+
+    assert!(is_elected_keyer(&members, &padded));
+    assert!(is_elected_keyer(&members, padded.trim_end_matches('=')));
+}
+
+#[test]
 fn accept_group_key_requires_elected_keyer() {
     // is_elected_keyer is the sole membership check used by accept_group_key_from
     // for the "who may install" question — cover the predicate here; epoch

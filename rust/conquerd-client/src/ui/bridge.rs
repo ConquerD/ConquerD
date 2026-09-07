@@ -1767,8 +1767,13 @@ fn room_chat_history_key(supernode_id: &str, room_id: &str) -> String {
     format!("{supernode_id}:{room_id}")
 }
 
-fn room_chat_store_peer_id(supernode_id: &str, room_id: &str) -> String {
-    format!("room:{supernode_id}:{room_id}")
+/// Conversation key for a room's chat history.
+///
+/// Delegates to the core so the Qt bridge and the Android JNI layer cannot
+/// drift apart — two clients sharing a profile must agree byte-for-byte.
+/// Deliberately takes no supernode: see [`crate::chat_store::room_conversation_id`].
+fn room_chat_store_peer_id(room_id: &str) -> String {
+    crate::chat_store::room_conversation_id(room_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -3350,7 +3355,7 @@ impl ffi::AppBridge {
         let rid = room_id.to_string();
         let key = room_chat_history_key(&sn, &rid);
         if let Some(ref cs) = self.rust().chat_store {
-            let store_key = room_chat_store_peer_id(&sn, &rid);
+            let store_key = room_chat_store_peer_id(&rid);
             let json_msgs: Vec<String> = {
                 let r = self.rust();
                 cs.get_history(&store_key, 0)
@@ -4671,7 +4676,7 @@ impl ffi::AppBridge {
 
         // Persist outbound message so loadRoomChatHistory can replay it after restart.
         if let Some(ref cs) = chat_store_opt {
-            let store_key = room_chat_store_peer_id(&sn, &rid);
+            let store_key = room_chat_store_peer_id(&rid);
             let chat_msg = crate::chat_store::ChatMessage {
                 id: message_id.clone(),
                 peer_id: store_key,
@@ -4938,7 +4943,7 @@ impl ffi::AppBridge {
         })
         .to_string();
         if let Some(ref cs) = chat_store_opt {
-            let store_key = room_chat_store_peer_id(&sn, &rid);
+            let store_key = room_chat_store_peer_id(&rid);
             let chat_msg = crate::chat_store::ChatMessage {
                 id: message_id.clone(),
                 peer_id: store_key,
@@ -5367,7 +5372,7 @@ fn send_room_chat_to(
     })
     .to_string();
     if let Some(ref cs) = chat_store_opt {
-        let store_key = room_chat_store_peer_id(&sn, &rid);
+        let store_key = room_chat_store_peer_id(&rid);
         let chat_msg = crate::chat_store::ChatMessage {
             id: message_id,
             peer_id: store_key,
@@ -5675,8 +5680,10 @@ fn room_chat_message_to_json(
     msg: &crate::chat_store::ChatMessage,
 ) -> serde_json::Value {
     let sender = room_chat_display_sender(bridge, &msg.sender_handle, &msg.sender);
-    // store peer_id is `room:{sn}:{rid}` — surface ids for UI filtering.
-    let (supernode_id, room_id) = parse_room_chat_store_key(&msg.peer_id);
+    // The store key carries the room id alone; the UI still filters on the
+    // hosting node, so look that up live rather than reading it off the key.
+    let room_id = parse_room_chat_store_key(&msg.peer_id);
+    let supernode_id = room_host_for(bridge, &room_id);
     serde_json::json!({
         "msg_id": msg.id,
         "sender": sender,
@@ -5695,15 +5702,36 @@ fn room_chat_message_to_json(
     })
 }
 
-fn parse_room_chat_store_key(store_key: &str) -> (String, String) {
-    // Format from room_chat_store_peer_id: "room:{supernode_id}:{room_id}"
+/// Recover the room id from a stored conversation key.
+///
+/// Accepts the legacy `room:{supernode_id}:{room_id}` form too, because a
+/// store is only folded to the canonical key when it is next opened and a
+/// long-running session can still be holding rows read before that.
+fn parse_room_chat_store_key(store_key: &str) -> String {
     let Some(rest) = store_key.strip_prefix("room:") else {
-        return (String::new(), String::new());
+        return String::new();
     };
-    match rest.split_once(':') {
-        Some((sn, rid)) => (sn.to_owned(), rid.to_owned()),
-        None => (String::new(), rest.to_owned()),
+    match rest.rsplit_once(':') {
+        Some((_legacy_host, room_id)) => room_id.to_owned(),
+        None => rest.to_owned(),
     }
+}
+
+/// Which supernode currently hosts `room_id`, for UI filtering.
+///
+/// The conversation key no longer encodes a host — a room's identity is its
+/// id — so the live answer comes from the room store instead.
+fn room_host_for(bridge: &AppBridgeRust, room_id: &str) -> String {
+    let Some(rs) = bridge.room_store.as_ref() else {
+        return String::new();
+    };
+    let store = rs.read();
+    store
+        .list()
+        .into_iter()
+        .find(|entry| entry.room_id == room_id)
+        .map(|entry| entry.supernode_id.clone())
+        .unwrap_or_default()
 }
 
 fn attachment_body_label(kind: &crate::chat_store::MessageKind, name: &str) -> String {
@@ -5799,7 +5827,7 @@ fn insert_inbound_file_offer(
         })
         .to_string();
         if let Some(ref cs) = bridge.rust().chat_store {
-            let store_key = room_chat_store_peer_id(&sn, &rid);
+            let store_key = room_chat_store_peer_id(&rid);
             let chat_msg = crate::chat_store::ChatMessage {
                 id: message_id.clone(),
                 peer_id: store_key,
@@ -8645,7 +8673,7 @@ fn dispatch_event(
                 })
                 .to_string();
                 if let Some(ref cs) = bridge.rust().chat_store {
-                    let store_key = room_chat_store_peer_id(&sn, &room_id);
+                    let store_key = room_chat_store_peer_id(&room_id);
                     let chat_msg = crate::chat_store::ChatMessage {
                         id: message_id.clone(),
                         peer_id: store_key,
@@ -9002,7 +9030,7 @@ fn dispatch_event(
                         })
                         .to_string();
                         if let Some(ref cs) = bridge.rust().chat_store {
-                            let store_key = room_chat_store_peer_id(&sn, &rid);
+                            let store_key = room_chat_store_peer_id(&rid);
                             let chat_msg = crate::chat_store::ChatMessage {
                                 id: message_id.clone(),
                                 peer_id: store_key,

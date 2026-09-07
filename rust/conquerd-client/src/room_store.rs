@@ -539,7 +539,32 @@ impl RoomStore {
             .contains(&Self::sidebar_hide_key(supernode_id, room_id))
     }
 
-    /// Remove a room from the deleted set (e.g. re-invited).
+    /// Un-hide a room, restoring it to the local Rooms list.
+    ///
+    /// The persisting counterpart to [`Self::hide_from_sidebar`]. Use this
+    /// rather than [`Self::undelete`] for anything user-driven: `undelete`
+    /// only mutates memory, so a restart would resurrect the tombstone and the
+    /// room would silently vanish again.
+    pub fn unhide_from_sidebar(&mut self, supernode_id: &str, room_id: &str) -> Result<()> {
+        let key = Self::sidebar_hide_key(supernode_id, room_id);
+        if !self.deleted_ids.remove(&key) {
+            // Nothing was hidden under this key. Not an error: hide state is
+            // written against every cluster member, so most keys in a sweep
+            // legitimately miss.
+            return Ok(());
+        }
+        info!(
+            "RoomStore: un-hid room {} on supernode {}",
+            &room_id[..room_id.len().min(12)],
+            &supernode_id[..supernode_id.len().min(12)]
+        );
+        self.save()
+    }
+
+    /// Remove a room from the deleted set in memory only (e.g. re-invited).
+    ///
+    /// Does **not** persist — see [`Self::unhide_from_sidebar`] for the
+    /// user-facing operation.
     pub fn undelete(&mut self, supernode_id: &str, room_id: &str) {
         self.deleted_ids
             .remove(&Self::entry_key(supernode_id, room_id));
@@ -1008,6 +1033,37 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["Alpha".to_string(), "Beta".to_string()]);
+    }
+
+    #[test]
+    fn unhide_from_sidebar_persists_across_reopen() {
+        let dir = tempdir().expect("temp dir");
+        let identity = Identity::generate();
+        let path = dir.path().join("my_rooms.dat");
+
+        {
+            let mut store = RoomStore::open(&identity, Some(&path)).expect("open");
+            store.hide_from_sidebar("sn-a", "r1").expect("hide");
+            assert!(store.is_hidden_from_sidebar("sn-a", "r1"));
+            store.unhide_from_sidebar("sn-a", "r1").expect("unhide");
+            assert!(!store.is_hidden_from_sidebar("sn-a", "r1"));
+        }
+
+        // The whole point: it must still be un-hidden after a restart.
+        let store = RoomStore::open(&identity, Some(&path)).expect("reopen");
+        assert!(!store.is_hidden_from_sidebar("sn-a", "r1"));
+    }
+
+    #[test]
+    fn unhide_of_a_visible_room_is_a_no_op() {
+        let dir = tempdir().expect("temp dir");
+        let identity = Identity::generate();
+        let mut store =
+            RoomStore::open(&identity, Some(&dir.path().join("my_rooms.dat"))).expect("open");
+        store
+            .unhide_from_sidebar("sn-a", "never-hidden")
+            .expect("no-op");
+        assert!(!store.is_hidden_from_sidebar("sn-a", "never-hidden"));
     }
 
     #[test]

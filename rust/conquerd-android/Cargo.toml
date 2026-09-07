@@ -1,0 +1,54 @@
+[package]
+name = "conquerd-android"
+version = "1.0.0"
+edition = "2021"
+description = "JNI bridge exposing the ConquerD client core to the Android app."
+
+# cdylib only: this crate exists to be dlopen'd by the JVM as
+# `libconquerd_android.so`. Nothing in-tree links against it as a Rust library.
+[lib]
+name = "conquerd_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The whole client core — transport, crypto, stores, rooms, files. Built
+# without `qt-ui`, which is what keeps Qt out of the Android graph entirely.
+conquerd-client = { path = "../conquerd-client" }
+
+anyhow = "1"
+jni = "0.21"
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip for the same reason conquerd-client pins it: signed message
+# timestamps must survive a JSON round-trip bit-exactly or signatures break.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Oboe (cpal's Android audio backend) asks this crate for the JavaVM and the
+# Android Context. It is already in the graph transitively; naming it directly
+# is what lets us *initialise* it. Pinned to the same 0.1 the audio stack
+# resolves, because the handoff is a process-global in that crate - two
+# versions would mean initialising one and reading the other.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+# Its own workspace root, mirroring conquerd-client: the Android build must not
+# drag the server-side workspace (or its wayland-scanner patch) along.
+[workspace]
+
+# Full DWARF for the whole dependency graph makes the debug .so ~230 MB, which
+# is slow to push over adb for very little gain: on-device debugging attaches
+# to Kotlin, and dropping DWARF while keeping the symbol table still leaves
+# Rust panic backtraces with real function names.
+[profile.dev]
+strip = "debuginfo"
+
+[profile.release]
+strip = "symbols"

@@ -84,6 +84,7 @@ ruff_audit.json
 /.clientC
 /rust/target
 /rust/conquerd-client/target-check
+/rust/target-check
 /rust/conquerd-client/target
 /terminals
 /agent-tools
@@ -95,3 +96,24 @@ ruff_audit.json
 /rust/target-headless2
 /rust/target-headless-check
 rust/sz2.html
+
+# Android client
+# Gradle sets CARGO_TARGET_DIR here so Android objects stay out of rust/target.
+/rust/target-android
+# Default cargo target for the JNI workspace (`cd rust/conquerd-android && cargo ndk …`).
+/rust/conquerd-android/target
+/android/.gradle
+/android/.kotlin
+/android/.cxx
+/android/app/.cxx
+/android/build
+/android/app/build
+/android/captures
+/android/local.properties
+# Cross-compiled client core, dropped here by cargo-ndk (tens of MB per ABI)
+/android/app/src/main/jniLibs
+*.apk
+*.aab
+*.jks
+*.keystore
+*.hprof

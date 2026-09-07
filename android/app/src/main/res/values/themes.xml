@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Compose paints the whole UI, so the platform theme only has to hand off
+      cleanly at launch. NoActionBar because the app draws its own top bars,
+      and a translucent status bar so edge-to-edge content sits under it.
+    -->
+    <style name="Theme.ConquerD" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/background</item>
+    </style>
+</resources>

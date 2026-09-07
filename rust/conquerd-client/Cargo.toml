@@ -84,8 +84,11 @@ rupnp = { version = "1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Clipboard access (invite link copy)
-arboard = { version = "3", default-features = false }
+# Clipboard access (invite link copy). Only the Qt bridge copies to the
+# clipboard, so this rides the `qt-ui` feature rather than being unconditional:
+# headless builds do not want it, and on Android it does not compile at all
+# (arboard has no backend for the platform).
+arboard = { version = "3", default-features = false, optional = true }
 
 # Linux camera capture (Video4Linux2).
 #
@@ -167,7 +170,7 @@ tempfile = "3"
 [features]
 # Enable this when Qt6 is installed and QTDIR is set.
 # Activates the cxx-qt bridge and QML UI layer.
-qt-ui = ["dep:cxx-qt", "dep:cxx-qt-lib", "dep:cxx"]
+qt-ui = ["dep:cxx-qt", "dep:cxx-qt-lib", "dep:cxx", "dep:arboard"]
 # Enable Qt WebEngine (Chromium embed) for inline YouTube, file preview,
 # and the node browser panel. Requires Qt WebEngine to be installed via
 # the Qt Maintenance Tool (separate optional Qt component).

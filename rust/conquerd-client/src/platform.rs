@@ -233,6 +233,12 @@ pub fn set_taskbar_badge(count: u32) {
             ])
             .spawn();
     }
+    // Android has no desktop taskbar — the unread count reaches the user
+    // through the notification channel instead, which the Kotlin layer owns.
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = count;
+    }
 }
 
 /// Clear the taskbar badge.

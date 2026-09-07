@@ -360,6 +360,128 @@ change as well as a code change** — that rule now lives in the Documentation A
 - **WS fallback for room video media** — deliberately relay-datagram-only; members on WS-only
   keep audio, not video (documented on `SendRoomVideo`).
 
+## Crypto — group-key keyer handover on join
+
+Found 2026-09-06 while testing Android room voice against the live `acdc` cluster. Two distinct
+problems; the first is fixed, the second is not.
+
+**Fixed:** `is_elected_keyer` compared `public_id`s raw. Membership is a union of snapshots and the
+relay path spells ids un-padded while SFU/signaling spell them padded, so one identity appeared as
+both `A...sg` and `A...sg=`; the un-padded copy sorts first, so receivers rejected the rightful
+keyer's `SfuGroupKey` as "not elected". Now normalised, with two regression tests. Invariant is in
+`agents.md`.
+
+**Open — a newly elected keyer cannot take over an established room.** Election picks the
+lexicographically smallest member, so a *joining* member can legitimately become the new keyer. It
+then mints via `should_mint_first_room_key`, which fires on `!has_real_key` and therefore starts at
+**epoch 0**. Every existing member is already at epoch N and `accept_group_key_epoch` only admits
+`cur` or `cur.wrapping_add(1)` — deliberately, to refuse hostile epoch jumps — so the new keyer's
+key is rejected by everyone while it rejects theirs (they are, correctly, not the elected keyer).
+Observed live: a phone joining `default` became the elected keyer at epoch 0/1 while another member
+kept rotating 2 -> 3 -> 4, and neither side could open the other's frames. Both behave exactly as
+written; the protocol has no handover.
+
+Whoever picks this up: the fix is *not* to loosen `accept_group_key_epoch`, which is the guard
+against hostile epoch jumps. Options worth weighing — have the incoming keyer adopt the highest
+epoch it has observed and mint at `+1` rather than 0; defer minting until it has either received the
+current key or confirmed no other member holds one; or make handover explicit (the outgoing keyer
+seals the current epoch to the new one). Note the retry loop gives up after 16 attempts and does not
+re-arm, so even once the conflict clears the room does not self-heal without a rejoin.
+
+**Testing note:** the public `default` room is a bad place to test room E2E. It carries members on
+clients you do not control, and a single un-upgraded participant acting as a competing keyer is
+indistinguishable from a local bug. Use a private two-party room.
+
+## Android client — remaining
+
+Foundation landed 2026-09-06: the **whole `conquerd-client` core cross-compiles and runs on
+`aarch64-linux-android`**, wrapped by `rust/conquerd-android` (JNI cdylib) under a Kotlin/Compose
+app in `android/`. One `./gradlew assembleDebug` builds Rust and APK together. Durable invariants
+— the JSON command/event boundary, the media-never-crosses-JNI rule, the event pump thread, the
+build-script host/target rule — are in `agents.md`; the build and debug runbook is
+`docs/ANDROID.md`. Do not re-litigate the Qt-vs-Compose decision; the rationale is recorded there.
+
+Working today: identity create/unlock, all three stores, QUIC + relay + supernode signaling,
+direct chat (history, send, acks, failure status, typing), invite generate/accept plus a
+`conquerd://` intent filter, room list/join/leave and room chat, a foreground service that keeps
+sessions alive, and `audio.start`/`stop`/`set_muted` into `CallController`.
+
+**First hardware run 2026-09-06** on a Pixel 11 (Android 17 / API 37, arm64-v8a): the library
+loads, the JNI round-trip works, and the core starts clean — identity generated, stores opened,
+`ConnectionManager` and `CallController` running, QUIC endpoint bound. UPnP finds no gateway on
+mobile, as expected. **Still unproven: everything involving a second party** — no invite has been
+exchanged, no message sent, no supernode reached from the device.
+
+### Still open (rough priority)
+
+1. **Room voice on a clean room.** Direct 1:1 voice is proven (see above). Room voice gets as far as
+   `Audio pipeline started` but has never exchanged audible audio, because the only room it has been
+   tried in is the public `default`, where a third participant on an un-upgraded client fights for
+   keyer (see "Crypto - group-key keyer handover"). Retest in a private two-party room before
+   drawing any conclusion about the room path itself.
+
+2. **Survive the background.** Nothing has yet been tested across doze, a screen-off transition, or
+   a Wi-Fi/cellular handover - the three things a desktop never exercises and the most likely place
+   for the next class of failure.
+
+3. **Identity auto-unlock via Android Keystore.** `keyring` compiles for Android but has no backend
+   there, so `keyring_load_aes_key` always misses and *every launch asks for the passphrase*. The
+   fix is a Keystore-backed AES key wrapping the same derived key the desktop caches, reached over
+   JNI — not a new key schedule. Until then the app is usable but tedious.
+
+4. **Call UI polish.** The call flow works end to end; what is missing is refinement - no speaking
+   indicators (the core does not surface per-peer audio activity to this layer), no call duration,
+   no reconnect affordance when a call drops.
+
+5. **Camera capture.** `CameraSource` is the seam and `NullCamera` is what currently satisfies it.
+   Needs a CameraX `ImageAnalysis` (YUV_420_888) → tightly-packed I420 backend, with the frames
+   crossing into Rust through a direct `ByteBuffer` rather than JSON. VP8 encode already works
+   everywhere, so a backend only has to produce `RawFrame`.
+
+6. **Video render.** Decoded I420 to a `Surface` via `ANativeWindow` from Rust, rather than pushing
+   frames up into Compose.
+
+7. **Screen share.** `MediaProjection` → `VirtualDisplay` → `ImageReader`. Note this is a **privacy
+   disclosure as well as a code change** — per the Documentation Agent contract, a new capture
+   backend must update `PRIVACY.md` in the same change.
+
+8. **In-app portal on `android.webkit.WebView`.** The system WebView replaces Qt WebEngine with no
+   binary-size cost and exposes both seams `web.host.app.v1` needs: `shouldInterceptRequest` to
+   serve `conquerd://` content from the core over the authenticated QUIC session, and
+   `addJavascriptInterface` for the `window.conquerd` bridge. **Security gate:** that interface must
+   be attached only to `conquerd://`-origin content, never to arbitrary web pages, with
+   `setAllowFileAccess(false)` and `setAllowUniversalAccessFromFileURLs(false)`. External links
+   belong in a Custom Tab, outside the trust boundary.
+
+9. **File transfer UI** over the Storage Access Framework — Android has no free-standing filesystem
+   path to hand `SendFile`.
+
+10. **`ACCESS_LOCAL_NETWORK` before raising targetSdk to 36+.** Android 16 makes local-network
+   access a runtime permission, and a P2P client that cannot reach a LAN peer loses its direct
+   path and silently falls back to relay for everyone on the same Wi-Fi. On the Pixel 11 (API 37)
+   the app is currently granted it implicitly *because* targetSdk is 35 - `dumpsys` shows
+   `granted=true, flags=[REVOKE_WHEN_REQUESTED]`, meaning the grant evaporates the moment the app
+   asks properly. Raising targetSdk without adding the request and a rationale turns every direct
+   LAN session into a relayed one, with no error to explain it.
+
+11. **Multi-device (one identity, several live endpoints).** Not supported, and the failure is
+   silent rather than refused. `relay.rs` (`peers.insert`), `signaling.rs` (`register_quic_sender`)
+   and the endpoint mailbox all key on identity alone, so a second live connection evicts the
+   first; room group keys are sealed per *member identity* to one signaling target, so the losing
+   device fails closed and sees nothing. Real support needs per-device subkeys under the identity
+   key, a device registry peers can learn, and group-key sealing per device rather than per member
+   — plus a history-sync story, since the stores are local and unsynced. Until then the supported
+   answers are "copy the identity and run one at a time"
+   (`scripts/push_android_profile.ps1`) or "give the phone its own identity and trust it as a
+   peer". Worth deciding deliberately: it changes the `SfuGroupKey` fan-out and the ACL shape.
+
+12. **CI.** No Android job exists. It needs the NDK, `cargo-ndk`, and `cmake;3.31.6` specifically —
+   CMake 4 rejects libopus's declared `cmake_minimum_required`.
+
+13. **Release APK hardening.** R8 rules for the JNI surface and kotlinx.serialization are written
+    (`app/proguard-rules.pro`) but a minified release build has never been run, so they are
+    untested. Signing config is also absent.
+
 ## Discovery / federation (speculative — only if demand appears)
 
 - **In-band capability gossip.** Connected peers exchange each other's supernode capability bundles

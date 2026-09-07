@@ -118,8 +118,27 @@ impl MessageStatus {
     }
 }
 
+/// The conversation key a room's chat history is stored under.
+///
+/// Keyed on `room_id` alone, deliberately. A `room_id` is already
+/// `SHA-256(creator_public_id ":" room_name)` truncated to 64 bits
+/// (`derive_room_id` on the supernode), so it is anchored in the creator's key
+/// space and identical on every supernode that ever hosts the room. The
+/// earlier `room:{supernode_id}:{room_id}` form added nothing to uniqueness
+/// and actively broke identity: a cluster failover re-keys the room to a
+/// sibling, which silently started a second conversation for the same room.
+///
+/// Both the Qt bridge and the Android JNI layer call this. Two clients sharing
+/// a profile must agree byte-for-byte or each sees only half the history.
+pub fn room_conversation_id(room_id: &str) -> String {
+    format!("room:{room_id}")
+}
+
 /// A single chat message as returned from the store.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` is for read-out only — rows are written column by column with
+/// `body` and `sender_handle` encrypted, so this is not a persistence format.
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub id: String,
     pub peer_id: String,
@@ -220,6 +239,48 @@ impl ChatStore {
                 ON messages (peer_id, timestamp);
             "#,
         )?;
+
+        self.migrate_room_keys(&conn)?;
+        Ok(())
+    }
+
+    /// Fold legacy `room:{supernode_id}:{room_id}` conversations onto
+    /// `room:{room_id}`.
+    ///
+    /// Idempotent: the `LIKE 'room:%:%'` filter needs two colons, and a folded
+    /// key has one, so a second run matches nothing. Supernode ids are
+    /// base64url and never contain a colon, which is what makes the room id
+    /// recoverable as the trailing component.
+    fn migrate_room_keys(&self, conn: &Connection) -> Result<()> {
+        let legacy: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT peer_id FROM messages WHERE peer_id LIKE 'room:%:%'")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.filter_map(std::result::Result::ok).collect()
+        };
+        if legacy.is_empty() {
+            return Ok(());
+        }
+
+        let mut moved = 0usize;
+        for old_key in &legacy {
+            let Some(room_id) = old_key.rsplit(':').next() else {
+                continue;
+            };
+            let new_key = room_conversation_id(room_id);
+            if &new_key == old_key {
+                continue;
+            }
+            moved += conn.execute(
+                "UPDATE messages SET peer_id = ?1 WHERE peer_id = ?2",
+                (&new_key, old_key),
+            )?;
+        }
+        tracing::info!(
+            "chat store: folded {} legacy room conversation(s), {} message(s) re-keyed",
+            legacy.len(),
+            moved
+        );
         Ok(())
     }
 
@@ -591,6 +652,70 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    #[test]
+    fn room_conversation_id_ignores_the_host() {
+        // The whole point: the same room on two different supernodes is one
+        // conversation.
+        assert_eq!(
+            room_conversation_id("5919ee78b42b260c"),
+            "room:5919ee78b42b260c"
+        );
+    }
+
+    #[test]
+    fn migration_folds_legacy_room_keys_and_is_idempotent() {
+        let dir = tempdir().expect("temp dir");
+        let identity = Identity::generate();
+        let db = dir.path().join("chat.db");
+
+        // Write history the way the old key scheme did: the same room, split
+        // across two cluster members.
+        {
+            let store = ChatStore::open(&identity, Some(&db)).expect("open");
+            store
+                .insert(&make_msg(
+                    "room:nodeA:5919ee78b42b260c",
+                    "from node A",
+                    false,
+                ))
+                .expect("insert a");
+            store
+                .insert(&make_msg(
+                    "room:nodeB:5919ee78b42b260c",
+                    "from node B",
+                    false,
+                ))
+                .expect("insert b");
+            store
+                .insert(&make_msg("peer-direct", "unrelated direct message", false))
+                .expect("insert direct");
+        }
+
+        // Reopening runs the migration.
+        let store = ChatStore::open(&identity, Some(&db)).expect("reopen");
+        let folded = store
+            .get_history("room:5919ee78b42b260c", 0)
+            .expect("history");
+        assert_eq!(folded.len(), 2, "both members' messages land in one room");
+
+        // Direct conversations must not be touched.
+        assert_eq!(
+            store.get_history("peer-direct", 0).expect("direct").len(),
+            1
+        );
+
+        // A second open must not re-key anything or lose messages.
+        drop(store);
+        let store = ChatStore::open(&identity, Some(&db)).expect("third open");
+        assert_eq!(
+            store
+                .get_history("room:5919ee78b42b260c", 0)
+                .expect("history")
+                .len(),
+            2,
+        );
+    }
+
     fn make_msg(peer_id: &str, body: &str, is_self: bool) -> ChatMessage {
         ChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -674,7 +799,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join(CHAT_DB_FILENAME);
         let id = Identity::generate();
-        let room_key = "room:supernode-a:room-1";
+        // Canonical key: a room's history is keyed on the room, not on
+        // whichever supernode was hosting when the message arrived.
+        let room_key = room_conversation_id("room-1");
+        let room_key = room_key.as_str();
 
         {
             let store = ChatStore::open(&id, Some(&db_path)).unwrap();
