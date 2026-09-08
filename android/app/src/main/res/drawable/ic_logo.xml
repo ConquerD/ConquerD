@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The ConquerD "D://" mark, traced from the desktop client's
+  rust/conquerd-client/qml/icons/logo.svg so both clients draw the identical
+  geometry. Keep the 122x56 viewport: the launcher and notification variants
+  scale these same coordinates.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="61dp"
+    android:height="28dp"
+    android:viewportWidth="122"
+    android:viewportHeight="56">
+
+    <!-- D: pentagon with the counter cut out. -->
+    <path
+        android:fillColor="@color/logo"
+        android:fillType="evenOdd"
+        android:pathData="M0,0 L36,0 L48,28 L36,56 L0,56 Z M11,11 L28,11 L37,28 L28,45 L11,45 Z" />
+
+    <!-- Colon: two squares with a 1-unit corner radius. -->
+    <path
+        android:fillColor="@color/logo"
+        android:pathData="M59,17 L65,17 A1,1 0 0 1 66,18 L66,24 A1,1 0 0 1 65,25 L59,25 A1,1 0 0 1 58,24 L58,18 A1,1 0 0 1 59,17 Z" />
+    <path
+        android:fillColor="@color/logo"
+        android:pathData="M59,41 L65,41 A1,1 0 0 1 66,42 L66,48 A1,1 0 0 1 65,49 L59,49 A1,1 0 0 1 58,48 L58,42 A1,1 0 0 1 59,41 Z" />
+
+    <!-- Double slash. -->
+    <path
+        android:fillColor="@color/logo"
+        android:pathData="M76,56 L87,56 L105,0 L94,0 Z" />
+    <path
+        android:fillColor="@color/logo"
+        android:pathData="M92,56 L103,56 L121,0 L110,0 Z" />
+</vector>

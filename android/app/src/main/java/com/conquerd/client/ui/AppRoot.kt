@@ -4,6 +4,7 @@ import android.Manifest
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -71,10 +73,12 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.conquerd.client.AppViewModel
+import com.conquerd.client.R
 import com.conquerd.client.ChatMessage
 import com.conquerd.client.AppState
 import com.conquerd.client.CallPhase
@@ -267,9 +271,23 @@ private fun UnlockScreen(busy: Boolean, version: String, onUnlock: (String) -> U
 
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
-        verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        // Optical centre rather than Arrangement.Center: the block is roughly
+        // 350dp in an 850dp viewport, and splitting that slack evenly leaves a
+        // quarter of the screen empty above the mark. Weighting the gap 1:2
+        // lifts it to where the eye expects a sign-in screen to sit, and keeps
+        // the field high enough that the IME does not shove the layout when it
+        // opens.
+        Spacer(Modifier.weight(1f))
+
+        Image(
+            painter = painterResource(R.drawable.ic_logo),
+            contentDescription = null,
+            modifier = Modifier.width(122.dp).height(56.dp),
+        )
+        Spacer(Modifier.height(16.dp))
+
         Text("ConquerD", style = MaterialTheme.typography.headlineLarge)
         Spacer(Modifier.height(8.dp))
         Text(
@@ -317,6 +335,8 @@ private fun UnlockScreen(busy: Boolean, version: String, onUnlock: (String) -> U
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        Spacer(Modifier.weight(2f))
     }
 }
 
@@ -330,7 +350,21 @@ private fun HomeScreen(viewModel: AppViewModel) {
 
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
+            // The Scaffold above already pays the status-bar inset for this
+            // content, and an M3 top bar applies its own by default - which
+            // insets the bar twice and leaves a status-bar-height band of dead
+            // space above the title. These bars live inside the Scaffold body
+            // rather than its topBar slot, so the inset is not theirs to add.
+            windowInsets = WindowInsets(0, 0, 0, 0),
             title = { Text(if (state.tab == HomeTab.PEERS) "Peers" else "Rooms") },
+            navigationIcon = {
+                // Decorative: the title beside it already names the screen.
+                Image(
+                    painter = painterResource(R.drawable.ic_logo),
+                    contentDescription = null,
+                    modifier = Modifier.padding(start = 12.dp).width(40.dp).height(18.dp),
+                )
+            },
             actions = {
                 IconButton(
                     onClick = {
@@ -380,7 +414,7 @@ private fun HomeScreen(viewModel: AppViewModel) {
             }
         }
 
-        NavigationBar {
+        NavigationBar(windowInsets = WindowInsets(0, 0, 0, 0)) {
             NavigationBarItem(
                 selected = state.tab == HomeTab.PEERS,
                 onClick = { viewModel.selectTab(HomeTab.PEERS) },
@@ -595,6 +629,12 @@ private fun ChatScreen(
 
     Column(Modifier.fillMaxSize().imePadding()) {
         TopAppBar(
+            // The Scaffold above already pays the status-bar inset for this
+            // content, and an M3 top bar applies its own by default - which
+            // insets the bar twice and leaves a status-bar-height band of dead
+            // space above the title. These bars live inside the Scaffold body
+            // rather than its topBar slot, so the inset is not theirs to add.
+            windowInsets = WindowInsets(0, 0, 0, 0),
             title = { Text(peer.label) },
             navigationIcon = {
                 IconButton(onClick = onBack) {
@@ -716,6 +756,12 @@ private fun RoomChatScreen(
 
     Column(Modifier.fillMaxSize().imePadding()) {
         TopAppBar(
+            // The Scaffold above already pays the status-bar inset for this
+            // content, and an M3 top bar applies its own by default - which
+            // insets the bar twice and leaves a status-bar-height band of dead
+            // space above the title. These bars live inside the Scaffold body
+            // rather than its topBar slot, so the inset is not theirs to add.
+            windowInsets = WindowInsets(0, 0, 0, 0),
             title = {
                 Column {
                     Text(room.roomName.ifBlank { room.roomId.take(12) })

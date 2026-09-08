@@ -1,7 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  A shield enclosing a "C". 108x108 canvas with the mark inside the 72dp
-  safe zone, so no launcher mask crops it.
+  Launcher foreground: the "D://" mark from @drawable/ic_logo, same geometry,
+  scaled into the adaptive-icon canvas.
+
+  Of the 108x108 canvas only the inner 72dp survives the launcher mask, and a
+  circular mask keeps only a 72dp-diameter circle of that. A 64x29 mark is the
+  largest the wordmark's 122:56 aspect fits inside that circle, so nothing is
+  clipped whichever mask a launcher applies.
+
+    scale     = 64 / 122 = 0.5246   ->  drawn size 64 x 29.4
+    translate = ((108 - 64) / 2, (108 - 29.4) / 2)
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
@@ -9,11 +17,27 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M54,26 L76,34 L76,54 C76,68 66,78 54,83 C42,78 32,68 32,54 L32,34 Z" />
+    <group
+        android:scaleX="0.5246"
+        android:scaleY="0.5246"
+        android:translateX="22"
+        android:translateY="39.31">
 
-    <path
-        android:fillColor="#FF3B82F6"
-        android:pathData="M62,46 C59,43 55,42 52,44 C48,46 46,50 46,54 C46,58 48,62 52,64 C55,66 59,65 62,62 L58,58 C56,60 54,60 53,59 C51,58 50,56 50,54 C50,52 51,50 53,49 C54,48 56,48 58,50 Z" />
+        <path
+            android:fillColor="@color/logo"
+            android:fillType="evenOdd"
+            android:pathData="M0,0 L36,0 L48,28 L36,56 L0,56 Z M11,11 L28,11 L37,28 L28,45 L11,45 Z" />
+        <path
+            android:fillColor="@color/logo"
+            android:pathData="M59,17 L65,17 A1,1 0 0 1 66,18 L66,24 A1,1 0 0 1 65,25 L59,25 A1,1 0 0 1 58,24 L58,18 A1,1 0 0 1 59,17 Z" />
+        <path
+            android:fillColor="@color/logo"
+            android:pathData="M59,41 L65,41 A1,1 0 0 1 66,42 L66,48 A1,1 0 0 1 65,49 L59,49 A1,1 0 0 1 58,48 L58,42 A1,1 0 0 1 59,41 Z" />
+        <path
+            android:fillColor="@color/logo"
+            android:pathData="M76,56 L87,56 L105,0 L94,0 Z" />
+        <path
+            android:fillColor="@color/logo"
+            android:pathData="M92,56 L103,56 L121,0 L110,0 Z" />
+    </group>
 </vector>

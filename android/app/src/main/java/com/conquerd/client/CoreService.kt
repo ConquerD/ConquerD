@@ -68,7 +68,7 @@ class CoreService : Service() {
             .setContentText(
                 getString(if (inCall) R.string.service_text_call else R.string.service_text),
             )
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(open)
             .setOngoing(true)
             .build()

@@ -2,4 +2,6 @@
 <resources>
     <color name="background">#FF101418</color>
     <color name="brand">#FF3B82F6</color>
+    <!-- The "D://" mark's red, shared with the desktop client's logo.svg. -->
+    <color name="logo">#FFFF2B40</color>
 </resources>
