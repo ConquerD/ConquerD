@@ -297,7 +297,28 @@ impl SourceSpec {
         }
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    pub(super) fn open(&self, _width: u32, _height: u32) -> anyhow::Result<Box<dyn CameraSource>> {
+        match self {
+            // The requested size is ignored: CameraX chooses a resolution near
+            // what the app asked for when it binds, and the real dimensions
+            // come back with the first frame.
+            Self::Camera { .. } => Ok(Box::new(super::camera::AndroidCamera::open()?)),
+            Self::Screen { .. } => {
+                // MediaProjection needs a user consent dialog per session and
+                // has no equivalent of a device id, so it cannot be opened
+                // from here the way a camera can.
+                anyhow::bail!("screen capture is not implemented on Android yet")
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    )))]
     pub(super) fn open(&self, _width: u32, _height: u32) -> anyhow::Result<Box<dyn CameraSource>> {
         anyhow::bail!("video capture is not implemented on this platform")
     }

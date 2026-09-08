@@ -13,10 +13,12 @@
 //! [`command`] and [`event`], so adding a feature does not mean adding a JNI
 //! signature on both sides of the boundary.
 
+mod camera;
 mod command;
 mod event;
 mod session;
 mod sink;
+mod video;
 
 #[cfg(target_os = "android")]
 mod logcat;
@@ -24,8 +26,8 @@ mod logcat;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Once;
 
-use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jlong, jstring};
+use jni::objects::{JByteBuffer, JClass, JObject, JString};
+use jni::sys::{jint, jlong, jstring};
 use jni::JNIEnv;
 use tracing::{error, info};
 
@@ -273,6 +275,96 @@ pub extern "system" fn Java_com_conquerd_client_NativeCore_nativeCommand<'local>
             )
         }
     }
+}
+
+/// `void NativeCore.nativeSubmitCameraFrame(...)`
+///
+/// Called from CameraX's analyzer thread for every frame. Does nothing unless
+/// a capture is open, so Kotlin can keep the camera bound across start/stop
+/// without coordinating with the core.
+// Android-only: the frame queue it feeds lives behind the same cfg. The
+// packing and rotation in `camera.rs` stay host-compilable so their tests run
+// on any machine.
+#[cfg(target_os = "android")]
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub extern "system" fn Java_com_conquerd_client_NativeCore_nativeSubmitCameraFrame<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    y: JByteBuffer<'local>,
+    y_row_stride: jint,
+    u: JByteBuffer<'local>,
+    u_row_stride: jint,
+    u_pixel_stride: jint,
+    v: JByteBuffer<'local>,
+    v_row_stride: jint,
+    v_pixel_stride: jint,
+    width: jint,
+    height: jint,
+    rotation_degrees: jint,
+) {
+    // Cheap bail-out: the analyzer keeps running while video is off.
+    if !conquerd_client::video::camera::android_impl::is_open() {
+        return;
+    }
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    // SAFETY: CameraX plane buffers are direct, and the `ImageProxy` that owns
+    // them is held open by the caller for the duration of this call. The
+    // slices are only read, and never escape `build_frame`, which copies.
+    let planes = unsafe {
+        let Some(y) = direct_slice(&env, &y) else {
+            return;
+        };
+        let Some(u) = direct_slice(&env, &u) else {
+            return;
+        };
+        let Some(v) = direct_slice(&env, &v) else {
+            return;
+        };
+        (y, u, v)
+    };
+
+    let frame = crate::camera::build_frame(
+        &crate::camera::Plane {
+            data: planes.0,
+            row_stride: y_row_stride.max(0) as usize,
+            pixel_stride: 1,
+        },
+        &crate::camera::Plane {
+            data: planes.1,
+            row_stride: u_row_stride.max(0) as usize,
+            pixel_stride: u_pixel_stride.max(1) as usize,
+        },
+        &crate::camera::Plane {
+            data: planes.2,
+            row_stride: v_row_stride.max(0) as usize,
+            pixel_stride: v_pixel_stride.max(1) as usize,
+        },
+        width as usize,
+        height as usize,
+        rotation_degrees,
+    );
+
+    conquerd_client::video::camera::android_impl::submit_frame(frame);
+}
+
+/// Borrow a direct `ByteBuffer` as a slice.
+///
+/// # Safety
+///
+/// The returned slice borrows JVM-owned memory that is only guaranteed valid
+/// while the calling frame holds the buffer alive.
+#[cfg(target_os = "android")]
+unsafe fn direct_slice<'a>(env: &JNIEnv<'_>, buffer: &JByteBuffer<'_>) -> Option<&'a [u8]> {
+    let address = env.get_direct_buffer_address(buffer).ok()?;
+    let capacity = env.get_direct_buffer_capacity(buffer).ok()?;
+    if address.is_null() || capacity == 0 {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(address, capacity))
 }
 
 /// `void NativeCore.nativeStop(long handle)`

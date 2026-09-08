@@ -56,6 +56,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -68,6 +69,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -75,6 +78,7 @@ import com.conquerd.client.AppViewModel
 import com.conquerd.client.ChatMessage
 import com.conquerd.client.AppState
 import com.conquerd.client.CallPhase
+import com.conquerd.client.CameraCapture
 import com.conquerd.client.CallState
 import com.conquerd.client.ConnectionMode
 import com.conquerd.client.HomeTab
@@ -96,6 +100,23 @@ fun AppRoot(viewModel: AppViewModel) {
         val message = state.error ?: state.notice ?: return@LaunchedEffect
         snackbars.showSnackbar(message)
         viewModel.dismissError()
+    }
+
+    // Hold the screen awake while the camera is live.
+    //
+    // CameraX unbinds when its lifecycle owner stops, and locking the phone
+    // stops it even under `ProcessLifecycleOwner` - so a lock kills the
+    // capture mid-call. Android deliberately restricts camera access from the
+    // lock screen, so the answer is to not let it lock while streaming rather
+    // than to try to keep capturing behind it.
+    //
+    // Deliberately video-only: an audio call is expected to keep running with
+    // the screen off, and pinning the display on for one would waste
+    // significant battery for no benefit.
+    val view = LocalView.current
+    DisposableEffect(state.videoActive) {
+        view.keepScreenOn = state.videoActive
+        onDispose { view.keepScreenOn = false }
     }
 
     Scaffold(
@@ -126,11 +147,17 @@ fun AppRoot(viewModel: AppViewModel) {
                     joined = state.roomJoined,
                     voiceActive = state.roomVoiceActive,
                     muted = state.muted,
+                    videoActive = state.videoActive,
                     onBack = viewModel::closeRoom,
                     onSend = viewModel::sendRoomChat,
                     onJoinVoice = viewModel::joinRoomVoice,
                     onLeaveVoice = viewModel::leaveRoomVoice,
                     onToggleMute = viewModel::toggleMute,
+                    // No peer id: the supernode fans room video out to every
+                    // participant, rather than it being addressed to one.
+                    onToggleVideo = { wanted ->
+                        if (wanted) viewModel.startVideo(null) else viewModel.stopVideo(null)
+                    },
                 )
             }
         }
@@ -143,10 +170,14 @@ fun AppRoot(viewModel: AppViewModel) {
     state.call?.let { call ->
         CallOverlay(
             call = call,
+            videoActive = state.videoActive,
             onAccept = viewModel::acceptCall,
             onReject = viewModel::rejectCall,
             onEnd = viewModel::endCall,
             onToggleMute = viewModel::toggleMute,
+            onToggleVideo = { wanted ->
+                if (wanted) viewModel.startVideo(call.peerId) else viewModel.stopVideo(call.peerId)
+            },
         )
     }
 }
@@ -158,11 +189,26 @@ fun AppRoot(viewModel: AppViewModel) {
 @Composable
 private fun CallOverlay(
     call: CallState,
+    videoActive: Boolean,
     onAccept: () -> Unit,
     onReject: () -> Unit,
     onEnd: () -> Unit,
     onToggleMute: () -> Unit,
+    onToggleVideo: (Boolean) -> Unit,
 ) {
+    val context = LocalContext.current
+
+    // CameraX has to be bound before the core asks for video: the native side
+    // waits a few seconds for a first frame to learn the capture size, so
+    // binding afterwards would race that timeout.
+    val requestCamera = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            CameraCapture.start(context)
+            onToggleVideo(true)
+        }
+    }
     if (call.phase == CallPhase.INCOMING) {
         AlertDialog(
             onDismissRequest = { /* a ringing call needs an explicit answer */ },
@@ -194,6 +240,18 @@ private fun CallOverlay(
                 }
                 TextButton(onClick = onToggleMute) {
                     Text(if (call.muted) "Unmute" else "Mute")
+                }
+                TextButton(
+                    onClick = {
+                        if (videoActive) {
+                            onToggleVideo(false)
+                            CameraCapture.stop()
+                        } else {
+                            requestCamera.launch(Manifest.permission.CAMERA)
+                        }
+                    },
+                ) {
+                    Text(if (videoActive) "Stop video" else "Video")
                 }
                 TextButton(onClick = onEnd) { Text("End") }
             }
@@ -625,18 +683,32 @@ private fun RoomChatScreen(
     joined: Boolean,
     voiceActive: Boolean,
     muted: Boolean,
+    videoActive: Boolean,
     onBack: () -> Unit,
     onSend: (String) -> Unit,
     onJoinVoice: () -> Unit,
     onLeaveVoice: () -> Unit,
     onToggleMute: () -> Unit,
+    onToggleVideo: (Boolean) -> Unit,
 ) {
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val context = LocalContext.current
 
     val requestMic = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> if (granted) onJoinVoice() }
+
+    // CameraX must be bound before the core asks for video — the native side
+    // waits for a first frame to learn the capture size.
+    val requestCamera = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            CameraCapture.start(context)
+            onToggleVideo(true)
+        }
+    }
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
@@ -691,7 +763,16 @@ private fun RoomChatScreen(
             VoiceRail(
                 members = members,
                 muted = muted,
+                videoActive = videoActive,
                 onToggleMute = onToggleMute,
+                onToggleVideo = {
+                    if (videoActive) {
+                        onToggleVideo(false)
+                        CameraCapture.stop()
+                    } else {
+                        requestCamera.launch(Manifest.permission.CAMERA)
+                    }
+                },
                 onLeave = onLeaveVoice,
             )
         }
@@ -764,7 +845,9 @@ private fun RoomChatScreen(
 private fun VoiceRail(
     members: List<String>,
     muted: Boolean,
+    videoActive: Boolean,
     onToggleMute: () -> Unit,
+    onToggleVideo: () -> Unit,
     onLeave: () -> Unit,
 ) {
     Surface(
@@ -783,6 +866,9 @@ private fun VoiceRail(
                 )
                 TextButton(onClick = onToggleMute) {
                     Text(if (muted) "Unmute" else "Mute")
+                }
+                TextButton(onClick = onToggleVideo) {
+                    Text(if (videoActive) "Stop video" else "Video")
                 }
                 TextButton(onClick = onLeave) { Text("Leave") }
             }

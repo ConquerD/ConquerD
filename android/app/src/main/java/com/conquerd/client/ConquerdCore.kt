@@ -181,8 +181,16 @@ val JsonObject.errorText: String?
 /** The `event` discriminator, or empty for a command reply. */
 fun JsonObject.eventName(): String = (this["event"] as? JsonPrimitive)?.contentOrNull.orEmpty()
 
-/** Read a string field, or null. */
-fun JsonObject.string(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
+/**
+ * Read a string field, or null.
+ *
+ * Strict about the type: `contentOrNull` alone renders a JSON number as its
+ * digits, so a numeric field would read as a string and a type change on the
+ * wire would pass silently. Mirrors `Value::as_str` on the Rust side, which
+ * the command layer already uses for its arguments.
+ */
+fun JsonObject.string(key: String): String? =
+    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
 
 /** Read a string field, or empty. */
 fun JsonObject.stringOrEmpty(key: String): String = string(key).orEmpty()

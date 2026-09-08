@@ -60,6 +60,8 @@ data class AppState(
     val roomVoiceActive: Boolean = false,
     /** Local mute, shared by direct calls and room voice. */
     val muted: Boolean = false,
+    /** True while the local camera is capturing and sending. */
+    val videoActive: Boolean = false,
 )
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -434,6 +436,50 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Start sending local video.
+     *
+     * The caller must already have bound CameraX — the native side waits a few
+     * seconds for a first frame to learn the capture size and fails if none
+     * arrives, so binding after this would race that timeout.
+     *
+     * `peerId` targets a direct call; `null` sends into the current room.
+     */
+    fun startVideo(peerId: String?) = viewModelScope.launch {
+        CoreService.setMediaActive(
+            getApplication(),
+            microphone = _state.value.call != null || _state.value.roomVoiceActive,
+            camera = true,
+        )
+
+        val reply = core.command("video.start") {
+            if (peerId != null) put("peer_id", peerId)
+        }
+        if (reply.ok) {
+            _state.update { it.copy(videoActive = true) }
+        } else {
+            _state.update { it.copy(error = reply.errorText) }
+            CoreService.setMediaActive(
+                getApplication(),
+                microphone = _state.value.call != null || _state.value.roomVoiceActive,
+                camera = false,
+            )
+        }
+    }
+
+    /** Stop local video. Idempotent; the core accepts "off" when already off. */
+    fun stopVideo(peerId: String?) = viewModelScope.launch {
+        _state.update { it.copy(videoActive = false) }
+        core.command("video.stop") {
+            if (peerId != null) put("peer_id", peerId)
+        }
+        CoreService.setMediaActive(
+            getApplication(),
+            microphone = _state.value.call != null || _state.value.roomVoiceActive,
+            camera = false,
+        )
+    }
+
     /** Mute the microphone. Applies to a direct call or room voice alike. */
     fun setMuted(muted: Boolean) {
         _state.update { it.copy(muted = muted, call = it.call?.copy(muted = muted)) }
@@ -563,8 +609,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             "call_ended" -> {
-                _state.update { it.copy(call = null) }
+                // Stop the camera too: a call that ends with video still
+                // running leaves the capture thread holding the device and the
+                // camera indicator lit with nothing to send to.
+                if (_state.value.videoActive) {
+                    viewModelScope.launch { core.command("video.stop") }
+                }
+                _state.update { it.copy(call = null, videoActive = false) }
                 CoreService.setMediaActive(getApplication(), microphone = false, camera = false)
+            }
+
+            // A capture that stopped on its own - the camera was revoked, or
+            // CameraX unbound. The core has already released its side; the UI
+            // has to stop claiming video is live.
+            "video_ended" -> {
+                _state.update {
+                    if (!it.videoActive) it
+                    else it.copy(
+                        videoActive = false,
+                        notice = "Camera stopped: ${event.stringOrEmpty("reason")}",
+                    )
+                }
+                CameraCapture.stop()
+                CoreService.setMediaActive(
+                    getApplication(),
+                    microphone = _state.value.call != null || _state.value.roomVoiceActive,
+                    camera = false,
+                )
             }
 
             "invite_accepted" -> {

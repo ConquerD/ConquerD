@@ -8559,19 +8559,38 @@ fn dispatch_event(
         }
         ConnectionEvent::PeerVideoStateChanged { peer_id, active } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
+                // The announcement carries the sender's `public_id`, but peer
+                // rows - and the video tiles bound to them - are keyed by the
+                // *list* peer id. A room roster is made of public_ids so the
+                // two coincide there, which is why room video lit an indicator
+                // while a direct call never did: its list id is the hex peer
+                // id and nothing matched. Register both forms rather than
+                // choosing, so neither path can regress.
+                let resolved = lookup_list_peer_id(bridge.rust(), &peer_id);
+                let mut keys = vec![peer_id.clone()];
+                if let Some(list_id) = resolved {
+                    if list_id != peer_id {
+                        keys.push(list_id);
+                    }
+                }
+
                 // Remembered as well as signalled: the signal only reaches rows
                 // that exist right now, and the next roster reset would drop it.
                 {
                     let mut r = bridge.as_mut().rust_mut();
-                    if active {
-                        r.peer_video_active.insert(peer_id.clone());
-                    } else {
-                        r.peer_video_active.remove(&peer_id);
+                    for key in &keys {
+                        if active {
+                            r.peer_video_active.insert(key.clone());
+                        } else {
+                            r.peer_video_active.remove(key);
+                        }
                     }
                 }
-                bridge
-                    .as_mut()
-                    .peer_video_state_changed(QString::from(peer_id.as_str()), active);
+                for key in &keys {
+                    bridge
+                        .as_mut()
+                        .peer_video_state_changed(QString::from(key.as_str()), active);
+                }
                 // Camera-off: free the decoder (inter-frame state is useless
                 // across a stream restart) and blank the tile so the last
                 // frame does not stick after the indicator goes dark.

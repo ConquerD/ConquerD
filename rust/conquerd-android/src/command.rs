@@ -8,6 +8,7 @@
 //! sides of the boundary every time one changes.
 
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use conquerd_client::call_controller::CallCommand;
@@ -51,6 +52,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "call.accept",
     "call.reject",
     "call.end",
+    "video.start",
+    "video.stop",
     "audio.start",
     "audio.stop",
     "audio.set_muted",
@@ -479,6 +482,64 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
             });
             let _ = session.call_tx.try_send(CallCommand::StopAudio);
             queued(signalled)
+        }
+
+        // ── Video ─────────────────────────────────────────────────────────
+        //
+        // Capture is driven by CameraX on the Kotlin side; this opens the
+        // consumer end. `AndroidCamera::open` waits for the first frame, so
+        // the camera must already be bound when this is called.
+        "video.start" => {
+            if session.video.read().is_some() {
+                return err("video capture is already running");
+            }
+
+            let peer_id = arg_str(&parsed, "peer_id")
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            let device_id = arg_str(&parsed, "device_id").unwrap_or("android:front");
+            let quality = arg_str(&parsed, "quality").unwrap_or("balanced");
+
+            match crate::video::start(
+                session.cmd_tx.clone(),
+                peer_id.clone(),
+                device_id,
+                quality,
+                Arc::clone(&session.video),
+                session.sink.clone(),
+            ) {
+                Ok(sender) => {
+                    *session.video.write() = Some(sender);
+                    // Tell the far end to expect frames. Without this a peer
+                    // shows no tile at all, because a video stream that was
+                    // never announced is indistinguishable from none.
+                    // `direct_peer` None means "announce to the room".
+                    let _ = session.send(ConnectionCommand::SendVideoState {
+                        active: true,
+                        direct_peer: peer_id,
+                    });
+                    json!({ "ok": true })
+                }
+                Err(e) => err(format!("could not start video: {e}")),
+            }
+        }
+        "video.stop" => {
+            let stopped = session.video.write().take();
+            let announced = session.send(ConnectionCommand::SendVideoState {
+                active: false,
+                direct_peer: arg_str(&parsed, "peer_id")
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned),
+            });
+            match stopped {
+                Some(sender) => {
+                    sender.stop();
+                    queued(announced)
+                }
+                // Idempotent: a UI that lost track of state should be able to
+                // ask for "off" without getting an error.
+                None => json!({ "ok": true }),
+            }
         }
 
         // ── Audio ─────────────────────────────────────────────────────────

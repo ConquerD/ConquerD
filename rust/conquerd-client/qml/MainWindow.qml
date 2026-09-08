@@ -2792,6 +2792,10 @@ ApplicationWindow {
                 NumberAnimation { duration: Theme.animFast; easing.type: Easing.InOutQuad }
             }
 
+            // Direct calls have no videoActive model role, so the rail reads
+            // camera state from this map instead.
+            videoActivePeers: root.videoActivePeers
+
             // Always the active voice session only (never the selected text room).
             participantModel: backend.voice_active && backend.in_room
                 ? roomModel

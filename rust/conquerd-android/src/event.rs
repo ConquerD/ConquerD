@@ -392,6 +392,45 @@ pub fn to_json(event: &ConnectionEvent) -> Option<Value> {
     Some(value)
 }
 
+/// Render a call-controller event as JSON.
+///
+/// These come from `CallController`'s own event channel, which is separate
+/// from the connection manager's. Dropping that receiver — as this layer
+/// originally did — costs the real call state, the speaking indicators and
+/// every capture error, leaving the UI to guess from signalling alone.
+pub fn call_event_to_json(event: &conquerd_client::call_controller::CallEvent) -> Option<Value> {
+    use conquerd_client::call_controller::CallEvent as E;
+
+    let value = match event {
+        E::StateChanged(state) => json!({
+            "event": "call_state",
+            "state": debug_name(state),
+        }),
+        E::PeerAudioStateChanged { peer_id, state } => json!({
+            "event": "peer_audio_state",
+            "peer_id": peer_id,
+            "state": debug_name(state),
+        }),
+        E::LocalSpeakingChanged(speaking) => {
+            json!({ "event": "local_speaking", "speaking": speaking })
+        }
+        E::RemoteSpeakingChanged { peer_id, speaking } => json!({
+            "event": "remote_speaking",
+            "peer_id": peer_id,
+            "speaking": speaking,
+        }),
+        E::CallError(reason) => json!({ "event": "call_error", "reason": reason }),
+        E::CaptureError(reason) => json!({ "event": "capture_error", "reason": reason }),
+        // Level meters tick many times a second and the UI does not draw them
+        // yet; forwarding them would be the audio-frame mistake again.
+        E::LocalLevelChanged(_) | E::RemoteLevelChanged { .. } | E::MetricsUpdated(_) => {
+            return None
+        }
+    };
+
+    Some(value)
+}
+
 /// Lowercased `Debug` name of a fieldless enum value.
 fn debug_name<T: std::fmt::Debug>(value: &T) -> String {
     format!("{value:?}").to_lowercase()
@@ -402,4 +441,137 @@ fn debug_name<T: std::fmt::Debug>(value: &T) -> String {
 /// than collapse the whole event.
 fn parse_or_string(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conquerd_client::connection_manager::ConnectionEvent;
+
+    fn name_of(event: &ConnectionEvent) -> String {
+        to_json(event)
+            .expect("event should be forwarded")
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// The rule that keeps a call from costing a JSON encode per frame.
+    ///
+    /// These arrive hundreds of times a second carrying raw payload bytes.
+    /// Forwarding one is not a cosmetic regression - it is per-frame CPU on
+    /// every call, for a UI that has no use for the data.
+    #[test]
+    fn real_time_media_is_never_forwarded() {
+        let media = [
+            ConnectionEvent::SfuAudioReceived {
+                peer_id: "p".into(),
+                opus_data: vec![1, 2, 3],
+            },
+            ConnectionEvent::DirectAudioReceived {
+                peer_id: "p".into(),
+                opus_data: vec![1, 2, 3],
+            },
+            ConnectionEvent::ContentAudioReceived {
+                peer_id: "p".into(),
+                opus: vec![1, 2, 3],
+                pts_us: 0,
+                seq: 0,
+            },
+            ConnectionEvent::PortalGameDatagram {
+                supernode_id: "s".into(),
+                payload: vec![1, 2, 3],
+            },
+        ];
+
+        for event in &media {
+            assert!(
+                to_json(event).is_none(),
+                "media must not cross the JNI boundary: {event:?}",
+            );
+        }
+    }
+
+    /// Wire names are the app's contract, not an echo of the Rust variant
+    /// names - renaming a variant must not silently reshape them.
+    #[test]
+    fn wire_names_are_stable() {
+        assert_eq!(
+            name_of(&ConnectionEvent::PeerConnected("p".into())),
+            "peer_connected",
+        );
+        assert_eq!(
+            name_of(&ConnectionEvent::ChatMessage {
+                peer_id: "p".into(),
+                message_id: "m".into(),
+                body: "hi".into(),
+                timestamp: 1.0,
+                sender_handle: "h".into(),
+            }),
+            "chat_message",
+        );
+        assert_eq!(
+            name_of(&ConnectionEvent::RoomChatMessage {
+                supernode_id: "s".into(),
+                room_id: "r".into(),
+                sender_id: "p".into(),
+                sender_handle: "h".into(),
+                body: "hi".into(),
+                timestamp: 1.0,
+                message_id: "m".into(),
+            }),
+            "room_chat_message",
+        );
+        assert_eq!(
+            name_of(&ConnectionEvent::CallEnded {
+                peer_id: "p".into()
+            }),
+            "call_ended",
+        );
+    }
+
+    /// A relay ticket is a bearer credential. Rust holds it; there is no
+    /// reason for it to sit in a Kotlin string where it can be logged.
+    #[test]
+    fn relay_grants_do_not_leak_the_ticket() {
+        let json = to_json(&ConnectionEvent::RelayGranted {
+            supernode_id: "s".into(),
+            ticket: "SECRET-TICKET".into(),
+            relay_host: "h".into(),
+            relay_port: 1,
+            portal_only: false,
+        })
+        .expect("forwarded");
+
+        let encoded = json.to_string();
+        assert!(
+            !encoded.contains("SECRET-TICKET"),
+            "the relay ticket must not reach the UI layer: {encoded}",
+        );
+    }
+
+    #[test]
+    fn embedded_json_is_reparsed_rather_than_double_encoded() {
+        let json = to_json(&ConnectionEvent::ConnectionStats {
+            peer_id: "p".into(),
+            json: r#"{"rtt_ms":42}"#.into(),
+        })
+        .expect("forwarded");
+
+        assert_eq!(json["stats"]["rtt_ms"], json!(42));
+    }
+
+    #[test]
+    fn malformed_embedded_json_degrades_to_a_string() {
+        // A bad payload should reach the UI as data rather than collapse the
+        // whole event.
+        let json = to_json(&ConnectionEvent::ConnectionStats {
+            peer_id: "p".into(),
+            json: "not json".into(),
+        })
+        .expect("forwarded");
+
+        assert_eq!(json["stats"], json!("not json"));
+    }
 }

@@ -113,6 +113,52 @@ you actually need the emulator. `conquerd.ndkApi` must stay equal to `minSdk`
 (26): cargo-ndk bakes it into the clang target triple, and a mismatch produces a
 library `dlopen` refuses on older devices with no useful diagnostic.
 
+## Tests
+
+```powershell
+cd rust/conquerd-android && cargo test        # 23, host - no device needed
+cd android && ./gradlew testDebugUnitTest     # 13, JVM
+```
+
+Both run on any machine: the Rust tests cover the pure halves of the JNI layer
+(frame packing and rotation, command parsing, event mapping, media routing) and
+the Kotlin tests cover the JSON boundary and the display models.
+
+Two of them exist because of specific regressions and should not be deleted as
+redundant:
+
+* `session::tests::inbound_direct_audio_reaches_the_call_controller` - filtering
+  media out of the event JSON *without* routing it to `CallController` made
+  calls connect, signal correctly and stay completely silent. A wiring bug, so
+  only a wiring test catches it.
+* `command::tests::every_known_command_has_a_match_arm` - a range edit once
+  deleted `room.join` and `room.leave` while leaving them advertised;
+  everything still compiled, because a missing arm just falls through to the
+  catch-all. The test reads its own source, which is crude, but `dispatch`
+  needs a live `Session` and cannot be called from a unit test.
+
+**Not covered, and worth knowing:** the JNI boundary itself (no instrumented
+tests), session lifecycle, and anything needing a device or a live core. Those
+gaps are why on-device logcat has been the real test harness so far.
+
+## 16 KB page alignment
+
+Android 15+ can run with 16 KB memory pages, and a shared library whose `LOAD`
+segments are 4 KB-aligned will not load there. Check every native library in the
+APK, not just ours:
+
+```powershell
+unzip -o app-debug.apk "lib/arm64-v8a/*"
+llvm-readelf -l lib/arm64-v8a/<name>.so | findstr LOAD   # Align must be 0x4000
+zipalign -c -P 16 -v 4 app-debug.apk                     # and the zip itself
+```
+
+**NDK r28 emits 16 KB-aligned segments by default**, so `libconquerd_android.so`
+needs no linker flags. The risk is dependencies: CameraX **1.3.4** shipped
+`libimage_processing_util_jni.so` at 4 KB and produced exactly this warning on a
+Pixel. Fixed by moving to CameraX **1.4.2**. Any new dependency carrying a `.so`
+is worth re-checking with the commands above.
+
 ## Install and debug
 
 ```powershell

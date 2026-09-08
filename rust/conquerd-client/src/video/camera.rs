@@ -59,6 +59,141 @@ impl CameraSource for NullCamera {
     }
 }
 
+/// Android capture: frames are pushed in from CameraX rather than pulled.
+///
+/// Every other backend owns its device and blocks in `next_frame`. Android
+/// cannot: the camera lives behind CameraX in the app process, which delivers
+/// `YUV_420_888` buffers on its own analyzer thread. So the JNI layer packs
+/// each buffer into I420 and calls [`android_impl::submit_frame`], and this
+/// backend is the consumer end of that queue.
+#[cfg(target_os = "android")]
+pub mod android_impl {
+    use super::{CameraSource, RawFrame};
+    use parking_lot::Mutex;
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::time::Duration;
+    use tracing::{info, warn};
+
+    /// How long `open` waits for CameraX to deliver its first buffer.
+    ///
+    /// Generous: the app has to bind a lifecycle, pick a camera and let the
+    /// sensor settle, and on a cold start that is not instant.
+    const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// How long a running capture waits before deciding the camera is gone.
+    const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Queue depth. Two frames: enough to absorb a scheduling hiccup, small
+    /// enough that a slow encoder drops rather than builds latency. Video is
+    /// better late-free than complete.
+    const QUEUE_DEPTH: usize = 2;
+
+    /// The live capture's inbox, if one is open.
+    static INBOX: Mutex<Option<SyncSender<RawFrame>>> = Mutex::new(None);
+
+    /// Hand a captured frame to the encoder.
+    ///
+    /// Called from CameraX's analyzer thread through JNI. Drops the frame when
+    /// no capture is open or the queue is full — never blocks, because
+    /// stalling that thread stalls the camera itself.
+    pub fn submit_frame(frame: RawFrame) {
+        let guard = INBOX.lock();
+        let Some(tx) = guard.as_ref() else {
+            return;
+        };
+        let _ = tx.try_send(frame);
+    }
+
+    /// Whether a capture is currently consuming frames.
+    pub fn is_open() -> bool {
+        INBOX.lock().is_some()
+    }
+
+    pub struct AndroidCamera {
+        rx: Receiver<RawFrame>,
+        width: u32,
+        height: u32,
+    }
+
+    impl AndroidCamera {
+        /// Open the capture and wait for the first frame.
+        ///
+        /// The first frame is what establishes the dimensions: CameraX picks a
+        /// resolution near the request rather than honouring it, and callers
+        /// read `dimensions()` immediately after opening.
+        pub fn open() -> anyhow::Result<Self> {
+            let (tx, rx) = sync_channel(QUEUE_DEPTH);
+            {
+                let mut guard = INBOX.lock();
+                if guard.is_some() {
+                    anyhow::bail!("a camera capture is already open");
+                }
+                *guard = Some(tx);
+            }
+
+            match rx.recv_timeout(FIRST_FRAME_TIMEOUT) {
+                Ok(first) => {
+                    let (width, height) = (first.width, first.height);
+                    info!("[video] Android camera delivering {width}x{height}");
+                    // The first frame established the size; it is dropped
+                    // rather than queued, so capture starts from live video.
+                    Ok(Self { rx, width, height })
+                }
+                Err(_) => {
+                    // Clear the inbox or a later open would see it occupied.
+                    *INBOX.lock() = None;
+                    anyhow::bail!(
+                        "no camera frame within {}s - is CameraX bound and the permission granted?",
+                        FIRST_FRAME_TIMEOUT.as_secs()
+                    )
+                }
+            }
+        }
+    }
+
+    impl CameraSource for AndroidCamera {
+        fn next_frame(&mut self) -> anyhow::Result<RawFrame> {
+            self.rx
+                .recv_timeout(FRAME_TIMEOUT)
+                .map_err(|_| anyhow::anyhow!("camera stopped delivering frames"))
+        }
+
+        fn dimensions(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+    }
+
+    impl Drop for AndroidCamera {
+        fn drop(&mut self) {
+            // Releasing the inbox is what tells `submit_frame` to stop
+            // copying buffers, and what lets a later capture open.
+            *INBOX.lock() = None;
+            warn!("[video] Android camera capture closed");
+        }
+    }
+
+    /// The cameras CameraX can bind.
+    ///
+    /// Reported statically rather than enumerated: selection happens on the
+    /// Kotlin side through `CameraSelector`, and the core only needs stable
+    /// ids to round-trip through settings.
+    pub fn list_devices() -> Vec<super::CameraDevice> {
+        vec![
+            super::CameraDevice {
+                id: "android:front".to_owned(),
+                name: "Front camera".to_owned(),
+            },
+            super::CameraDevice {
+                id: "android:back".to_owned(),
+                name: "Back camera".to_owned(),
+            },
+        ]
+    }
+}
+
+#[cfg(target_os = "android")]
+pub use android_impl::{list_devices, AndroidCamera};
+
 #[cfg(target_os = "windows")]
 pub use windows_impl::{list_devices, MfCamera};
 
@@ -75,7 +210,12 @@ pub use macos_impl::{list_devices, AvfCamera};
 pub use macos_impl::{list_devices as lint_macos_list_devices, AvfCamera as LintMacosCamera};
 
 /// Enumerate cameras. Always empty where capture is unimplemented.
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+)))]
 pub fn list_devices() -> Vec<CameraDevice> {
     Vec::new()
 }

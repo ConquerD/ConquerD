@@ -553,6 +553,28 @@ impl ConnectionManager {
         });
     }
 
+    /// The `public_id` of the peer a direct media datagram is addressed to.
+    ///
+    /// Direct media binds its signature to `direct_conv_id(sender, recipient)`,
+    /// and the **receiver** can only rebuild that from two public ids: its own
+    /// and the sender's, which rides the fragment header. The `peers` map,
+    /// however, is keyed by the *hex* peer id. Signing against that key
+    /// produces a different `conv_id` on each side, so every frame is rejected
+    /// as `frame signature rejected` while the transport works perfectly —
+    /// which is exactly how it presents: video arrives and is thrown away.
+    ///
+    /// Returns `peer_id` unchanged when it is already a public id, or when the
+    /// peer is not in the store, so callers that already pass the right form
+    /// are unaffected.
+    fn recipient_public_id(&self, peer_id: &str) -> String {
+        self.peer_store
+            .read()
+            .get(peer_id)
+            .map(|record| record.identity_pub.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| peer_id.to_owned())
+    }
+
     pub(super) fn resolve_quic_peer_alias(&self, peer_id: &str) -> String {
         self.quic_peer_aliases
             .get(peer_id)
@@ -729,7 +751,7 @@ impl ConnectionManager {
             .get(peer_id)
             .copied()
             .unwrap_or(0);
-        let conv_id = crate::video::direct_conv_id(&sender, peer_id);
+        let conv_id = crate::video::direct_conv_id(&sender, &self.recipient_public_id(peer_id));
         let signing_bytes = crate::content_audio::content_audio_signing_bytes(
             &conv_id, &sender, seq, pts_us, &opus,
         );
@@ -803,7 +825,8 @@ impl ConnectionManager {
 
         let sender = self.identity.public_id();
         let seq = self.direct_video_seq.get(peer_id).copied().unwrap_or(0);
-        let conv_id = crate::video::direct_conv_id(&sender, peer_id);
+
+        let conv_id = crate::video::direct_conv_id(&sender, &self.recipient_public_id(peer_id));
         let signing_bytes = crate::video::video_frame_signing_bytes(
             &conv_id, &sender, seq, codec, pts_us, &encoded,
         );

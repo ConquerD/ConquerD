@@ -43,6 +43,28 @@ object NativeCore {
         sink: EventSink,
     ): Long
 
+    /**
+     * Hand one captured frame to the encoder.
+     *
+     * Called on CameraX's analyzer thread. Cheap and non-blocking when video is
+     * off, so the analyzer can stay bound across start/stop without
+     * coordinating with the core. Planes are the `ImageProxy`'s direct buffers
+     * and are only read for the duration of the call.
+     */
+    external fun nativeSubmitCameraFrame(
+        y: java.nio.ByteBuffer,
+        yRowStride: Int,
+        u: java.nio.ByteBuffer,
+        uRowStride: Int,
+        uPixelStride: Int,
+        v: java.nio.ByteBuffer,
+        vRowStride: Int,
+        vPixelStride: Int,
+        width: Int,
+        height: Int,
+        rotationDegrees: Int,
+    )
+
     /** Run one command, returning one JSON reply. Never throws. */
     external fun nativeCommand(handle: Long, json: String): String
 

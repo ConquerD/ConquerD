@@ -14,6 +14,9 @@ crate-type = ["cdylib"]
 # The whole client core — transport, crypto, stores, rooms, files. Built
 # without `qt-ui`, which is what keeps Qt out of the Android graph entirely.
 conquerd-client = { path = "../conquerd-client" }
+# For `VideoCodec`, which rides the video send commands. Same path dependency
+# conquerd-client uses, so both resolve to one copy of the type.
+conquerd-features = { path = "../conquerd-features" }
 
 anyhow = "1"
 jni = "0.21"

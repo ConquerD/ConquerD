@@ -343,6 +343,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "conquerd-client",
+ "conquerd-features",
  "jni 0.21.1",
  "ndk-context",
  "parking_lot",

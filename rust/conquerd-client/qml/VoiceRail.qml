@@ -21,6 +21,20 @@ Rectangle {
     // ── Public API ────────────────────────────────────────────────────────
 
     /// The RoomModel (or a synthetic 2-entry ListModel for direct calls).
+    /// Peer ids currently sending video, as a set (`{peerId: true}`).
+    ///
+    /// Needed because `videoActive` is a role on `RoomModel` only:
+    /// `directCallModel` is a plain ListModel without the field, so in a
+    /// direct call `model.videoActive` is always undefined and every
+    /// video-gated control stayed greyed out no matter what the peer sent.
+    /// Owned by MainWindow and passed down whole.
+    property var videoActivePeers: ({})
+
+    /// Whether `peerId` is sending video, from either source.
+    function peerHasVideo(peerId) {
+        return root.videoActivePeers[peerId] === true
+    }
+
     property var participantModel: null
 
     /// Display name shown in the header (room name or remote peer handle).
@@ -571,6 +585,7 @@ Rectangle {
                     ringStore:   root.ringStateForPeer(model.peerId)
                     showNameBubbles: root.showNameBubbles
                     videoActive: model.videoActive === true
+                                 || root.peerHasVideo(model.peerId)
                     locallyMuted: model.localMuted === true
 
                     onContextMenuRequested: peerMenu.openFor(
@@ -578,7 +593,7 @@ Rectangle {
                         model.handle || model.peerId || "",
                         model.localMuted === true,
                         model.localVolume === undefined ? 100 : model.localVolume,
-                        model.videoActive === true,
+                        model.videoActive === true || root.peerHasVideo(model.peerId),
                         model.isSelf === true)
                     onExpandVideoRequested: root.expandVideoRequested(model.peerId)
                 }

@@ -6,6 +6,7 @@
 
 use jni::objects::{GlobalRef, JObject, JValue};
 use jni::{JNIEnv, JavaVM};
+use std::sync::Arc;
 use tracing::warn;
 
 /// JNI signature of `void onEvent(String)`.
@@ -16,8 +17,12 @@ const ON_EVENT_SIG: &str = "(Ljava/lang/String;)V";
 /// Holds the `JavaVM` rather than a `JNIEnv` because a `JNIEnv` is only valid
 /// on the thread that produced it, and events are emitted from the pump thread
 /// rather than from whichever thread called into JNI.
+#[derive(Clone)]
 pub struct EventSink {
-    vm: JavaVM,
+    /// Behind an `Arc` so the sink can be cloned: core events and call events
+    /// are pumped by separate threads, each needing its own JVM attachment but
+    /// the same listener.
+    vm: Arc<JavaVM>,
     listener: GlobalRef,
 }
 
@@ -26,7 +31,7 @@ impl EventSink {
     /// return from `nativeStart`.
     pub fn new(env: &JNIEnv<'_>, listener: &JObject<'_>) -> jni::errors::Result<Self> {
         Ok(Self {
-            vm: env.get_java_vm()?,
+            vm: Arc::new(env.get_java_vm()?),
             listener: env.new_global_ref(listener)?,
         })
     }

@@ -36,6 +36,14 @@ pub struct Session {
     /// Cached because `Identity::public_id` allocates and the chat path reads
     /// it for every outbound message.
     pub my_public_id: String,
+    /// The live local video capture, if any.
+    ///
+    /// One at a time: the camera is a single device, and `AndroidCamera::open`
+    /// refuses a second capture rather than silently stealing frames from the
+    /// first.
+    pub video: Arc<RwLock<Option<conquerd_client::video::sender::VideoSender>>>,
+    /// A clone of the event sink, so a capture that dies on its own can say so.
+    pub sink: EventSink,
     /// Cluster rosters learned from `ClusterMembersUpdated`, keyed by the
     /// supernode that reported them.
     ///
@@ -45,6 +53,7 @@ pub struct Session {
     /// against a sibling.
     pub cluster_members: Arc<RwLock<HashMap<String, Vec<String>>>>,
     pump: Option<std::thread::JoinHandle<()>>,
+    call_pump: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Session {
@@ -92,13 +101,20 @@ impl Session {
             ConnectionManager::split(Arc::clone(&identity), Arc::clone(&peer_store));
         runtime.spawn(cm_fut);
 
-        let (call_tx, _call_events, call_fut) = CallController::split(Some(cmd_tx.clone()));
+        let (call_tx, call_events, call_fut) = CallController::split(Some(cmd_tx.clone()));
         runtime.spawn(call_fut);
 
         let (_sfu_tx, _sfu_events, sfu_fut) = SfuClient::split(Some(cmd_tx.clone()));
         runtime.spawn(sfu_fut);
 
         let cluster_members = Arc::new(RwLock::new(HashMap::new()));
+        // The call controller has its own event channel, separate from the
+        // connection manager's. Dropping it costs the real call state (the UI
+        // is left guessing from signalling, and an answered call still reads
+        // "calling"), the speaking indicators, and every capture error.
+        let call_pump = spawn_call_event_pump(call_events, sink.clone())?;
+        let sink_for_session = sink.clone();
+
         let pump = spawn_event_pump(
             event_rx,
             sink,
@@ -117,8 +133,11 @@ impl Session {
             chat_store,
             room_store,
             my_public_id,
+            video: Arc::new(RwLock::new(None)),
+            sink: sink_for_session,
             cluster_members,
             pump: Some(pump),
+            call_pump: Some(call_pump),
         })
     }
 
@@ -157,6 +176,13 @@ impl Session {
 
     /// Shut the core down and wait for the pump thread to finish.
     pub fn stop(mut self) {
+        // Release the camera before anything else: the capture thread holds
+        // the device, and a session that ends without stopping it leaves the
+        // camera indicator lit on a phone with no call in progress.
+        if let Some(video) = self.video.write().take() {
+            video.stop();
+        }
+
         // Ask the manager to close cleanly first, so peers see a disconnect
         // rather than a dropped socket.
         let _ = self.cmd_tx.try_send(ConnectionCommand::Shutdown);
@@ -176,9 +202,14 @@ impl Session {
             },
         ));
 
-        if let Some(pump) = self.pump.take() {
-            if pump.join().is_err() {
-                error!("event pump thread panicked");
+        for (name, handle) in [
+            ("core event", self.pump.take()),
+            ("call event", self.call_pump.take()),
+        ] {
+            if let Some(handle) = handle {
+                if handle.join().is_err() {
+                    error!("{name} pump thread panicked");
+                }
             }
         }
         info!("session stopped");
@@ -250,6 +281,40 @@ fn spawn_event_pump(
             }
 
             info!("event pump finished");
+        })
+}
+
+/// Forward call-controller events to Kotlin.
+///
+/// A second thread rather than merging into the core pump: each needs its own
+/// permanent JVM attachment, and merging two typed tokio channels would mean a
+/// select loop inside a thread that is deliberately blocking.
+fn spawn_call_event_pump(
+    mut call_events: mpsc::Receiver<conquerd_client::call_controller::CallEvent>,
+    sink: EventSink,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("conquerd-call-events".to_owned())
+        .spawn(move || {
+            let mut guard = match sink.attach() {
+                Ok(g) => g,
+                Err(e) => {
+                    error!("could not attach call-event thread to the JVM: {e}");
+                    return;
+                }
+            };
+
+            while let Some(ev) = call_events.blocking_recv() {
+                let Some(payload) = event::call_event_to_json(&ev) else {
+                    continue;
+                };
+                match serde_json::to_string(&payload) {
+                    Ok(json) => sink.emit(&mut guard, &json),
+                    Err(e) => warn!("could not encode call event: {e}"),
+                }
+            }
+
+            info!("call event pump finished");
         })
 }
 
@@ -393,5 +458,84 @@ fn persist_if_chat(chat_store: &ChatStore, event: &ConnectionEvent) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conquerd_client::call_controller::CallCommand;
+
+    /// The regression this exists for: filtering media out of the event JSON
+    /// without routing it here made calls connect, signal correctly, and stay
+    /// completely silent - every inbound frame was dropped, with no error
+    /// anywhere. A wiring bug, not a logic bug, so only a wiring test catches
+    /// it.
+    #[test]
+    fn inbound_direct_audio_reaches_the_call_controller() {
+        let (tx, mut rx) = mpsc::channel(8);
+        route_media(
+            &tx,
+            &ConnectionEvent::DirectAudioReceived {
+                peer_id: "peer-a".to_owned(),
+                opus_data: vec![1, 2, 3],
+            },
+        );
+
+        match rx.try_recv() {
+            Ok(CallCommand::DirectAudioInbound { peer_id, opus_data }) => {
+                assert_eq!(peer_id, "peer-a");
+                assert_eq!(opus_data, vec![1, 2, 3]);
+            }
+            _ => panic!("direct audio must be handed to the call controller"),
+        }
+    }
+
+    #[test]
+    fn inbound_room_audio_reaches_the_call_controller() {
+        let (tx, mut rx) = mpsc::channel(8);
+        route_media(
+            &tx,
+            &ConnectionEvent::SfuAudioReceived {
+                peer_id: "peer-b".to_owned(),
+                opus_data: vec![9],
+            },
+        );
+
+        match rx.try_recv() {
+            Ok(CallCommand::RoomAudioInbound { peer_id, opus_data }) => {
+                assert_eq!(peer_id, "peer-b");
+                assert_eq!(opus_data, vec![9]);
+            }
+            _ => panic!("room audio must be handed to the call controller"),
+        }
+    }
+
+    #[test]
+    fn non_media_events_are_not_routed_to_audio() {
+        let (tx, mut rx) = mpsc::channel(8);
+        route_media(&tx, &ConnectionEvent::PeerConnected("peer".to_owned()));
+        assert!(
+            rx.try_recv().is_err(),
+            "only media belongs on the call-controller channel",
+        );
+    }
+
+    /// The pump must keep draining the event channel even when playout is
+    /// behind. A dropped frame is concealed by the jitter buffer; a stalled
+    /// pump would freeze chat and presence along with the audio.
+    #[test]
+    fn a_full_audio_queue_drops_rather_than_blocking() {
+        let (tx, _rx) = mpsc::channel(1);
+        for _ in 0..8 {
+            route_media(
+                &tx,
+                &ConnectionEvent::SfuAudioReceived {
+                    peer_id: "peer".to_owned(),
+                    opus_data: vec![0],
+                },
+            );
+        }
+        // Reaching here without blocking is the assertion.
     }
 }
