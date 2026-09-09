@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-use crate::crypto::normalize_public_id;
+use crate::crypto::{b64url_decode, derive_peer_id, normalize_public_id};
 use crate::protocol::{MessageType, SignalingMessage};
 use conquerd_features::ReplayGuard;
 
@@ -224,6 +224,16 @@ fn identity_key_variants(identity_pub: &str) -> Vec<String> {
 pub struct SignalingState {
     /// identity_pub → WebSocket sender channel
     pub peer_sockets: HashMap<String, PeerTx>,
+    /// Hex `peer_id` → the `peer_sockets` key that identity is registered under.
+    ///
+    /// One identity has two spellings on the wire: the base64url `public_id`
+    /// a peer signs as, and the hex SHA-256 `peer_id`. Clients address peers
+    /// by either, but the socket table is keyed only by the first, so a
+    /// hex-addressed message was dropped as "not connected" even though the
+    /// peer was sitting right there. Derived from the signed sender, never
+    /// read from the payload - a self-reported alias would let any peer claim
+    /// another's traffic.
+    pub peer_id_aliases: HashMap<String, String>,
     /// identity_pub → reliable QUIC relay signaling-stream sender channel.
     /// Populated by the relay's signaling-stream hook; preferred over the
     /// WebSocket socket by [`SignalingServer::send_to_peer`] for lower-latency,
@@ -237,10 +247,51 @@ impl SignalingState {
     pub fn new() -> Self {
         Self {
             peer_sockets: HashMap::new(),
+            peer_id_aliases: HashMap::new(),
             quic_senders: HashMap::new(),
             connected_count: 0,
         }
     }
+
+    /// Resolve a routing target to a live WebSocket, whichever spelling of the
+    /// identity the sender used.
+    ///
+    /// Exact-matching the target is what made this necessary: a peer is keyed
+    /// by the `sender` of its first message, but callers address it by a
+    /// padded or unpadded `public_id`, or by the hex `peer_id`. All three name
+    /// the same key, so dropping the other two loses perfectly routable
+    /// traffic - silently, since the sender is never told.
+    pub fn socket_for_target(&self, target: &str) -> Option<&PeerTx> {
+        for key in identity_key_variants(target) {
+            if let Some(tx) = self.peer_sockets.get(&key) {
+                return Some(tx);
+            }
+        }
+        let canonical = self.peer_id_aliases.get(target)?;
+        self.peer_sockets.get(canonical)
+    }
+
+    /// Drop a peer's socket and every alias that pointed at it.
+    ///
+    /// An alias outliving its socket would leave the resolver returning a key
+    /// that resolves to nothing, so the two are removed together.
+    pub fn remove_peer_socket(&mut self, key: &str) {
+        self.peer_sockets.remove(key);
+        self.peer_id_aliases.retain(|_, canonical| canonical != key);
+    }
+}
+
+/// The hex `peer_id` spelling of a base64url `public_id`, when it is one.
+///
+/// Derived from the sender the message was signed as, so a peer can only ever
+/// register the alias belonging to its own key. `None` for anything that is
+/// not a well-formed 32-byte public key.
+fn peer_id_alias_for(sender: &str) -> Option<String> {
+    let bytes = b64url_decode(sender).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    Some(derive_peer_id(&bytes))
 }
 
 /// Callback trait for the supernode to handle messages.
@@ -644,6 +695,9 @@ async fn handle_ws_connection(
             peer_id = Some(parsed.sender.clone());
             let mut st = state.write();
             let replaced = st.peer_sockets.insert(parsed.sender.clone(), tx.clone());
+            if let Some(alias) = peer_id_alias_for(&parsed.sender) {
+                st.peer_id_aliases.insert(alias, parsed.sender.clone());
+            }
             if replaced.is_none() {
                 st.connected_count += 1;
             } else {
@@ -666,7 +720,7 @@ async fn handle_ws_connection(
         if let Some(ref target) = parsed.target {
             if target != our_id {
                 let st = state.read();
-                if let Some(target_tx) = st.peer_sockets.get(target) {
+                if let Some(target_tx) = st.socket_for_target(target) {
                     if target_tx.send(&msg) {
                         debug!(
                             "Relayed {:?} from {} → {}",
@@ -706,7 +760,7 @@ async fn handle_ws_connection(
             .get(pid)
             .is_some_and(|stored| stored.same_channel(&tx));
         if is_ours {
-            st.peer_sockets.remove(pid);
+            st.remove_peer_socket(pid);
             st.connected_count = st.connected_count.saturating_sub(1);
             drop(st);
             replay_guard.forget_peer(pid);
@@ -1040,4 +1094,141 @@ mod tests {
         assert!(!is_bulk_file_data(MessageType::SfuFileRequest));
         assert!(!is_bulk_file_data(MessageType::ChatMessage));
     }
+
+    // ── Target resolution across identity spellings ─────────────────────────
+
+    /// A 32-byte key and the two spellings a peer is addressed by.
+    fn spellings(seed: u8) -> (String, String) {
+        let key = [seed; 32];
+        let public_id = normalize_public_id(&crate::crypto::b64url_encode(&key));
+        (public_id, derive_peer_id(&key))
+    }
+
+    /// The regression this exists for. The phone and the desktop each addressed
+    /// the other by hex `peer_id` on the relay path; the socket table is keyed
+    /// by the base64url `public_id` the peer signed as, so the supernode logged
+    /// "not connected" and dropped the envelope while the peer sat connected.
+    /// Nothing told the sender, so it simply retried forever.
+    #[test]
+    fn a_hex_peer_id_target_reaches_a_peer_registered_by_public_id() {
+        let (public_id, hex_peer_id) = spellings(7);
+        assert_ne!(public_id, hex_peer_id);
+
+        let mut st = SignalingState::new();
+        let (tx, mut rx) = peer_channel();
+        st.peer_sockets.insert(public_id.clone(), tx);
+        st.peer_id_aliases
+            .insert(hex_peer_id.clone(), public_id.clone());
+
+        let found = st
+            .socket_for_target(&hex_peer_id)
+            .expect("the hex spelling must resolve to the same peer");
+        assert!(found.send(r#"{"type":"ping"}"#));
+        assert!(rx.try_recv().is_some());
+    }
+
+    /// The relay lookup used to bypass `identity_key_variants` entirely, so it
+    /// was intolerant of padding as well as of the hex form.
+    #[test]
+    fn an_unpadded_target_reaches_a_padded_registration() {
+        let (public_id, _) = spellings(9);
+        let bare = public_id.trim_end_matches('=').to_owned();
+        assert_ne!(bare, public_id);
+
+        let mut st = SignalingState::new();
+        let (tx, _rx) = peer_channel();
+        st.peer_sockets.insert(public_id, tx);
+
+        assert!(
+            st.socket_for_target(&bare).is_some(),
+            "padding must not decide whether a peer is reachable"
+        );
+    }
+
+    /// An unknown target still resolves to nothing - the resolver widens which
+    /// spellings match one identity, it does not make routing promiscuous.
+    #[test]
+    fn an_unknown_target_still_resolves_to_nothing() {
+        let (public_id, _) = spellings(11);
+        let (other_public_id, other_hex) = spellings(12);
+
+        let mut st = SignalingState::new();
+        let (tx, _rx) = peer_channel();
+        st.peer_sockets.insert(public_id, tx);
+
+        assert!(st.socket_for_target(&other_public_id).is_none());
+        assert!(st.socket_for_target(&other_hex).is_none());
+    }
+
+    /// The alias is derived from the sender the message was signed as, never
+    /// read from the payload. HELLO does carry a `peer_id` field, but trusting
+    /// it would let any peer claim the alias of an identity it does not hold
+    /// and be handed that peer's relayed traffic.
+    #[test]
+    fn the_alias_is_derived_from_the_signed_sender() {
+        let (public_id, hex_peer_id) = spellings(13);
+        assert_eq!(peer_id_alias_for(&public_id).as_deref(), Some(&*hex_peer_id));
+
+        // A different identity derives a different alias, so one peer
+        // registering cannot shadow another.
+        let (other_public_id, other_hex) = spellings(14);
+        assert_eq!(
+            peer_id_alias_for(&other_public_id).as_deref(),
+            Some(&*other_hex)
+        );
+        assert_ne!(hex_peer_id, other_hex);
+    }
+
+    /// Anything that is not a 32-byte key has no alias, rather than a
+    /// derivation over whatever bytes it happened to decode to.
+    #[test]
+    fn a_malformed_sender_has_no_alias() {
+        assert!(peer_id_alias_for("").is_none());
+        assert!(peer_id_alias_for("not-base64!!").is_none());
+        assert!(
+            peer_id_alias_for(&crate::crypto::b64url_encode(&[1u8; 16])).is_none(),
+            "a short key must not produce an alias"
+        );
+    }
+
+    /// An alias outliving its socket would leave the resolver handing back a
+    /// key that resolves to nothing.
+    #[test]
+    fn dropping_a_peer_drops_its_alias() {
+        let (public_id, hex_peer_id) = spellings(15);
+        let mut st = SignalingState::new();
+        let (tx, _rx) = peer_channel();
+        st.peer_sockets.insert(public_id.clone(), tx);
+        st.peer_id_aliases
+            .insert(hex_peer_id.clone(), public_id.clone());
+
+        st.remove_peer_socket(&public_id);
+
+        assert!(st.peer_sockets.is_empty());
+        assert!(st.peer_id_aliases.is_empty(), "the alias must not outlive the socket");
+        assert!(st.socket_for_target(&hex_peer_id).is_none());
+    }
+
+    /// One peer reconnecting must not strip the alias of another.
+    #[test]
+    fn dropping_one_peer_leaves_another_alias_intact() {
+        let (a_pub, a_hex) = spellings(20);
+        let (b_pub, b_hex) = spellings(21);
+        let mut st = SignalingState::new();
+        let (a_tx, _a_rx) = peer_channel();
+        let (b_tx, _b_rx) = peer_channel();
+        st.peer_sockets.insert(a_pub.clone(), a_tx);
+        st.peer_sockets.insert(b_pub.clone(), b_tx);
+        st.peer_id_aliases.insert(a_hex.clone(), a_pub.clone());
+        st.peer_id_aliases.insert(b_hex.clone(), b_pub.clone());
+
+        st.remove_peer_socket(&a_pub);
+
+        assert!(st.socket_for_target(&a_hex).is_none());
+        assert!(
+            st.socket_for_target(&b_hex).is_some(),
+            "one peer leaving must not unroute another"
+        );
+    }
+
 }
