@@ -57,6 +57,11 @@ data class Room(
     @SerialName("invite_token") val inviteToken: String = "",
     @SerialName("space_id") val spaceId: String = "",
     /**
+     * Parent node in the Space tree; empty or equal to [spaceId] means the room
+     * sits directly under the server rather than inside another room.
+     */
+    @SerialName("parent_id") val parentId: String = "",
+    /**
      * Hidden from the sidebar on this profile.
      *
      * Local-only state that lives in the room store's tombstone list rather

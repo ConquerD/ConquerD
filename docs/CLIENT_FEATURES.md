@@ -153,7 +153,8 @@ read.
 * **Android** — `room.list`, `room.create`, `room.join`, `room.leave`,
   `room.hide`, `room.unhide`, `room.chat.subscribe`, `room.chat.unsubscribe`,
   `room.chat.send`, `room.history`, `room.request_list`, `room.voice.join`,
-  `room.voice.leave`. No sub-rooms and no room invites.
+  `room.voice.leave`. `room.create` takes an optional `parent_room_id`.
+  Generating room invites is not wired.
 
   Creation was not just a missing command. Nothing else on Android writes to
   the room store — the rooms a phone lists were persisted by a desktop client
@@ -175,8 +176,23 @@ signed, and admission is proved against it rather than asserted.
 * **Core** — `space.rs` (Layer 1: nested tree, signed-root sync, proof-based
   admission).
 * **Desktop** — nested room UI; membership proofs on join.
-* **Android** — **nothing**. Rooms appear flat; the `in a space` suffix in the
-  room list is the only trace.
+* **Android** — nested room list and sub-room creation.
+
+  Two things were already true before any Android work, and are worth knowing
+  before you build this for another client. **Proof-carrying joins are handled
+  by the core, not the client**: `handle_accept_room_invite` stashes the
+  invite's space creds and `send_room_join` attaches them to the `SfuJoin`
+  single-use, so any client that forwards a `conquerd://…room#…` link to
+  `AcceptInvite` gets proof-based admission for free. And **`room.list`
+  already carries the nesting** — `space_id` and `parent_id` are stamped onto
+  the stored entry by `adopt_room_into_space` — so a flat list is a UI choice,
+  not a data gap.
+
+  What a client does have to supply is the parent for a create it initiates:
+  the supernode's `RoomCreated` reply carries the new room id but not what you
+  asked to nest it under, so the intent is held between request and reply
+  (`pending_sub_room_parent`, keyed `supernode_id:room_name`, the same shape
+  the desktop bridge uses).
 
 ### 7. Direct voice calls
 
@@ -375,9 +391,10 @@ Android yet) or is purely local (theme, camera choice).
 | Direct chat | Full | Full, minus per-peer clear |
 | Rooms join / leave / chat | Yes | Yes |
 | Room create | Yes | Yes |
-| Sub-rooms / room invites | Yes | **No** |
+| Sub-rooms | Yes | Yes |
+| Room invites | Yes | **No** |
 | Room hide | Yes | Yes |
-| Spaces (nested, proof admission) | Yes | **No** |
+| Spaces (nested, proof admission) | Yes | Nested list, sub-rooms, proof joins |
 | Direct voice | Full stack + tuning | Basic call + mute |
 | Room voice | Yes | Yes |
 | Video send | Camera + screen share | Camera only |

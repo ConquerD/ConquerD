@@ -680,6 +680,17 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 _ => "public",
             };
 
+            // Creating inside another room nests it in the Space tree. The
+            // parent is remembered until `RoomCreated` comes back, because the
+            // reply carries the new room id but not what we asked to nest it
+            // under.
+            if let Some(parent) = arg_str(&parsed, "parent_room_id").filter(|p| !p.is_empty()) {
+                session
+                    .pending_sub_room_parent
+                    .write()
+                    .insert(format!("{supernode_id}:{room_name}"), parent.to_owned());
+            }
+
             // The room is persisted when the supernode answers with
             // `RoomCreated` - see `persist_if_room_created`. Nothing is written
             // here, so a create that never lands leaves no phantom room behind.

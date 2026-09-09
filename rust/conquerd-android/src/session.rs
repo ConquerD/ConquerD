@@ -51,6 +51,14 @@ pub struct Session {
     pub video: Arc<RwLock<Option<conquerd_client::video::sender::VideoSender>>>,
     /// A clone of the event sink, so a capture that dies on its own can say so.
     pub sink: EventSink,
+    /// Parent room for a create still in flight, keyed `supernode_id:room_name`.
+    ///
+    /// The supernode's `RoomCreated` reply carries the new room id but not the
+    /// parent we asked for, so the intent has to be held between the request
+    /// and the reply. Same approach as the desktop bridge's
+    /// `pending_sub_room_parent`, and keyed the same way: a name is unique
+    /// enough within one host for the moment a create is outstanding.
+    pub pending_sub_room_parent: Arc<RwLock<HashMap<String, String>>>,
     /// Cluster rosters learned from `ClusterMembersUpdated`, keyed by the
     /// supernode that reported them.
     ///
@@ -92,6 +100,8 @@ impl Session {
         // meaningful HOME, so it must be set before any store is opened.
         std::env::set_var("CONQUERD_HOME", &key_dir);
 
+        let pending_sub_room_parent: Arc<RwLock<HashMap<String, String>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let (identity, identity_key) =
             unlock_identity(&key_dir, passphrase, keyfile_path, stored_key)?;
         let identity = Arc::new(identity);
@@ -143,6 +153,7 @@ impl Session {
             Arc::clone(&chat_store),
             key_dir.clone(),
             Arc::clone(&room_store),
+            Arc::clone(&pending_sub_room_parent),
             Arc::clone(&identity),
             cmd_tx.clone(),
             call_tx.clone(),
@@ -160,6 +171,7 @@ impl Session {
             chat_store,
             room_store,
             my_public_id,
+            pending_sub_room_parent,
             video: Arc::new(RwLock::new(None)),
             sink: sink_for_session,
             cluster_members,
@@ -298,6 +310,7 @@ fn spawn_event_pump(
     chat_store: Arc<ChatStore>,
     home_dir: PathBuf,
     room_store: Arc<RwLock<RoomStore>>,
+    pending_sub_room_parent: Arc<RwLock<HashMap<String, String>>>,
     identity: Arc<Identity>,
     cmd_tx: mpsc::Sender<ConnectionCommand>,
     call_tx: mpsc::Sender<CallCommand>,
@@ -321,6 +334,7 @@ fn spawn_event_pump(
                 persist_if_room_chat(&chat_store, &my_public_id, &ev);
                 persist_if_room_created(
                     &room_store,
+                    &pending_sub_room_parent,
                     &identity,
                     &cmd_tx,
                     &my_public_id,
@@ -591,6 +605,7 @@ fn persist_if_file_complete(
 /// differently from a desktop-created one.
 fn persist_if_room_created(
     room_store: &Arc<RwLock<RoomStore>>,
+    pending_sub_room_parent: &Arc<RwLock<HashMap<String, String>>>,
     identity: &Arc<Identity>,
     cmd_tx: &mpsc::Sender<ConnectionCommand>,
     my_public_id: &str,
@@ -628,8 +643,6 @@ fn persist_if_room_created(
         .with_supernode(supernode_id)
         .with_creator(my_public_id, true)
         .with_invite_token(invite_token)
-        // Android has no sub-room UI, so a room created here is always
-        // top-level and the creator always holds the invite.
         .with_invite_policy("owner");
 
     if let Err(e) = room_store.write().upsert(entry) {
@@ -642,6 +655,13 @@ fn persist_if_room_created(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // The parent we asked for, if this create came from "inside" another
+    // room. Removed rather than read: the intent belongs to one create.
+    let parent_node_id = pending_sub_room_parent
+        .write()
+        .remove(&format!("{supernode_id}:{room_name}"))
+        .unwrap_or_default();
+
     // Best-effort, exactly as on the desktop: a signing or persist hiccup
     // must not lose the room that was already created server-side.
     let adopted = room_store.write().adopt_room_into_space(
@@ -650,7 +670,7 @@ fn persist_if_room_created(
         room_id,
         room_name,
         room_type,
-        "",
+        &parent_node_id,
         issued_at,
         |b| identity.sign(b),
     );

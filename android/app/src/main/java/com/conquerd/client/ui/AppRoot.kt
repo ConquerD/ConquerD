@@ -638,10 +638,11 @@ private fun HomeScreen(viewModel: AppViewModel) {
     if (showCreateRoom) {
         CreateRoomDialog(
             supernodes = state.supernodes,
+            rooms = state.rooms,
             onDismiss = { showCreateRoom = false },
-            onCreate = { supernodeId, name, isPrivate ->
+            onCreate = { supernodeId, name, isPrivate, parentRoomId ->
                 showCreateRoom = false
-                viewModel.createRoom(supernodeId, name, isPrivate)
+                viewModel.createRoom(supernodeId, name, isPrivate, parentRoomId)
             },
         )
     }
@@ -704,7 +705,7 @@ private fun RoomsList(
     // Hidden is per-profile local state, so the desktop's choices arrive with
     // the room list and are honoured here rather than re-derived.
     val visible = remember(rooms, showHidden) {
-        rooms.filter { showHidden || !it.hidden }.sortedBy { it.roomName.lowercase() }
+        layOutSpaceTree(rooms.filter { showHidden || !it.hidden })
     }
 
     if (visible.isEmpty()) {
@@ -732,7 +733,8 @@ private fun RoomsList(
     }
 
     LazyColumn(Modifier.fillMaxSize()) {
-        items(visible, key = { it.key }) { room ->
+        items(visible, key = { it.room.key }) { node ->
+            val room = node.room
             ListItem(
                 headlineContent = { Text(room.roomName.ifBlank { room.roomId.take(12) }) },
                 supportingContent = {
@@ -748,14 +750,75 @@ private fun RoomsList(
                 },
                 // Long-press toggles. Purely local either way: the room stays
                 // on the supernode and other members are unaffected.
-                modifier = Modifier.combinedClickable(
-                    onClick = { onOpenRoom(room) },
-                    onLongClick = { onSetHidden(room, !room.hidden) },
-                ),
+                //
+                // Depth is an indent rather than a drawn tree: nesting is
+                // rarely more than two deep, and an indent reads as "inside
+                // that one" without spending phone width on connectors.
+                modifier = Modifier
+                    .padding(start = (node.depth * 20).dp)
+                    .combinedClickable(
+                        onClick = { onOpenRoom(room) },
+                        onLongClick = { onSetHidden(room, !room.hidden) },
+                    ),
             )
             HorizontalDivider()
         }
     }
+}
+
+/** A room placed in the Space tree, with how deep it sits. */
+private data class RoomNode(val room: Room, val depth: Int)
+
+/**
+ * Order rooms parent-before-child and record each one's depth.
+ *
+ * The core hands back a flat list carrying `space_id` and `parent_id`; the
+ * nesting is only implied. Rooms whose parent is absent from the list are
+ * treated as top-level rather than dropped — a sub-room can outlive the parent
+ * in the local store when the parent was hidden or never synced, and a room
+ * you cannot see is worse than one shown at the wrong depth.
+ */
+private fun layOutSpaceTree(rooms: List<Room>): List<RoomNode> {
+    val byRoomId = rooms.associateBy { it.roomId }
+    val children = rooms.groupBy { room ->
+        val parent = room.parentId
+        // Empty, self-referential, pointing at the space itself, or naming a
+        // room we do not have all mean "top level".
+        if (parent.isBlank() ||
+            parent == room.roomId ||
+            parent == room.spaceId ||
+            parent !in byRoomId
+        ) {
+            ""
+        } else {
+            parent
+        }
+    }
+
+    val ordered = mutableListOf<RoomNode>()
+    val seen = mutableSetOf<String>()
+
+    fun walk(parentId: String, depth: Int) {
+        children[parentId]
+            .orEmpty()
+            .sortedBy { it.roomName.lowercase() }
+            .forEach { room ->
+                // A parent cycle would otherwise recurse forever; the store is
+                // not supposed to contain one, but this list must not hang.
+                if (!seen.add(room.roomId)) return@forEach
+                ordered += RoomNode(room, depth)
+                walk(room.roomId, depth + 1)
+            }
+    }
+
+    walk("", 0)
+
+    // Anything a cycle excluded still gets shown, flat.
+    rooms.filter { it.roomId !in seen }
+        .sortedBy { it.roomName.lowercase() }
+        .forEach { ordered += RoomNode(it, 0) }
+
+    return ordered
 }
 
 @Composable
@@ -887,15 +950,24 @@ private fun PeerRow(
 @Composable
 private fun CreateRoomDialog(
     supernodes: List<Peer>,
+    rooms: List<Room>,
     onDismiss: () -> Unit,
-    onCreate: (String, String, Boolean) -> Unit,
+    onCreate: (String, String, Boolean, String) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
     var isPrivate by remember { mutableStateOf(false) }
     var hostIndex by remember { mutableStateOf(0) }
     var hostMenuOpen by remember { mutableStateOf(false) }
+    var parent by remember { mutableStateOf<Room?>(null) }
+    var parentMenuOpen by remember { mutableStateOf(false) }
 
     val host = supernodes.getOrNull(hostIndex)
+
+    // Only rooms on the chosen host can be a parent: the Space tree belongs to
+    // one supernode, so nesting across hosts is not a thing to offer.
+    val candidates = remember(rooms, host) {
+        rooms.filter { host != null && it.supernodeId == host.peerId }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -933,6 +1005,36 @@ private fun CreateRoomDialog(
                     }
                 }
 
+                if (candidates.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Box {
+                        TextButton(onClick = { parentMenuOpen = true }) {
+                            Text("Inside: ${parent?.roomName ?: "nothing"}")
+                        }
+                        DropdownMenu(
+                            expanded = parentMenuOpen,
+                            onDismissRequest = { parentMenuOpen = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Nothing - top level") },
+                                onClick = {
+                                    parent = null
+                                    parentMenuOpen = false
+                                },
+                            )
+                            candidates.forEach { room ->
+                                DropdownMenuItem(
+                                    text = { Text(room.roomName.ifBlank { room.roomId.take(12) }) },
+                                    onClick = {
+                                        parent = room
+                                        parentMenuOpen = false
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+
                 if (supernodes.size > 1) {
                     Spacer(Modifier.height(12.dp))
                     Box {
@@ -959,7 +1061,9 @@ private fun CreateRoomDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { host?.let { onCreate(it.peerId, name, isPrivate) } },
+                onClick = {
+                    host?.let { onCreate(it.peerId, name, isPrivate, parent?.roomId.orEmpty()) }
+                },
                 enabled = name.isNotBlank() && host != null,
             ) { Text("Create") }
         },

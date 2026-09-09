@@ -571,8 +571,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * answers with `RoomCreated`, which also adopts it into the Space tree —
      * so a create that never lands leaves no phantom room in the list.
      */
-    fun createRoom(supernodeId: String, name: String, isPrivate: Boolean) =
-        viewModelScope.launch {
+    fun createRoom(
+        supernodeId: String,
+        name: String,
+        isPrivate: Boolean,
+        parentRoomId: String = "",
+    ) = viewModelScope.launch {
             val trimmed = name.trim()
             if (trimmed.isEmpty()) return@launch
 
@@ -580,6 +584,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 put("supernode_id", supernodeId)
                 put("room_name", trimmed)
                 put("room_type", if (isPrivate) "private" else "public")
+                if (parentRoomId.isNotBlank()) put("parent_room_id", parentRoomId)
             }
             if (!reply.ok) {
                 _state.update { it.copy(error = reply.errorText) }
