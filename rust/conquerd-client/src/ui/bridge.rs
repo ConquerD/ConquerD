@@ -410,12 +410,18 @@ pub mod ffi {
         /// Either `passphrase` or `file_path` may be empty; at least one must be set.
         /// `file_path` must be a local OS file path (not a URL).
         /// Called from QML after the user submits the passphrase dialog.
+        ///
+        /// `remember` opts into OS keyring auto-unlock for this identity. It is
+        /// always the user's explicit choice, and unchecking it forgets a key
+        /// stored earlier, so the checkbox state and the keyring agree after
+        /// every unlock.
         #[qinvokable]
         #[rust_name = "unlock_with_passphrase_and_file"]
         fn unlockWithPassphraseAndFile(
             self: Pin<&mut AppBridge>,
             passphrase: &QString,
             file_path: &QString,
+            remember: bool,
         );
 
         /// Emitted when the identity requires a passphrase to unlock.
@@ -1838,6 +1844,7 @@ impl ffi::AppBridge {
         mut self: Pin<&mut Self>,
         passphrase: &QString,
         file_path: &QString,
+        remember: bool,
     ) {
         let key_dir = crate::identity::Identity::default_key_dir();
         let dat = key_dir.join(crate::identity::IDENTITY_FILENAME);
@@ -1856,8 +1863,9 @@ impl ffi::AppBridge {
 
         if dat.exists() {
             // Unlock existing identity
-            match crate::identity::Identity::load_with_passphrase(&key_material, &key_dir) {
-                Ok(id) => {
+            match crate::identity::Identity::load_with_passphrase_keyed(&key_material, &key_dir) {
+                Ok((id, aes_key)) => {
+                    apply_auto_unlock_choice(&id.public_id(), &aes_key, remember);
                     self.continue_initialization(Arc::new(id));
                 }
                 Err(e) => {
@@ -1871,12 +1879,16 @@ impl ffi::AppBridge {
             // Create new identity with this key material
             std::fs::create_dir_all(&key_dir).ok();
             let id = crate::identity::Identity::generate();
-            if let Err(e) = id.save_encrypted(&key_material, &key_dir) {
-                error!("Failed to save new identity: {e}");
-                self.as_mut()
-                    .set_session_banner(QString::from("Failed to create identity."));
-                return;
-            }
+            let aes_key = match id.save_encrypted_keyed(&key_material, &key_dir) {
+                Ok((_, key)) => key,
+                Err(e) => {
+                    error!("Failed to save new identity: {e}");
+                    self.as_mut()
+                        .set_session_banner(QString::from("Failed to create identity."));
+                    return;
+                }
+            };
+            apply_auto_unlock_choice(&id.public_id(), &aes_key, remember);
             self.continue_initialization(Arc::new(id));
         }
     }
@@ -9682,5 +9694,25 @@ mod local_file_path_tests {
         assert!(!starts_with_drive_letter("/C:/x"));
         assert!(!starts_with_drive_letter("1:/x"));
         assert!(!starts_with_drive_letter(""));
+    }
+}
+
+/// Apply the user's auto-unlock choice for `public_id` after a successful unlock.
+///
+/// Storing the Argon2id-derived file key - never the passphrase - is what lets
+/// the next launch skip the prompt. The `false` branch matters as much as the
+/// `true` one: unchecking the box has to erase a key stored on an earlier
+/// unlock, or "off" would only mean "off next time".
+fn apply_auto_unlock_choice(public_id: &str, aes_key: &[u8; 32], remember: bool) {
+    if remember {
+        if crate::identity::keyring_store_aes_key(public_id, aes_key) {
+            info!("Auto-unlock enabled — identity key stored in the OS keyring");
+        } else {
+            // Not fatal: the identity is open, the user just has to type the
+            // passphrase again next time. A silent failure would be worse.
+            warn!("Auto-unlock requested but the OS keyring refused the key");
+        }
+    } else if crate::identity::keyring_delete_aes_key(public_id) {
+        info!("Auto-unlock disabled — identity key removed from the OS keyring");
     }
 }

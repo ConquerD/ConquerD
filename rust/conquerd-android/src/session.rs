@@ -30,6 +30,13 @@ pub struct Session {
     pub cmd_tx: mpsc::Sender<ConnectionCommand>,
     pub call_tx: mpsc::Sender<CallCommand>,
     pub identity: Arc<Identity>,
+    /// The Argon2id-derived key that opened (or sealed) `identity.dat`.
+    ///
+    /// Held so `identity.export_key` can hand it to Kotlin for the Android
+    /// Keystore when - and only when - the user has asked to stay unlocked.
+    /// It is the file key, not the passphrase: it opens this one identity on
+    /// this one device and is worthless anywhere else.
+    pub identity_key: [u8; 32],
     pub peer_store: Arc<RwLock<PeerStore>>,
     pub chat_store: Arc<ChatStore>,
     pub room_store: Arc<RwLock<RoomStore>>,
@@ -63,7 +70,19 @@ impl Session {
     /// client persists lives under it. An empty `passphrase` means an
     /// unencrypted identity, matching the desktop client's "press Enter for no
     /// passphrase" path.
-    pub fn start(home_dir: &str, passphrase: &str, sink: EventSink) -> anyhow::Result<Self> {
+    ///
+    /// `stored_key` is a previously exported file key, unsealed from the
+    /// Android Keystore by the Kotlin side when the user turned on staying
+    /// unlocked. When present the passphrase is not consulted at all; when it
+    /// no longer opens the file (identity replaced, key stale) start-up fails
+    /// so the caller falls back to prompting rather than silently running on a
+    /// different identity.
+    pub fn start(
+        home_dir: &str,
+        passphrase: &str,
+        stored_key: Option<[u8; 32]>,
+        sink: EventSink,
+    ) -> anyhow::Result<Self> {
         let key_dir = PathBuf::from(home_dir);
         std::fs::create_dir_all(&key_dir)?;
 
@@ -72,7 +91,8 @@ impl Session {
         // meaningful HOME, so it must be set before any store is opened.
         std::env::set_var("CONQUERD_HOME", &key_dir);
 
-        let identity = Arc::new(unlock_identity(&key_dir, passphrase)?);
+        let (identity, identity_key) = unlock_identity(&key_dir, passphrase, stored_key)?;
+        let identity = Arc::new(identity);
         let my_public_id = identity.public_id();
         info!(
             "identity unlocked: {} ({})",
@@ -119,6 +139,10 @@ impl Session {
             event_rx,
             sink,
             Arc::clone(&chat_store),
+            key_dir.clone(),
+            Arc::clone(&room_store),
+            Arc::clone(&identity),
+            cmd_tx.clone(),
             call_tx.clone(),
             Arc::clone(&cluster_members),
             my_public_id.clone(),
@@ -129,6 +153,7 @@ impl Session {
             cmd_tx,
             call_tx,
             identity,
+            identity_key,
             peer_store,
             chat_store,
             room_store,
@@ -217,18 +242,33 @@ impl Session {
 }
 
 /// Load the identity at `key_dir`, creating one on first launch.
-fn unlock_identity(key_dir: &Path, passphrase: &str) -> anyhow::Result<Identity> {
-    if key_dir.join(identity::IDENTITY_FILENAME).exists() {
-        return Identity::load_with_passphrase(passphrase.as_bytes(), key_dir)
+fn unlock_identity(
+    key_dir: &Path,
+    passphrase: &str,
+    stored_key: Option<[u8; 32]>,
+) -> anyhow::Result<(Identity, [u8; 32])> {
+    let exists = key_dir.join(identity::IDENTITY_FILENAME).exists();
+
+    // A key from the Keystore skips Argon2id entirely - that is the whole
+    // point of staying unlocked, and on a phone the 64 MiB hash is the slowest
+    // thing in start-up.
+    if let (true, Some(key)) = (exists, stored_key) {
+        let identity = Identity::load_encrypted(&key, key_dir)
+            .map_err(|e| anyhow::anyhow!("stored unlock key did not open the identity: {e}"))?;
+        return Ok((identity, key));
+    }
+
+    if exists {
+        return Identity::load_with_passphrase_keyed(passphrase.as_bytes(), key_dir)
             .map_err(|e| anyhow::anyhow!("could not unlock identity: {e}"));
     }
 
     info!("no identity found — generating one");
     let fresh = Identity::generate();
-    fresh
-        .save_encrypted(passphrase.as_bytes(), key_dir)
+    let (_, key) = fresh
+        .save_encrypted_keyed(passphrase.as_bytes(), key_dir)
         .map_err(|e| anyhow::anyhow!("could not save new identity: {e}"))?;
-    Ok(fresh)
+    Ok((fresh, key))
 }
 
 /// Start the thread that forwards core events to Kotlin.
@@ -237,10 +277,15 @@ fn unlock_identity(key_dir: &Path, passphrase: &str) -> anyhow::Result<Identity>
 /// an event means calling into the JVM, which requires the calling thread to
 /// stay attached — and tokio moves tasks between worker threads freely, so a
 /// task would have to attach and detach around every single event.
+#[allow(clippy::too_many_arguments)]
 fn spawn_event_pump(
     mut event_rx: mpsc::Receiver<ConnectionEvent>,
     sink: EventSink,
     chat_store: Arc<ChatStore>,
+    home_dir: PathBuf,
+    room_store: Arc<RwLock<RoomStore>>,
+    identity: Arc<Identity>,
+    cmd_tx: mpsc::Sender<ConnectionCommand>,
     call_tx: mpsc::Sender<CallCommand>,
     cluster_members: Arc<RwLock<HashMap<String, Vec<String>>>>,
     my_public_id: String,
@@ -260,6 +305,13 @@ fn spawn_event_pump(
                 route_media(&call_tx, &ev);
                 persist_if_chat(&chat_store, &ev);
                 persist_if_room_chat(&chat_store, &my_public_id, &ev);
+                persist_if_room_created(
+                    &room_store,
+                    &identity,
+                    &cmd_tx,
+                    &my_public_id,
+                    &ev,
+                );
 
                 if let ConnectionEvent::ClusterMembersUpdated {
                     supernode_id,
@@ -271,9 +323,16 @@ fn spawn_event_pump(
                         .insert(supernode_id.clone(), members.clone());
                 }
 
-                let Some(payload) = event::to_json(&ev) else {
+                let saved_file = persist_if_file_complete(&chat_store, &home_dir, &ev);
+
+                let Some(mut payload) = event::to_json(&ev) else {
                     continue;
                 };
+                // Where the file landed is decided here, not in the core, so
+                // it is stamped on after rendering rather than inside it.
+                if let Some(path) = saved_file {
+                    payload["path"] = serde_json::Value::String(path);
+                }
                 match serde_json::to_string(&payload) {
                     Ok(json) => sink.emit(&mut guard, &json),
                     Err(e) => warn!("could not encode event: {e}"),
@@ -402,6 +461,196 @@ fn persist_if_room_chat(chat_store: &ChatStore, my_public_id: &str, event: &Conn
     };
     if let Err(e) = chat_store.insert(&msg) {
         warn!("could not persist room chat: {e}");
+    }
+}
+
+/// The one-line label a file shows as in chat, matching the desktop's icons.
+pub(crate) fn attachment_label(
+    kind: &conquerd_client::chat_store::MessageKind,
+    name: &str,
+) -> String {
+    use conquerd_client::chat_store::MessageKind;
+    match kind {
+        MessageKind::Image => format!("🖼 {name}"),
+        MessageKind::Video => format!("🎬 {name}"),
+        _ => format!("📎 {name}"),
+    }
+}
+
+/// Save a completed download and put it in the chat history.
+///
+/// Returns the absolute path the file ended up at, which the pump stamps onto
+/// the outgoing event — the core hands the UI a payload it cannot serialise,
+/// so without this Kotlin would be told a transfer finished and never told
+/// where it landed.
+///
+/// Small files arrive as bytes and are written here; a streamed file was
+/// already written and verified by the transfer manager, and is left where it
+/// is rather than copied a second time.
+fn persist_if_file_complete(
+    chat_store: &ChatStore,
+    home_dir: &Path,
+    event: &ConnectionEvent,
+) -> Option<String> {
+    use conquerd_client::chat_store::{ChatMessage, MessageStatus};
+    use conquerd_client::file_transfer::TransferPayload;
+
+    let ConnectionEvent::FileComplete {
+        transfer_id,
+        peer_id,
+        room_id,
+        rel_path,
+        payload,
+        ..
+    } = event
+    else {
+        return None;
+    };
+
+    let saved_path = match payload {
+        TransferPayload::SavedAt { path, .. } => path.clone(),
+        TransferPayload::Bytes(bytes) => {
+            let dir = home_dir.join("received");
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                warn!("could not create the received-files directory: {e}");
+                return None;
+            }
+            // Prefix with the transfer id: two peers sending "photo.jpg" must
+            // not overwrite each other, and the id is already unique.
+            let safe_name = rel_path.replace(['/', '\\'], "_");
+            let path = dir.join(format!("{transfer_id}-{safe_name}"));
+            if let Err(e) = std::fs::write(&path, bytes) {
+                warn!("could not save the received file: {e}");
+                return None;
+            }
+            path.to_string_lossy().into_owned()
+        }
+    };
+
+    let byte_len = std::fs::metadata(&saved_path).map(|m| m.len()).unwrap_or(0);
+    let kind = conquerd_client::chat_store::message_kind_for_path(rel_path);
+
+    // Room files belong to the room conversation, 1:1 files to the peer's.
+    let conversation = if room_id.is_empty() {
+        peer_id.clone()
+    } else {
+        room_id.clone()
+    };
+
+    let record = ChatMessage {
+        id: format!("xfer-{transfer_id}"),
+        peer_id: conversation.clone(),
+        sender: peer_id.clone(),
+        recipient: String::new(),
+        body: attachment_label(&kind, rel_path),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+        is_self: false,
+        status: MessageStatus::Delivered,
+        kind,
+        attachment_name: rel_path.clone(),
+        attachment_path: saved_path.clone(),
+        size_str: conquerd_client::chat_store::format_byte_size(byte_len),
+        status_note: String::new(),
+        sender_handle: String::new(),
+    };
+    if let Err(e) = chat_store.upsert(&record) {
+        warn!("could not record the received file in history: {e}");
+    }
+
+    Some(saved_path)
+}
+
+/// Persist a room the supernode just created for us.
+///
+/// Nothing else on Android writes to the room store — the rooms a phone lists
+/// were put there by a desktop client and travelled with the identity — so
+/// without this a room created here would show up once and vanish on restart.
+///
+/// Mirrors `bridge.rs`'s `RoomCreated` handler: skip rooms we already know
+/// (a cluster replay or rematerialize re-announces them), persist the entry,
+/// then adopt it into the Space tree and announce the signed root. The Space
+/// half matters even though this client has no Space UI: a room outside the
+/// tree cannot be admitted to by proof, so a phone-created room would behave
+/// differently from a desktop-created one.
+fn persist_if_room_created(
+    room_store: &Arc<RwLock<RoomStore>>,
+    identity: &Arc<Identity>,
+    cmd_tx: &mpsc::Sender<ConnectionCommand>,
+    my_public_id: &str,
+    event: &ConnectionEvent,
+) {
+    let ConnectionEvent::RoomCreated {
+        supernode_id,
+        room_id,
+        room_name,
+        room_type,
+        invite_token,
+    } = event
+    else {
+        return;
+    };
+
+    if supernode_id.is_empty() || room_id.is_empty() || room_id == "default" {
+        return;
+    }
+
+    {
+        let store = room_store.read();
+        if store.get(supernode_id, room_id).is_some() {
+            info!("ignoring RoomCreated for a room already in the store");
+            return;
+        }
+    }
+
+    let entry = conquerd_client::room_store::RoomEntry::new(room_id, room_name)
+        .with_type(if room_type.is_empty() {
+            "public"
+        } else {
+            room_type
+        })
+        .with_supernode(supernode_id)
+        .with_creator(my_public_id, true)
+        .with_invite_token(invite_token)
+        // Android has no sub-room UI, so a room created here is always
+        // top-level and the creator always holds the invite.
+        .with_invite_policy("owner");
+
+    if let Err(e) = room_store.write().upsert(entry) {
+        warn!("could not persist the created room: {e}");
+        return;
+    }
+
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Best-effort, exactly as on the desktop: a signing or persist hiccup
+    // must not lose the room that was already created server-side.
+    let adopted = room_store.write().adopt_room_into_space(
+        my_public_id,
+        supernode_id,
+        room_id,
+        room_name,
+        room_type,
+        "",
+        issued_at,
+        |b| identity.sign(b),
+    );
+    match adopted {
+        Ok(root) => match serde_json::to_string(&root) {
+            Ok(root_json) => {
+                let _ = cmd_tx.try_send(ConnectionCommand::AnnounceSpaceRoot {
+                    supernode_id: supernode_id.clone(),
+                    root_json,
+                });
+            }
+            Err(e) => warn!("could not encode the new space root: {e}"),
+        },
+        Err(e) => warn!("could not adopt the room into the space tree: {e}"),
     }
 }
 

@@ -90,6 +90,8 @@ data class IdentityInfo(
     @SerialName("public_id") val publicId: String = "",
     @SerialName("peer_id") val peerId: String = "",
     val fingerprint: String = "",
+    /** The name peers see for us; empty until one is set. */
+    val handle: String = "",
 )
 
 /**

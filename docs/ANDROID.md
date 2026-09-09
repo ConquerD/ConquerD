@@ -266,16 +266,14 @@ before relying on the copy.
 
 ## What is wired, and what is not
 
-Working end to end:
+The per-feature answer lives in [CLIENT_FEATURES.md](CLIENT_FEATURES.md), which
+compares every desktop capability against the Android command surface. Keeping
+the list in one place stops the two documents disagreeing — as they did while
+camera capture, call accept/reject and Keystore auto-unlock landed here but the
+list below still called them missing.
 
-* Identity create/unlock, peer store, chat store, room store
-* QUIC transport, relay, supernode signaling — the full core
-* Direct chat: history, send, delivery acks, failure status, typing
-* Invites: generate and accept, plus a `conquerd://` intent filter
-* Rooms: list, join (public and invite-token), leave, room chat
-* Foreground service so sessions survive the screen going off, upgrading to the
-  `microphone` service type before capture starts (Android 14+ blocks it otherwise)
-* **Direct 1:1 voice calls** - validated on a Pixel 11 against the desktop client
+What is worth knowing here, because it is Android-specific rather than a
+feature gap:
 
 **`ndk_context` must be initialised in `nativeStart` and must stay there.** cpal's
 Oboe backend asks it for the JavaVM and Android `Context` when opening a stream;
@@ -285,13 +283,14 @@ every later command then fails on a closed channel far from the real cause.
 Relatedly, the panic hook that routes panics to logcat is load-bearing: Android
 discards stderr, so a panicking tokio task otherwise dies in complete silence.
 
-Not yet wired — see `backlog.md` for the ordered list:
+**The identity file key, not the passphrase, is what gets stored.** The `keyring`
+crate compiles for Android but has no backend there, so `IdentityVault.kt` seals
+the key the core exports (`identity.export_key`) with an AndroidKeyStore AES-GCM
+key. See the identity section of [CLIENT_FEATURES.md](CLIENT_FEATURES.md).
 
-* Call signaling UI (the `CallCommand` path exists; the accept/reject flow does not)
-* Camera capture (`CameraSource` is the seam; needs a CameraX → I420 backend)
-* Screen share (MediaProjection)
-* Video render to a `Surface`
-* File transfer UI over the Storage Access Framework
-* The in-app portal on `android.webkit.WebView`
-* Android Keystore for identity auto-unlock — `keyring` compiles but has no
-  Android backend, so today every launch asks for the passphrase
+**A foreground service owns the session.** A peer-to-peer client that dies when
+the screen turns off cannot hold a session or receive a message, so the core
+runs under a `dataSync` foreground service that upgrades to `microphone` before
+capture starts — Android 14+ refuses the type otherwise.
+
+See `backlog.md` for the ordered list of what to build next.

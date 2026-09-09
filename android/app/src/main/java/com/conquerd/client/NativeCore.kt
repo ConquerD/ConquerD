@@ -31,6 +31,10 @@ object NativeCore {
      *
      * @param homeDir app-private directory holding identity, peers, chat and rooms.
      * @param passphrase empty for an unencrypted identity.
+     * @param storedKey base64url identity file key from [IdentityVault], or null
+     *   to unlock with [passphrase]. When set the passphrase is not consulted,
+     *   and a key that no longer opens the file fails the start so the caller
+     *   can prompt instead.
      * @param context the application context. Handed to `ndk-context` so cpal's
      *   Oboe backend can open an audio device — without it the first attempt to
      *   start audio panics inside the native library.
@@ -39,6 +43,7 @@ object NativeCore {
     external fun nativeStart(
         homeDir: String,
         passphrase: String,
+        storedKey: String?,
         context: Context,
         sink: EventSink,
     ): Long

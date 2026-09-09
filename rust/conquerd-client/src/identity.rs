@@ -150,6 +150,18 @@ impl Identity {
     /// Use `crypto::build_passphrase_material` to combine a text passphrase and/or
     /// a keyfile into the `passphrase` bytes before calling this.
     pub fn save_encrypted(&self, passphrase: &[u8], directory: &Path) -> Result<PathBuf> {
+        Ok(self.save_encrypted_keyed(passphrase, directory)?.0)
+    }
+
+    /// Same as [`Self::save_encrypted`], also returning the derived AES key.
+    ///
+    /// Callers that offer keyring auto-unlock need the key a fresh identity
+    /// was sealed with, and re-deriving it would mean running Argon2id twice.
+    pub fn save_encrypted_keyed(
+        &self,
+        passphrase: &[u8],
+        directory: &Path,
+    ) -> Result<(PathBuf, [u8; 32])> {
         std::fs::create_dir_all(directory)?;
         let path = directory.join(IDENTITY_FILENAME);
         let pub_b64 = self.public_id();
@@ -178,7 +190,7 @@ impl Identity {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
-        Ok(path)
+        Ok((path, aes_key))
     }
 
     /// Load from the encrypted identity file using a derived AES key.
@@ -221,6 +233,19 @@ impl Identity {
     /// Use `crypto::build_passphrase_material` to combine a text passphrase and/or
     /// a keyfile into the `passphrase` bytes before calling this.
     pub fn load_with_passphrase(passphrase: &[u8], directory: &Path) -> Result<Self> {
+        Ok(Self::load_with_passphrase_keyed(passphrase, directory)?.0)
+    }
+
+    /// Same as [`Self::load_with_passphrase`], also returning the derived AES key.
+    ///
+    /// This key - not the passphrase - is what keyring auto-unlock stores. It
+    /// opens this one identity file and nothing else, so remembering it never
+    /// writes a passphrase (which the user may have reused elsewhere) into the
+    /// OS secret store.
+    pub fn load_with_passphrase_keyed(
+        passphrase: &[u8],
+        directory: &Path,
+    ) -> Result<(Self, [u8; 32])> {
         let path = directory.join(IDENTITY_FILENAME);
         let text = std::fs::read_to_string(&path)?;
         let data: serde_json::Value = serde_json::from_str(&text)?;
@@ -253,29 +278,33 @@ impl Identity {
             )));
         }
         let aes_key = argon2id_kdf(passphrase, &salt, t, m, p)?;
-        Self::load_encrypted(&aes_key, directory)
+        let identity = Self::load_encrypted(&aes_key, directory)?;
+        Ok((identity, aes_key))
     }
 
     /// Try to load from the OS keyring cache, falling back to passphrase bytes.
     ///
     /// The keyring stores the derived AES key so Argon2id is only run once.
     /// Pass `b""` for keyring-only attempts (no passphrase prompt).
+    ///
+    /// Returns the AES key that opened the identity whichever path succeeded,
+    /// so a caller that just prompted for a passphrase can hand the key to
+    /// [`keyring_store_aes_key`] without deriving it a second time.
     pub fn load_with_keyring_or_passphrase(
         passphrase: &[u8],
         directory: &Path,
-    ) -> Result<(Self, Option<[u8; 32]>)> {
+    ) -> Result<(Self, [u8; 32])> {
         // Read public_id first without decrypting
         let pub_b64 = Self::read_public_id_from_dat(directory)?
             .ok_or_else(|| ClientError::Identity("identity.dat not found".into()))?;
 
         if let Some(aes_key) = keyring_load_aes_key(&pub_b64) {
             if let Ok(id) = Self::load_encrypted(&aes_key, directory) {
-                return Ok((id, Some(aes_key)));
+                return Ok((id, aes_key));
             }
             // keyring stale — fall through to passphrase
         }
-        let identity = Self::load_with_passphrase(passphrase, directory)?;
-        Ok((identity, None))
+        Self::load_with_passphrase_keyed(passphrase, directory)
     }
 
     /// Read only the public_id field from `identity.dat` (without decryption).
@@ -422,6 +451,33 @@ mod tests {
         let id = Identity::generate();
         id.save_encrypted(b"correct", dir.path()).unwrap();
         assert!(Identity::load_with_passphrase(b"wrong", dir.path()).is_err());
+    }
+
+    /// The whole auto-unlock feature rests on this: the key handed out at
+    /// unlock must be the one that reopens the file, with no passphrase in
+    /// sight. If these ever diverge, "stay unlocked" locks the user out.
+    #[test]
+    fn exported_key_reopens_the_identity_without_the_passphrase() {
+        let dir = tempdir().unwrap();
+        let id = Identity::generate();
+        let pub_id = id.public_id();
+
+        let (_, saved_key) = id.save_encrypted_keyed(b"test-passphrase", dir.path()).unwrap();
+        let reopened = Identity::load_encrypted(&saved_key, dir.path()).unwrap();
+        assert_eq!(reopened.public_id(), pub_id);
+
+        // The key derived on a later passphrase unlock is the same key, so a
+        // user who unlocks by hand and then opts in stores something that works.
+        let (_, loaded_key) =
+            Identity::load_with_passphrase_keyed(b"test-passphrase", dir.path()).unwrap();
+        assert_eq!(loaded_key, saved_key);
+
+        // And a key from a different passphrase must not open it.
+        let other = tempdir().unwrap();
+        let (_, other_key) = Identity::generate()
+            .save_encrypted_keyed(b"test-passphrase", other.path())
+            .unwrap();
+        assert!(Identity::load_encrypted(&other_key, dir.path()).is_err());
     }
 
     #[test]

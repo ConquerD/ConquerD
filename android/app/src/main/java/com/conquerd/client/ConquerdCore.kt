@@ -74,14 +74,25 @@ class ConquerdCore private constructor(context: Context) : NativeCore.EventSink 
      * Start the core, creating the identity on first launch.
      *
      * @param passphrase empty means an unencrypted identity.
+     * @param storedKey a file key from [IdentityVault] to unlock without the
+     *   passphrase, or null to use [passphrase].
      */
-    suspend fun start(passphrase: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun start(
+        passphrase: String,
+        storedKey: String? = null,
+    ): Result<Unit> = withContext(Dispatchers.IO) {
         synchronized(lifecycleLock) {
             if (isRunning) return@withContext Result.success(Unit)
             runCatching {
                 appContext.filesDir.resolve("conquerd").mkdirs()
                 val started =
-                    NativeCore.nativeStart(homeDir, passphrase, appContext, this@ConquerdCore)
+                    NativeCore.nativeStart(
+                        homeDir,
+                        passphrase,
+                        storedKey,
+                        appContext,
+                        this@ConquerdCore,
+                    )
                 check(started != 0L) { "the core returned no handle" }
                 Log.i(TAG, "core started, version ${version()}")
                 // Publish the handle last: until it is set `isRunning` is
@@ -198,6 +209,16 @@ fun JsonObject.stringOrEmpty(key: String): String = string(key).orEmpty()
 /** Read a numeric field, or 0.0. */
 fun JsonObject.number(key: String): Double =
     (this[key] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull() ?: 0.0
+
+/**
+ * Whether an event describes something this client did.
+ *
+ * The core echoes our own actions back as events so one code path updates the
+ * UI whoever caused them — which means an inbound-only reaction has to filter
+ * its own reflections out.
+ */
+fun JsonObject.isSelfEvent(): Boolean =
+    (this["is_self"] as? JsonPrimitive)?.booleanOrNull ?: false
 
 /** Read an array-of-strings field, or empty. */
 fun JsonObject.stringList(key: String): List<String> =

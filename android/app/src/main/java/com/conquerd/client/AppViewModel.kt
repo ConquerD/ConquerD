@@ -7,7 +7,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import com.conquerd.client.ui.AvatarArt
+import com.conquerd.client.ui.parseAvatarSvg
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.put
 
@@ -17,6 +21,7 @@ sealed interface Screen {
     data object Home : Screen
     data class Chat(val peer: Peer) : Screen
     data class RoomChat(val room: Room) : Screen
+    data object Settings : Screen
 }
 
 /** Which list the home screen is showing. */
@@ -35,10 +40,16 @@ data class CallState(
 data class AppState(
     val screen: Screen = Screen.Unlock,
     val busy: Boolean = false,
+    /** True while a stored key is being tried, so the prompt does not flash. */
+    val autoUnlocking: Boolean = false,
+    /** True when a key is stored and this launch skipped the passphrase. */
+    val stayUnlocked: Boolean = false,
     val error: String? = null,
     val notice: String? = null,
     val identity: IdentityInfo = IdentityInfo(),
     val peers: List<Peer> = emptyList(),
+    /** Known supernodes — the hosts a new room can be created on. */
+    val supernodes: List<Peer> = emptyList(),
     val rooms: List<Room> = emptyList(),
     val messages: List<ChatMessage> = emptyList(),
     val connectionMode: ConnectionMode = ConnectionMode.OFFLINE,
@@ -62,11 +73,45 @@ data class AppState(
     val muted: Boolean = false,
     /** True while the local camera is capturing and sending. */
     val videoActive: Boolean = false,
+    /** An inbound file offer waiting on accept or decline. */
+    val fileOffer: FileOffer? = null,
+    /** Live transfers by id, 0.0-1.0, for the progress line. */
+    val transfers: Map<String, Float> = emptyMap(),
+    /** The most recent completed download, offered for saving out. */
+    val savedFile: SavedFile? = null,
+    /** Device-local preferences. */
+    val prefs: Prefs = Prefs(),
+    /** Parsed identicons by peer id. Built once per peer, then reused. */
+    val avatars: Map<String, AvatarArt> = emptyMap(),
+)
+
+/** An inbound offer: nothing arrives until it is accepted. */
+data class FileOffer(
+    val transferId: String,
+    val peerId: String,
+    val name: String,
+    val size: Long,
+)
+
+/** A finished download sitting in app storage. */
+data class SavedFile(val name: String, val path: String)
+
+/** The device-local preferences, mirrored into state so the UI recomposes. */
+data class Prefs(
+    val frontCamera: Boolean = true,
+    val voiceActivation: Boolean = true,
+    val theme: String = AppSettings.THEME_SYSTEM,
 )
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val core = ConquerdCore.get(app)
+
+    /** Optional Keystore-backed "stay unlocked" storage. Empty until opted in. */
+    private val vault = IdentityVault(app)
+
+    /** Device-local preferences; the display name lives on the peer record. */
+    private val settings = AppSettings(app)
 
     private val _state = MutableStateFlow(AppState())
     val state: StateFlow<AppState> = _state.asStateFlow()
@@ -86,11 +131,91 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             core.events.collect(::onCoreEvent)
         }
+        _state.update {
+            it.copy(
+                prefs = Prefs(
+                    frontCamera = settings.frontCamera,
+                    voiceActivation = settings.voiceActivation,
+                    theme = settings.theme,
+                ),
+            )
+        }
+        attemptAutoUnlock()
+    }
+
+    // ── Settings ──────────────────────────────────────────────────────────
+
+    fun openSettings() = _state.update { it.copy(screen = Screen.Settings) }
+
+    fun closeSettings() = _state.update { it.copy(screen = Screen.Home) }
+
+    /**
+     * Set the name peers see, and tell them.
+     *
+     * Peers cache the handle, so a rename that is not announced leaves
+     * everyone else showing the old one — the core broadcasts for us.
+     */
+    fun setHandle(handle: String) = viewModelScope.launch {
+        val reply = core.command("identity.set_handle") { put("handle", handle.trim()) }
+        if (!reply.ok) {
+            _state.update { it.copy(error = reply.errorText) }
+            return@launch
+        }
+        refreshIdentity()
+        _state.update { it.copy(notice = "Name updated.") }
+    }
+
+    fun setFrontCamera(front: Boolean) {
+        settings.frontCamera = front
+        _state.update { it.copy(prefs = it.prefs.copy(frontCamera = front)) }
+    }
+
+    fun setVoiceActivation(enabled: Boolean) {
+        settings.voiceActivation = enabled
+        _state.update { it.copy(prefs = it.prefs.copy(voiceActivation = enabled)) }
+    }
+
+    fun setTheme(theme: String) {
+        settings.theme = theme
+        _state.update { it.copy(prefs = it.prefs.copy(theme = theme)) }
+    }
+
+    /**
+     * Open the identity with a stored key, when the user has asked for that.
+     *
+     * A stale key is not an error worth showing: the identity may have been
+     * replaced, or the Keystore entry dropped. Either way the stored key is
+     * forgotten and the passphrase screen appears as though it had never been
+     * set - which is also what happens on a device where nothing is stored.
+     */
+    private fun attemptAutoUnlock() {
+        val stored = vault.load() ?: return
+        _state.update { it.copy(autoUnlocking = true, busy = true) }
+
+        viewModelScope.launch {
+            val result = core.start(passphrase = "", storedKey = stored)
+            if (result.isFailure) {
+                vault.clear()
+                _state.update {
+                    it.copy(autoUnlocking = false, busy = false, stayUnlocked = false)
+                }
+                return@launch
+            }
+            _state.update { it.copy(autoUnlocking = false, stayUnlocked = true) }
+            onCoreStarted()
+        }
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────
 
-    fun unlock(passphrase: String) {
+    /**
+     * Unlock with a typed passphrase.
+     *
+     * [stayUnlocked] is the user's explicit choice on the unlock screen. False
+     * also *clears* a key stored earlier, so unticking the box is a way to turn
+     * the feature off rather than only declining to renew it.
+     */
+    fun unlock(passphrase: String, stayUnlocked: Boolean = false) {
         if (_state.value.busy) return
         _state.update { it.copy(busy = true, error = null) }
 
@@ -106,16 +231,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
 
-            CoreService.start(getApplication())
-            _state.update { it.copy(busy = false, screen = Screen.Home) }
-            refreshIdentity()
-            refreshPeers()
-            refreshRooms()
-
-            pendingInvite?.let { url ->
-                pendingInvite = null
-                acceptInvite(url)
+            val remembered = if (stayUnlocked) rememberIdentityKey() else {
+                vault.clear()
+                false
             }
+            _state.update { it.copy(stayUnlocked = remembered) }
+            onCoreStarted()
+        }
+    }
+
+    /**
+     * Ask the core for the identity file key and seal it in the Keystore.
+     *
+     * Returns whether it will actually survive the next launch, so the UI can
+     * say "you will still be asked" instead of quietly promising otherwise.
+     */
+    private suspend fun rememberIdentityKey(): Boolean {
+        val reply = core.command("identity.export_key")
+        val key = reply.stringOrEmpty("key")
+        if (!reply.ok || key.isBlank()) {
+            _state.update { it.copy(notice = "Could not stay unlocked — you will be asked again next time.") }
+            return false
+        }
+        if (!vault.store(key)) {
+            _state.update { it.copy(notice = "This device would not store the key — you will be asked again next time.") }
+            return false
+        }
+        return true
+    }
+
+    /** Shared tail of both unlock paths. */
+    private suspend fun onCoreStarted() {
+        CoreService.start(getApplication())
+        _state.update { it.copy(busy = false, screen = Screen.Home) }
+        refreshIdentity()
+        refreshPeers()
+        refreshRooms()
+
+        pendingInvite?.let { url ->
+            pendingInvite = null
+            acceptInvite(url)
         }
     }
 
@@ -125,7 +280,48 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = AppState()
     }
 
+    /**
+     * Lock and forget the stored key, so the next launch asks again.
+     *
+     * The thing to reach for when handing the phone to someone else. Mirrors
+     * the desktop's "Lock Identity & Quit". Forgetting the key is part of
+     * locking on purpose: a lock that a relaunch undoes is not a lock.
+     */
+    fun lockAndForget() {
+        vault.clear()
+        lock()
+    }
+
+    /**
+     * Turn staying unlocked on or off while the core is already running.
+     *
+     * Turning it on works at any time because the core can re-export the file
+     * key on demand - the user does not have to lock and retype a passphrase
+     * just to change their mind.
+     */
+    fun setStayUnlocked(enabled: Boolean) {
+        if (!enabled) {
+            vault.clear()
+            _state.update { it.copy(stayUnlocked = false, notice = "Stored key forgotten.") }
+            return
+        }
+
+        viewModelScope.launch {
+            val remembered = rememberIdentityKey()
+            _state.update {
+                if (remembered) {
+                    it.copy(stayUnlocked = true, notice = "This device will stay unlocked.")
+                } else {
+                    it.copy(stayUnlocked = false)
+                }
+            }
+        }
+    }
+
     // ── Reads ─────────────────────────────────────────────────────────────
+
+    /** Our own peer id, once the core has reported it. */
+    private fun identityPeerId(): String = _state.value.identity.peerId
 
     private suspend fun refreshIdentity() {
         val reply = core.command("identity.info")
@@ -136,6 +332,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     publicId = reply.stringOrEmpty("public_id"),
                     peerId = reply.stringOrEmpty("peer_id"),
                     fingerprint = reply.stringOrEmpty("fingerprint"),
+                    handle = reply.stringOrEmpty("handle"),
                 ),
             )
         }
@@ -149,8 +346,190 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         // Supernodes are infrastructure, not people — the desktop client keeps
         // them out of the contact list too.
-        val peers = reply.decodeList<Peer>(core, "peers").filterNot { it.isSupernode }
-        _state.update { it.copy(peers = peers) }
+        val all = reply.decodeList<Peer>(core, "peers")
+        _state.update {
+            it.copy(
+                peers = all.filterNot { p -> p.isSupernode },
+                // Kept rather than discarded: creating a room needs a host to
+                // create it on, and this is the only list of them we have.
+                supernodes = all.filter { p -> p.isSupernode },
+            )
+        }
+        refreshAvatars(all.filterNot { it.isSupernode }.map { it.peerId } + identityPeerId())
+    }
+
+    /**
+     * Forget a peer: drop the record and any call in progress with them.
+     *
+     * Local only, and not a revocation - they keep whatever they already have,
+     * and an old invite of theirs would let them back in. It is the same
+     * operation as the desktop's "Remove Peer".
+     */
+    fun removePeer(peerId: String) = viewModelScope.launch {
+        val reply = core.command("peer.remove") { put("peer_id", peerId) }
+        if (!reply.ok) {
+            _state.update { it.copy(error = reply.errorText) }
+            return@launch
+        }
+        _state.update { it.copy(notice = "Peer removed.") }
+        refreshPeers()
+    }
+
+    /**
+     * Delete one message from local history.
+     *
+     * Local only - the peer keeps their copy. The desktop behaves the same
+     * way; there is no "delete for everyone" in the protocol.
+     */
+    fun deleteMessage(messageId: String) = viewModelScope.launch {
+        val reply = core.command("chat.delete") { put("message_id", messageId) }
+        if (!reply.ok) {
+            _state.update { it.copy(error = reply.errorText) }
+            return@launch
+        }
+        _state.update { it.copy(messages = it.messages.filterNot { m -> m.id == messageId }) }
+    }
+
+    /** Re-send a failed message, keeping its id so the peer can deduplicate. */
+    fun retryMessage(messageId: String) = viewModelScope.launch {
+        val reply = core.command("chat.retry") { put("message_id", messageId) }
+        if (!reply.ok) {
+            _state.update {
+                it.copy(error = reply.errorText ?: "still could not send")
+            }
+        }
+        (_state.value.screen as? Screen.Chat)?.let { loadHistory(it.peer.peerId) }
+    }
+
+    // ── Files ─────────────────────────────────────────────────────────────
+
+    /**
+     * Offer a file to the peer whose chat is open.
+     *
+     * Staging copies the picked document into the sandbox first — see
+     * [FileStaging] for why a `content://` uri cannot be handed to the core.
+     */
+    fun sendFile(uri: android.net.Uri) {
+        val peer = (_state.value.screen as? Screen.Chat)?.peer ?: return
+
+        viewModelScope.launch {
+            val staged = withContext(Dispatchers.IO) {
+                FileStaging.stageForSend(getApplication(), uri)
+            }
+            if (staged == null) {
+                _state.update { it.copy(error = "Could not read that file.") }
+                return@launch
+            }
+
+            val reply = core.command("file.send") {
+                put("peer_id", peer.peerId)
+                put("path", staged.path)
+                put("rel_path", staged.displayName)
+            }
+            if (!reply.ok) {
+                _state.update { it.copy(error = reply.errorText) }
+                return@launch
+            }
+            loadHistory(peer.peerId)
+        }
+    }
+
+    /** Accept the pending offer, which is what actually starts the download. */
+    fun acceptFileOffer() = respondToOffer(accept = true)
+
+    /** Decline the pending offer. Nothing is sent; the sender simply waits. */
+    fun rejectFileOffer() = respondToOffer(accept = false)
+
+    private fun respondToOffer(accept: Boolean) {
+        val offer = _state.value.fileOffer ?: return
+        _state.update { it.copy(fileOffer = null) }
+
+        viewModelScope.launch {
+            val reply = core.command(if (accept) "file.accept" else "file.reject") {
+                put("transfer_id", offer.transferId)
+            }
+            if (!reply.ok) _state.update { it.copy(error = reply.errorText) }
+        }
+    }
+
+    /** Copy the last completed download to wherever the user picked. */
+    fun exportSavedFile(destination: android.net.Uri) {
+        val saved = _state.value.savedFile ?: return
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                FileStaging.exportTo(getApplication(), saved.path, destination)
+            }
+            _state.update {
+                if (ok) {
+                    it.copy(notice = "Saved ${saved.name}.", savedFile = null)
+                } else {
+                    it.copy(error = "Could not save ${saved.name}.")
+                }
+            }
+        }
+    }
+
+    fun dismissSavedFile() = _state.update { it.copy(savedFile = null) }
+
+    /** Block or unblock a peer, mirroring the desktop's context menu. */
+    fun setPeerBlocked(peerId: String, blocked: Boolean) = viewModelScope.launch {
+        val reply = core.command(if (blocked) "peer.block" else "peer.unblock") {
+            put("peer_id", peerId)
+        }
+        if (!reply.ok) {
+            _state.update { it.copy(error = reply.errorText) }
+            return@launch
+        }
+        _state.update { it.copy(notice = if (blocked) "Peer blocked." else "Peer unblocked.") }
+        refreshPeers()
+    }
+
+    /**
+     * Ask a supernode to host a new room.
+     *
+     * Nothing is stored locally here. The room is persisted when the supernode
+     * answers with `RoomCreated`, which also adopts it into the Space tree —
+     * so a create that never lands leaves no phantom room in the list.
+     */
+    fun createRoom(supernodeId: String, name: String, isPrivate: Boolean) =
+        viewModelScope.launch {
+            val trimmed = name.trim()
+            if (trimmed.isEmpty()) return@launch
+
+            val reply = core.command("room.create") {
+                put("supernode_id", supernodeId)
+                put("room_name", trimmed)
+                put("room_type", if (isPrivate) "private" else "public")
+            }
+            if (!reply.ok) {
+                _state.update { it.copy(error = reply.errorText) }
+                return@launch
+            }
+            _state.update { it.copy(notice = "Creating \"$trimmed\"...") }
+        }
+
+    /**
+     * Fetch identicons for peers we do not have one for yet.
+     *
+     * An avatar is a pure function of the peer's identity and their advertised
+     * config, so it is fetched once and kept. Missing ones are fetched rather
+     * than the whole set re-requested, because the common case after a refresh
+     * is that nothing changed.
+     */
+    private fun refreshAvatars(ids: List<String>) = viewModelScope.launch {
+        val have = _state.value.avatars
+        val wanted = ids.filter { it.isNotBlank() && it !in have }
+        if (wanted.isEmpty()) return@launch
+
+        val fetched = mutableMapOf<String, AvatarArt>()
+        wanted.forEach { id ->
+            val reply = core.command("avatar.svg") { put("peer_id", id) }
+            if (!reply.ok) return@forEach
+            parseAvatarSvg(reply.stringOrEmpty("svg"))?.let { fetched[id] = it }
+        }
+        if (fetched.isNotEmpty()) {
+            _state.update { it.copy(avatars = it.avatars + fetched) }
+        }
     }
 
     fun refreshRooms() = viewModelScope.launch {
@@ -233,7 +612,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         viewModelScope.launch {
-            val reply = core.command("call.start") { put("peer_id", peer.peerId) }
+            val reply = core.command("call.start") {
+                put("peer_id", peer.peerId)
+                put("voice_activation", settings.voiceActivation)
+            }
             if (!reply.ok) {
                 _state.update { it.copy(call = null, error = reply.errorText) }
                 CoreService.setMediaActive(getApplication(), microphone = false, camera = false)
@@ -454,6 +836,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
         val reply = core.command("video.start") {
             if (peerId != null) put("peer_id", peerId)
+            put("device_id", settings.cameraDeviceId)
         }
         if (reply.ok) {
             _state.update { it.copy(videoActive = true) }
@@ -649,6 +1032,56 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "handle_updated", "presence_updated" -> refreshPeers()
 
             "room_created", "room_invite_ready" -> refreshRooms()
+
+            // Our own offers echo back as events too; only an inbound one is
+            // a question for the user.
+            "file_offered" -> {
+                if (!event.isSelfEvent()) {
+                    _state.update {
+                        it.copy(
+                            fileOffer = FileOffer(
+                                transferId = event.stringOrEmpty("transfer_id"),
+                                peerId = event.stringOrEmpty("peer_id"),
+                                name = event.stringOrEmpty("rel_path"),
+                                size = event.number("size").toLong(),
+                            ),
+                        )
+                    }
+                }
+            }
+
+            "file_progress" -> {
+                val id = event.stringOrEmpty("transfer_id")
+                val progress = event.number("progress").toFloat()
+                _state.update { it.copy(transfers = it.transfers + (id to progress)) }
+            }
+
+            "file_complete" -> {
+                val id = event.stringOrEmpty("transfer_id")
+                val path = event.stringOrEmpty("path")
+                val name = event.stringOrEmpty("rel_path")
+                _state.update {
+                    it.copy(
+                        transfers = it.transfers - id,
+                        // Only a received file can be saved out; our own
+                        // completed upload is already on this device.
+                        savedFile = if (path.isNotBlank()) SavedFile(name, path) else it.savedFile,
+                    )
+                }
+                (_state.value.screen as? Screen.Chat)?.let { chat ->
+                    viewModelScope.launch { loadHistory(chat.peer.peerId) }
+                }
+            }
+
+            "file_failed" -> {
+                val id = event.stringOrEmpty("transfer_id")
+                _state.update {
+                    it.copy(
+                        transfers = it.transfers - id,
+                        error = event.stringOrEmpty("reason").ifBlank { "transfer failed" },
+                    )
+                }
+            }
 
             "room_chat_message" -> {
                 if (!isOpenRoom(event)) return@onCoreEvent
