@@ -1167,7 +1167,10 @@ mod tests {
     #[test]
     fn the_alias_is_derived_from_the_signed_sender() {
         let (public_id, hex_peer_id) = spellings(13);
-        assert_eq!(peer_id_alias_for(&public_id).as_deref(), Some(&*hex_peer_id));
+        assert_eq!(
+            peer_id_alias_for(&public_id).as_deref(),
+            Some(&*hex_peer_id)
+        );
 
         // A different identity derives a different alias, so one peer
         // registering cannot shadow another.
@@ -1205,7 +1208,10 @@ mod tests {
         st.remove_peer_socket(&public_id);
 
         assert!(st.peer_sockets.is_empty());
-        assert!(st.peer_id_aliases.is_empty(), "the alias must not outlive the socket");
+        assert!(
+            st.peer_id_aliases.is_empty(),
+            "the alias must not outlive the socket"
+        );
         assert!(st.socket_for_target(&hex_peer_id).is_none());
     }
 
@@ -1230,5 +1236,4 @@ mod tests {
             "one peer leaving must not unroute another"
         );
     }
-
 }
