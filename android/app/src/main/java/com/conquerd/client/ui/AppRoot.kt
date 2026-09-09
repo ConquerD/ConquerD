@@ -87,6 +87,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -155,6 +156,14 @@ fun AppRoot(viewModel: AppViewModel) {
 
                 Screen.Home -> HomeScreen(viewModel = viewModel)
 
+                is Screen.Portal -> PortalScreen(
+                    supernodeId = screen.supernodeId,
+                    label = screen.label,
+                    myPeerId = state.identity.publicId,
+                    core = viewModel.portalCore(),
+                    onBack = viewModel::closePortal,
+                )
+
                 Screen.Settings -> SettingsScreen(
                     state = state,
                     onBack = viewModel::closeSettings,
@@ -171,6 +180,7 @@ fun AppRoot(viewModel: AppViewModel) {
                     onSetNoiseStrength = viewModel::setNoiseStrength,
                     onSetVoiceBitrate = viewModel::setVoiceBitrate,
                     onRemoveSupernode = viewModel::removeSupernode,
+                    onOpenPortal = viewModel::openPortal,
                 )
 
                 is Screen.Chat -> ChatScreen(
@@ -1731,6 +1741,85 @@ private fun LockIdentityDialog(
     )
 }
 
+// ── Portal ───────────────────────────────────────────────────────
+
+/**
+ * A supernode's in-app portal.
+ *
+ * The WebView cannot load `conquerd://` itself - there is no such network
+ * protocol - so every request is intercepted and answered by the core over the
+ * identity QUIC relay. JavaScript is on because that is the entire point of
+ * the portal; what makes it defensible is that the pages come from a supernode
+ * the user has already trusted enough to relay their traffic, over an
+ * authenticated channel, and the WebView is given no file or content access.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PortalScreen(
+    supernodeId: String,
+    label: String,
+    myPeerId: String,
+    core: com.conquerd.client.ConquerdCore,
+    onBack: () -> Unit,
+) {
+    val bridge = remember(supernodeId, myPeerId) {
+        com.conquerd.client.PortalBridge(core, supernodeId, myPeerId)
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        TopAppBar(
+            windowInsets = WindowInsets(0, 0, 0, 0),
+            title = { Text(label) },
+            navigationIcon = {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Leave portal")
+                }
+            },
+        )
+
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { context ->
+                android.webkit.WebView(context).apply {
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    // No local file or content-provider reach: a portal page is
+                    // remote code, and the only thing it may touch is the
+                    // bridge below.
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
+
+                    addJavascriptInterface(bridge.PortalApi(), "__conquerdNative")
+
+                    webViewClient = object : android.webkit.WebViewClient() {
+                        override fun shouldInterceptRequest(
+                            view: android.webkit.WebView,
+                            request: android.webkit.WebResourceRequest,
+                        ): android.webkit.WebResourceResponse? =
+                            bridge.interceptRequest(request)
+
+                        override fun onPageFinished(
+                            view: android.webkit.WebView,
+                            url: String?,
+                        ) {
+                            // The SDK waits on `window.conquerd.ready`, so the
+                            // shim has to exist before the page script runs its
+                            // connect - injecting on finish is early enough
+                            // because the SDK awaits rather than reading once.
+                            view.evaluateJavascript(
+                                com.conquerd.client.PortalBridge.BOOTSTRAP_JS,
+                                null,
+                            )
+                        }
+                    }
+
+                    loadUrl("conquerd://$supernodeId/index.html")
+                }
+            },
+        )
+    }
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────
 
 /**
@@ -1759,6 +1848,7 @@ private fun SettingsScreen(
     onSetNoiseStrength: (Int) -> Unit,
     onSetVoiceBitrate: (Int) -> Unit,
     onRemoveSupernode: (String) -> Unit,
+    onOpenPortal: (SupernodeInfo) -> Unit,
 ) {
     var handle by remember(state.identity.handle) { mutableStateOf(state.identity.handle) }
     var showAvatarEditor by remember { mutableStateOf(false) }
@@ -1952,6 +2042,7 @@ private fun SettingsScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    TextButton(onClick = { onOpenPortal(node) }) { Text("Portal") }
                     TextButton(onClick = { confirmRemoveNode = node }) {
                         Text("Remove", color = MaterialTheme.colorScheme.error)
                     }

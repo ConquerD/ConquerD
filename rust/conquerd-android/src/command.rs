@@ -78,6 +78,11 @@ const KNOWN_COMMANDS: &[&str] = &[
     "file.send_room",
     "file.accept_room",
     "file.decline_room",
+    "portal.fetch",
+    "portal.open",
+    "portal.send",
+    "portal.poll",
+    "portal.close",
 ];
 
 /// How long a command that waits on the core may block the calling thread.
@@ -342,9 +347,20 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
         // ── Peers ─────────────────────────────────────────────────────────
         "peer.list" => {
             let store = session.peer_store.read();
+
+            // Our own record is in the store because the handle and avatar
+            // config live on it - that is where every outbound message reads
+            // the sender handle from. It is not a peer, though, and setting a
+            // name should not put the user in their own contact list.
+            let my_peer_id = session.identity.peer_id();
+            let my_pub = session.my_public_id.trim_end_matches('=');
+
             let peers: Vec<Value> = store
                 .list_peers()
                 .into_iter()
+                .filter(|p| {
+                    p.peer_id != my_peer_id && p.identity_pub.trim_end_matches('=') != my_pub
+                })
                 .map(|p| {
                     let mut v = serde_json::to_value(p).unwrap_or_else(|_| json!({}));
                     // `display_name` is a method, not a field, so it is not in
@@ -912,6 +928,123 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
             json!({ "ok": true, "applied": applied })
         }
 
+        // ── Portal ────────────────────────────────────────────────
+        //
+        // Portal pages are fetched over the identity QUIC relay, not HTTP: the
+        // supernode serves them through `web.host.app.v1`, so there is no URL a
+        // browser could load on its own.
+        "portal.fetch" => {
+            let (Some(supernode_id), Some(path)) = (
+                arg_str(&parsed, "supernode_id"),
+                arg_str(&parsed, "path"),
+            ) else {
+                return err("portal.fetch requires \"supernode_id\" and \"path\"");
+            };
+
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let queued_ok = session.send(ConnectionCommand::FetchWebApp {
+                supernode_id: supernode_id.to_owned(),
+                path: path.to_owned(),
+                query: arg_str(&parsed, "query").map(str::to_owned),
+                reply_tx,
+            });
+            if !queued_ok {
+                return err("could not reach the connection manager");
+            }
+
+            let response = match reply_rx.blocking_recv() {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return err(format!("portal fetch failed: {e}")),
+                Err(_) => return err("the core dropped the portal fetch"),
+            };
+
+            // Bodies run to 32 MB, so they go to a file rather than through
+            // this JSON reply - WebView wants a stream anyway.
+            let dir = std::path::Path::new(&session.home_dir).join("portal-cache");
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return err(format!("could not open the portal cache: {e}"));
+            }
+            let file = dir.join(format!("{:016x}", fxhash_path(supernode_id, path)));
+            if let Err(e) = std::fs::write(&file, &response.body) {
+                return err(format!("could not cache the portal response: {e}"));
+            }
+
+            json!({
+                "ok": true,
+                "status": response.status,
+                "content_type": response.content_type,
+                "path": file.to_string_lossy(),
+            })
+        }
+        "portal.open" => {
+            let Some(supernode_id) = arg_str(&parsed, "supernode_id") else {
+                return err("portal.open requires \"supernode_id\"");
+            };
+            let room = arg_str(&parsed, "room").unwrap_or("default").to_owned();
+
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if !session.send(ConnectionCommand::PortalGameOpen {
+                supernode_id: supernode_id.to_owned(),
+                room,
+                reply_tx,
+            }) {
+                return err("could not reach the connection manager");
+            }
+            match reply_rx.blocking_recv() {
+                Ok(Ok(())) => json!({ "ok": true, "peer_id": session.my_public_id }),
+                Ok(Err(e)) => err(format!("portal channel open failed: {e}")),
+                Err(_) => err("the core dropped the portal open"),
+            }
+        }
+        "portal.send" => {
+            let (Some(supernode_id), Some(payload_b64)) = (
+                arg_str(&parsed, "supernode_id"),
+                arg_str(&parsed, "payload"),
+            ) else {
+                return err("portal.send requires \"supernode_id\" and \"payload\"");
+            };
+            let Ok(payload) = conquerd_client::crypto::b64url_decode(payload_b64) else {
+                return err("that payload is not base64url");
+            };
+
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if !session.send(ConnectionCommand::PortalGameSend {
+                supernode_id: supernode_id.to_owned(),
+                payload,
+                reply_tx,
+            }) {
+                return err("could not reach the connection manager");
+            }
+            match reply_rx.blocking_recv() {
+                Ok(Ok(())) => json!({ "ok": true }),
+                Ok(Err(e)) => err(format!("portal send failed: {e}")),
+                Err(_) => err("the core dropped the portal send"),
+            }
+        }
+        "portal.poll" => {
+            // Drains rather than peeks: the page has taken delivery of these,
+            // and a frame delivered twice is worse than one arriving late.
+            let frames: Vec<Value> = {
+                let mut queue = session.portal_datagrams.lock();
+                queue
+                    .drain(..)
+                    .map(|payload| {
+                        Value::String(conquerd_client::crypto::b64url_encode_nopad(&payload))
+                    })
+                    .collect()
+            };
+            json!({ "ok": true, "frames": frames })
+        }
+        "portal.close" => {
+            let Some(supernode_id) = arg_str(&parsed, "supernode_id") else {
+                return err("portal.close requires \"supernode_id\"");
+            };
+            session.portal_datagrams.lock().clear();
+            queued(session.send(ConnectionCommand::PortalGameClose {
+                supernode_id: supernode_id.to_owned(),
+            }))
+        }
+
         // ── Calls ─────────────────────────────────────────────────────────
         //
         // These mirror the desktop bridge's start/accept/reject/end exactly:
@@ -1412,6 +1545,19 @@ fn generate_invite(session: &Session) -> Value {
         Ok(None) => err("the core declined to generate an invite"),
         Err(e) => err(format!("invite generation timed out: {e}")),
     }
+}
+
+/// A stable name for a cached portal response.
+///
+/// Not security-relevant: it only has to be deterministic per (node, path) so
+/// a reload overwrites rather than accumulating files.
+fn fxhash_path(supernode_id: &str, path: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in supernode_id.bytes().chain(b"/".iter().copied()).chain(path.bytes()) {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
 
 /// Read a non-empty string argument.

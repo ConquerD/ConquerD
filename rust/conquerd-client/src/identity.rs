@@ -462,7 +462,9 @@ mod tests {
         let id = Identity::generate();
         let pub_id = id.public_id();
 
-        let (_, saved_key) = id.save_encrypted_keyed(b"test-passphrase", dir.path()).unwrap();
+        let (_, saved_key) = id
+            .save_encrypted_keyed(b"test-passphrase", dir.path())
+            .unwrap();
         let reopened = Identity::load_encrypted(&saved_key, dir.path()).unwrap();
         assert_eq!(reopened.public_id(), pub_id);
 

@@ -296,8 +296,27 @@ client's QUIC channels — the multiplayer game demos run on this.
 
 * **Core** — `web_app_client.rs` (`web.host.app.v1`), `ui/scheme.rs`.
 * **Desktop** — `openNodePortal`, `ConquerdWebView.qml` (Qt WebEngine).
-* **Android** — **nothing**. Would be an `android.webkit.WebView` with the same
-  bridge.
+* **Android** — a `WebView` reached from a supernode row in Settings.
+  `portal.fetch` answers every request the WebView makes, because a
+  `conquerd://` URL is not fetchable by a browser: there is no such network
+  protocol, and the page is served over the identity QUIC relay. Bodies run to
+  32 MB, so a fetch is written to a cache file and the reply carries the path —
+  `shouldInterceptRequest` wants a stream anyway.
+
+  `portal.open` / `portal.send` / `portal.poll` / `portal.close` back the game
+  channel. The web SDK **polls** (`pollDatagrams` every 33 ms) rather than being
+  pushed to, so inbound datagrams are buffered in the session and drained by
+  the poll instead of crossing the JNI event pump — `event::to_json` already
+  refused to render them. The queue is bounded and drops oldest: these are
+  real-time frames, so a page that stopped polling wants current state, not a
+  backlog. That is the opposite of the file path, where a dropped chunk is data
+  loss.
+
+  `addJavascriptInterface` can only pass strings, so `PortalBridge.BOOTSTRAP_JS`
+  builds the promise-shaped `window.conquerd` the SDK awaits on top of the
+  string calls. Every bridge call returns JSON rather than throwing: an
+  exception across that boundary reaches the page as a bare "Error", losing
+  what the core said.
 
 ### 15. Plugins and feature modules
 
@@ -411,7 +430,7 @@ Android yet) or is purely local (theme, camera choice).
 | Content audio / A/V sync | Windows only | **No** |
 | File transfer | Direct + room | Direct + room |
 | Supernode / cluster management | Yes | List and remove |
-| Portal / web apps | Yes | **No** |
+| Portal / web apps | Yes | Pages + game channel |
 | Plugins (`x.*`) | Yes | **No** |
 | Ollama | Yes | **No** |
 | Avatars / handles | Yes, editable | Yes, editable |

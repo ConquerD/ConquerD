@@ -22,6 +22,8 @@ sealed interface Screen {
     data class Chat(val peer: Peer) : Screen
     data class RoomChat(val room: Room) : Screen
     data object Settings : Screen
+    /** A supernode's in-app portal, rendered in a WebView. */
+    data class Portal(val supernodeId: String, val label: String) : Screen
 }
 
 /** Which list the home screen is showing. */
@@ -170,6 +172,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun closeSettings() = _state.update { it.copy(screen = Screen.Home) }
+
+    /** Open a supernode's portal. */
+    fun openPortal(node: SupernodeInfo) = _state.update {
+        it.copy(screen = Screen.Portal(node.peerId, node.displayName))
+    }
+
+    /**
+     * Leave the portal, closing any game channel it opened.
+     *
+     * The page cannot be relied on to close it: a WebView torn down mid-frame
+     * never runs its unload handler, and the supernode would keep the lobby
+     * slot until it timed out.
+     */
+    fun closePortal() {
+        val portal = _state.value.screen as? Screen.Portal
+        _state.update { it.copy(screen = Screen.Settings) }
+        portal?.let { open ->
+            viewModelScope.launch {
+                core.command("portal.close") { put("supernode_id", open.supernodeId) }
+            }
+        }
+    }
+
+    /** The core handle the portal bridge issues its commands through. */
+    fun portalCore(): ConquerdCore = core
 
     /**
      * Set the name peers see, and tell them.

@@ -3,7 +3,7 @@
 //! A session owns the tokio runtime the client core runs on, the three
 //! on-disk stores, and the OS thread that pumps core events into Kotlin.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use conquerd_client::identity::{self, Identity};
 use conquerd_client::peer_store::PeerStore;
 use conquerd_client::room_store::RoomStore;
 use conquerd_client::sfu_client::SfuClient;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -23,6 +23,13 @@ use crate::event;
 use crate::sink::EventSink;
 
 /// A running client core.
+/// How many unpolled game datagrams to hold before dropping the oldest.
+///
+/// A second or so at a typical game tick: enough to ride out a stalled poll,
+/// short enough that a page which stopped polling does not accumulate stale
+/// state it will act on when it resumes.
+const PORTAL_DATAGRAM_QUEUE: usize = 64;
+
 pub struct Session {
     /// Dropped last, on `stop`: dropping the runtime shuts down every spawned
     /// task, which closes the event channel and lets the pump thread finish.
@@ -51,6 +58,20 @@ pub struct Session {
     pub video: Arc<RwLock<Option<conquerd_client::video::sender::VideoSender>>>,
     /// A clone of the event sink, so a capture that dies on its own can say so.
     pub sink: EventSink,
+    /// Where everything this client persists lives. Held because the portal
+    /// cache and received files are written beside the stores.
+    pub home_dir: PathBuf,
+    /// Inbound portal game datagrams waiting to be polled.
+    ///
+    /// The web SDK polls (`pollDatagrams` every 33 ms) rather than being
+    /// pushed to, so these are buffered here instead of being forwarded as
+    /// events - a game at 30 frames a second would otherwise cross the JNI
+    /// event pump continuously for no benefit.
+    ///
+    /// Bounded, oldest dropped: these are real-time frames, so a consumer that
+    /// has stopped polling wants the newest state, not a backlog. That is the
+    /// opposite of the file path, where dropping a chunk is data loss.
+    pub portal_datagrams: Arc<Mutex<VecDeque<Vec<u8>>>>,
     /// Parent room for a create still in flight, keyed `supernode_id:room_name`.
     ///
     /// The supernode's `RoomCreated` reply carries the new room id but not the
@@ -102,6 +123,8 @@ impl Session {
 
         let pending_sub_room_parent: Arc<RwLock<HashMap<String, String>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let portal_datagrams: Arc<Mutex<VecDeque<Vec<u8>>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
         let (identity, identity_key) =
             unlock_identity(&key_dir, passphrase, keyfile_path, stored_key)?;
         let identity = Arc::new(identity);
@@ -154,6 +177,7 @@ impl Session {
             key_dir.clone(),
             Arc::clone(&room_store),
             Arc::clone(&pending_sub_room_parent),
+            Arc::clone(&portal_datagrams),
             Arc::clone(&identity),
             cmd_tx.clone(),
             call_tx.clone(),
@@ -171,7 +195,9 @@ impl Session {
             chat_store,
             room_store,
             my_public_id,
+            home_dir: key_dir.clone(),
             pending_sub_room_parent,
+            portal_datagrams,
             video: Arc::new(RwLock::new(None)),
             sink: sink_for_session,
             cluster_members,
@@ -311,6 +337,7 @@ fn spawn_event_pump(
     home_dir: PathBuf,
     room_store: Arc<RwLock<RoomStore>>,
     pending_sub_room_parent: Arc<RwLock<HashMap<String, String>>>,
+    portal_datagrams: Arc<Mutex<VecDeque<Vec<u8>>>>,
     identity: Arc<Identity>,
     cmd_tx: mpsc::Sender<ConnectionCommand>,
     call_tx: mpsc::Sender<CallCommand>,
@@ -350,6 +377,8 @@ fn spawn_event_pump(
                         .write()
                         .insert(supernode_id.clone(), members.clone());
                 }
+
+                queue_portal_datagram(&portal_datagrams, &ev);
 
                 let saved_file = persist_if_file_complete(&chat_store, &home_dir, &ev);
 
@@ -490,6 +519,25 @@ fn persist_if_room_chat(chat_store: &ChatStore, my_public_id: &str, event: &Conn
     if let Err(e) = chat_store.insert(&msg) {
         warn!("could not persist room chat: {e}");
     }
+}
+
+/// Buffer an inbound portal game datagram for the next poll.
+///
+/// `event::to_json` deliberately never renders these, so this is the only
+/// path by which they reach the page.
+fn queue_portal_datagram(
+    queue: &Arc<Mutex<VecDeque<Vec<u8>>>>,
+    event: &ConnectionEvent,
+) {
+    let ConnectionEvent::PortalGameDatagram { payload, .. } = event else {
+        return;
+    };
+
+    let mut queue = queue.lock();
+    if queue.len() >= PORTAL_DATAGRAM_QUEUE {
+        queue.pop_front();
+    }
+    queue.push_back(payload.clone());
 }
 
 /// The one-line label a file shows as in chat, matching the desktop's icons.
