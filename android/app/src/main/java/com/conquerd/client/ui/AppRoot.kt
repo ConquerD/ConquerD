@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -25,14 +27,18 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material3.NavigationBar
@@ -40,8 +46,12 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -53,6 +63,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -84,6 +96,9 @@ import com.conquerd.client.AppState
 import com.conquerd.client.CallPhase
 import com.conquerd.client.CameraCapture
 import com.conquerd.client.CallState
+import com.conquerd.client.AppSettings
+import com.conquerd.client.FileOffer
+import com.conquerd.client.SavedFile
 import com.conquerd.client.ConnectionMode
 import com.conquerd.client.HomeTab
 import com.conquerd.client.Room
@@ -130,11 +145,21 @@ fun AppRoot(viewModel: AppViewModel) {
             when (val screen = state.screen) {
                 Screen.Unlock -> UnlockScreen(
                     busy = state.busy,
+                    autoUnlocking = state.autoUnlocking,
                     version = viewModel.coreVersion,
                     onUnlock = viewModel::unlock,
                 )
 
                 Screen.Home -> HomeScreen(viewModel = viewModel)
+
+                Screen.Settings -> SettingsScreen(
+                    state = state,
+                    onBack = viewModel::closeSettings,
+                    onSetHandle = viewModel::setHandle,
+                    onSetFrontCamera = viewModel::setFrontCamera,
+                    onSetVoiceActivation = viewModel::setVoiceActivation,
+                    onSetTheme = viewModel::setTheme,
+                )
 
                 is Screen.Chat -> ChatScreen(
                     peer = screen.peer,
@@ -142,6 +167,10 @@ fun AppRoot(viewModel: AppViewModel) {
                     onBack = viewModel::closeChat,
                     onSend = viewModel::sendChat,
                     onCall = { viewModel.startCall(screen.peer) },
+                    onRetry = { viewModel.retryMessage(it.id) },
+                    onDelete = { viewModel.deleteMessage(it.id) },
+                    transfers = state.transfers,
+                    onSendFile = viewModel::sendFile,
                 )
 
                 is Screen.RoomChat -> RoomChatScreen(
@@ -169,6 +198,24 @@ fun AppRoot(viewModel: AppViewModel) {
 
     state.inviteUrl?.let { url ->
         InviteDialog(url = url, onDismiss = viewModel::dismissInvite)
+    }
+
+    // A file offer is a question, not a notification: nothing is transferred
+    // until it is answered, so it interrupts rather than waiting in a list.
+    state.fileOffer?.let { offer ->
+        FileOfferDialog(
+            offer = offer,
+            onAccept = viewModel::acceptFileOffer,
+            onReject = viewModel::rejectFileOffer,
+        )
+    }
+
+    state.savedFile?.let { saved ->
+        SaveFilePrompt(
+            saved = saved,
+            onSave = viewModel::exportSavedFile,
+            onDismiss = viewModel::dismissSavedFile,
+        )
     }
 
     state.call?.let { call ->
@@ -266,8 +313,34 @@ private fun CallOverlay(
 // ── Unlock ─────────────────────────────────────────────────────────────────
 
 @Composable
-private fun UnlockScreen(busy: Boolean, version: String, onUnlock: (String) -> Unit) {
+private fun UnlockScreen(
+    busy: Boolean,
+    autoUnlocking: Boolean,
+    version: String,
+    onUnlock: (String, Boolean) -> Unit,
+) {
     var passphrase by remember { mutableStateOf("") }
+    var stayUnlocked by remember { mutableStateOf(false) }
+
+    // A stored key is being tried: asking for a passphrase we are about to not
+    // need would flash a prompt on every launch, which is the thing the user
+    // turned this on to avoid.
+    if (autoUnlocking) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Image(
+                painter = painterResource(R.drawable.ic_logo),
+                contentDescription = null,
+                modifier = Modifier.width(122.dp).height(56.dp),
+            )
+            Spacer(Modifier.height(24.dp))
+            CircularProgressIndicator(strokeWidth = 2.dp)
+        }
+        return
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
@@ -306,15 +379,50 @@ private fun UnlockScreen(busy: Boolean, version: String, onUnlock: (String) -> U
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-            keyboardActions = KeyboardActions(onGo = { onUnlock(passphrase) }),
+            keyboardActions = KeyboardActions(onGo = { onUnlock(passphrase, stayUnlocked) }),
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         )
 
+        Spacer(Modifier.height(8.dp))
+
+        // ── Optional auto-unlock ──────────────────────────────────────────
+        //
+        // Off unless the user turns it on, and the caption states both sides
+        // rather than selling the convenience: the cost - anyone who can use
+        // this phone can open the identity - is the part that is easy to miss.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = !busy) { stayUnlocked = !stayUnlocked },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(
+                checked = stayUnlocked,
+                onCheckedChange = { stayUnlocked = it },
+                enabled = !busy,
+            )
+            Column(Modifier.padding(start = 4.dp)) {
+                Text("Stay unlocked on this device", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    if (stayUnlocked) {
+                        "ConquerD will open without this passphrase. Your key is kept in " +
+                            "the Android Keystore, so anyone who can use this phone can open " +
+                            "your identity. Your passphrase itself is never stored."
+                    } else {
+                        "You will type this passphrase every launch. Your identity stays " +
+                            "unreadable to anyone who gets the phone's files."
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
         Spacer(Modifier.height(16.dp))
 
         Button(
-            onClick = { onUnlock(passphrase) },
+            onClick = { onUnlock(passphrase, stayUnlocked) },
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         ) {
@@ -347,6 +455,10 @@ private fun UnlockScreen(busy: Boolean, version: String, onUnlock: (String) -> U
 private fun HomeScreen(viewModel: AppViewModel) {
     val state by viewModel.state.collectAsState()
     var showAccept by remember { mutableStateOf(false) }
+    var showAppMenu by remember { mutableStateOf(false) }
+    var confirmLock by remember { mutableStateOf(false) }
+    var confirmRemovePeer by remember { mutableStateOf<Peer?>(null) }
+    var showCreateRoom by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
@@ -358,12 +470,32 @@ private fun HomeScreen(viewModel: AppViewModel) {
             windowInsets = WindowInsets(0, 0, 0, 0),
             title = { Text(if (state.tab == HomeTab.PEERS) "Peers" else "Rooms") },
             navigationIcon = {
-                // Decorative: the title beside it already names the screen.
-                Image(
-                    painter = painterResource(R.drawable.ic_logo),
-                    contentDescription = null,
-                    modifier = Modifier.padding(start = 12.dp).width(40.dp).height(18.dp),
-                )
+                // The mark doubles as the app menu, the way a desktop app's
+                // logo opens its application menu. It is the only affordance
+                // in the bar that is not about the current tab, so app-wide
+                // things - what this build is, who I am, signing out - belong
+                // behind it rather than competing with Refresh and Add.
+                Box {
+                    IconButton(onClick = { showAppMenu = true }) {
+                        Image(
+                            painter = painterResource(R.drawable.ic_logo),
+                            contentDescription = "App menu",
+                            modifier = Modifier.width(36.dp).height(17.dp),
+                        )
+                    }
+                    AppMenu(
+                        expanded = showAppMenu,
+                        state = state,
+                        version = viewModel.coreVersion,
+                        onDismiss = { showAppMenu = false },
+                        onSetStayUnlocked = viewModel::setStayUnlocked,
+                        onRequestLock = {
+                            showAppMenu = false
+                            confirmLock = true
+                        },
+                        onOpenSettings = viewModel::openSettings,
+                    )
+                }
             },
             actions = {
                 IconButton(
@@ -382,6 +514,12 @@ private fun HomeScreen(viewModel: AppViewModel) {
                         Icon(Icons.Filled.Add, contentDescription = "Create invite")
                     }
                 } else {
+                    IconButton(
+                        onClick = { showCreateRoom = true },
+                        enabled = state.supernodes.isNotEmpty(),
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = "Create room")
+                    }
                     val hiddenCount = state.rooms.count { it.hidden }
                     if (hiddenCount > 0) {
                         TextButton(onClick = { viewModel.toggleShowHiddenRooms() }) {
@@ -403,6 +541,10 @@ private fun HomeScreen(viewModel: AppViewModel) {
                     onOpenPeer = viewModel::openChat,
                     onCreateInvite = { viewModel.generateInvite() },
                     onAcceptInvite = { showAccept = true },
+                    onSetBlocked = { peer, blocked ->
+                        viewModel.setPeerBlocked(peer.peerId, blocked)
+                    },
+                    onRemove = { peer -> confirmRemovePeer = peer },
                 )
 
                 HomeTab.ROOMS -> RoomsList(
@@ -439,6 +581,39 @@ private fun HomeScreen(viewModel: AppViewModel) {
             },
         )
     }
+
+    confirmRemovePeer?.let { peer ->
+        RemovePeerDialog(
+            peer = peer,
+            onDismiss = { confirmRemovePeer = null },
+            onConfirm = {
+                confirmRemovePeer = null
+                viewModel.removePeer(peer.peerId)
+            },
+        )
+    }
+
+    if (showCreateRoom) {
+        CreateRoomDialog(
+            supernodes = state.supernodes,
+            onDismiss = { showCreateRoom = false },
+            onCreate = { supernodeId, name, isPrivate ->
+                showCreateRoom = false
+                viewModel.createRoom(supernodeId, name, isPrivate)
+            },
+        )
+    }
+
+    if (confirmLock) {
+        LockIdentityDialog(
+            stayUnlocked = state.stayUnlocked,
+            onDismiss = { confirmLock = false },
+            onConfirm = {
+                confirmLock = false
+                viewModel.lockAndForget()
+            },
+        )
+    }
 }
 
 @Composable
@@ -447,6 +622,8 @@ private fun PeersList(
     onOpenPeer: (Peer) -> Unit,
     onCreateInvite: () -> Unit,
     onAcceptInvite: () -> Unit,
+    onSetBlocked: (Peer, Boolean) -> Unit,
+    onRemove: (Peer) -> Unit,
 ) {
     if (state.peers.isEmpty()) {
         EmptyPeers(onCreateInvite = onCreateInvite, onAcceptInvite = onAcceptInvite)
@@ -458,7 +635,10 @@ private fun PeersList(
             PeerRow(
                 peer = peer,
                 online = peer.peerId in state.onlinePeers,
+                avatar = state.avatars[peer.peerId],
                 onClick = { onOpenPeer(peer) },
+                onSetBlocked = { blocked -> onSetBlocked(peer, blocked) },
+                onRemove = { onRemove(peer) },
             )
             HorizontalDivider()
         }
@@ -554,10 +734,36 @@ private fun ConnectionBanner(mode: ConnectionMode) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PeerRow(peer: Peer, online: Boolean, onClick: () -> Unit) {
+private fun PeerRow(
+    peer: Peer,
+    online: Boolean,
+    avatar: AvatarArt?,
+    onClick: () -> Unit,
+    onSetBlocked: (Boolean) -> Unit,
+    onRemove: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+
+    Box {
     ListItem(
-        headlineContent = { Text(peer.label) },
+        headlineContent = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(peer.label)
+                // Blocked is otherwise invisible: the row looks identical to a
+                // peer who simply is not online, which is the wrong story.
+                if (peer.blocked) {
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "blocked",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
         supportingContent = {
             Text(
                 peer.peerId,
@@ -567,16 +773,183 @@ private fun PeerRow(peer: Peer, online: Boolean, onClick: () -> Unit) {
             )
         },
         leadingContent = {
-            Box(
-                Modifier
-                    .size(10.dp)
-                    .clip(CircleShape)
-                    .background(
-                        if (online) Color(0xFF16A34A) else MaterialTheme.colorScheme.outlineVariant,
-                    ),
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (online) {
+                                Color(0xFF16A34A)
+                            } else {
+                                MaterialTheme.colorScheme.outlineVariant
+                            },
+                        ),
+                )
+                Spacer(Modifier.width(10.dp))
+                // Until the identicon arrives the row keeps its shape with a
+                // blank of the same size, so the list does not jump.
+                if (avatar != null) {
+                    Avatar(avatar, Modifier.size(36.dp))
+                } else {
+                    Box(
+                        Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(percent = 18))
+                            .background(MaterialTheme.colorScheme.surfaceVariant),
+                    )
+                }
+            }
+        },
+        // Long-press for the peer actions, the same gesture rooms already use
+        // for hide/unhide - one idiom for "more, on this row".
+        modifier = Modifier.combinedClickable(
+            onClick = onClick,
+            onLongClick = { menuOpen = true },
+        ),
+    )
+
+    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+        DropdownMenuItem(
+            text = { Text("Copy peer ID") },
+            onClick = {
+                clipboard.setText(androidx.compose.ui.text.AnnotatedString(peer.peerId))
+                menuOpen = false
+            },
+        )
+        DropdownMenuItem(
+            text = { Text(if (peer.blocked) "Unblock" else "Block") },
+            onClick = {
+                onSetBlocked(!peer.blocked)
+                menuOpen = false
+            },
+        )
+        HorizontalDivider()
+        DropdownMenuItem(
+            text = { Text("Remove peer", color = MaterialTheme.colorScheme.error) },
+            onClick = {
+                onRemove()
+                menuOpen = false
+            },
+        )
+    }
+    }
+}
+
+/**
+ * Create a room on one of the supernodes we know.
+ *
+ * The host picker only appears when there is a choice to make — with one
+ * supernode, asking which is noise.
+ */
+@Composable
+private fun CreateRoomDialog(
+    supernodes: List<Peer>,
+    onDismiss: () -> Unit,
+    onCreate: (String, String, Boolean) -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    var isPrivate by remember { mutableStateOf(false) }
+    var hostIndex by remember { mutableStateOf(0) }
+    var hostMenuOpen by remember { mutableStateOf(false) }
+
+    val host = supernodes.getOrNull(hostIndex)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New room") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Room name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                Spacer(Modifier.height(12.dp))
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { isPrivate = !isPrivate },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(checked = isPrivate, onCheckedChange = { isPrivate = it })
+                    Column(Modifier.padding(start = 4.dp)) {
+                        Text("Private", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            if (isPrivate) {
+                                "Only people you invite can join."
+                            } else {
+                                "Anyone on this supernode can find and join it."
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                if (supernodes.size > 1) {
+                    Spacer(Modifier.height(12.dp))
+                    Box {
+                        TextButton(onClick = { hostMenuOpen = true }) {
+                            Text("Host: ${host?.label ?: "choose"}")
+                        }
+                        DropdownMenu(
+                            expanded = hostMenuOpen,
+                            onDismissRequest = { hostMenuOpen = false },
+                        ) {
+                            supernodes.forEachIndexed { index, node ->
+                                DropdownMenuItem(
+                                    text = { Text(node.label) },
+                                    onClick = {
+                                        hostIndex = index
+                                        hostMenuOpen = false
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { host?.let { onCreate(it.peerId, name, isPrivate) } },
+                enabled = name.isNotBlank() && host != null,
+            ) { Text("Create") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/**
+ * Confirm before forgetting a peer.
+ *
+ * Removal drops the record and ends any call with them. It is recoverable -
+ * a fresh invite puts them back - but not from inside this screen, so it is
+ * worth one tap of friction.
+ */
+@Composable
+private fun RemovePeerDialog(peer: Peer, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Remove ${peer.label}?") },
+        text = {
+            Text(
+                "This forgets the peer on this device and ends any call with them. " +
+                    "Your chat history stays. You will need a new invite to reach " +
+                    "them again.",
             )
         },
-        modifier = Modifier.clickable(onClick = onClick),
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Remove", color = MaterialTheme.colorScheme.error)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
 
@@ -611,9 +984,19 @@ private fun ChatScreen(
     onBack: () -> Unit,
     onSend: (String) -> Unit,
     onCall: () -> Unit,
+    onRetry: (ChatMessage) -> Unit,
+    onDelete: (ChatMessage) -> Unit,
+    transfers: Map<String, Float>,
+    onSendFile: (android.net.Uri) -> Unit,
 ) {
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+
+    // OpenDocument rather than GetContent: it returns a durable uri we can
+    // read from for the length of a copy, which GetContent does not promise.
+    val pickFile = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> uri?.let(onSendFile) }
 
     // Ask at the point of use rather than on launch: a client that demands
     // the microphone before you have placed a call is asking for something it
@@ -653,13 +1036,32 @@ private fun ChatScreen(
             modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            items(messages, key = { it.id }) { MessageBubble(it) }
+            items(messages, key = { it.id }) { message ->
+                MessageBubble(
+                    message = message,
+                    onRetry = { onRetry(message) },
+                    onDelete = { onDelete(message) },
+                )
+            }
+        }
+
+        // One bar per transfer in flight, sending or receiving. A file moving
+        // is the only thing here slow enough to need one, so it takes space
+        // only while it is happening.
+        transfers.forEach { (_, progress) ->
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+            )
         }
 
         Row(
             modifier = Modifier.fillMaxWidth().padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            IconButton(onClick = { pickFile.launch(arrayOf("*/*")) }) {
+                Icon(Icons.Filled.AddCircle, contentDescription = "Attach a file")
+            }
             OutlinedTextField(
                 value = draft,
                 onValueChange = { draft = it },
@@ -681,8 +1083,15 @@ private fun ChatScreen(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MessageBubble(message: ChatMessage) {
+private fun MessageBubble(
+    message: ChatMessage,
+    onRetry: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
     val alignment = if (message.isSelf) Alignment.End else Alignment.Start
     val container = if (message.isSelf) {
         MaterialTheme.colorScheme.primaryContainer
@@ -691,8 +1100,46 @@ private fun MessageBubble(message: ChatMessage) {
     }
 
     Column(Modifier.fillMaxWidth(), horizontalAlignment = alignment) {
-        Card(colors = CardDefaults.cardColors(containerColor = container)) {
-            Text(message.body, modifier = Modifier.padding(10.dp))
+        Box {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = container),
+                modifier = Modifier.combinedClickable(
+                    onClick = {},
+                    onLongClick = { menuOpen = true },
+                ),
+            ) {
+                Text(message.body, modifier = Modifier.padding(10.dp))
+            }
+
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Copy") },
+                    onClick = {
+                        clipboard.setText(
+                            androidx.compose.ui.text.AnnotatedString(message.body),
+                        )
+                        menuOpen = false
+                    },
+                )
+                // Retry only where it can do something: a failed message of
+                // our own. Offering it on a delivered one invites a duplicate.
+                if (message.isSelf && message.status == "failed") {
+                    DropdownMenuItem(
+                        text = { Text("Try again") },
+                        onClick = {
+                            onRetry()
+                            menuOpen = false
+                        },
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                    onClick = {
+                        onDelete()
+                        menuOpen = false
+                    },
+                )
+            }
         }
         // A failed send is the one status worth spending a line on — the rest
         // (sending, sent, delivered) resolve on their own within a second.
@@ -963,6 +1410,364 @@ private fun RoomMessageBubble(message: RoomMessage) {
             modifier = Modifier.padding(horizontal = 4.dp),
         )
     }
+}
+
+// ── App menu ───────────────────────────────────────────────────────────────
+
+/**
+ * What this build is, who I am here, and the app-wide switches.
+ *
+ * Deliberately short: a phone menu that lists everything is a menu nobody
+ * reads. Identity and version are here because they are what you need when
+ * something is wrong and someone asks you what you are running.
+ */
+@Composable
+private fun AppMenu(
+    expanded: Boolean,
+    state: AppState,
+    version: String,
+    onDismiss: () -> Unit,
+    onSetStayUnlocked: (Boolean) -> Unit,
+    onRequestLock: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+
+    DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Image(
+                    painter = painterResource(R.drawable.ic_logo),
+                    contentDescription = null,
+                    modifier = Modifier.width(44.dp).height(20.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("ConquerD", style = MaterialTheme.typography.titleSmall)
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "core $version",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (state.identity.fingerprint.isNotBlank()) {
+                Text(
+                    state.identity.fingerprint,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        HorizontalDivider()
+
+        DropdownMenuItem(
+            text = { Text("Settings") },
+            leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
+            onClick = {
+                onOpenSettings()
+                onDismiss()
+            },
+        )
+
+        DropdownMenuItem(
+            text = { Text("Copy my peer ID") },
+            leadingIcon = { Icon(Icons.Filled.Person, contentDescription = null) },
+            enabled = state.identity.publicId.isNotBlank(),
+            onClick = {
+                clipboard.setText(
+                    androidx.compose.ui.text.AnnotatedString(state.identity.publicId),
+                )
+                onDismiss()
+            },
+        )
+
+        HorizontalDivider()
+
+        // The same choice as the unlock screen, reachable after the fact:
+        // changing your mind should not require locking yourself out first.
+        DropdownMenuItem(
+            text = {
+                Column {
+                    Text("Stay unlocked on this device")
+                    Text(
+                        if (state.stayUnlocked) {
+                            "On — opens without your passphrase"
+                        } else {
+                            "Off — asks for your passphrase each launch"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            trailingIcon = {
+                Switch(checked = state.stayUnlocked, onCheckedChange = null)
+            },
+            onClick = { onSetStayUnlocked(!state.stayUnlocked) },
+        )
+
+        HorizontalDivider()
+
+        DropdownMenuItem(
+            text = { Text("Lock identity", color = MaterialTheme.colorScheme.error) },
+            leadingIcon = {
+                Icon(
+                    Icons.Filled.Lock,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                )
+            },
+            onClick = onRequestLock,
+        )
+    }
+}
+
+/**
+ * Confirm before locking.
+ *
+ * Locking ends the session, drops the connection to every peer, and - when a
+ * key is stored - forgets it, so the way back in is the passphrase. That is
+ * too much to hang off one stray tap in a top bar.
+ */
+@Composable
+private fun LockIdentityDialog(
+    stayUnlocked: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Lock identity?") },
+        text = {
+            Text(
+                if (stayUnlocked) {
+                    "This signs out, disconnects your peers, and forgets the key kept " +
+                        "on this device. You will need your passphrase to open ConquerD again."
+                } else {
+                    "This signs out and disconnects your peers. You will need your " +
+                        "passphrase to open ConquerD again."
+                },
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Lock", color = MaterialTheme.colorScheme.error)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+// ── Settings ──────────────────────────────────────────────────────────────
+
+/**
+ * The handful of settings that mean something on a phone.
+ *
+ * The desktop persists about sixty; most of the rest are device pickers,
+ * window geometry and tray behaviour that a phone either decides for itself
+ * or does not have. Each control here changes what the next call or launch
+ * actually does.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsScreen(
+    state: AppState,
+    onBack: () -> Unit,
+    onSetHandle: (String) -> Unit,
+    onSetFrontCamera: (Boolean) -> Unit,
+    onSetVoiceActivation: (Boolean) -> Unit,
+    onSetTheme: (String) -> Unit,
+) {
+    var handle by remember(state.identity.handle) { mutableStateOf(state.identity.handle) }
+
+    Column(Modifier.fillMaxSize()) {
+        TopAppBar(
+            windowInsets = WindowInsets(0, 0, 0, 0),
+            title = { Text("Settings") },
+            navigationIcon = {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                }
+            },
+        )
+
+        Column(
+            Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+        ) {
+            Text("Your name", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = handle,
+                onValueChange = { handle = it },
+                placeholder = { Text("Not set") },
+                supportingText = {
+                    Text("What peers see instead of your ID. Changing it tells them.")
+                },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = { onSetHandle(handle) },
+                enabled = handle.trim() != state.identity.handle,
+            ) { Text("Save name") }
+
+            Spacer(Modifier.height(24.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+
+            SettingSwitch(
+                title = "Front camera",
+                subtitle = if (state.prefs.frontCamera) {
+                    "Video calls open with the selfie camera"
+                } else {
+                    "Video calls open with the rear camera"
+                },
+                checked = state.prefs.frontCamera,
+                onCheckedChange = onSetFrontCamera,
+            )
+
+            SettingSwitch(
+                title = "Voice activation",
+                subtitle = if (state.prefs.voiceActivation) {
+                    "The mic opens when you speak"
+                } else {
+                    "The mic stays open for the whole call"
+                },
+                checked = state.prefs.voiceActivation,
+                onCheckedChange = onSetVoiceActivation,
+            )
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+
+            Text("Theme", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(8.dp))
+            listOf(
+                AppSettings.THEME_SYSTEM to "Follow the system",
+                AppSettings.THEME_LIGHT to "Light",
+                AppSettings.THEME_DARK to "Dark",
+            ).forEach { (value, label) ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSetTheme(value) }
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(
+                        selected = state.prefs.theme == value,
+                        onClick = { onSetTheme(value) },
+                    )
+                    Text(label, Modifier.padding(start = 8.dp))
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+            Text(
+                "Fingerprint ${state.identity.fingerprint.take(23)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingSwitch(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+// ── Files ──────────────────────────────────────────────────────────────────
+
+/**
+ * Ask before downloading. Declining sends nothing back — the offer simply
+ * goes unanswered, which is what the protocol does too.
+ */
+@Composable
+private fun FileOfferDialog(
+    offer: FileOffer,
+    onAccept: () -> Unit,
+    onReject: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onReject,
+        title = { Text("Incoming file") },
+        text = {
+            Column {
+                Text(offer.name, style = MaterialTheme.typography.bodyLarge)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    formatSize(offer.size),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = onAccept) { Text("Accept") } },
+        dismissButton = { TextButton(onClick = onReject) { Text("Decline") } },
+    )
+}
+
+/**
+ * Offer to copy a finished download somewhere the user can reach.
+ *
+ * The file is already saved in app storage; this is the copy out to their own
+ * documents, so dismissing loses nothing but the shortcut.
+ */
+@Composable
+private fun SaveFilePrompt(
+    saved: SavedFile,
+    onSave: (android.net.Uri) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val createDocument = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("*/*"),
+    ) { uri -> if (uri != null) onSave(uri) else onDismiss() }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("File received") },
+        text = { Text("${saved.name} finished downloading. Save a copy?") },
+        confirmButton = {
+            TextButton(onClick = { createDocument.launch(saved.name) }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Not now") } },
+    )
+}
+
+/** Byte counts the way the desktop's `format_byte_size` renders them. */
+private fun formatSize(bytes: Long): String = when {
+    bytes >= 1024L * 1024 * 1024 -> "%.1f GB".format(bytes / (1024.0 * 1024 * 1024))
+    bytes >= 1024L * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024))
+    bytes >= 1024L -> "%.1f KB".format(bytes / 1024.0)
+    else -> "$bytes bytes"
 }
 
 // ── Dialogs ────────────────────────────────────────────────────────────────

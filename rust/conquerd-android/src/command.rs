@@ -18,7 +18,7 @@ use conquerd_client::protocol::{MessageType, SignalingMessage};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::session::Session;
+use crate::session::{attachment_label, Session};
 
 /// Every command [`dispatch`] answers, for the unknown-command error.
 ///
@@ -26,17 +26,24 @@ use crate::session::Session;
 /// diagnostic aid, not a source of truth - the match arms are.
 const KNOWN_COMMANDS: &[&str] = &[
     "identity.info",
+    "identity.export_key",
+    "identity.set_handle",
+    "avatar.svg",
     "peer.list",
     "peer.block",
     "peer.unblock",
+    "peer.remove",
     "chat.history",
     "chat.send",
     "chat.mark_read",
     "chat.unread_total",
     "chat.typing",
+    "chat.delete",
+    "chat.retry",
     "invite.generate",
     "invite.accept",
     "room.list",
+    "room.create",
     "room.hide",
     "room.unhide",
     "room.join",
@@ -57,6 +64,10 @@ const KNOWN_COMMANDS: &[&str] = &[
     "audio.start",
     "audio.stop",
     "audio.set_muted",
+    "file.send",
+    "file.accept",
+    "file.reject",
+    "file.cancel",
 ];
 
 /// How long a command that waits on the core may block the calling thread.
@@ -93,7 +104,112 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
             "public_id": session.my_public_id,
             "peer_id": session.identity.peer_id(),
             "fingerprint": session.identity.fingerprint(),
+            "handle": session
+                .peer_store
+                .read()
+                .get(&session.identity.peer_id())
+                .map(|r| r.handle.clone())
+                .unwrap_or_default(),
         }),
+
+        // Hand the identity file key to Kotlin so it can be sealed in the
+        // Android Keystore. Only called when the user ticked "stay unlocked":
+        // nothing here decides that policy, and nothing stores the key on the
+        // Rust side. The reply crosses one in-process JNI boundary inside the
+        // app's own sandbox - it never touches a log, an event, or the disk.
+        "identity.export_key" => json!({
+            "ok": true,
+            "key": conquerd_client::crypto::b64url_encode(&session.identity_key),
+        }),
+
+        // Set the name peers see for us.
+        //
+        // Stored on our own record in the peer store rather than a settings
+        // file: that is where every outbound message already reads the sender
+        // handle from, so one write covers chat, invites and the peer list.
+        "identity.set_handle" => {
+            let handle = arg_str(&parsed, "handle").unwrap_or_default().trim().to_owned();
+            if handle.chars().count() > 64 {
+                return err("that name is too long");
+            }
+
+            let my_peer_id = session.identity.peer_id();
+            {
+                let mut store = session.peer_store.write();
+                match store.get_mut(&my_peer_id) {
+                    Some(record) => record.handle = handle.clone(),
+                    None => {
+                        // First run on this device: our own record does not
+                        // exist until something writes it.
+                        let mut record = conquerd_client::peer_store::PeerRecord {
+                            peer_id: my_peer_id.clone(),
+                            identity_pub: session.my_public_id.clone(),
+                            handle: handle.clone(),
+                            ..Default::default()
+                        };
+                        record.created_at = now_secs();
+                        store.upsert(record);
+                    }
+                }
+                if let Err(e) = store.save() {
+                    return err(format!("could not save the name: {e}"));
+                }
+            }
+
+            // Peers keep their own copy of our handle, so a rename that is not
+            // announced leaves everyone else showing the old one.
+            if !handle.is_empty() {
+                let _ = session.send(ConnectionCommand::BroadcastHandleUpdateToAll {
+                    handle: handle.clone(),
+                });
+            }
+            json!({ "ok": true, "handle": handle })
+        }
+
+        // Render a peer's identicon.
+        //
+        // The SVG is built by the shared core, not reimplemented here: the
+        // colour rules (islands, dual-hue modes, shade modes) are intricate
+        // enough that a second implementation would drift, and an avatar that
+        // differs between a peer's desktop and phone is worse than none.
+        "avatar.svg" => {
+            let Some(raw_id) = arg_str(&parsed, "peer_id") else {
+                return err("avatar.svg requires \"peer_id\"");
+            };
+
+            let my_public_id = session.my_public_id.clone();
+            let my_peer_id = session.identity.peer_id();
+            let store = session.peer_store.read();
+
+            // Avatars are seeded from identity_pub; the UI passes whatever id
+            // it has, which for a peer row is the hex peer_id.
+            let seed = conquerd_client::avatar_config::avatar_seed_id(
+                raw_id,
+                &my_public_id,
+                &my_peer_id,
+                |raw| {
+                    store
+                        .get(raw)
+                        .or_else(|| store.get_by_identity(raw))
+                        .map(|rec| rec.identity_pub.clone())
+                        .filter(|pub_id| !pub_id.is_empty())
+                },
+            );
+
+            // A peer who advertised their own look gets it; everyone else the
+            // factory default, which is what the desktop falls back to too.
+            let config = store
+                .get(raw_id)
+                .or_else(|| store.get_by_identity(raw_id))
+                .and_then(|rec| rec.avatar_config.clone())
+                .unwrap_or_default();
+
+            json!({
+                "ok": true,
+                "svg": conquerd_client::avatar_config::build_avatar_svg(&seed, &config),
+                "tint": conquerd_client::avatar_config::avatar_tint_hex(&seed, &config),
+            })
+        }
 
         // ── Peers ─────────────────────────────────────────────────────────
         "peer.list" => {
@@ -128,6 +244,35 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
             };
             queued(session.send(command))
         }
+        "peer.remove" => {
+            let Some(peer_id) = arg_str(&parsed, "peer_id") else {
+                return err("peer.remove requires \"peer_id\"");
+            };
+
+            // Same order as the desktop's removePeer: forget the record first,
+            // then tear down any call with them - a peer that is gone from the
+            // store but still holding a live audio session is the one state
+            // the UI cannot represent.
+            let removed = {
+                let mut store = session.peer_store.write();
+                let removed = store.remove_by_any_id(peer_id).is_some();
+                if removed {
+                    if let Err(e) = store.save() {
+                        return err(format!("peer removed but the store would not save: {e}"));
+                    }
+                }
+                removed
+            };
+
+            if !removed {
+                return err("no such peer");
+            }
+
+            let _ = session.call_tx.try_send(CallCommand::RemovePeer {
+                peer_id: peer_id.to_owned(),
+            });
+            json!({ "ok": true })
+        }
 
         // ── Direct chat ───────────────────────────────────────────────────
         "chat.history" => {
@@ -144,6 +289,21 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
             }
         }
         "chat.send" => send_chat(session, &parsed),
+        "chat.delete" => {
+            let Some(msg_id) = arg_str(&parsed, "message_id") else {
+                return err("chat.delete requires \"message_id\"");
+            };
+            match session.chat_store.delete_message(msg_id) {
+                Ok(()) => json!({ "ok": true }),
+                Err(e) => err(format!("could not delete the message: {e}")),
+            }
+        }
+        "chat.retry" => {
+            let Some(msg_id) = arg_str(&parsed, "message_id") else {
+                return err("chat.retry requires \"message_id\"");
+            };
+            retry_chat(session, msg_id)
+        }
         "chat.mark_read" => {
             let Some(peer_id) = arg_str(&parsed, "peer_id") else {
                 return err("chat.mark_read requires \"peer_id\"");
@@ -410,6 +570,42 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 Err(e) => err(format!("could not read room history: {e}")),
             }
         }
+        "room.create" => {
+            let Some(supernode_id) = arg_str(&parsed, "supernode_id") else {
+                return err("room.create requires \"supernode_id\"");
+            };
+            let room_name = arg_str(&parsed, "room_name").unwrap_or_default().trim();
+            if room_name.is_empty() {
+                return err("a room needs a name");
+            }
+
+            // Same normalisation as the desktop: anything that is not
+            // explicitly private is public, so a typo cannot silently produce
+            // a room with weaker access than the user asked for.
+            let room_type = match arg_str(&parsed, "room_type")
+                .unwrap_or("public")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "private" => "private",
+                _ => "public",
+            };
+
+            // The room is persisted when the supernode answers with
+            // `RoomCreated` - see `persist_if_room_created`. Nothing is written
+            // here, so a create that never lands leaves no phantom room behind.
+            queued(session.send(ConnectionCommand::CreateRoom {
+                supernode_id: supernode_id.to_owned(),
+                room_name: room_name.to_owned(),
+                room_type: room_type.to_owned(),
+                room_id: None,
+                creator_id: None,
+                materialize_only: false,
+                invite_policy: "owner".to_owned(),
+                invite_token: String::new(),
+            }))
+        }
         "room.request_list" => {
             let Some(supernode_id) = arg_str(&parsed, "supernode_id") else {
                 return err("room.request_list requires \"supernode_id\"");
@@ -417,6 +613,26 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
             queued(session.send(ConnectionCommand::RequestRoomList {
                 supernode_id: supernode_id.to_owned(),
             }))
+        }
+
+        // ── File transfer ─────────────────────────────────────────────────
+        //
+        // Kotlin hands over a path inside the app sandbox, not the SAF
+        // `content://` uri it was given: the core streams the file lazily from
+        // disk over the whole transfer, and a content uri's lifetime is the
+        // picker's, not ours.
+        "file.send" => send_file(session, &parsed),
+        "file.accept" | "file.reject" | "file.cancel" => {
+            let Some(transfer_id) = arg_str(&parsed, "transfer_id") else {
+                return err("a file action requires \"transfer_id\"");
+            };
+            let transfer_id = transfer_id.to_owned();
+            let command = match cmd.as_str() {
+                "file.accept" => ConnectionCommand::AcceptFile { transfer_id },
+                "file.reject" => ConnectionCommand::RejectFile { transfer_id },
+                _ => ConnectionCommand::CancelFile { transfer_id },
+            };
+            queued(session.send(command))
         }
 
         // ── Calls ─────────────────────────────────────────────────────────
@@ -596,6 +812,124 @@ fn send_signal(session: &Session, kind: MessageType, peer_id: &str) -> bool {
 /// The message is written to the store as `Sending` before it goes out, so it
 /// appears in history immediately and a later ack or failure updates the row
 /// that is already there.
+/// Offer a file to a peer, echoing it into our own chat history.
+///
+/// Mirrors the desktop's `sendFile`: the path is handed over rather than the
+/// bytes, so a 250 MB file is streamed from disk instead of held in memory,
+/// and the local bubble is keyed `xfer-{transfer_id}` so the offer can be
+/// found again later.
+fn send_file(session: &Session, parsed: &Value) -> Value {
+    let (Some(peer_id), Some(path)) = (arg_str(parsed, "peer_id"), arg_str(parsed, "path")) else {
+        return err("file.send requires \"peer_id\" and \"path\"");
+    };
+
+    // The display name is the picked document's name, which need not match the
+    // sandbox file Kotlin copied it into.
+    let rel_path = arg_str(parsed, "rel_path")
+        .filter(|n| !n.is_empty())
+        .unwrap_or("file")
+        .to_owned();
+
+    let byte_len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) => return err(format!("cannot read that file: {e}")),
+    };
+    if byte_len > conquerd_client::file_transfer::MAX_TRANSFER_SIZE as u64 {
+        return err(format!(
+            "{} is over the {} limit",
+            conquerd_client::chat_store::format_byte_size(byte_len),
+            conquerd_client::chat_store::format_byte_size(
+                conquerd_client::file_transfer::MAX_TRANSFER_SIZE as u64
+            ),
+        ));
+    }
+
+    let transfer_id = uuid::Uuid::new_v4().simple().to_string()[..16].to_owned();
+    let sent = session.send(ConnectionCommand::SendFile {
+        peer_id: peer_id.to_owned(),
+        rel_path: rel_path.clone(),
+        path: path.to_owned(),
+        transfer_id: transfer_id.clone(),
+        purpose: "file".to_owned(),
+    });
+
+    let kind = conquerd_client::chat_store::message_kind_for_path(&rel_path);
+    let record = ChatMessage {
+        id: format!("xfer-{transfer_id}"),
+        peer_id: peer_id.to_owned(),
+        sender: session.my_public_id.clone(),
+        recipient: peer_id.to_owned(),
+        body: attachment_label(&kind, &rel_path),
+        timestamp: now_secs(),
+        is_self: true,
+        status: if sent {
+            MessageStatus::Sent
+        } else {
+            MessageStatus::Failed
+        },
+        kind,
+        attachment_name: rel_path.clone(),
+        attachment_path: path.to_owned(),
+        size_str: conquerd_client::chat_store::format_byte_size(byte_len),
+        status_note: String::new(),
+        sender_handle: String::new(),
+    };
+    if let Err(e) = session.chat_store.upsert(&record) {
+        warn!("could not echo the file offer into history: {e}");
+    }
+
+    json!({ "ok": sent, "transfer_id": transfer_id })
+}
+
+/// Re-send a message that failed, keeping its original id.
+///
+/// Same shape as the desktop's `retryMessage`: the id is reused so the peer
+/// deduplicates a message that did arrive, and the stored status is moved to
+/// whatever the second attempt achieved rather than being left on "failed".
+fn retry_chat(session: &Session, msg_id: &str) -> Value {
+    let stored = match session.chat_store.get_by_id(msg_id) {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return err("no such message"),
+        Err(e) => return err(format!("could not read the message: {e}")),
+    };
+
+    // Only our own text messages can be re-sent: an inbound message has no
+    // outbound form, and a file or system entry is not a chat body.
+    if !stored.is_self || stored.peer_id.is_empty() || stored.kind != MessageKind::Text {
+        return err("only your own text messages can be retried");
+    }
+
+    let mut outbound =
+        SignalingMessage::new(MessageType::ChatMessage, session.my_public_id.clone());
+    outbound.target = Some(stored.peer_id.clone());
+    outbound
+        .payload
+        .insert("body".into(), Value::String(stored.body.clone()));
+    outbound
+        .payload
+        .insert("message_id".into(), Value::String(stored.id.clone()));
+    outbound.payload.insert(
+        "sender_handle".into(),
+        Value::String(stored.sender_handle.clone()),
+    );
+
+    let sent = session.send(ConnectionCommand::SendMessage(outbound));
+    let status = if sent {
+        MessageStatus::Sending
+    } else {
+        MessageStatus::Failed
+    };
+
+    if let Err(e) = session
+        .chat_store
+        .update_status_note(msg_id, status.clone(), "")
+    {
+        return err(format!("resent, but the status would not save: {e}"));
+    }
+
+    json!({ "ok": sent, "status": status.as_str() })
+}
+
 fn send_chat(session: &Session, parsed: &Value) -> Value {
     let (Some(peer_id), Some(body)) = (arg_str(parsed, "peer_id"), arg_str(parsed, "body")) else {
         return err("chat.send requires \"peer_id\" and \"body\"");

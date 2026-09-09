@@ -4,7 +4,7 @@
 //!
 //! * `nativeVersion()` — the core version string; also a cheap check that the
 //!   library loaded at all.
-//! * `nativeStart(homeDir, passphrase, sink)` — unlock the identity, open the
+//! * `nativeStart(homeDir, passphrase, storedKey, sink)` — unlock the identity, open the
 //!   stores, start the core. Returns an opaque handle.
 //! * `nativeCommand(handle, json)` — run one command, return one JSON reply.
 //! * `nativeStop(handle)` — shut the core down.
@@ -170,7 +170,12 @@ fn initialize_ndk_context(env: &JNIEnv<'_>, context: &JObject<'_>) -> jni::error
     Ok(())
 }
 
-/// `long NativeCore.nativeStart(String homeDir, String passphrase, Context context, EventSink sink)`
+/// `long NativeCore.nativeStart(String homeDir, String passphrase, String storedKey,
+/// Context context, EventSink sink)`
+///
+/// `storedKey` is the base64url file key Kotlin unsealed from the Android
+/// Keystore when the user chose to stay unlocked, or null to unlock with the
+/// passphrase as before.
 ///
 /// Returns 0 and throws on failure.
 #[no_mangle]
@@ -179,6 +184,7 @@ pub extern "system" fn Java_com_conquerd_client_NativeCore_nativeStart<'local>(
     _class: JClass<'local>,
     home_dir: JString<'local>,
     passphrase: JString<'local>,
+    stored_key: JString<'local>,
     context: JObject<'local>,
     listener: JObject<'local>,
 ) -> jlong {
@@ -204,6 +210,17 @@ pub extern "system" fn Java_com_conquerd_client_NativeCore_nativeStart<'local>(
     // same as the desktop client's empty-passphrase path.
     let passphrase = read_string(&mut env, &passphrase).unwrap_or_default();
 
+    // A malformed stored key is treated as no key rather than an error: the
+    // passphrase path still works, so the worst case is one extra prompt
+    // instead of an app that cannot start.
+    let stored_key = read_string(&mut env, &stored_key).and_then(|encoded| {
+        let bytes = conquerd_client::crypto::b64url_decode(&encoded).ok()?;
+        <[u8; 32]>::try_from(bytes.as_slice()).ok()
+    });
+    if stored_key.is_some() {
+        info!("starting with a stored unlock key");
+    }
+
     let sink = match EventSink::new(&env, &listener) {
         Ok(s) => s,
         Err(e) => {
@@ -215,7 +232,7 @@ pub extern "system" fn Java_com_conquerd_client_NativeCore_nativeStart<'local>(
     // A panic unwinding into the JVM is undefined behaviour, so start-up is
     // fenced: any panic below becomes a Java exception instead.
     let started = catch_unwind(AssertUnwindSafe(|| {
-        Session::start(&home_dir, &passphrase, sink)
+        Session::start(&home_dir, &passphrase, stored_key, sink)
     }));
 
     match started {

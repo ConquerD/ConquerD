@@ -7,6 +7,9 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.ViewModelProvider
 import com.conquerd.client.ui.AppRoot
@@ -35,7 +38,16 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            ConquerdTheme {
+            // Collected here rather than inside the theme so a change repaints
+            // the whole tree, including the system bars.
+            val state by viewModel.state.collectAsState()
+            ConquerdTheme(
+                darkTheme = when (state.prefs.theme) {
+                    AppSettings.THEME_DARK -> true
+                    AppSettings.THEME_LIGHT -> false
+                    else -> isSystemInDarkTheme()
+                },
+            ) {
                 AppRoot(viewModel = viewModel)
             }
         }
