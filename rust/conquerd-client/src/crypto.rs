@@ -271,7 +271,29 @@ pub fn derive_pairwise_relay_key(
     let shared = secret.diffie_hellman(&public);
 
     // Bind the key to the unordered pair of identities.
-    let mut ids = [our_identity_pub_b64, peer_identity_pub_b64];
+    //
+    // On the un-padded spelling, for the same reason `is_elected_keyer`
+    // compares that way: the relay path carries `public_id` without base64
+    // padding while SFU/signaling carry it with, so one identity appears as
+    // both `A…sg` and `A…sg=`. `our_identity_pub_b64` is always our own
+    // padded `public_id()`, but the peer id is whatever the caller happened to
+    // hold - a roster entry, an envelope sender, a peer record.
+    //
+    // Binding raw meant the two ends of one pair could derive different keys
+    // from the same shared secret: a keyer sealing a group key to a roster
+    // entry (un-padded) produced a blob the recipient - deriving against the
+    // padded sender of the envelope - could not open. It failed silently, so
+    // the group key was never installed, never acked, and room audio and video
+    // stayed dead in both directions while direct calls, which never derive a
+    // pairwise key, worked fine.
+    //
+    // Safe to normalise for the same reason it is safe there: an Ed25519
+    // `public_id` is always 43 base64url chars (44 padded), so trimming `=`
+    // can only ever collapse the two spellings of one identity, never merge
+    // two distinct ones.
+    let our_bare = our_identity_pub_b64.trim_end_matches('=');
+    let peer_bare = peer_identity_pub_b64.trim_end_matches('=');
+    let mut ids = [our_bare, peer_bare];
     ids.sort_unstable();
     let mut info =
         Vec::with_capacity(PAIRWISE_RELAY_KEY_INFO.len() + ids[0].len() + ids[1].len() + 2);
@@ -455,6 +477,47 @@ pub fn build_passphrase_material(text: &str, file_path: &str) -> Result<Vec<u8>>
 
 #[cfg(test)]
 mod tests {
+    /// Both ends of a pair must derive the same key whichever spelling of the
+    /// peer id they happen to hold.
+    ///
+    /// The two spellings are not hypothetical: room membership is a union of
+    /// snapshots, and the relay path carries `public_id` un-padded while
+    /// SFU/signaling carry it padded. When this binding used the raw strings,
+    /// a keyer sealing a group key to a roster entry produced a blob the
+    /// recipient could not open, which silenced room audio and video in both
+    /// directions while leaving direct calls working.
+    #[test]
+    fn pairwise_key_ignores_base64_padding() {
+        use crate::identity::Identity;
+
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+
+        let alice_pub = alice.public_id();
+        let bob_pub = bob.public_id();
+        // `public_id` is padded; the un-padded spelling is what the relay path
+        // carries for the same identity.
+        let bob_bare = bob_pub.trim_end_matches('=').to_owned();
+        let alice_bare = alice_pub.trim_end_matches('=').to_owned();
+        assert_ne!(bob_pub, bob_bare, "public_id is expected to be padded");
+
+        // Alice holding either spelling of Bob derives one key.
+        let padded = alice.derive_pairwise_relay_key(&bob_pub).unwrap();
+        let bare = alice.derive_pairwise_relay_key(&bob_bare).unwrap();
+        assert_eq!(padded, bare, "padding must not change the derived key");
+
+        // And Bob, holding either spelling of Alice, derives the same one.
+        assert_eq!(padded, bob.derive_pairwise_relay_key(&alice_pub).unwrap());
+        assert_eq!(padded, bob.derive_pairwise_relay_key(&alice_bare).unwrap());
+
+        // A different pair still gets a different key.
+        let carol = Identity::generate();
+        assert_ne!(
+            padded,
+            alice.derive_pairwise_relay_key(&carol.public_id()).unwrap()
+        );
+    }
+
     use super::*;
 
     #[test]
