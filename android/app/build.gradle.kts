@@ -27,6 +27,42 @@ val conquerdNdkApi: String = providers.gradleProperty("conquerd.ndkApi").orNull 
 /// Overridable so a machine with a non-PATH toolchain can point at its own.
 val cargoExecutable: String = providers.gradleProperty("conquerd.cargo").orNull ?: "cargo"
 
+/// Keystore that signs the APK, when CI supplies one.
+///
+/// Android replaces an installed app only if the replacement carries the same
+/// signature, so a build meant to land on a device already running ConquerD
+/// has to be signed with the key that signed what is there now. An APK signed
+/// with a CI runner's own throwaway debug keystore cannot be installed over it
+/// at all - only after an uninstall, and an uninstall takes app-private
+/// storage with it: the identity key and the whole message store, with
+/// `allowBackup` off and no copy anywhere else.
+///
+/// Unset on a developer machine, where the build falls through to the debug
+/// keystore Gradle manages itself. That is what has always signed local
+/// builds, so it is also what the CI secret should hold.
+val signingKeystore: String? = providers.environmentVariable("CONQUERD_KEYSTORE").orNull
+
+/// Passwords for [signingKeystore]. The defaults are the published
+/// debug-keystore credentials, so reusing a debug keystore needs no secret
+/// beyond the file itself; a real release keystore overrides all three.
+val signingStorePassword: String =
+    providers.environmentVariable("CONQUERD_KEYSTORE_PASSWORD").orNull ?: "android"
+val signingKeyAlias: String =
+    providers.environmentVariable("CONQUERD_KEY_ALIAS").orNull ?: "androiddebugkey"
+val signingKeyPassword: String =
+    providers.environmentVariable("CONQUERD_KEY_PASSWORD").orNull ?: "android"
+
+/// Build stamp appended to the version name, so a side-loaded APK can be
+/// identified from the device Settings screen.
+///
+/// Deliberately not `versionCode`: Android refuses to install an APK whose
+/// versionCode is below the installed one, so bumping it per CI run would mean
+/// a later local build could only be installed by uninstalling first - which
+/// costs the identity key and the message store. versionName carries no such
+/// rule, so it is the safe place to put a build number.
+val conquerdBuildStamp: String =
+    providers.environmentVariable("CONQUERD_BUILD_ID").orNull?.let { "-$it" } ?: ""
+
 val rustCrateDir = rootProject.layout.projectDirectory.dir("../rust/conquerd-android")
 val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 
@@ -92,10 +128,24 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = 1
-        versionName = "1.0.0"
+        versionName = "1.0.0$conquerdBuildStamp"
 
         ndk {
             abiFilters += conquerdAbis
+        }
+    }
+
+    // Left alone on a developer machine, where AGP's own debug keystore signs
+    // the build exactly as it always has. CI replaces it so the APK it
+    // produces is installable over what is already on a test device.
+    if (signingKeystore != null) {
+        signingConfigs {
+            getByName("debug") {
+                storeFile = file(signingKeystore)
+                storePassword = signingStorePassword
+                keyAlias = signingKeyAlias
+                keyPassword = signingKeyPassword
+            }
         }
     }
 

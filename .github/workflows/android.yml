@@ -1,0 +1,180 @@
+name: Android
+
+# Builds the APK and attaches it to a rolling `android-nightly` prerelease, so
+# a test device can be updated from its own browser with no USB and no LAN.
+#
+# Deliberately a separate workflow rather than a job in release.yml: the Android
+# toolchain is the fussiest in the repo (a pinned NDK, a pinned CMake, an NDK
+# cross-build of libopus and libvpx), and a break in it must not hold up the
+# desktop and supernode nightlies that pipeline publishes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [develop]
+    paths:
+      - 'android/**'
+      - 'rust/conquerd-android/**'
+      - 'rust/conquerd-client/**'
+      - 'rust/conquerd-features/**'
+      - 'rust/conquerd-opus/**'
+      - 'rust/conquerd-vpx/**'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.97.1"
+  # Must match `ndkVersion` in android/app/build.gradle.kts. The NDK decides
+  # which libc symbols the core links against, so it is pinned in both places.
+  NDK_VERSION: "28.2.13676358"
+  # Not CMake 4: it rejects the `cmake_minimum_required` libopus declares.
+  CMAKE_VERSION: "3.31.6"
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+    env:
+      # Mapped here so the steps below can branch on whether it is set —
+      # the `secrets` context is not available in a step-level `if`.
+      KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # libopus and libvpx are submodules; the NDK build compiles both.
+          submodules: recursive
+
+      - name: Use JDK 17
+        # The runner image already ships Temurin 17, so there is nothing to
+        # install and no extra action to pin — just point Gradle at it.
+        run: echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (2025-04)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-linux-android
+
+      - name: Cache Cargo registry + Android target dir
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-ndk
+            rust/target-android
+          key: android-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/conquerd-client/Cargo.lock') }}
+          restore-keys: |
+            android-cargo-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Cache Opus DNN model weights
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            rust/conquerd-opus/opus/dnn/lace_data.c
+            rust/conquerd-opus/opus/dnn/nolace_data.c
+            rust/conquerd-opus/opus/dnn/fargan_data.c
+            rust/conquerd-opus/opus/dnn/pitchdnn_data.c
+            rust/conquerd-opus/opus/dnn/plc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_enc_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_dec_data.c
+            rust/conquerd-opus/opus/dnn/dred_rdovae_stats_data.c
+            rust/conquerd-opus/opus/dnn/bbwenet_data.c
+            rust/conquerd-opus/opus/dnn/lossgen_data.c
+            rust/conquerd-opus/opus/dnn/models
+          key: opus-dnn-a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e
+
+      - name: Fetch Opus DNN model weights
+        # conquerd-opus builds with the `dnn` feature by default, and its
+        # build.rs fails outright when these C arrays are missing.
+        run: bash scripts/fetch_opus_weights.sh
+
+      - name: Install the pinned NDK and CMake
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
+          # Ahead of the system CMake on PATH: the runner's own is a different
+          # version than the one this build is known to work with.
+          echo "$ANDROID_SDK_ROOT/cmake/${CMAKE_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo-ndk
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-ndk > /dev/null; then
+            cargo install cargo-ndk --locked
+          fi
+
+      - name: Decode the signing keystore
+        if: env.KEYSTORE_B64 != ''
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/conquerd.keystore"
+          echo "CONQUERD_KEYSTORE=$RUNNER_TEMP/conquerd.keystore" >> "$GITHUB_ENV"
+          echo "Signing with the keystore from ANDROID_KEYSTORE_B64."
+
+      - name: Warn that the APK will not be installable over an existing app
+        if: env.KEYSTORE_B64 == ''
+        run: |
+          echo "::warning title=Unsigned by the shared key::ANDROID_KEYSTORE_B64 is not set, so this APK is signed with a throwaway keystore. Android will refuse to install it over an existing ConquerD, and uninstalling first destroys the on-device identity key and message store."
+
+      - name: Derive the build stamp
+        run: echo "BUILD_STAMP=${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+
+      - name: Build the APK
+        working-directory: android
+        env:
+          # Stamped into versionName only. See build.gradle.kts for why
+          # versionCode deliberately stays put.
+          CONQUERD_BUILD_ID: ${{ env.BUILD_STAMP }}
+        run: ./gradlew assembleDebug --console=plain --no-daemon
+
+      - name: Stage the APK
+        id: stage
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          NAME="ConquerD-android-arm64-${BUILD_STAMP}.apk"
+          cp android/app/build/outputs/apk/debug/app-debug.apk "dist/$NAME"
+          echo "apk_name=$NAME" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - name: Upload the APK as a run artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-debug-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Create or update the Android nightly release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: android-nightly
+          name: "Android Nightly"
+          prerelease: true
+          draft: false
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          files: dist/*.apk
+          body: |
+            **Development Android build** from the `develop` branch. Debug build, arm64-v8a.
+
+            - APK: `${{ steps.stage.outputs.apk_name }}`
+            - Commit: ${{ github.sha }}
+            - Shows in Settings as version `1.0.0-${{ env.BUILD_STAMP }}`
+
+            Open this page on the device and tap the APK to install over the
+            existing app. The browser needs "Install unknown apps" once, under
+            Settings, Apps, Special app access.
+
+            Installing in place only works while the APK is signed with the same
+            key as the build already on the device. Do not uninstall to work
+            around a signature error: app-private storage holds the identity key
+            and the whole message store, `allowBackup` is off, and there is no
+            copy anywhere else.
