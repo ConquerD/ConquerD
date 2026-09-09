@@ -553,6 +553,19 @@ pub enum ConnectionCommand {
     RemoveSupernode {
         supernode_id: String,
     },
+    /// The device's network changed underneath us — a phone moving from Wi-Fi
+    /// to cellular, onto a different Wi-Fi, or on and off a VPN.
+    ///
+    /// Sockets opened on the old local address do not fail: a TCP connection
+    /// whose source address has vanished neither errors nor delivers, so the
+    /// client would sit on a dead WebSocket, never emit a disconnect, and stay
+    /// silently offline. Only the platform knows the change happened, so it
+    /// has to say so; the manager then drops and re-dials at once instead of
+    /// waiting for a liveness deadline to expire.
+    ///
+    /// Safe to send liberally — it is a no-op when nothing is connected, and
+    /// re-dialing a healthy session costs one reconnect.
+    NetworkChanged,
     /// Send an Opus audio frame to the current SFU room via the supernode.
     /// Used as a WebSocket fallback when direct QUIC is unavailable.
     SendRoomAudio {

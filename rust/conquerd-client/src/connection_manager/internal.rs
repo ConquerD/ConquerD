@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::protocol::SignalingMessage;
@@ -147,6 +147,13 @@ pub(super) struct SupernodeSession {
     pub(super) send_tx: mpsc::Sender<WsMessage>,
     pub(super) connected: bool,
     pub(super) ws_task: tokio::task::JoinHandle<()>,
+    /// Raised when the platform reports the local network moved under us.
+    ///
+    /// Wakes the session's `supernode_ws_task` whether it is running a socket
+    /// or waiting out a reconnect backoff. A socket left on a vanished source
+    /// address never errors, so without an outside nudge the only thing that
+    /// recovers it is the task's own idle deadline.
+    pub(super) reconnect_now: Arc<Notify>,
 }
 
 #[cfg(test)]

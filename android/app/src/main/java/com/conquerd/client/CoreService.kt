@@ -29,7 +29,22 @@ class CoreService : Service() {
     private var microphoneActive = false
     private var cameraActive = false
 
+    /**
+     * Watches for the device changing network.
+     *
+     * Owned by the service rather than the activity for the same reason the
+     * core is: the phone is most likely to hop between Wi-Fi and cellular while
+     * the app is in someone's pocket, which is exactly when no activity exists
+     * to notice.
+     */
+    private val networkMonitor by lazy { NetworkMonitor(this, ConquerdCore.get(this)) }
+
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        networkMonitor.start()
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         createChannel()
@@ -49,6 +64,7 @@ class CoreService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        networkMonitor.stop()
         ConquerdCore.get(this).stop()
     }
 

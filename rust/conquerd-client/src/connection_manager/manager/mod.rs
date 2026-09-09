@@ -24,7 +24,7 @@ use conquerd_features::{
 };
 use parking_lot::RwLock;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 
@@ -524,6 +524,7 @@ impl ConnectionManager {
                 send_tx,
                 connected: true,
                 ws_task: tokio::spawn(async {}),
+                reconnect_now: Arc::new(Notify::new()),
             },
         );
         send_rx
@@ -965,6 +966,9 @@ impl ConnectionManager {
                         }
                         ConnectionCommand::RemoveSupernode { supernode_id } => {
                             self.remove_supernode(&supernode_id).await;
+                        }
+                        ConnectionCommand::NetworkChanged => {
+                            self.handle_network_changed();
                         }
                         ConnectionCommand::SubscribeRoomChat { supernode_id, room_id } => {
                             self.chat_active_rooms
@@ -1519,6 +1523,7 @@ impl ConnectionManager {
         let internal_tx = self.internal_tx.clone();
         let (send_tx, send_rx) = mpsc::channel::<WsMessage>(64);
         let peer_id_clone = peer_id.clone();
+        let reconnect_now = Arc::new(Notify::new());
 
         // Spawn a dedicated task for this supernode connection
         let ws_task = tokio::spawn(supernode_ws_task(
@@ -1527,6 +1532,7 @@ impl ConnectionManager {
             candidates,
             send_rx,
             internal_tx,
+            Arc::clone(&reconnect_now),
         ));
 
         self.supernodes.insert(
@@ -1537,6 +1543,7 @@ impl ConnectionManager {
                 send_tx,
                 connected: false,
                 ws_task,
+                reconnect_now,
             },
         );
     }
@@ -1561,6 +1568,37 @@ impl ConnectionManager {
             "Supernode removed from trust store: {}",
             &supernode_id[..8.min(supernode_id.len())]
         );
+    }
+
+    /// The platform reported that the device's network changed — Wi-Fi to
+    /// cellular, one Wi-Fi to another, a VPN coming up or going down.
+    ///
+    /// Every socket we hold was opened on a local address that has just gone
+    /// away, and TCP will not say so: a WebSocket stranded that way neither
+    /// errors nor delivers, so its task would otherwise wait out the full
+    /// read-idle deadline before redialing. Nudging each session instead makes
+    /// the recovery immediate. Nothing else needs doing here — the
+    /// `WsDisconnected` each session emits already tears down its QUIC relay
+    /// and room state, and the matching `WsConnected` rebuilds them.
+    pub(super) fn handle_network_changed(&mut self) {
+        info!(
+            "Network changed — redialing {} supernode session(s), {} pending peer reconnect(s)",
+            self.supernodes.len(),
+            self.pending_peer_reconnects.len()
+        );
+        for sn in self.supernodes.values() {
+            // `notify_one` leaves a permit when the task is mid-dial rather
+            // than parked, so the signal is never lost to a race.
+            sn.reconnect_now.notify_one();
+        }
+        // Backoff earned on the old network says nothing about the new one, so
+        // trusted direct peers get their next attempt now rather than up to a
+        // minute from now.
+        let now = Instant::now();
+        for pending in self.pending_peer_reconnects.values_mut() {
+            pending.attempts = 0;
+            pending.next_at = now;
+        }
     }
 
     pub(super) async fn handle_internal_event(&mut self, event: InternalEvent) {

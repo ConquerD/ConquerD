@@ -32,6 +32,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "avatar.set_config",
     "supernode.list",
     "supernode.remove",
+    "net.changed",
     "peer.list",
     "peer.block",
     "peer.unblock",
@@ -346,6 +347,14 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
             // re-added supernode finds its rooms again.
             json!({ "ok": true })
         }
+
+        // The platform saw the device move between networks. Only Android
+        // knows this happened: a socket opened on the address that just went
+        // away neither errors nor delivers, so without this the core would
+        // hold a dead WebSocket until its read-idle deadline expired.
+        //
+        // Fire-and-forget, and cheap enough to send on every callback.
+        "net.changed" => queued(session.send(ConnectionCommand::NetworkChanged)),
 
         // ── Peers ─────────────────────────────────────────────────────────
         "peer.list" => {
