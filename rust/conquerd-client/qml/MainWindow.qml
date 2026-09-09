@@ -1402,9 +1402,9 @@ ApplicationWindow {
 
     PassphraseDialog {
         id: passphraseDialog
-        onSubmitted: function(passphrase, filePath) {
+        onSubmitted: function(passphrase, filePath, remember) {
             passphraseDialog.visible = false
-            backend.unlockWithPassphraseAndFile(passphrase, filePath)
+            backend.unlockWithPassphraseAndFile(passphrase, filePath, remember)
         }
     }
 

@@ -1,6 +1,7 @@
 // PassphraseDialog.qml — Shown when the identity requires a passphrase and/or keyfile.
 
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import QtQuick.Dialogs
@@ -16,7 +17,15 @@ Item {
     property string errorText: ""
     property string _selectedFilePath: ""
 
-    signal submitted(string passphrase, string filePath)
+    // Name the actual store rather than saying "the OS keyring": the user can
+    // only judge the trade-off if they know where the key lands, and it is the
+    // place they would go to remove it by hand.
+    readonly property string _keyringName:
+        Qt.platform.os === "windows" ? "Windows Credential Manager"
+        : Qt.platform.os === "osx"   ? "the macOS Keychain"
+                                     : "your desktop keyring"
+
+    signal submitted(string passphrase, string filePath, bool remember)
 
     FileDialog {
         id: filePickerDialog
@@ -137,6 +146,36 @@ Item {
                 }
             }
 
+            // ── Optional auto-unlock ──────────────────────────────────
+            //
+            // Off by default and never implied: leaving this alone keeps the
+            // behaviour every existing user already has. The body text spells
+            // out both sides rather than selling the convenience, because the
+            // cost is real - the key sits in the OS store for anything running
+            // as this user to read.
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingXs
+
+                CheckBox {
+                    id: rememberBox
+                    text: "Stay unlocked on this device (optional)"
+                    checked: false
+                    font.pixelSize: Theme.fontSizeBody
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: Theme.spacingLg
+                    text: rememberBox.checked
+                          ? "On: ConquerD opens without asking for this passphrase again on this device. Your key is stored in " + root._keyringName + ", so anyone who can use your account here - or any program running as you - can open your identity. Your passphrase itself is never stored."
+                          : "Off: you type this passphrase every launch. Your identity file is useless to anyone who copies it without the passphrase."
+                    font.pixelSize: Theme.fontSizeCaption
+                    color: Theme.muted
+                    wrapMode: Text.WordWrap
+                }
+            }
+
             StyledButton {
                 Layout.fillWidth: true
                 text: root.isNew ? "Create identity" : "Unlock"
@@ -161,7 +200,7 @@ Item {
         }
 
         root.errorText = ""
-        root.submitted(pass, file)
+        root.submitted(pass, file, rememberBox.checked)
         passphraseField.text = ""
         confirmField.text = ""
         root._selectedFilePath = ""
