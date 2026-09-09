@@ -1515,9 +1515,15 @@ fn send_chat(session: &Session, parsed: &Value) -> Value {
 
 /// Send a message to a room's chat.
 ///
-/// Unlike direct chat this is not persisted locally first: room history is
-/// replayed from the room itself, and the sender sees its own message when it
-/// comes back through `room_chat_message`.
+/// Persisted locally on the way out, exactly like direct chat. It used to
+/// rely on seeing its own message when it came back through
+/// `room_chat_message`, but it never does: the supernode skips the author
+/// when it fans a room frame out, so the one participant guaranteed never to
+/// receive a copy is the person who sent it. Everyone else saw the message
+/// and the sender watched their own room go silent.
+///
+/// Writing it here is safe against a future echo - the inbound path drops any
+/// message whose id it already holds.
 fn send_room_chat(session: &Session, parsed: &Value) -> Value {
     let (Some(supernode_id), Some(room_id), Some(body)) = (
         arg_str(parsed, "supernode_id"),
@@ -1535,15 +1541,48 @@ fn send_room_chat(session: &Session, parsed: &Value) -> Value {
         .map(|rec| rec.display_name())
         .unwrap_or_default();
 
+    let timestamp = now_secs();
     let sent = session.send(ConnectionCommand::SendSfuChat {
         supernode_id: supernode_id.to_owned(),
         room_id: room_id.to_owned(),
         body: body.to_owned(),
-        sender_handle,
+        sender_handle: sender_handle.clone(),
         message_id: message_id.clone(),
     });
 
-    json!({ "ok": sent, "message_id": message_id })
+    let record = ChatMessage {
+        id: message_id.clone(),
+        // Keyed on the room alone, matching the inbound path and the desktop:
+        // a room_id already identifies the room on whichever supernode hosts it.
+        peer_id: conquerd_client::chat_store::room_conversation_id(room_id),
+        sender: session.my_public_id.clone(),
+        recipient: String::new(),
+        body: body.to_owned(),
+        timestamp,
+        is_self: true,
+        // `Sent`, never `Sending`: room chat has no per-recipient ack, so a
+        // message left pending would stay pending for good.
+        status: if sent {
+            MessageStatus::Sent
+        } else {
+            MessageStatus::Failed
+        },
+        kind: MessageKind::Text,
+        attachment_name: String::new(),
+        attachment_path: String::new(),
+        size_str: String::new(),
+        status_note: if sent {
+            String::new()
+        } else {
+            "could not reach the connection manager".to_owned()
+        },
+        sender_handle,
+    };
+    if let Err(e) = session.chat_store.insert(&record) {
+        warn!("could not persist outbound room chat: {e}");
+    }
+
+    json!({ "ok": sent, "message_id": message_id, "timestamp": timestamp })
 }
 
 /// Ask the core to mint an invite URL.

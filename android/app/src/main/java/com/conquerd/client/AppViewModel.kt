@@ -1138,6 +1138,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 put("room_id", room.roomId)
                 put("body", trimmed)
             }
+            // Same contract as sendChat: the core persists the message either
+            // way, so reloading shows its true state. Nothing arrives to
+            // prompt this on its own - the supernode skips the author when it
+            // fans a room frame out, so a sender never receives its own
+            // message back.
+            loadRoomHistory(room)
             if (!reply.ok) _state.update { it.copy(error = reply.errorText) }
         }
     }
