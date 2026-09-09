@@ -56,6 +56,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "room.leave",
     "room.chat.subscribe",
     "room.chat.unsubscribe",
+    "room.resubscribe_all",
     "room.chat.send",
     "room.voice.join",
     "room.voice.leave",
@@ -342,10 +343,19 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 }
             }
 
+            // Dropping the trust record is not the same as hanging up. The
+            // WebSocket task keeps its own state and reconnects on a timer, so
+            // without this the "removed" node came straight back - a new HELLO
+            // seconds later, still relaying, still holding its QUIC relay. The
+            // desktop has always torn the session down here.
+            let stopped = session.send(ConnectionCommand::RemoveSupernode {
+                supernode_id: node_id.to_owned(),
+            });
+
             // Rooms hosted there stay in the store but become unreachable; the
             // desktop behaves the same way, and keeping them means a
             // re-added supernode finds its rooms again.
-            json!({ "ok": true })
+            json!({ "ok": true, "session_closed": stopped })
         }
 
         // The platform saw the device move between networks. Only Android
@@ -696,6 +706,12 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
             queued(session.send(command))
         }
         "room.chat.send" => send_room_chat(session, &parsed),
+        "room.resubscribe_all" => {
+            let Some(supernode_id) = arg_str(&parsed, "supernode_id") else {
+                return err("room.resubscribe_all requires \"supernode_id\"");
+            };
+            resubscribe_rooms(session, supernode_id)
+        }
 
         // ── Room voice ────────────────────────────────────────────────────
         //
@@ -1511,6 +1527,103 @@ fn send_chat(session: &Session, parsed: &Value) -> Value {
     }
 
     json!({ "ok": sent, "message_id": message_id, "timestamp": timestamp })
+}
+
+/// Rematerialize every room this identity holds on `supernode_id` and stay
+/// subscribed to their text chat, whichever room the UI happens to be showing.
+///
+/// Membership is not a view state. Subscribing only to the room on screen made
+/// the phone a member of exactly one room at a time, and closing the view took
+/// it back out — so from every other member's side the phone kept leaving.
+/// Once it was the only one left in a room, the remaining member became the
+/// elected group keyer, rotated the room key, and sealed chat to an epoch the
+/// phone had never been offered. Room chat then failed to open in *both*
+/// directions: the phone resealing an epoch nobody acked, the other side
+/// sending one the phone could not decrypt.
+///
+/// The desktop and headless clients have always done this on connect - see
+/// `replay_saved_rooms_on_supernode_connect` and
+/// `headless_rematerialize_and_subscribe`. This is the Android equivalent, and
+/// it is deliberately a near-transcription of them: three subtly different
+/// membership policies across three clients is what produced the split brain.
+fn resubscribe_rooms(session: &Session, supernode_id: &str) -> Value {
+    // A cluster presents as one logical node, so rooms saved under a sibling
+    // have to be found when replaying onto this member.
+    let member_ids: Vec<String> = {
+        let rosters = session.cluster_members.read();
+        rosters
+            .iter()
+            .find(|(host, _)| host.trim_end_matches('=') == supernode_id.trim_end_matches('='))
+            .map(|(_, members)| members.clone())
+            .unwrap_or_default()
+    };
+
+    // Resolve everything under the store locks, then release them before
+    // sending: nothing below needs them, and holding a lock across a queue
+    // push is a habit worth not forming.
+    let entries = {
+        let room_store = session.room_store.read();
+        let peer_store = session.peer_store.read();
+        let all = if member_ids.is_empty() {
+            room_store.list_for_supernode_resolved(&peer_store, supernode_id)
+        } else {
+            room_store.list_for_cluster_members(&peer_store, &member_ids)
+        };
+        all.into_iter()
+            .filter(|entry| entry.room_id != "default")
+            .filter(|entry| {
+                // Hide is keyed under the invite host, so check every cluster
+                // alias: a room hidden under A stays hidden on B and C.
+                let hidden = room_store.is_hidden_from_sidebar(&entry.supernode_id, &entry.room_id)
+                    || room_store.is_hidden_from_sidebar(supernode_id, &entry.room_id)
+                    || member_ids
+                        .iter()
+                        .any(|k| room_store.is_hidden_from_sidebar(k, &entry.room_id));
+                !hidden
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut subscribed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // The built-in public room is always present on a supernode, so subscribe
+    // to its chat unconditionally rather than waiting for someone to open it.
+    let mut sent = session.send(ConnectionCommand::SubscribeRoomChat {
+        supernode_id: supernode_id.to_owned(),
+        room_id: "default".to_owned(),
+    });
+    subscribed.insert("default".to_owned());
+
+    for entry in entries {
+        let creator_id = if entry.creator_id.is_empty() {
+            session.my_public_id.clone()
+        } else {
+            entry.creator_id.clone()
+        };
+        sent &= session.send(ConnectionCommand::CreateRoom {
+            supernode_id: supernode_id.to_owned(),
+            room_name: entry.room_name.clone(),
+            room_type: entry.room_type.clone(),
+            room_id: Some(entry.room_id.clone()),
+            creator_id: Some(creator_id),
+            materialize_only: true,
+            invite_policy: entry.invite_policy.clone(),
+            invite_token: entry.invite_token.clone(),
+        });
+        if subscribed.insert(entry.room_id.clone()) {
+            sent &= session.send(ConnectionCommand::SubscribeRoomChat {
+                supernode_id: supernode_id.to_owned(),
+                room_id: entry.room_id.clone(),
+            });
+        }
+    }
+
+    info!(
+        "[rooms] resubscribed {} room(s) on {}",
+        subscribed.len(),
+        &supernode_id[..12.min(supernode_id.len())]
+    );
+    json!({ "ok": sent, "rooms": subscribed.len() })
 }
 
 /// Send a message to a room's chat.

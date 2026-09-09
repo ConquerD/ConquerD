@@ -1032,10 +1032,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 core.command("room.voice.leave")
                 CoreService.setMediaActive(getApplication(), microphone = false, camera = false)
             }
-            core.command("room.chat.unsubscribe") {
-                put("supernode_id", room.supernodeId)
-                put("room_id", room.roomId)
-            }
+            // Deliberately no room.chat.unsubscribe here. Closing the view
+            // is not leaving the room, and unsubscribing on the way out is
+            // what removed us from the roster and let the remaining member
+            // rotate the group key without us. The desktop keeps every room
+            // it can see subscribed regardless of which one is selected;
+            // leaving for real goes through hiding or removing the room.
             core.command("room.leave") {
                 put("supernode_id", room.supernodeId)
                 put("room_id", room.roomId)
@@ -1211,10 +1213,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-            "supernode_connected" ->
+            "supernode_connected" -> {
                 _state.update {
                     it.copy(connectionMode = maxOf(it.connectionMode, ConnectionMode.RELAY))
                 }
+                // Rejoin every room we hold on this node, not just the one on
+                // screen. Membership is not a view state: being a member of
+                // only the open room meant every other member saw us leave the
+                // moment we backed out, and a room we were the last one in got
+                // its group key rotated to an epoch we were never offered.
+                // The desktop and headless clients have always done this on
+                // connect.
+                val id = event.stringOrEmpty("supernode_id")
+                if (id.isNotEmpty()) {
+                    viewModelScope.launch {
+                        core.command("room.resubscribe_all") { put("supernode_id", id) }
+                        refreshRooms()
+                    }
+                }
+            }
 
             "supernode_disconnected" ->
                 _state.update { it.copy(connectionMode = ConnectionMode.OFFLINE) }
