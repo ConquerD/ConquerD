@@ -4,7 +4,7 @@
 //!
 //! * `nativeVersion()` — the core version string; also a cheap check that the
 //!   library loaded at all.
-//! * `nativeStart(homeDir, passphrase, storedKey, sink)` — unlock the identity, open the
+//! * `nativeStart(homeDir, passphrase, keyfilePath, storedKey, sink)` — unlock the identity, open the
 //!   stores, start the core. Returns an opaque handle.
 //! * `nativeCommand(handle, json)` — run one command, return one JSON reply.
 //! * `nativeStop(handle)` — shut the core down.
@@ -170,8 +170,12 @@ fn initialize_ndk_context(env: &JNIEnv<'_>, context: &JObject<'_>) -> jni::error
     Ok(())
 }
 
-/// `long NativeCore.nativeStart(String homeDir, String passphrase, String storedKey,
-/// Context context, EventSink sink)`
+/// `long NativeCore.nativeStart(String homeDir, String passphrase, String keyfilePath,
+/// String storedKey, Context context, EventSink sink)`
+///
+/// `keyfilePath` is a file inside the app sandbox whose SHA-256 is combined
+/// with the passphrase, matching the desktop's keyfile support. Empty means
+/// passphrase only.
 ///
 /// `storedKey` is the base64url file key Kotlin unsealed from the Android
 /// Keystore when the user chose to stay unlocked, or null to unlock with the
@@ -184,6 +188,7 @@ pub extern "system" fn Java_com_conquerd_client_NativeCore_nativeStart<'local>(
     _class: JClass<'local>,
     home_dir: JString<'local>,
     passphrase: JString<'local>,
+    keyfile_path: JString<'local>,
     stored_key: JString<'local>,
     context: JObject<'local>,
     listener: JObject<'local>,
@@ -213,6 +218,8 @@ pub extern "system" fn Java_com_conquerd_client_NativeCore_nativeStart<'local>(
     // A malformed stored key is treated as no key rather than an error: the
     // passphrase path still works, so the worst case is one extra prompt
     // instead of an app that cannot start.
+    let keyfile_path = read_string(&mut env, &keyfile_path).unwrap_or_default();
+
     let stored_key = read_string(&mut env, &stored_key).and_then(|encoded| {
         let bytes = conquerd_client::crypto::b64url_decode(&encoded).ok()?;
         <[u8; 32]>::try_from(bytes.as_slice()).ok()
@@ -232,7 +239,7 @@ pub extern "system" fn Java_com_conquerd_client_NativeCore_nativeStart<'local>(
     // A panic unwinding into the JVM is undefined behaviour, so start-up is
     // fenced: any panic below becomes a Java exception instead.
     let started = catch_unwind(AssertUnwindSafe(|| {
-        Session::start(&home_dir, &passphrase, stored_key, sink)
+        Session::start(&home_dir, &passphrase, &keyfile_path, stored_key, sink)
     }));
 
     match started {

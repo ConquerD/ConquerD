@@ -96,7 +96,9 @@ Create or unlock an identity at start-up; optionally stay unlocked.
   via the `keyring` crate, opt-in per unlock and cleared when unticked.
 * **Android** — `identity.info`, `identity.export_key`, `identity.set_handle`. The `keyring` crate has
   no Android backend, so the Kotlin side seals the exported key with an
-  AndroidKeyStore AES-GCM key (`IdentityVault.kt`). No keyfile support.
+  AndroidKeyStore AES-GCM key (`IdentityVault.kt`). Keyfiles are supported:
+  the picked document is staged into the sandbox first, because the core reads
+  the file itself rather than taking bytes.
 
 ### 2. Peers and trust
 
@@ -131,9 +133,11 @@ ephemeral X25519 key; the handshake completes over the supernode.
   `loadMoreHistory`, `clearUnread`, `getStoredMessageCount`,
   `purgeAllChatHistory`, `trimMessagesByAge`, `trimMessagesByCount`.
 * **Android** — `chat.history`, `chat.send`, `chat.mark_read`,
-  `chat.unread_total`, `chat.typing`, `chat.delete`, `chat.retry`. Long-press a
-  bubble for Copy / Try again / Delete, with retry offered only on your own
-  failed messages. No bulk purge or retention trimming.
+  `chat.unread_total`, `chat.typing`, `chat.delete`, `chat.retry`,
+  `chat.purge_all`, `chat.trim`. Long-press a bubble for Copy / Try again /
+  Delete, with retry offered only on your own failed messages; Settings carries
+  purge and age trimming. `chat.trim` folds the desktop's two trim invokables
+  into one command with `days` and `keep_per_peer` bounds.
 
 ### 5. Rooms
 
@@ -308,7 +312,14 @@ hosting an image.
   desktop and phone is worse than none. `Avatar.kt`'s parser is deliberately
   strict — it expects the fixed shape `build_avatar_svg` emits and falls back
   to a flat tint rather than guessing, so a change there surfaces as a plain
-  square instead of a wrong picture. No avatar *editing* on Android.
+  square instead of a wrong picture.
+
+  `avatar.set_config` stores the config on our own peer record — the same place
+  the handle lives, and the place `avatar.svg` already reads a peer's config
+  from — then broadcasts it, because peers cache it. The editor previews
+  through `avatar.svg` with an explicit config, so what it shows is what peers
+  will draw. It exposes grid, shading, dual-hue and islands; the remaining
+  knobs are refinements that need a bigger screen to be worth the space.
 
 ### 18. Updates
 
@@ -355,13 +366,13 @@ Android yet) or is purely local (theme, camera choice).
 
 | Feature | Desktop | Android |
 |---|---|---|
-| Identity create / unlock | Passphrase + keyfile | Passphrase only |
+| Identity create / unlock | Passphrase + keyfile | Passphrase + keyfile |
 | Stay unlocked | OS keyring, opt-in | AndroidKeyStore, opt-in |
 | Peer list / presence | Yes | Yes |
 | Peer block / unblock | Yes | Yes |
 | Peer remove | Yes | Yes |
 | Invites generate / accept | Yes | Yes |
-| Direct chat | Full, with retry/purge/retention | Send, history, typing, unread, delete, retry |
+| Direct chat | Full | Full, minus per-peer clear |
 | Rooms join / leave / chat | Yes | Yes |
 | Room create | Yes | Yes |
 | Sub-rooms / room invites | Yes | **No** |
@@ -377,7 +388,7 @@ Android yet) or is purely local (theme, camera choice).
 | Portal / web apps | Yes | **No** |
 | Plugins (`x.*`) | Yes | **No** |
 | Ollama | Yes | **No** |
-| Avatars / handles | Yes, editable | Display only |
+| Avatars / handles | Yes, editable | Yes, editable |
 | Settings | ~60 persisted | Name, camera, voice activation, theme |
 
 ---

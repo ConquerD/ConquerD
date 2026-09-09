@@ -29,6 +29,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "identity.export_key",
     "identity.set_handle",
     "avatar.svg",
+    "avatar.set_config",
     "peer.list",
     "peer.block",
     "peer.unblock",
@@ -40,6 +41,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "chat.typing",
     "chat.delete",
     "chat.retry",
+    "chat.purge_all",
+    "chat.trim",
     "invite.generate",
     "invite.accept",
     "room.list",
@@ -166,6 +169,53 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
             json!({ "ok": true, "handle": handle })
         }
 
+        // Change how our own avatar looks, and tell peers.
+        //
+        // Stored on our own peer record, the same place the handle lives and
+        // the same place `avatar.svg` already reads a peer's config from, so
+        // one write covers the peer list, chat and our own preview. Peers
+        // cache it, so a change that is not announced leaves them rendering
+        // the old one.
+        "avatar.set_config" => {
+            let Some(config_json) = arg_str(&parsed, "config") else {
+                return err("avatar.set_config requires \"config\"");
+            };
+
+            // Parse before storing: a config the renderer cannot read would
+            // leave every avatar of ours blank until it was set again.
+            let config: conquerd_client::avatar_config::AvatarConfig =
+                match serde_json::from_str(config_json) {
+                    Ok(c) => c,
+                    Err(e) => return err(format!("that avatar config is not valid: {e}")),
+                };
+
+            let my_peer_id = session.identity.peer_id();
+            {
+                let mut store = session.peer_store.write();
+                match store.get_mut(&my_peer_id) {
+                    Some(record) => record.avatar_config = Some(config),
+                    None => {
+                        let mut record = conquerd_client::peer_store::PeerRecord {
+                            peer_id: my_peer_id.clone(),
+                            identity_pub: session.my_public_id.clone(),
+                            avatar_config: Some(config),
+                            ..Default::default()
+                        };
+                        record.created_at = now_secs();
+                        store.upsert(record);
+                    }
+                }
+                if let Err(e) = store.save() {
+                    return err(format!("could not save the avatar: {e}"));
+                }
+            }
+
+            let _ = session.send(ConnectionCommand::BroadcastAvatarConfigToAll {
+                config_json: config_json.to_owned(),
+            });
+            json!({ "ok": true })
+        }
+
         // Render a peer's identicon.
         //
         // The SVG is built by the shared core, not reimplemented here: the
@@ -196,13 +246,20 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 },
             );
 
-            // A peer who advertised their own look gets it; everyone else the
-            // factory default, which is what the desktop falls back to too.
-            let config = store
-                .get(raw_id)
-                .or_else(|| store.get_by_identity(raw_id))
-                .and_then(|rec| rec.avatar_config.clone())
-                .unwrap_or_default();
+            // An explicit config previews an edit before it is saved; without
+            // one, a peer who advertised their own look gets it and everyone
+            // else the factory default, matching the desktop's fallback.
+            let config = match arg_str(&parsed, "config").filter(|c| !c.is_empty()) {
+                Some(json) => match serde_json::from_str(json) {
+                    Ok(c) => c,
+                    Err(e) => return err(format!("that avatar config is not valid: {e}")),
+                },
+                None => store
+                    .get(raw_id)
+                    .or_else(|| store.get_by_identity(raw_id))
+                    .and_then(|rec| rec.avatar_config.clone())
+                    .unwrap_or_default(),
+            };
 
             json!({
                 "ok": true,
@@ -297,6 +354,37 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 Ok(()) => json!({ "ok": true }),
                 Err(e) => err(format!("could not delete the message: {e}")),
             }
+        }
+        // Local retention. None of this reaches the peer: they keep their own
+        // copy, and the protocol has no "delete for everyone".
+        "chat.purge_all" => match session.chat_store.purge_all() {
+            Ok(removed) => json!({ "ok": true, "removed": removed }),
+            Err(e) => err(format!("could not purge history: {e}")),
+        },
+        "chat.trim" => {
+            // One command with two modes rather than two commands: they are
+            // the same user intent - "keep less" - and a caller that sends
+            // neither bound has asked for nothing.
+            let days = parsed.get("days").and_then(Value::as_i64);
+            let keep = parsed.get("keep_per_peer").and_then(Value::as_i64);
+            if days.is_none() && keep.is_none() {
+                return err("chat.trim needs \"days\" or \"keep_per_peer\"");
+            }
+
+            let mut removed = 0usize;
+            if let Some(days) = days {
+                match session.chat_store.trim_by_age(days as i32) {
+                    Ok(n) => removed += n,
+                    Err(e) => return err(format!("could not trim by age: {e}")),
+                }
+            }
+            if let Some(keep) = keep {
+                match session.chat_store.trim_by_count(keep as i32) {
+                    Ok(n) => removed += n,
+                    Err(e) => return err(format!("could not trim by count: {e}")),
+                }
+            }
+            json!({ "ok": true, "removed": removed })
         }
         "chat.retry" => {
             let Some(msg_id) = arg_str(&parsed, "message_id") else {

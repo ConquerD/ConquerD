@@ -64,6 +64,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -159,6 +160,10 @@ fun AppRoot(viewModel: AppViewModel) {
                     onSetFrontCamera = viewModel::setFrontCamera,
                     onSetVoiceActivation = viewModel::setVoiceActivation,
                     onSetTheme = viewModel::setTheme,
+                    onSetAvatarConfig = viewModel::setAvatarConfig,
+                    onPreviewAvatar = viewModel::previewAvatar,
+                    onPurgeHistory = viewModel::purgeChatHistory,
+                    onTrimHistory = viewModel::trimChatHistory,
                 )
 
                 is Screen.Chat -> ChatScreen(
@@ -317,10 +322,15 @@ private fun UnlockScreen(
     busy: Boolean,
     autoUnlocking: Boolean,
     version: String,
-    onUnlock: (String, Boolean) -> Unit,
+    onUnlock: (String, Boolean, android.net.Uri?) -> Unit,
 ) {
     var passphrase by remember { mutableStateOf("") }
     var stayUnlocked by remember { mutableStateOf(false) }
+    var keyfile by remember { mutableStateOf<android.net.Uri?>(null) }
+
+    val pickKeyfile = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> keyfile = uri }
 
     // A stored key is being tried: asking for a passphrase we are about to not
     // need would flash a prompt on every launch, which is the thing the user
@@ -379,10 +389,42 @@ private fun UnlockScreen(
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-            keyboardActions = KeyboardActions(onGo = { onUnlock(passphrase, stayUnlocked) }),
+            keyboardActions = KeyboardActions(
+                onGo = { onUnlock(passphrase, stayUnlocked, keyfile) },
+            ),
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         )
+
+        Spacer(Modifier.height(8.dp))
+
+        // A keyfile can stand in for a passphrase or strengthen one: the core
+        // hashes the file and appends it to the typed text. Matching the
+        // desktop matters here - an identity created with both only opens
+        // with both.
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextButton(
+                onClick = { pickKeyfile.launch(arrayOf("*/*")) },
+                enabled = !busy,
+            ) { Text(if (keyfile == null) "Use a keyfile" else "Change keyfile") }
+
+            if (keyfile != null) {
+                TextButton(onClick = { keyfile = null }, enabled = !busy) { Text("Clear") }
+            }
+        }
+        if (keyfile != null) {
+            Text(
+                keyfile?.lastPathSegment ?: "keyfile selected",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
 
         Spacer(Modifier.height(8.dp))
 
@@ -422,7 +464,7 @@ private fun UnlockScreen(
         Spacer(Modifier.height(16.dp))
 
         Button(
-            onClick = { onUnlock(passphrase, stayUnlocked) },
+            onClick = { onUnlock(passphrase, stayUnlocked, keyfile) },
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         ) {
@@ -1578,8 +1620,14 @@ private fun SettingsScreen(
     onSetFrontCamera: (Boolean) -> Unit,
     onSetVoiceActivation: (Boolean) -> Unit,
     onSetTheme: (String) -> Unit,
+    onSetAvatarConfig: (String) -> Unit,
+    onPreviewAvatar: suspend (String) -> AvatarArt?,
+    onPurgeHistory: () -> Unit,
+    onTrimHistory: (Int) -> Unit,
 ) {
     var handle by remember(state.identity.handle) { mutableStateOf(state.identity.handle) }
+    var showAvatarEditor by remember { mutableStateOf(false) }
+    var confirmPurge by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
@@ -1646,6 +1694,47 @@ private fun SettingsScreen(
             HorizontalDivider()
             Spacer(Modifier.height(16.dp))
 
+            Text("Your avatar", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                state.avatars[state.identity.peerId]?.let { art ->
+                    Avatar(art, Modifier.size(56.dp))
+                    Spacer(Modifier.width(12.dp))
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "Drawn from your identity, so it is the same everywhere.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = { showAvatarEditor = true }) { Text("Edit") }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+
+            Text("Chat history", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Stored on this device only. Deleting does not remove anything " +
+                    "from your peers - they keep their own copies.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            Row {
+                TextButton(onClick = { onTrimHistory(30) }) { Text("Trim over 30 days") }
+                TextButton(onClick = { confirmPurge = true }) {
+                    Text("Delete all", color = MaterialTheme.colorScheme.error)
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+
             Text("Theme", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(8.dp))
             listOf(
@@ -1676,6 +1765,124 @@ private fun SettingsScreen(
             )
         }
     }
+
+    if (showAvatarEditor) {
+        AvatarEditorDialog(
+            onPreview = onPreviewAvatar,
+            onDismiss = { showAvatarEditor = false },
+            onSave = { json ->
+                showAvatarEditor = false
+                onSetAvatarConfig(json)
+            },
+        )
+    }
+
+    if (confirmPurge) {
+        AlertDialog(
+            onDismissRequest = { confirmPurge = false },
+            title = { Text("Delete all messages?") },
+            text = {
+                Text(
+                    "Every message on this device is removed. Your peers keep " +
+                        "their copies, and this cannot be undone.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmPurge = false
+                    onPurgeHistory()
+                }) { Text("Delete all", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmPurge = false }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+/**
+ * Edit the identicon.
+ *
+ * A handful of the core's knobs, not all of them: grid size and the three
+ * colour switches are what visibly change the picture, and the rest
+ * (island connectivity, hue stepping, background lightness) are refinements
+ * that need a bigger screen to be worth exposing.
+ *
+ * The preview is rendered by the core through `avatar.svg`, so what is shown
+ * is exactly what peers will draw.
+ */
+@Composable
+private fun AvatarEditorDialog(
+    onPreview: suspend (String) -> AvatarArt?,
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit,
+) {
+    var grid by remember { mutableStateOf(16f) }
+    var shadeMode by remember { mutableStateOf(1f) }
+    var dualHue by remember { mutableStateOf(false) }
+    var islands by remember { mutableStateOf(true) }
+    var preview by remember { mutableStateOf<AvatarArt?>(null) }
+
+    // Grid must be even: the pattern is mirrored about the vertical centre.
+    val configJson = remember(grid, shadeMode, dualHue, islands) {
+        val evenGrid = (grid.toInt() / 2) * 2
+        "{\"grid\":$evenGrid,\"shade_mode\":${shadeMode.toInt()}," +
+            "\"dual_hue\":$dualHue,\"islands\":$islands}"
+    }
+
+    LaunchedEffect(configJson) { preview = onPreview(configJson) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Your avatar") },
+        text = {
+            Column {
+                preview?.let { art ->
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Avatar(art, Modifier.size(96.dp))
+                    }
+                    Spacer(Modifier.height(16.dp))
+                }
+
+                Text("Detail", style = MaterialTheme.typography.labelMedium)
+                Slider(
+                    value = grid,
+                    onValueChange = { grid = it },
+                    valueRange = 8f..32f,
+                    steps = 11,
+                )
+
+                Text("Shading", style = MaterialTheme.typography.labelMedium)
+                Slider(
+                    value = shadeMode,
+                    onValueChange = { shadeMode = it },
+                    valueRange = 1f..3f,
+                    steps = 1,
+                )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { dualHue = !dualHue },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(checked = dualHue, onCheckedChange = { dualHue = it })
+                    Text("Two colours")
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { islands = !islands },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(checked = islands, onCheckedChange = { islands = it })
+                    Text("Colour each shape")
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(configJson) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable

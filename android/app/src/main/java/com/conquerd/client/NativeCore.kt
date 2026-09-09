@@ -31,6 +31,9 @@ object NativeCore {
      *
      * @param homeDir app-private directory holding identity, peers, chat and rooms.
      * @param passphrase empty for an unencrypted identity.
+     * @param keyfilePath a file in the app sandbox whose SHA-256 is combined with
+     *   the passphrase, or empty for passphrase only. Matches the desktop's
+     *   keyfile support, so the same identity opens on both with the same pair.
      * @param storedKey base64url identity file key from [IdentityVault], or null
      *   to unlock with [passphrase]. When set the passphrase is not consulted,
      *   and a key that no longer opens the file fails the start so the caller
@@ -43,6 +46,7 @@ object NativeCore {
     external fun nativeStart(
         homeDir: String,
         passphrase: String,
+        keyfilePath: String,
         storedKey: String?,
         context: Context,
         sink: EventSink,

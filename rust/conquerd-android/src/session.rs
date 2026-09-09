@@ -80,6 +80,7 @@ impl Session {
     pub fn start(
         home_dir: &str,
         passphrase: &str,
+        keyfile_path: &str,
         stored_key: Option<[u8; 32]>,
         sink: EventSink,
     ) -> anyhow::Result<Self> {
@@ -91,7 +92,8 @@ impl Session {
         // meaningful HOME, so it must be set before any store is opened.
         std::env::set_var("CONQUERD_HOME", &key_dir);
 
-        let (identity, identity_key) = unlock_identity(&key_dir, passphrase, stored_key)?;
+        let (identity, identity_key) =
+            unlock_identity(&key_dir, passphrase, keyfile_path, stored_key)?;
         let identity = Arc::new(identity);
         let my_public_id = identity.public_id();
         info!(
@@ -245,6 +247,7 @@ impl Session {
 fn unlock_identity(
     key_dir: &Path,
     passphrase: &str,
+    keyfile_path: &str,
     stored_key: Option<[u8; 32]>,
 ) -> anyhow::Result<(Identity, [u8; 32])> {
     let exists = key_dir.join(identity::IDENTITY_FILENAME).exists();
@@ -258,15 +261,26 @@ fn unlock_identity(
         return Ok((identity, key));
     }
 
+    // Text, keyfile, or both — `build_passphrase_material` concatenates the
+    // passphrase with SHA-256 of the file, so the same identity opens on the
+    // desktop with the same pair. An empty passphrase with no keyfile stays
+    // legal: it is the unencrypted-identity path.
+    let material = if keyfile_path.is_empty() {
+        passphrase.as_bytes().to_vec()
+    } else {
+        conquerd_client::crypto::build_passphrase_material(passphrase, keyfile_path)
+            .map_err(|e| anyhow::anyhow!("could not read the keyfile: {e}"))?
+    };
+
     if exists {
-        return Identity::load_with_passphrase_keyed(passphrase.as_bytes(), key_dir)
+        return Identity::load_with_passphrase_keyed(&material, key_dir)
             .map_err(|e| anyhow::anyhow!("could not unlock identity: {e}"));
     }
 
     info!("no identity found — generating one");
     let fresh = Identity::generate();
     let (_, key) = fresh
-        .save_encrypted_keyed(passphrase.as_bytes(), key_dir)
+        .save_encrypted_keyed(&material, key_dir)
         .map_err(|e| anyhow::anyhow!("could not save new identity: {e}"))?;
     Ok((fresh, key))
 }

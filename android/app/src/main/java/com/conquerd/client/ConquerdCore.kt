@@ -74,11 +74,14 @@ class ConquerdCore private constructor(context: Context) : NativeCore.EventSink 
      * Start the core, creating the identity on first launch.
      *
      * @param passphrase empty means an unencrypted identity.
+     * @param keyfilePath a sandbox path whose contents strengthen [passphrase],
+     *   or empty for passphrase only.
      * @param storedKey a file key from [IdentityVault] to unlock without the
      *   passphrase, or null to use [passphrase].
      */
     suspend fun start(
         passphrase: String,
+        keyfilePath: String = "",
         storedKey: String? = null,
     ): Result<Unit> = withContext(Dispatchers.IO) {
         synchronized(lifecycleLock) {
@@ -89,6 +92,7 @@ class ConquerdCore private constructor(context: Context) : NativeCore.EventSink 
                     NativeCore.nativeStart(
                         homeDir,
                         passphrase,
+                        keyfilePath,
                         storedKey,
                         appContext,
                         this@ConquerdCore,

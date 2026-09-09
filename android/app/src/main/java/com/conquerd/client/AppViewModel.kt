@@ -215,12 +215,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * also *clears* a key stored earlier, so unticking the box is a way to turn
      * the feature off rather than only declining to renew it.
      */
-    fun unlock(passphrase: String, stayUnlocked: Boolean = false) {
+    fun unlock(
+        passphrase: String,
+        stayUnlocked: Boolean = false,
+        keyfile: android.net.Uri? = null,
+    ) {
         if (_state.value.busy) return
         _state.update { it.copy(busy = true, error = null) }
 
         viewModelScope.launch {
-            val result = core.start(passphrase)
+            // The core reads the keyfile itself, repeatedly, so it needs a
+            // sandbox path rather than the picker's uri - same constraint as
+            // sending a file.
+            val stagedKeyfile = keyfile?.let { uri ->
+                withContext(Dispatchers.IO) { FileStaging.stageForSend(getApplication(), uri) }
+            }
+            if (keyfile != null && stagedKeyfile == null) {
+                _state.update { it.copy(busy = false, error = "Could not read that keyfile.") }
+                return@launch
+            }
+
+            val result = core.start(passphrase, stagedKeyfile?.path.orEmpty())
             result.onFailure { e ->
                 // The overwhelmingly common cause is a wrong passphrase, and
                 // the Rust error text says so; surface it rather than a
@@ -399,6 +414,71 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         (_state.value.screen as? Screen.Chat)?.let { loadHistory(it.peer.peerId) }
+    }
+
+    // ── History ─────────────────────────────────────────────────────
+
+    /**
+     * Delete every message on this device.
+     *
+     * Local only: peers keep their copies, and the protocol has no delete for
+     * everyone. Worth saying plainly in the UI, because "delete all messages"
+     * reads like it reaches further than it does.
+     */
+    fun purgeChatHistory() = viewModelScope.launch {
+        val reply = core.command("chat.purge_all")
+        if (!reply.ok) {
+            _state.update { it.copy(error = reply.errorText) }
+            return@launch
+        }
+        _state.update {
+            it.copy(
+                messages = emptyList(),
+                notice = "Deleted ${reply.number("removed").toInt()} messages.",
+            )
+        }
+    }
+
+    /** Drop messages older than [days], keeping the rest. */
+    fun trimChatHistory(days: Int) = viewModelScope.launch {
+        val reply = core.command("chat.trim") { put("days", days) }
+        if (!reply.ok) {
+            _state.update { it.copy(error = reply.errorText) }
+            return@launch
+        }
+        _state.update {
+            it.copy(notice = "Removed ${reply.number("removed").toInt()} older messages.")
+        }
+    }
+
+    // ── Avatar ─────────────────────────────────────────────────────
+
+    /** Render an avatar for a config that has not been saved yet. */
+    suspend fun previewAvatar(configJson: String): AvatarArt? {
+        val reply = core.command("avatar.svg") {
+            put("peer_id", _state.value.identity.peerId)
+            put("config", configJson)
+        }
+        return if (reply.ok) parseAvatarSvg(reply.stringOrEmpty("svg")) else null
+    }
+
+    /**
+     * Save our avatar config and tell peers.
+     *
+     * Peers cache the config, so an unannounced change leaves them rendering
+     * the old avatar - the core broadcasts for us.
+     */
+    fun setAvatarConfig(configJson: String) = viewModelScope.launch {
+        val reply = core.command("avatar.set_config") { put("config", configJson) }
+        if (!reply.ok) {
+            _state.update { it.copy(error = reply.errorText) }
+            return@launch
+        }
+        // Drop the cached art for ourselves so the next read re-renders it.
+        _state.update {
+            it.copy(avatars = it.avatars - it.identity.peerId, notice = "Avatar updated.")
+        }
+        refreshAvatars(listOf(_state.value.identity.peerId))
     }
 
     // ── Files ─────────────────────────────────────────────────────────────
