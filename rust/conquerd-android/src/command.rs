@@ -30,6 +30,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "identity.set_handle",
     "avatar.svg",
     "avatar.set_config",
+    "supernode.list",
+    "supernode.remove",
     "peer.list",
     "peer.block",
     "peer.unblock",
@@ -58,6 +60,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "room.voice.leave",
     "room.history",
     "room.request_list",
+    "room.invite",
     "call.start",
     "call.accept",
     "call.reject",
@@ -67,10 +70,14 @@ const KNOWN_COMMANDS: &[&str] = &[
     "audio.start",
     "audio.stop",
     "audio.set_muted",
+    "audio.tune",
     "file.send",
     "file.accept",
     "file.reject",
     "file.cancel",
+    "file.send_room",
+    "file.accept_room",
+    "file.decline_room",
 ];
 
 /// How long a command that waits on the core may block the calling thread.
@@ -266,6 +273,70 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 "svg": conquerd_client::avatar_config::build_avatar_svg(&seed, &config),
                 "tint": conquerd_client::avatar_config::avatar_tint_hex(&seed, &config),
             })
+        }
+
+        // The infrastructure side of the peer store. Supernodes are filtered
+        // out of the contact list, so without this they are invisible and
+        // un-removable from the phone.
+        "supernode.list" => {
+            let store = session.peer_store.read();
+            let rosters = session.cluster_members.read();
+
+            let nodes: Vec<Value> = store
+                .list_peers()
+                .into_iter()
+                .filter(|p| p.is_supernode)
+                .map(|p| {
+                    // A cluster presents as one logical node; showing the
+                    // roster is how a user tells "one node" from "three that
+                    // fail over to each other".
+                    let members = rosters
+                        .iter()
+                        .find(|(host, _)| {
+                            host.trim_end_matches('=') == p.identity_pub.trim_end_matches('=')
+                        })
+                        .map(|(_, members)| members.clone())
+                        .unwrap_or_default();
+                    json!({
+                        "peer_id": p.peer_id,
+                        "identity_pub": p.identity_pub,
+                        "display_name": p.display_name(),
+                        "cluster_members": members,
+                    })
+                })
+                .collect();
+
+            json!({ "ok": true, "supernodes": nodes })
+        }
+        "supernode.remove" => {
+            let Some(node_id) = arg_str(&parsed, "node_id") else {
+                return err("supernode.remove requires \"node_id\"");
+            };
+
+            {
+                let mut store = session.peer_store.write();
+                let Some(record) = store
+                    .get(node_id)
+                    .or_else(|| store.get_by_identity(node_id))
+                    .cloned()
+                else {
+                    return err("no such supernode");
+                };
+                if !record.is_supernode {
+                    return err("that peer is not a supernode");
+                }
+                if store.remove_by_any_id(node_id).is_none() {
+                    return err("no such supernode");
+                }
+                if let Err(e) = store.save() {
+                    return err(format!("removed, but the store would not save: {e}"));
+                }
+            }
+
+            // Rooms hosted there stay in the store but become unreachable; the
+            // desktop behaves the same way, and keeping them means a
+            // re-added supernode finds its rooms again.
+            json!({ "ok": true })
         }
 
         // ── Peers ─────────────────────────────────────────────────────────
@@ -705,6 +776,51 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 invite_token: String::new(),
             }))
         }
+        // Share a room. A shareable link has no known grantee, so it carries a
+        // Space inclusion proof and no grant; naming a peer adds a grant bound
+        // to their identity_pub.
+        "room.invite" => {
+            let (Some(supernode_id), Some(room_id)) = (
+                arg_str(&parsed, "supernode_id"),
+                arg_str(&parsed, "room_id"),
+            ) else {
+                return err("room.invite requires \"supernode_id\" and \"room_id\"");
+            };
+
+            let stored = session.room_store.read().get(supernode_id, room_id).cloned();
+            let Some(entry) = stored else {
+                return err("that room is not in the local store");
+            };
+
+            let (space_root, space_proof) =
+                space_invite_fields(session, supernode_id, room_id);
+
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            let queued_ok = session.send(ConnectionCommand::GenerateRoomInvite {
+                supernode_id: supernode_id.to_owned(),
+                room_id: room_id.to_owned(),
+                room_name: entry.room_name.clone(),
+                room_type: if entry.room_type.is_empty() {
+                    "public".to_owned()
+                } else {
+                    entry.room_type.clone()
+                },
+                invite_token: entry.invite_token.clone(),
+                space_root,
+                space_proof,
+                space_grant: String::new(),
+                reply_tx,
+            });
+            if !queued_ok {
+                return err("could not reach the connection manager");
+            }
+
+            match reply_rx.recv_timeout(REPLY_TIMEOUT) {
+                Ok(Some(url)) => json!({ "ok": true, "invite_url": url }),
+                Ok(None) => err("the core declined to generate a room invite"),
+                Err(e) => err(format!("room invite generation timed out: {e}")),
+            }
+        }
         "room.request_list" => {
             let Some(supernode_id) = arg_str(&parsed, "supernode_id") else {
                 return err("room.request_list requires \"supernode_id\"");
@@ -721,6 +837,23 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
         // disk over the whole transfer, and a content uri's lifetime is the
         // picker's, not ours.
         "file.send" => send_file(session, &parsed),
+        // Room files are advertised, not pushed: the offer reaches everyone and
+        // nothing moves until a member accepts, which is why accepting is a
+        // request back to the originator rather than a local decision.
+        "file.send_room" => send_room_file(session, &parsed),
+        "file.accept_room" | "file.decline_room" => {
+            let Some(transfer_id) = arg_str(&parsed, "transfer_id") else {
+                return err("a room file action requires \"transfer_id\"");
+            };
+            let transfer_id = transfer_id.to_owned();
+            queued(session.send(if cmd == "file.accept_room" {
+                ConnectionCommand::AcceptRoomFile { transfer_id }
+            } else {
+                // Declining is local only - the originator is never told, they
+                // simply never receive a request.
+                ConnectionCommand::DeclineRoomFile { transfer_id }
+            }))
+        }
         "file.accept" | "file.reject" | "file.cancel" => {
             let Some(transfer_id) = arg_str(&parsed, "transfer_id") else {
                 return err("a file action requires \"transfer_id\"");
@@ -732,6 +865,51 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 _ => ConnectionCommand::CancelFile { transfer_id },
             };
             queued(session.send(command))
+        }
+
+        // Audio tuning. One command with optional fields rather than six: they
+        // are set together from one screen, and a caller that sends none has
+        // asked for nothing.
+        "audio.tune" => {
+            let mut applied = 0;
+
+            if let Some(gain) = parsed.get("input_gain").and_then(Value::as_u64) {
+                let _ = session
+                    .call_tx
+                    .try_send(CallCommand::SetInputGain(gain.min(200) as u32));
+                applied += 1;
+            }
+            if let Some(gain) = parsed.get("output_gain").and_then(Value::as_u64) {
+                let _ = session
+                    .call_tx
+                    .try_send(CallCommand::SetOutputGain(gain.min(200) as u32));
+                applied += 1;
+            }
+            if let Some(on) = parsed.get("noise_suppression").and_then(Value::as_bool) {
+                let _ = session.call_tx.try_send(CallCommand::SetNoiseSuppression(on));
+                applied += 1;
+            }
+            if let Some(level) = parsed.get("noise_strength").and_then(Value::as_u64) {
+                let _ = session
+                    .call_tx
+                    .try_send(CallCommand::SetNoiseStrength(level.min(4) as u32));
+                applied += 1;
+            }
+            if let Some(bps) = parsed.get("bitrate_bps").and_then(Value::as_u64) {
+                let _ = session
+                    .call_tx
+                    .try_send(CallCommand::SetOutgoingBitrate(bps as u32));
+                applied += 1;
+            }
+            if let Some(on) = parsed.get("voice_activation").and_then(Value::as_bool) {
+                let _ = session.call_tx.try_send(CallCommand::SetVoiceActivation(on));
+                applied += 1;
+            }
+
+            if applied == 0 {
+                return err("audio.tune needs at least one setting");
+            }
+            json!({ "ok": true, "applied": applied })
         }
 
         // ── Calls ─────────────────────────────────────────────────────────
@@ -911,6 +1089,105 @@ fn send_signal(session: &Session, kind: MessageType, peer_id: &str) -> bool {
 /// The message is written to the store as `Sending` before it goes out, so it
 /// appears in history immediately and a later ack or failure updates the row
 /// that is already there.
+/// Build the Space inclusion proof and signed root an invite carries.
+///
+/// Empty pair when this room is not in a Space we own — the invite then falls
+/// back to the legacy token path, which is what a room created before Spaces
+/// existed still uses.
+fn space_invite_fields(session: &Session, supernode_id: &str, room_id: &str) -> (String, String) {
+    let space_id = conquerd_client::room_store::RoomStore::space_id_for(
+        &session.my_public_id,
+        supernode_id,
+    );
+    let store = session.room_store.read();
+    let Some(space) = store.get_space(&space_id) else {
+        return (String::new(), String::new());
+    };
+    let Some(proof) = space.prove(room_id) else {
+        return (String::new(), String::new());
+    };
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let root = space.signed_root(issued_at, |b| session.identity.sign(b));
+    (
+        serde_json::to_string(&root).unwrap_or_default(),
+        serde_json::to_string(&proof).unwrap_or_default(),
+    )
+}
+
+/// Advertise a file to a room, echoing it into the room's history.
+///
+/// Unlike a 1:1 offer nothing is sent yet: the advertisement reaches the room
+/// and members pull it if they want it.
+fn send_room_file(session: &Session, parsed: &Value) -> Value {
+    let (Some(supernode_id), Some(room_id), Some(path)) = (
+        arg_str(parsed, "supernode_id"),
+        arg_str(parsed, "room_id"),
+        arg_str(parsed, "path"),
+    ) else {
+        return err("file.send_room requires \"supernode_id\", \"room_id\" and \"path\"");
+    };
+
+    let rel_path = arg_str(parsed, "rel_path")
+        .filter(|n| !n.is_empty())
+        .unwrap_or("file")
+        .to_owned();
+
+    let byte_len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) => return err(format!("cannot read that file: {e}")),
+    };
+    if byte_len > conquerd_client::file_transfer::MAX_TRANSFER_SIZE as u64 {
+        return err(format!(
+            "{} is over the {} limit",
+            conquerd_client::chat_store::format_byte_size(byte_len),
+            conquerd_client::chat_store::format_byte_size(
+                conquerd_client::file_transfer::MAX_TRANSFER_SIZE as u64
+            ),
+        ));
+    }
+
+    let transfer_id = uuid::Uuid::new_v4().simple().to_string()[..16].to_owned();
+    let sent = session.send(ConnectionCommand::SendSfuFile {
+        supernode_id: supernode_id.to_owned(),
+        room_id: room_id.to_owned(),
+        rel_path: rel_path.clone(),
+        path: path.to_owned(),
+        transfer_id: transfer_id.clone(),
+        purpose: "file".to_owned(),
+    });
+
+    let kind = conquerd_client::chat_store::message_kind_for_path(&rel_path);
+    let record = ChatMessage {
+        id: format!("xfer-{transfer_id}"),
+        // Room history is keyed by room id, the same as room chat.
+        peer_id: room_id.to_owned(),
+        sender: session.my_public_id.clone(),
+        recipient: room_id.to_owned(),
+        body: attachment_label(&kind, &rel_path),
+        timestamp: now_secs(),
+        is_self: true,
+        status: if sent {
+            MessageStatus::Sent
+        } else {
+            MessageStatus::Failed
+        },
+        kind,
+        attachment_name: rel_path.clone(),
+        attachment_path: path.to_owned(),
+        size_str: conquerd_client::chat_store::format_byte_size(byte_len),
+        status_note: String::new(),
+        sender_handle: String::new(),
+    };
+    if let Err(e) = session.chat_store.upsert(&record) {
+        warn!("could not echo the room file offer into history: {e}");
+    }
+
+    json!({ "ok": sent, "transfer_id": transfer_id })
+}
+
 /// Offer a file to a peer, echoing it into our own chat history.
 ///
 /// Mirrors the desktop's `sendFile`: the path is handed over rather than the

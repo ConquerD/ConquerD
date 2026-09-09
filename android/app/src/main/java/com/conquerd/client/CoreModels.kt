@@ -89,6 +89,21 @@ data class RoomMessage(
     val isSelf: Boolean,
 )
 
+/**
+ * A supernode we know, with the cluster it fronts for.
+ *
+ * `decodeList` swallows a decode failure and returns an empty list, so the
+ * field names have to match the wire exactly - a mismatch here would show as
+ * "no supernodes" rather than an error.
+ */
+@Serializable
+data class SupernodeInfo(
+    @SerialName("peer_id") val peerId: String = "",
+    @SerialName("identity_pub") val identityPub: String = "",
+    @SerialName("display_name") val displayName: String = "",
+    @SerialName("cluster_members") val clusterMembers: List<String> = emptyList(),
+)
+
 /** Who we are, from `identity.info`. */
 @Serializable
 data class IdentityInfo(

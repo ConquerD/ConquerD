@@ -83,6 +83,8 @@ data class AppState(
     val prefs: Prefs = Prefs(),
     /** Parsed identicons by peer id. Built once per peer, then reused. */
     val avatars: Map<String, AvatarArt> = emptyMap(),
+    /** Known supernodes, for the management screen. */
+    val supernodeInfo: List<SupernodeInfo> = emptyList(),
 )
 
 /** An inbound offer: nothing arrives until it is accepted. */
@@ -91,6 +93,14 @@ data class FileOffer(
     val peerId: String,
     val name: String,
     val size: Long,
+    /**
+     * True for a room offer, which is an advertisement rather than a push.
+     *
+     * Accepting one asks the originator to start sending; accepting a 1:1
+     * offer just lets bytes already on their way through. Different commands,
+     * so the difference has to survive into the dialog.
+     */
+    val isRoom: Boolean = false,
 )
 
 /** A finished download sitting in app storage. */
@@ -101,7 +111,12 @@ data class Prefs(
     val frontCamera: Boolean = true,
     val voiceActivation: Boolean = true,
     val theme: String = AppSettings.THEME_SYSTEM,
+    val inputGain: Int = 100,
+    val outputGain: Int = 100,
+    val noiseStrength: Int = 2,
+    val voiceBitrate: Int = 32_000,
 )
+
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -137,6 +152,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     frontCamera = settings.frontCamera,
                     voiceActivation = settings.voiceActivation,
                     theme = settings.theme,
+                    inputGain = settings.inputGain,
+                    outputGain = settings.outputGain,
+                    noiseStrength = settings.noiseStrength,
+                    voiceBitrate = settings.voiceBitrate,
                 ),
             )
         }
@@ -145,7 +164,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ── Settings ──────────────────────────────────────────────────────────
 
-    fun openSettings() = _state.update { it.copy(screen = Screen.Settings) }
+    fun openSettings() {
+        _state.update { it.copy(screen = Screen.Settings) }
+        refreshSupernodes()
+    }
 
     fun closeSettings() = _state.update { it.copy(screen = Screen.Home) }
 
@@ -173,6 +195,75 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setVoiceActivation(enabled: Boolean) {
         settings.voiceActivation = enabled
         _state.update { it.copy(prefs = it.prefs.copy(voiceActivation = enabled)) }
+    }
+
+    /**
+     * Push the stored audio tuning at the core.
+     *
+     * Called on every change and again when a call starts: the call controller
+     * does not persist anything, so a setting made between calls would
+     * otherwise be forgotten by the next one.
+     */
+    fun applyAudioTuning() = viewModelScope.launch {
+        core.command("audio.tune") {
+            put("input_gain", settings.inputGain)
+            put("output_gain", settings.outputGain)
+            put("noise_strength", settings.noiseStrength)
+            put("noise_suppression", settings.noiseStrength > 0)
+            put("bitrate_bps", settings.voiceBitrate)
+            put("voice_activation", settings.voiceActivation)
+        }
+    }
+
+    fun setInputGain(value: Int) {
+        settings.inputGain = value
+        _state.update { it.copy(prefs = it.prefs.copy(inputGain = settings.inputGain)) }
+        applyAudioTuning()
+    }
+
+    fun setOutputGain(value: Int) {
+        settings.outputGain = value
+        _state.update { it.copy(prefs = it.prefs.copy(outputGain = settings.outputGain)) }
+        applyAudioTuning()
+    }
+
+    fun setNoiseStrength(value: Int) {
+        settings.noiseStrength = value
+        _state.update { it.copy(prefs = it.prefs.copy(noiseStrength = settings.noiseStrength)) }
+        applyAudioTuning()
+    }
+
+    fun setVoiceBitrate(value: Int) {
+        settings.voiceBitrate = value
+        _state.update { it.copy(prefs = it.prefs.copy(voiceBitrate = settings.voiceBitrate)) }
+        applyAudioTuning()
+    }
+
+    // ── Supernodes ───────────────────────────────────────────────
+
+    fun refreshSupernodes() = viewModelScope.launch {
+        val reply = core.command("supernode.list")
+        if (!reply.ok) return@launch
+        _state.update {
+            it.copy(supernodeInfo = reply.decodeList<SupernodeInfo>(core, "supernodes"))
+        }
+    }
+
+    /**
+     * Forget a supernode.
+     *
+     * Rooms hosted there stay in the store, so re-adding it later finds them
+     * again — the same choice the desktop makes.
+     */
+    fun removeSupernode(nodeId: String) = viewModelScope.launch {
+        val reply = core.command("supernode.remove") { put("node_id", nodeId) }
+        if (!reply.ok) {
+            _state.update { it.copy(error = reply.errorText) }
+            return@launch
+        }
+        _state.update { it.copy(notice = "Supernode removed.") }
+        refreshSupernodes()
+        refreshPeers()
     }
 
     fun setTheme(theme: String) {
@@ -278,6 +369,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Shared tail of both unlock paths. */
     private suspend fun onCoreStarted() {
         CoreService.start(getApplication())
+        applyAudioTuning()
         _state.update { it.copy(busy = false, screen = Screen.Home) }
         refreshIdentity()
         refreshPeers()
@@ -514,6 +606,55 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Advertise a file to the room that is open.
+     *
+     * Nothing is sent yet: room files are advertised and pulled, so members
+     * decide individually whether to spend the bandwidth.
+     */
+    fun sendRoomFile(uri: android.net.Uri) {
+        val room = (_state.value.screen as? Screen.RoomChat)?.room ?: return
+
+        viewModelScope.launch {
+            val staged = withContext(Dispatchers.IO) {
+                FileStaging.stageForSend(getApplication(), uri)
+            }
+            if (staged == null) {
+                _state.update { it.copy(error = "Could not read that file.") }
+                return@launch
+            }
+
+            val reply = core.command("file.send_room") {
+                put("supernode_id", room.supernodeId)
+                put("room_id", room.roomId)
+                put("path", staged.path)
+                put("rel_path", staged.displayName)
+            }
+            if (!reply.ok) {
+                _state.update { it.copy(error = reply.errorText) }
+                return@launch
+            }
+            _state.update { it.copy(notice = "Shared ${staged.displayName} with the room.") }
+        }
+    }
+
+    /** Build a shareable link for the open room. */
+    fun generateRoomInvite() {
+        val room = (_state.value.screen as? Screen.RoomChat)?.room ?: return
+
+        viewModelScope.launch {
+            val reply = core.command("room.invite") {
+                put("supernode_id", room.supernodeId)
+                put("room_id", room.roomId)
+            }
+            if (!reply.ok) {
+                _state.update { it.copy(error = reply.errorText) }
+                return@launch
+            }
+            _state.update { it.copy(inviteUrl = reply.stringOrEmpty("invite_url")) }
+        }
+    }
+
     /** Accept the pending offer, which is what actually starts the download. */
     fun acceptFileOffer() = respondToOffer(accept = true)
 
@@ -524,10 +665,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val offer = _state.value.fileOffer ?: return
         _state.update { it.copy(fileOffer = null) }
 
+        val command = when {
+            offer.isRoom && accept -> "file.accept_room"
+            offer.isRoom -> "file.decline_room"
+            accept -> "file.accept"
+            else -> "file.reject"
+        }
+
         viewModelScope.launch {
-            val reply = core.command(if (accept) "file.accept" else "file.reject") {
-                put("transfer_id", offer.transferId)
-            }
+            val reply = core.command(command) { put("transfer_id", offer.transferId) }
             if (!reply.ok) _state.update { it.copy(error = reply.errorText) }
         }
     }
@@ -1129,6 +1275,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                                 peerId = event.stringOrEmpty("peer_id"),
                                 name = event.stringOrEmpty("rel_path"),
                                 size = event.number("size").toLong(),
+                                // Room offers carry the hosting supernode; 1:1
+                                // offers leave it empty.
+                                isRoom = event.stringOrEmpty("supernode_id").isNotBlank(),
                             ),
                         )
                     }

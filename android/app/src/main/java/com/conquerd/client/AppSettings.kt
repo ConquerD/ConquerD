@@ -35,6 +35,31 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_VOICE_ACTIVATION, true)
         set(value) = prefs.edit().putBoolean(KEY_VOICE_ACTIVATION, value).apply()
 
+    /** Microphone gain, 0-200 where 100 is unity. */
+    var inputGain: Int
+        get() = prefs.getInt(KEY_INPUT_GAIN, 100)
+        set(value) = prefs.edit().putInt(KEY_INPUT_GAIN, value.coerceIn(0, 200)).apply()
+
+    /** Speaker gain, 0-200 where 100 is unity. */
+    var outputGain: Int
+        get() = prefs.getInt(KEY_OUTPUT_GAIN, 100)
+        set(value) = prefs.edit().putInt(KEY_OUTPUT_GAIN, value.coerceIn(0, 200)).apply()
+
+    /** Noise gate: 0 off, 1 mild, 2 moderate, 3 aggressive, 4 max. */
+    var noiseStrength: Int
+        get() = prefs.getInt(KEY_NOISE_STRENGTH, 2)
+        set(value) = prefs.edit().putInt(KEY_NOISE_STRENGTH, value.coerceIn(0, 4)).apply()
+
+    /**
+     * Outgoing Opus bitrate ceiling in bits per second.
+     *
+     * A ceiling, not a target: the core lowers the live rate under packet
+     * loss regardless of what is set here.
+     */
+    var voiceBitrate: Int
+        get() = prefs.getInt(KEY_VOICE_BITRATE, 32_000)
+        set(value) = prefs.edit().putInt(KEY_VOICE_BITRATE, value.coerceIn(8_000, 128_000)).apply()
+
     /** "system", "light" or "dark". */
     var theme: String
         get() = prefs.getString(KEY_THEME, THEME_SYSTEM) ?: THEME_SYSTEM
@@ -53,5 +78,9 @@ class AppSettings(context: Context) {
         private const val KEY_FRONT_CAMERA = "front_camera"
         private const val KEY_VOICE_ACTIVATION = "voice_activation"
         private const val KEY_THEME = "theme"
+        private const val KEY_INPUT_GAIN = "input_gain"
+        private const val KEY_OUTPUT_GAIN = "output_gain"
+        private const val KEY_NOISE_STRENGTH = "noise_strength"
+        private const val KEY_VOICE_BITRATE = "voice_bitrate"
     }
 }

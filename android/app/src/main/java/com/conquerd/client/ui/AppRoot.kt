@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
@@ -100,6 +101,7 @@ import com.conquerd.client.CallState
 import com.conquerd.client.AppSettings
 import com.conquerd.client.FileOffer
 import com.conquerd.client.SavedFile
+import com.conquerd.client.SupernodeInfo
 import com.conquerd.client.ConnectionMode
 import com.conquerd.client.HomeTab
 import com.conquerd.client.Room
@@ -164,6 +166,11 @@ fun AppRoot(viewModel: AppViewModel) {
                     onPreviewAvatar = viewModel::previewAvatar,
                     onPurgeHistory = viewModel::purgeChatHistory,
                     onTrimHistory = viewModel::trimChatHistory,
+                    onSetInputGain = viewModel::setInputGain,
+                    onSetOutputGain = viewModel::setOutputGain,
+                    onSetNoiseStrength = viewModel::setNoiseStrength,
+                    onSetVoiceBitrate = viewModel::setVoiceBitrate,
+                    onRemoveSupernode = viewModel::removeSupernode,
                 )
 
                 is Screen.Chat -> ChatScreen(
@@ -196,6 +203,9 @@ fun AppRoot(viewModel: AppViewModel) {
                     onToggleVideo = { wanted ->
                         if (wanted) viewModel.startVideo(null) else viewModel.stopVideo(null)
                     },
+                    transfers = state.transfers,
+                    onSendFile = viewModel::sendRoomFile,
+                    onShare = viewModel::generateRoomInvite,
                 )
             }
         }
@@ -1323,8 +1333,15 @@ private fun RoomChatScreen(
     onLeaveVoice: () -> Unit,
     onToggleMute: () -> Unit,
     onToggleVideo: (Boolean) -> Unit,
+    transfers: Map<String, Float>,
+    onSendFile: (android.net.Uri) -> Unit,
+    onShare: () -> Unit,
 ) {
     var draft by remember { mutableStateOf("") }
+
+    val pickFile = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> uri?.let(onSendFile) }
     val listState = rememberLazyListState()
     val context = LocalContext.current
 
@@ -1375,6 +1392,9 @@ private fun RoomChatScreen(
                 }
             },
             actions = {
+                IconButton(onClick = onShare) {
+                    Icon(Icons.Filled.Share, contentDescription = "Share this room")
+                }
                 IconButton(
                     enabled = joined,
                     onClick = {
@@ -1451,6 +1471,12 @@ private fun RoomChatScreen(
             modifier = Modifier.fillMaxWidth().padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            IconButton(
+                onClick = { pickFile.launch(arrayOf("*/*")) },
+                enabled = joined,
+            ) {
+                Icon(Icons.Filled.AddCircle, contentDescription = "Share a file")
+            }
             OutlinedTextField(
                 value = draft,
                 onValueChange = { draft = it },
@@ -1728,10 +1754,16 @@ private fun SettingsScreen(
     onPreviewAvatar: suspend (String) -> AvatarArt?,
     onPurgeHistory: () -> Unit,
     onTrimHistory: (Int) -> Unit,
+    onSetInputGain: (Int) -> Unit,
+    onSetOutputGain: (Int) -> Unit,
+    onSetNoiseStrength: (Int) -> Unit,
+    onSetVoiceBitrate: (Int) -> Unit,
+    onRemoveSupernode: (String) -> Unit,
 ) {
     var handle by remember(state.identity.handle) { mutableStateOf(state.identity.handle) }
     var showAvatarEditor by remember { mutableStateOf(false) }
     var confirmPurge by remember { mutableStateOf(false) }
+    var confirmRemoveNode by remember { mutableStateOf<SupernodeInfo?>(null) }
 
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
@@ -1839,6 +1871,97 @@ private fun SettingsScreen(
             HorizontalDivider()
             Spacer(Modifier.height(16.dp))
 
+            Text("Voice", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(8.dp))
+
+            TuningSlider(
+                label = "Microphone",
+                value = state.prefs.inputGain.toFloat(),
+                range = 0f..200f,
+                display = "${state.prefs.inputGain}%",
+                onChange = { onSetInputGain(it.toInt()) },
+            )
+            TuningSlider(
+                label = "Speaker",
+                value = state.prefs.outputGain.toFloat(),
+                range = 0f..200f,
+                display = "${state.prefs.outputGain}%",
+                onChange = { onSetOutputGain(it.toInt()) },
+            )
+            TuningSlider(
+                label = "Noise gate",
+                value = state.prefs.noiseStrength.toFloat(),
+                range = 0f..4f,
+                steps = 3,
+                display = when (state.prefs.noiseStrength) {
+                    0 -> "off"
+                    1 -> "mild"
+                    2 -> "moderate"
+                    3 -> "aggressive"
+                    else -> "max"
+                },
+                onChange = { onSetNoiseStrength(it.toInt()) },
+            )
+            TuningSlider(
+                label = "Voice quality",
+                value = state.prefs.voiceBitrate.toFloat(),
+                range = 8_000f..128_000f,
+                // A ceiling, not a promise: the core drops below it under loss.
+                display = "${state.prefs.voiceBitrate / 1000} kbps max",
+                onChange = { onSetVoiceBitrate((it / 1000).toInt() * 1000) },
+            )
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+
+            Text("Supernodes", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "The servers that relay your traffic and host rooms. Added by " +
+                    "accepting an invite.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+
+            if (state.supernodeInfo.isEmpty()) {
+                Text(
+                    "None yet.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            state.supernodeInfo.forEach { node ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(node.displayName, style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            // A cluster presents as one node; saying how many
+                            // members it has is what distinguishes "one server"
+                            // from "three that fail over".
+                            if (node.clusterMembers.size > 1) {
+                                "cluster of ${node.clusterMembers.size}"
+                            } else {
+                                node.peerId.take(16)
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(onClick = { confirmRemoveNode = node }) {
+                        Text("Remove", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+
             Text("Theme", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(8.dp))
             listOf(
@@ -1877,6 +2000,29 @@ private fun SettingsScreen(
             onSave = { json ->
                 showAvatarEditor = false
                 onSetAvatarConfig(json)
+            },
+        )
+    }
+
+    confirmRemoveNode?.let { node ->
+        AlertDialog(
+            onDismissRequest = { confirmRemoveNode = null },
+            title = { Text("Remove ${node.displayName}?") },
+            text = {
+                Text(
+                    "You will stop relaying through it and lose access to the " +
+                        "rooms it hosts. Rooms stay in your list, so re-adding " +
+                        "it later finds them again.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRemoveNode = null
+                    onRemoveSupernode(node.peerId)
+                }) { Text("Remove", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRemoveNode = null }) { Text("Cancel") }
             },
         )
     }
@@ -1989,6 +2135,32 @@ private fun AvatarEditorDialog(
     )
 }
 
+/** A labelled slider that shows the value it is about to set. */
+@Composable
+private fun TuningSlider(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    display: String,
+    onChange: (Float) -> Unit,
+    steps: Int = 0,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+        Text(
+            display,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    Slider(
+        value = value.coerceIn(range.start, range.endInclusive),
+        onValueChange = onChange,
+        valueRange = range,
+        steps = steps,
+    )
+}
+
 @Composable
 private fun SettingSwitch(
     title: String,
@@ -2029,7 +2201,7 @@ private fun FileOfferDialog(
 ) {
     AlertDialog(
         onDismissRequest = onReject,
-        title = { Text("Incoming file") },
+        title = { Text(if (offer.isRoom) "File shared in a room" else "Incoming file") },
         text = {
             Column {
                 Text(offer.name, style = MaterialTheme.typography.bodyLarge)

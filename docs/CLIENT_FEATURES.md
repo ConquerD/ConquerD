@@ -153,8 +153,9 @@ read.
 * **Android** — `room.list`, `room.create`, `room.join`, `room.leave`,
   `room.hide`, `room.unhide`, `room.chat.subscribe`, `room.chat.unsubscribe`,
   `room.chat.send`, `room.history`, `room.request_list`, `room.voice.join`,
-  `room.voice.leave`. `room.create` takes an optional `parent_room_id`.
-  Generating room invites is not wired.
+  `room.voice.leave`, `room.invite`. `room.create` takes an optional
+  `parent_room_id`. A shareable link carries a Space inclusion proof and no
+  grant; per-peer grants (`generateRoomInviteForPeer`) are not wired.
 
   Creation was not just a missing command. Nothing else on Android writes to
   the room store — the rooms a phone lists were persisted by a desktop client
@@ -204,8 +205,12 @@ signed, and admission is proved against it rather than asserted.
   `testSpeaker`, `setVoiceActivation`, `setNoiseStrength`, `setJitterDepth`,
   `setVoiceBitrate`, `enablePtt`, `disablePtt`.
 * **Android** — `call.start`, `call.accept`, `call.reject`, `call.end`,
-  `audio.start`, `audio.stop`, `audio.set_muted`. Voice activation is a flag on
-  `audio.start`. No device selection, no mic test, no PTT, no tuning.
+  `audio.start`, `audio.stop`, `audio.set_muted`, `audio.tune`. The last takes
+  input/output gain, noise suppression and strength, bitrate ceiling and voice
+  activation as optional fields — they are set together from one screen, and
+  the call controller persists none of them, so the client re-applies on every
+  start. No device selection (the platform picks), no mic test, no PTT, and no
+  jitter-depth control — that one has no `CallCommand` behind it.
 
 `ndk_context` must be initialised in `nativeStart` before any audio starts, or
 cpal's Oboe backend panics and takes the call controller with it.
@@ -249,8 +254,11 @@ meet it.
   Room files are advertised then pulled rather than pushed.
 * **Desktop** — `sendFile`, `acceptFile`, `rejectFile`, `sendRoomFile`,
   `acceptRoomFile`, `declineRoomFile`, `openContainingFolder`.
-* **Android** — `file.send`, `file.accept`, `file.reject`, `file.cancel` for
-  1:1 transfers. Room files (`sendRoomFile` / `acceptRoomFile`) are not wired.
+* **Android** — `file.send`, `file.accept`, `file.reject`, `file.cancel`, plus
+  `file.send_room`, `file.accept_room`, `file.decline_room`. The room path is
+  advertise-then-pull: nothing moves until a member accepts, so accepting is a
+  request back to the originator rather than a local decision, and declining
+  tells nobody.
 
   Two Android-specific constraints shape this. A SAF `content://` uri cannot be
   handed to the core — the core streams from a path for the length of the
@@ -268,9 +276,10 @@ member must resolve to the same place, and sessions fail over between members.
 * **Core** — `cluster.rs`, `quic_relay_client.rs`, `connection_fallback.rs`.
 * **Desktop** — `isKnownSupernode`, `removeSupernode`, `resolveSupernodeNodeId`,
   `clusterRepresentative`, `configureDirectP2p`, `openNodePortal`.
-* **Android** — cluster rosters are tracked internally (`cluster_members` on
-  the session, folded into room listing so one room does not appear N times),
-  but there is no management surface.
+* **Android** — `supernode.list` and `supernode.remove`, surfaced in Settings
+  with the cluster size beside each node. Adding one is still done by accepting
+  its invite, as on the desktop. Removing leaves the rooms it hosted in the
+  store so re-adding finds them again.
 
 ### 13. Connection state
 
@@ -392,21 +401,21 @@ Android yet) or is purely local (theme, camera choice).
 | Rooms join / leave / chat | Yes | Yes |
 | Room create | Yes | Yes |
 | Sub-rooms | Yes | Yes |
-| Room invites | Yes | **No** |
+| Room invites | Link + per-peer grant | Link only |
 | Room hide | Yes | Yes |
 | Spaces (nested, proof admission) | Yes | Nested list, sub-rooms, proof joins |
-| Direct voice | Full stack + tuning | Basic call + mute |
+| Direct voice | Full stack + tuning | Call, mute, gain/noise/bitrate |
 | Room voice | Yes | Yes |
 | Video send | Camera + screen share | Camera only |
 | Video receive | Yes | **No** |
 | Content audio / A/V sync | Windows only | **No** |
-| File transfer | Direct + room | Direct only |
-| Supernode / cluster management | Yes | Internal only |
+| File transfer | Direct + room | Direct + room |
+| Supernode / cluster management | Yes | List and remove |
 | Portal / web apps | Yes | **No** |
 | Plugins (`x.*`) | Yes | **No** |
 | Ollama | Yes | **No** |
 | Avatars / handles | Yes, editable | Yes, editable |
-| Settings | ~60 persisted | Name, camera, voice activation, theme |
+| Settings | ~60 persisted | Name, avatar, camera, voice tuning, history, theme |
 
 ---
 
