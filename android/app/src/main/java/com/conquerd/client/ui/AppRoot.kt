@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -23,8 +24,12 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -34,6 +39,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
@@ -48,6 +54,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.CardDefaults
@@ -74,10 +81,13 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -95,6 +105,7 @@ import androidx.compose.ui.unit.dp
 import com.conquerd.client.AppViewModel
 import com.conquerd.client.R
 import com.conquerd.client.ChatMessage
+import kotlinx.coroutines.launch
 import com.conquerd.client.AppState
 import com.conquerd.client.CallPhase
 import com.conquerd.client.CameraCapture
@@ -1171,9 +1182,16 @@ private fun ChatScreen(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> if (granted) onCall() }
 
-    // Follow the conversation as it grows, the way every chat app does.
+    val scrolledAway by rememberScrolledAwayFromLatest(listState)
+    val scope = rememberCoroutineScope()
+
+    // Follow the conversation as it grows, the way every chat app does -
+    // unless the reader has scrolled back, where snatching the view to the end
+    // mid-sentence is the exact thing the jump button exists to prevent.
     LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+        if (messages.isNotEmpty() && !scrolledAway) {
+            listState.animateScrollToItem(messages.lastIndex)
+        }
     }
 
     Column(Modifier.fillMaxSize().imePadding()) {
@@ -1197,17 +1215,23 @@ private fun ChatScreen(
             },
         )
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            items(messages, key = { it.id }) { message ->
-                MessageBubble(
-                    message = message,
-                    onRetry = { onRetry(message) },
-                    onDelete = { onDelete(message) },
-                )
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                items(messages, key = { it.id }) { message ->
+                    MessageBubble(
+                        message = message,
+                        onRetry = { onRetry(message) },
+                        onDelete = { onDelete(message) },
+                    )
+                }
+            }
+
+            JumpToCurrentButton(visible = scrolledAway) {
+                scope.launch { listState.animateScrollToItem(messages.lastIndex) }
             }
         }
 
@@ -1370,8 +1394,16 @@ private fun RoomChatScreen(
         }
     }
 
+    val scrolledAway by rememberScrolledAwayFromLatest(listState)
+    val scope = rememberCoroutineScope()
+
+    // Left alone once the reader has scrolled back; JumpToCurrentButton is the
+    // way forward again. A busy room otherwise drags the view off whatever is
+    // being read every time anyone speaks.
     LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+        if (messages.isNotEmpty() && !scrolledAway) {
+            listState.animateScrollToItem(messages.lastIndex)
+        }
     }
 
     Column(Modifier.fillMaxSize().imePadding()) {
@@ -1468,12 +1500,18 @@ private fun RoomChatScreen(
                 )
             }
         } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                items(messages, key = { it.messageId }) { RoomMessageBubble(it) }
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    items(messages, key = { it.messageId }) { RoomMessageBubble(it) }
+                }
+
+                JumpToCurrentButton(visible = scrolledAway) {
+                    scope.launch { listState.animateScrollToItem(messages.lastIndex) }
+                }
             }
         }
 
@@ -2387,3 +2425,56 @@ private fun AcceptInviteDialog(onDismiss: () -> Unit, onAccept: (String) -> Unit
 
 private fun formatTime(epochSeconds: Double): String =
     DateFormat.getTimeInstance(DateFormat.SHORT).format(Date((epochSeconds * 1000).toLong()))
+
+// ── Jump to current ────────────────────────────────────────────────────────
+
+/**
+ * How far from the newest message counts as "away", in list items.
+ *
+ * Small deliberately. The button exists so that reading back never hides an
+ * arriving message, and a threshold much larger than this lets several land
+ * unseen before anything says so.
+ */
+private const val JUMP_TO_CURRENT_AFTER_ITEMS = 3
+
+/**
+ * True while [listState] is scrolled far enough from the newest message that
+ * an arriving message would land unseen below the fold.
+ *
+ * `derivedStateOf` rather than a plain read: scroll position changes every
+ * frame while a finger is down, and recomposing the whole chat screen on each
+ * of those would cost far more than the one boolean anyone actually reads.
+ */
+@Composable
+private fun rememberScrolledAwayFromLatest(listState: LazyListState): State<Boolean> =
+    remember(listState) {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull() ?: return@derivedStateOf false
+            info.totalItemsCount - 1 - last.index >= JUMP_TO_CURRENT_AFTER_ITEMS
+        }
+    }
+
+/**
+ * The affordance back to the newest message, shown over the bottom of a chat
+ * list while the reader has scrolled away from it.
+ *
+ * Pairs with suppressing auto-scroll: a list that keeps snapping to the end
+ * needs no such button, and one that stops snapping without offering it
+ * strands the reader.
+ */
+@Composable
+private fun BoxScope.JumpToCurrentButton(visible: Boolean, onClick: () -> Unit) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(),
+        exit = fadeOut(),
+        modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp),
+    ) {
+        FilledTonalButton(onClick = onClick) {
+            Icon(Icons.Filled.KeyboardArrowDown, contentDescription = null)
+            Spacer(Modifier.width(6.dp))
+            Text("Jump to current")
+        }
+    }
+}

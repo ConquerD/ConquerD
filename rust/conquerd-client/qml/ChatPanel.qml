@@ -287,6 +287,17 @@ Item {
                     Qt.callLater(function() { msgList.positionViewAtEnd() })
             }
 
+            // Lives in the list's content item, like the empty state above it,
+            // so its y is in content coordinates - hence tracking contentY to
+            // stay parked at the bottom of the viewport instead of scrolling
+            // away with the messages.
+            JumpToCurrentButton {
+                list: msgList
+                z: 2
+                x: Math.round((msgList.width - width) / 2)
+                y: msgList.contentY + msgList.height - height - Theme.spacingMd
+            }
+
             ColumnLayout {
                 anchors.centerIn: parent
                 width: Math.min(parent.width - 48, 260)

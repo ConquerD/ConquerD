@@ -252,7 +252,37 @@ Item {
             clip: true
             model: roomChatModel
             spacing: 2
-            onCountChanged: Qt.callLater(function() { roomChat.positionViewAtEnd() })
+
+            /*!
+                Whether the view is close enough to the newest message to keep
+                following it.
+
+                Room chat used to jump to the end on every arriving message,
+                which made reading anything older impossible in a busy room -
+                the view snatched itself away mid-sentence. A reader who has
+                scrolled up is now left alone, and JumpToCurrentButton is how
+                they come back.
+            */
+            property bool pinnedToLatest: true
+
+            onContentYChanged: {
+                pinnedToLatest = contentHeight <= height
+                    || contentY >= contentHeight - height - 24
+            }
+
+            onCountChanged: {
+                if (pinnedToLatest)
+                    Qt.callLater(function() { roomChat.positionViewAtEnd() })
+            }
+
+            // In the list's content item, so y is in content coordinates and
+            // has to track contentY to stay parked at the viewport bottom.
+            JumpToCurrentButton {
+                list: roomChat
+                z: 2
+                x: Math.round((roomChat.width - width) / 2)
+                y: roomChat.contentY + roomChat.height - height - Theme.spacingMd
+            }
 
             EmptyState {
                 anchors.centerIn: parent

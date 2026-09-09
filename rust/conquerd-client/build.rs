@@ -381,6 +381,7 @@ fn build_qt_ui() {
         QmlFile::from("qml/RoomPanel.qml"),
         QmlFile::from("qml/SessionBanner.qml"),
         QmlFile::from("qml/StyledButton.qml"),
+        QmlFile::from("qml/JumpToCurrentButton.qml"),
         QmlFile::from("qml/StyledTextField.qml"),
         QmlFile::from("qml/EmptyState.qml"),
         QmlFile::from("qml/SettingsCard.qml"),
