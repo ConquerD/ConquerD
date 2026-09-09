@@ -15,8 +15,8 @@ import java.io.FileInputStream
  * A `conquerd://` page is not fetchable by a browser: the supernode serves it
  * over the identity QUIC relay through `web.host.app.v1`, so every request the
  * WebView makes has to be intercepted and answered by the core. That is what
- * [interceptRequest] does; [PortalApi] is the JS-visible object the web SDK
- * drives once the page is running.
+ * [interceptRequest] does; [PortalApi] is the JS-visible object the shim drives
+ * once the page is running.
  *
  * The SDK polls for inbound datagrams rather than being pushed to, which is
  * why there is no callback into JS here — the core buffers frames and
@@ -59,14 +59,44 @@ class PortalBridge(
         if (!file.exists()) return errorResponse("portal response missing")
 
         val contentType = reply.stringOrEmpty("content_type").ifBlank { "text/html" }
+        val mime = contentType.substringBefore(';').trim()
+
+        // The bridge is injected into the HTML rather than evaluated after
+        // load. Pages test for `window.conquerd` while they parse, so anything
+        // that runs on page-finished is far too late — the page has already
+        // decided it is in the wrong browser. The desktop gets this for free
+        // with QWebEngineScript's DocumentCreation injection point; WebView's
+        // WebViewClient has no equivalent, but every byte of the document
+        // passes through here, so the script can simply lead it.
+        val body = if (mime == "text/html") {
+            injectBridge(file.readText()).byteInputStream()
+        } else {
+            FileInputStream(file)
+        }
+
         return WebResourceResponse(
-            contentType.substringBefore(';').trim(),
+            mime,
             contentType.substringAfter("charset=", "utf-8").trim(),
             reply.number("status").toInt().takeIf { it in 100..599 } ?: 200,
             "OK",
             emptyMap(),
-            FileInputStream(file),
+            body,
         )
+    }
+
+    /** Put the bridge script ahead of anything the document might run. */
+    private fun injectBridge(html: String): String {
+        val tag = "<script>${bootstrapJs()}</script>"
+
+        // After <head> when there is one, so the document still parses as the
+        // author wrote it; otherwise lead the document.
+        val head = HEAD_OPEN.find(html)
+        return when {
+            head != null -> html.substring(0, head.range.last + 1) +
+                tag +
+                html.substring(head.range.last + 1)
+            else -> tag + html
+        }
     }
 
     private fun errorResponse(message: String) = WebResourceResponse(
@@ -78,12 +108,159 @@ class PortalBridge(
         message.byteInputStream(),
     )
 
-    /** The object exposed to page JS as `window.conquerd`'s backing API. */
+    /**
+     * The shim that becomes `window.conquerd`.
+     *
+     * Deliberately the same surface the desktop injects in `scheme.cpp`: a
+     * frozen `{supernodeId, ready}` whose promise resolves to the API object.
+     * A page written against the desktop must not have to care which client it
+     * is running in, so the names match exactly — `closeChannel`, not `close`.
+     */
+    private fun bootstrapJs(): String = """
+        (function () {
+          if (window.conquerd) return;
+          var raw = window.__conquerdNative;
+          if (!raw) return;
+          var sn = window.location.hostname;
+          var parse = function (s) {
+            try { return JSON.parse(s); } catch (e) { return { ok: false, error: 'bad reply' }; }
+          };
+          var api = Object.freeze({
+            myPeerId: raw.myPeerId(),
+            version: raw.version(),
+            nativeTransport: true,
+            supernodeId: sn,
+            openChannel: function (room) {
+              return Promise.resolve(parse(raw.openChannel(room || 'default')));
+            },
+            sendDatagramB64: function (b64) {
+              return Promise.resolve(parse(raw.sendDatagramB64(b64)));
+            },
+            pollDatagrams: function () {
+              return Promise.resolve(parse(raw.pollDatagrams()));
+            },
+            closeChannel: function () {
+              return Promise.resolve(parse(raw.closeChannel()));
+            },
+            fetch: function (path, opts) {
+              var base = 'conquerd://' + sn;
+              var url = path.charAt(0) === '/' ? base + path : base + '/' + path;
+              return window.fetch(url, opts);
+            }
+          });
+
+          // Route page fetches of conquerd:// through the bridge. Chromium
+          // refuses the scheme outright, so without this a page's own API
+          // calls fail with "URL scheme conquerd is not supported" while its
+          // documents and assets - which take the interceptor path - load fine.
+          var nativeFetch = window.fetch ? window.fetch.bind(window) : null;
+          window.fetch = function (input, opts) {
+            var href;
+            try {
+              href = new URL(
+                typeof input === 'string' ? input : (input && input.url) || '',
+                window.location.href
+              ).href;
+            } catch (e) {
+              href = '';
+            }
+
+            if (href.indexOf('conquerd:') !== 0) {
+              if (!nativeFetch) return Promise.reject(new Error('fetch unavailable'));
+              return nativeFetch(input, opts);
+            }
+
+            return new Promise(function (resolve, reject) {
+              var res = parse(raw.fetchB64(href));
+              if (!res || res.ok === false) {
+                reject(new TypeError(res && res.error ? res.error : 'portal fetch failed'));
+                return;
+              }
+              var binary = atob(res.body || '');
+              var bytes = new Uint8Array(binary.length);
+              for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+              resolve(new Response(bytes, {
+                status: res.status || 200,
+                headers: { 'Content-Type': res.content_type || 'text/plain' }
+              }));
+            });
+          };
+          Object.defineProperty(window, 'conquerd', {
+            configurable: false,
+            writable: false,
+            value: Object.freeze({ supernodeId: sn, ready: Promise.resolve(api) })
+          });
+        })();
+    """.trimIndent()
+
+    /** The object exposed to page JS, wrapped by the shim above. */
     inner class PortalApi {
 
         /** The identity the page sees — the base64url public id, as on desktop. */
         @JavascriptInterface
         fun myPeerId(): String = myPeerId
+
+        @JavascriptInterface
+        fun version(): String = core.version()
+
+        /**
+         * Fetch a `conquerd://` URL on behalf of page script.
+         *
+         * `shouldInterceptRequest` only sees document and subresource loads.
+         * Chromium rejects `fetch()` and XHR on an unregistered scheme before
+         * the interceptor runs — "URL scheme conquerd is not supported" — so
+         * script-initiated requests have to come back through here instead.
+         * Qt WebEngine avoids this by registering the scheme properly, which
+         * WebView has no equivalent of.
+         *
+         * Method and body are dropped, matching the desktop: `scheme.cpp` never
+         * reads the request method and `FetchWebApp` carries neither, so every
+         * portal request is a GET with a query string on both clients.
+         */
+        @JavascriptInterface
+        fun fetchB64(rawUrl: String): String {
+            val url = runCatching { android.net.Uri.parse(rawUrl) }.getOrNull()
+                ?: return failure("that is not a URL")
+            if (url.scheme != SCHEME) return failure("not a portal URL")
+
+            val reply = runBlocking {
+                core.command("portal.fetch") {
+                    put("supernode_id", url.host ?: supernodeId)
+                    put("path", url.path.orEmpty().ifEmpty { "/" })
+                    url.query?.let { put("query", it) }
+                }
+            }
+            if (!reply.ok) return failure(reply.errorText ?: "portal fetch failed")
+
+            val file = File(reply.stringOrEmpty("path"))
+            if (!file.exists()) return failure("portal response missing")
+            if (file.length() > MAX_INLINE_BODY) {
+                // Page APIs return small JSON. Anything this large is a document
+                // or asset, which loads through the interceptor without ever
+                // passing the bytes through JavaScript.
+                return failure("response too large for a page fetch")
+            }
+
+            val body = android.util.Base64.encodeToString(
+                file.readBytes(),
+                android.util.Base64.NO_WRAP,
+            )
+            return buildString {
+                append("{\"ok\":true,\"status\":")
+                append(reply.number("status").toInt().takeIf { it in 100..599 } ?: 200)
+                append(",\"content_type\":")
+                append(jsonString(reply.stringOrEmpty("content_type").ifBlank { "text/plain" }))
+                append(",\"body\":")
+                append(jsonString(body))
+                append("}")
+            }
+        }
+
+        private fun failure(message: String) =
+            "{\"ok\":false,\"error\":${jsonString(message)}}"
+
+        private fun jsonString(value: String) =
+            kotlinx.serialization.json.JsonPrimitive(value).toString()
 
         /**
          * Join a game lobby. Returns a JSON reply the shim turns into a promise.
@@ -108,7 +285,7 @@ class PortalBridge(
         fun pollDatagrams(): String = call("portal.poll") {}
 
         @JavascriptInterface
-        fun close(): String = call("portal.close") {
+        fun closeChannel(): String = call("portal.close") {
             put("supernode_id", supernodeId)
         }
 
@@ -121,29 +298,15 @@ class PortalBridge(
     companion object {
         const val SCHEME = "conquerd"
         private const val TAG = "PortalBridge"
+        private val HEAD_OPEN = Regex("<head[^>]*>", RegexOption.IGNORE_CASE)
 
         /**
-         * The shim that turns the injected object into the API the SDK expects.
+         * Ceiling on a body handed to page script.
          *
-         * `addJavascriptInterface` can only pass strings, so the promises,
-         * JSON parsing and the `ready` handshake the web SDK waits on are built
-         * here in JS over the string calls above.
+         * Documents and assets never come this way - they load through the
+         * interceptor as a stream - so this only bounds page API responses,
+         * which are small.
          */
-        val BOOTSTRAP_JS = """
-            (function () {
-              if (window.conquerd && window.conquerd.ready) return;
-              const raw = window.__conquerdNative;
-              if (!raw) return;
-              const parse = (s) => { try { return JSON.parse(s); } catch (e) { return { ok: false, error: 'bad reply' }; } };
-              const api = {
-                myPeerId: raw.myPeerId(),
-                openChannel: (room) => Promise.resolve(parse(raw.openChannel(room || 'default'))),
-                sendDatagramB64: (b64) => Promise.resolve(parse(raw.sendDatagramB64(b64))),
-                pollDatagrams: () => Promise.resolve(parse(raw.pollDatagrams())),
-                close: () => Promise.resolve(parse(raw.close())),
-              };
-              window.conquerd = { ready: Promise.resolve(api), ...api };
-            })();
-        """.trimIndent()
+        private const val MAX_INLINE_BODY = 4L * 1024 * 1024
     }
 }

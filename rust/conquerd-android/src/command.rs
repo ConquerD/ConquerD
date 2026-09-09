@@ -143,7 +143,10 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
         // file: that is where every outbound message already reads the sender
         // handle from, so one write covers chat, invites and the peer list.
         "identity.set_handle" => {
-            let handle = arg_str(&parsed, "handle").unwrap_or_default().trim().to_owned();
+            let handle = arg_str(&parsed, "handle")
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
             if handle.chars().count() > 64 {
                 return err("that name is too long");
             }
@@ -803,13 +806,16 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 return err("room.invite requires \"supernode_id\" and \"room_id\"");
             };
 
-            let stored = session.room_store.read().get(supernode_id, room_id).cloned();
+            let stored = session
+                .room_store
+                .read()
+                .get(supernode_id, room_id)
+                .cloned();
             let Some(entry) = stored else {
                 return err("that room is not in the local store");
             };
 
-            let (space_root, space_proof) =
-                space_invite_fields(session, supernode_id, room_id);
+            let (space_root, space_proof) = space_invite_fields(session, supernode_id, room_id);
 
             let (reply_tx, reply_rx) = std_mpsc::channel();
             let queued_ok = session.send(ConnectionCommand::GenerateRoomInvite {
@@ -902,7 +908,9 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 applied += 1;
             }
             if let Some(on) = parsed.get("noise_suppression").and_then(Value::as_bool) {
-                let _ = session.call_tx.try_send(CallCommand::SetNoiseSuppression(on));
+                let _ = session
+                    .call_tx
+                    .try_send(CallCommand::SetNoiseSuppression(on));
                 applied += 1;
             }
             if let Some(level) = parsed.get("noise_strength").and_then(Value::as_u64) {
@@ -918,7 +926,9 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
                 applied += 1;
             }
             if let Some(on) = parsed.get("voice_activation").and_then(Value::as_bool) {
-                let _ = session.call_tx.try_send(CallCommand::SetVoiceActivation(on));
+                let _ = session
+                    .call_tx
+                    .try_send(CallCommand::SetVoiceActivation(on));
                 applied += 1;
             }
 
@@ -934,10 +944,9 @@ pub fn dispatch(session: &Session, request: &str) -> Value {
         // supernode serves them through `web.host.app.v1`, so there is no URL a
         // browser could load on its own.
         "portal.fetch" => {
-            let (Some(supernode_id), Some(path)) = (
-                arg_str(&parsed, "supernode_id"),
-                arg_str(&parsed, "path"),
-            ) else {
+            let (Some(supernode_id), Some(path)) =
+                (arg_str(&parsed, "supernode_id"), arg_str(&parsed, "path"))
+            else {
                 return err("portal.fetch requires \"supernode_id\" and \"path\"");
             };
 
@@ -1228,10 +1237,8 @@ fn send_signal(session: &Session, kind: MessageType, peer_id: &str) -> bool {
 /// back to the legacy token path, which is what a room created before Spaces
 /// existed still uses.
 fn space_invite_fields(session: &Session, supernode_id: &str, room_id: &str) -> (String, String) {
-    let space_id = conquerd_client::room_store::RoomStore::space_id_for(
-        &session.my_public_id,
-        supernode_id,
-    );
+    let space_id =
+        conquerd_client::room_store::RoomStore::space_id_for(&session.my_public_id, supernode_id);
     let store = session.room_store.read();
     let Some(space) = store.get_space(&space_id) else {
         return (String::new(), String::new());
@@ -1553,7 +1560,11 @@ fn generate_invite(session: &Session) -> Value {
 /// a reload overwrites rather than accumulating files.
 fn fxhash_path(supernode_id: &str, path: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in supernode_id.bytes().chain(b"/".iter().copied()).chain(path.bytes()) {
+    for byte in supernode_id
+        .bytes()
+        .chain(b"/".iter().copied())
+        .chain(path.bytes())
+    {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x1000_0000_01b3);
     }

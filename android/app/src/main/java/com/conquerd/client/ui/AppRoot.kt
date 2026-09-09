@@ -1798,19 +1798,6 @@ private fun PortalScreen(
                         ): android.webkit.WebResourceResponse? =
                             bridge.interceptRequest(request)
 
-                        override fun onPageFinished(
-                            view: android.webkit.WebView,
-                            url: String?,
-                        ) {
-                            // The SDK waits on `window.conquerd.ready`, so the
-                            // shim has to exist before the page script runs its
-                            // connect - injecting on finish is early enough
-                            // because the SDK awaits rather than reading once.
-                            view.evaluateJavascript(
-                                com.conquerd.client.PortalBridge.BOOTSTRAP_JS,
-                                null,
-                            )
-                        }
                     }
 
                     loadUrl("conquerd://$supernodeId/index.html")

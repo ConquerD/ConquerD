@@ -123,8 +123,7 @@ impl Session {
 
         let pending_sub_room_parent: Arc<RwLock<HashMap<String, String>>> =
             Arc::new(RwLock::new(HashMap::new()));
-        let portal_datagrams: Arc<Mutex<VecDeque<Vec<u8>>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
+        let portal_datagrams: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
         let (identity, identity_key) =
             unlock_identity(&key_dir, passphrase, keyfile_path, stored_key)?;
         let identity = Arc::new(identity);
@@ -525,10 +524,7 @@ fn persist_if_room_chat(chat_store: &ChatStore, my_public_id: &str, event: &Conn
 ///
 /// `event::to_json` deliberately never renders these, so this is the only
 /// path by which they reach the page.
-fn queue_portal_datagram(
-    queue: &Arc<Mutex<VecDeque<Vec<u8>>>>,
-    event: &ConnectionEvent,
-) {
+fn queue_portal_datagram(queue: &Arc<Mutex<VecDeque<Vec<u8>>>>, event: &ConnectionEvent) {
     let ConnectionEvent::PortalGameDatagram { payload, .. } = event else {
         return;
     };
