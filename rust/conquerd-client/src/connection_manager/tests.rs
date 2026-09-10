@@ -1391,6 +1391,28 @@ async fn presence_is_addressed_to_the_identity_the_relay_routes_on() {
     assert_eq!(targets, vec!["base64identity".to_owned()]);
 }
 
+#[tokio::test]
+async fn no_announces_are_sent_while_nothing_can_carry_them() {
+    let mut context = harness::test_cm();
+    context
+        .store
+        .write()
+        .upsert(presence_peer("hexpeerid", "base64identity"));
+
+    // No supernode session and no direct peer: the dispatcher would warn once
+    // per trusted peer per tick, so the sweep has to stay quiet instead.
+    assert!(!context.cm.has_any_outbound_path());
+    context.cm.broadcast_presence().await;
+
+    let mut outbound = context.cm.test_add_supernode_session("supernode");
+    assert!(context.cm.has_any_outbound_path());
+    context.cm.broadcast_presence().await;
+    assert!(
+        outbound.try_recv().is_ok(),
+        "an announce goes out as soon as a path exists"
+    );
+}
+
 mod harness {
     use super::super::events::ConnectionEvent;
     use super::super::ConnectionManager;

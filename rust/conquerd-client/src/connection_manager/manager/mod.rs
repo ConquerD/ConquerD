@@ -2342,9 +2342,25 @@ impl ConnectionManager {
     /// never get a direct session, so the relay is the only place their
     /// liveness can be observed at all.
     pub(super) async fn broadcast_presence(&mut self) {
+        if !self.has_any_outbound_path() {
+            // Nothing can carry an announce. Without this the dispatcher logs
+            // a dropped-relay warning per trusted peer per tick, so a client
+            // sitting on a dead network fills the log with one line per
+            // contact every 30 seconds.
+            return;
+        }
         for target in self.presence_targets() {
             self.send_presence_to(&target, false).await;
         }
+    }
+
+    /// Whether any transport could carry a peer-targeted message right now.
+    pub(super) fn has_any_outbound_path(&self) -> bool {
+        self.supernodes.values().any(|sn| sn.connected)
+            || self
+                .peers
+                .values()
+                .any(|p| p.state == PeerConnectionState::Connected)
     }
 
     /// Trusted, non-supernode peers to announce to, addressed the way the
