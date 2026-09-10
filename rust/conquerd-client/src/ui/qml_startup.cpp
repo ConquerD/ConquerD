@@ -7,12 +7,24 @@
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
 #include <QWindow>
-#include <QtCore/QString>
 #include <cstdio>
 #include <cstdlib>
 
+// Qt headers are found either as <QString> (module -I …/QtCore) or as
+// <QtCore/QString> (parent -I …/include, or macOS -F frameworks). aqt CI
+// layouts differ across Windows / Linux / macOS, so accept either spelling.
+#if __has_include(<QString>)
+#include <QString>
+#elif __has_include(<QtCore/QString>)
+#include <QtCore/QString>
+#endif
+
 #if defined(Q_OS_WIN)
+#if __has_include(<QTimer>)
+#include <QTimer>
+#elif __has_include(<QtCore/QTimer>)
 #include <QtCore/QTimer>
+#endif
 #endif
 
 #if defined(Q_OS_WIN)
