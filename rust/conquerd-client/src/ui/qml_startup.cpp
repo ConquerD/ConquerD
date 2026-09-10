@@ -8,24 +8,6 @@
 #include <QQuickWindow>
 #include <QWindow>
 #include <cstdio>
-#include <cstdlib>
-
-// Qt headers are found either as <QString> (module -I …/QtCore) or as
-// <QtCore/QString> (parent -I …/include, or macOS -F frameworks). aqt CI
-// layouts differ across Windows / Linux / macOS, so accept either spelling.
-#if __has_include(<QString>)
-#include <QString>
-#elif __has_include(<QtCore/QString>)
-#include <QtCore/QString>
-#endif
-
-#if defined(Q_OS_WIN)
-#if __has_include(<QTimer>)
-#include <QTimer>
-#elif __has_include(<QtCore/QTimer>)
-#include <QtCore/QTimer>
-#endif
-#endif
 
 #if defined(Q_OS_WIN)
 // Defined in window_chrome.cpp (linked only on Windows qt-ui builds).
@@ -61,10 +43,10 @@ extern "C" void conquerd_install_qt_message_handler(void) {
 /// empty ApplicationWindow title otherwise falls back to the executable
 /// basename (still `conquerd-client` from cargo).
 extern "C" void conquerd_set_app_identity(void) {
-    QGuiApplication::setApplicationName(QStringLiteral("DoubleSlash"));
-    QGuiApplication::setApplicationDisplayName(QStringLiteral("DoubleSlash"));
-    QGuiApplication::setOrganizationName(QStringLiteral("DoubleSlash"));
-    QGuiApplication::setOrganizationDomain(QStringLiteral("doubleslash.space"));
+    QGuiApplication::setApplicationName("DoubleSlash");
+    QGuiApplication::setApplicationDisplayName("DoubleSlash");
+    QGuiApplication::setOrganizationName("DoubleSlash");
+    QGuiApplication::setOrganizationDomain("doubleslash.space");
 }
 
 extern "C" void conquerd_qml_post_load_check(QQmlApplicationEngine *engine) {
@@ -96,21 +78,9 @@ extern "C" void conquerd_qml_post_load_check(QQmlApplicationEngine *engine) {
                     quickWin->y());
 #if defined(Q_OS_WIN)
             // Force HWND creation then install snap-friendly frame chrome.
+            // Re-arm on show is WM_SHOWWINDOW in window_chrome.cpp.
             (void)quickWin->winId();
             conquerd_enable_windows_snap(static_cast<QWindow *>(quickWin));
-            // Qt re-applies window flags at show(), which undoes GWL_STYLE
-            // until the next frame change (the user dragging the window).
-            // Re-arm chrome after the window becomes visible.
-            QObject::connect(quickWin, &QWindow::visibleChanged, quickWin,
-                             [quickWin](bool vis) {
-                                 if (!vis) {
-                                     return;
-                                 }
-                                 QTimer::singleShot(0, quickWin, [quickWin]() {
-                                     conquerd_enable_windows_snap(
-                                         static_cast<QWindow *>(quickWin));
-                                 });
-                             });
 #endif
         } else if (auto *win = qobject_cast<QWindow *>(obj)) {
             sawWindow = true;
@@ -124,14 +94,6 @@ extern "C" void conquerd_qml_post_load_check(QQmlApplicationEngine *engine) {
 #if defined(Q_OS_WIN)
             (void)win->winId();
             conquerd_enable_windows_snap(win);
-            QObject::connect(win, &QWindow::visibleChanged, win, [win](bool vis) {
-                if (!vis) {
-                    return;
-                }
-                QTimer::singleShot(0, win, [win]() {
-                    conquerd_enable_windows_snap(win);
-                });
-            });
 #endif
         }
     }
