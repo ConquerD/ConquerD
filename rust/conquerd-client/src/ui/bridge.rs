@@ -44,6 +44,15 @@ pub mod ffi {
         /// True when local audio capture is active (direct call OR room voice).
         /// Distinguishes "chat-only room join" from "voice room join".
         #[qproperty(bool, voice_active)]
+        /// True only when the *active voice session* is a room.
+        ///
+        /// Not the same question as `in_room`, which a chat-only room join also
+        /// sets and nothing clears until that room is left. Keying voice UI off
+        /// `voice_active && in_room` therefore mistakes "a text room is open"
+        /// for "the voice session is that room" — which pointed the voice rail
+        /// at the text room's roster during a 1:1 call, and pointed hang-up at
+        /// `leaveRoom()` instead of `endCall()`.
+        #[qproperty(bool, voice_in_room)]
         #[qproperty(QString, session_banner)]
         #[qproperty(QString, call_state)]
         #[qproperty(QString, public_id)]
@@ -1156,6 +1165,7 @@ pub struct AppBridgeRust {
     // QML property backing fields
     peer_count: i32,
     in_room: bool,
+    voice_in_room: bool,
     voice_active: bool,
     session_banner: QString,
     call_state: QString,
@@ -1565,6 +1575,7 @@ impl Default for AppBridgeRust {
         Self {
             peer_count: 0,
             in_room: false,
+            voice_in_room: false,
             voice_active: false,
             session_banner: QString::default(),
             call_state: QString::from("idle"),
@@ -2233,6 +2244,7 @@ impl ffi::AppBridge {
         }
         self.as_mut().set_call_state(QString::from("idle"));
         self.as_mut().set_voice_active(false);
+        sync_voice_in_room(&mut self.as_mut());
         self.as_mut().reset_inbound_video();
         emit_peers_updated(self.as_mut());
     }
@@ -2276,6 +2288,7 @@ impl ffi::AppBridge {
         clear_room_member_presence(&mut self.as_mut().rust_mut());
         self.as_mut().set_in_room(false);
         self.as_mut().set_voice_active(false);
+        sync_voice_in_room(&mut self.as_mut());
         self.as_mut().reset_inbound_video();
         emit_peers_updated(self.as_mut());
     }
@@ -2419,6 +2432,7 @@ impl ffi::AppBridge {
         }
         self.as_mut().set_call_state(QString::from("connecting"));
         self.as_mut().set_voice_active(true);
+        sync_voice_in_room(&mut self.as_mut());
         {
             let resolved = lookup_list_peer_id(self.rust(), &pid);
             set_active_direct_call_presence(&mut self.as_mut().rust_mut(), &pid, true, resolved);
@@ -3701,6 +3715,7 @@ impl ffi::AppBridge {
                 let mut r = self.as_mut().rust_mut();
                 r.voice_supernode_id = supernode_id.clone();
                 r.voice_room_id = room_id.clone();
+                sync_voice_in_room(&mut self.as_mut());
             }
             if let Some(ref tx) = self.rust().call_cmd_tx {
                 let _ = tx.try_send(CallCommand::SetRoomMode {
@@ -3725,6 +3740,7 @@ impl ffi::AppBridge {
         }
         self.as_mut().set_call_state(QString::from("in_call"));
         self.as_mut().set_voice_active(true);
+        sync_voice_in_room(&mut self.as_mut());
         {
             let resolved = lookup_list_peer_id(self.rust(), &pid);
             set_active_direct_call_presence(&mut self.as_mut().rust_mut(), &pid, true, resolved);
@@ -3947,6 +3963,7 @@ impl ffi::AppBridge {
             let mut r = self.as_mut().rust_mut();
             r.voice_supernode_id = new_sid.clone();
             r.voice_room_id = new_rid.clone();
+            sync_voice_in_room(&mut self.as_mut());
         }
 
         // Join signaling for the new room (chat context + voice).
@@ -3995,6 +4012,7 @@ impl ffi::AppBridge {
         }
 
         self.as_mut().set_voice_active(true);
+        sync_voice_in_room(&mut self.as_mut());
     }
 
     fn subscribe_room_chat(mut self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) {
@@ -4485,6 +4503,7 @@ impl ffi::AppBridge {
             r.voice_room_id.clear();
             r.room_participant_ids.clear();
             self.as_mut().set_voice_active(false);
+            sync_voice_in_room(&mut self.as_mut());
             self.as_mut().reset_inbound_video();
         }
         if self.rust().current_supernode_id == canon {
@@ -6502,6 +6521,22 @@ fn emit_member_list_json(
     }
 }
 
+/// Recompute [`voice_in_room`] from the authoritative pair.
+///
+/// Derived rather than set by hand at each transition: the two facts that
+/// decide it (`voice_active` and whether the session has a room id) are
+/// written from several places, and every past attempt to track the answer
+/// separately is what let it drift out of step.
+fn sync_voice_in_room(bridge: &mut Pin<&mut ffi::AppBridge>) {
+    let in_room_voice = {
+        let r = bridge.rust();
+        r.voice_active && !r.voice_room_id.is_empty()
+    };
+    if bridge.rust().voice_in_room != in_room_voice {
+        bridge.as_mut().set_voice_in_room(in_room_voice);
+    }
+}
+
 fn seed_voice_participants_self(bridge: &mut Pin<&mut ffi::AppBridge>) {
     let my_public_id = bridge.rust().my_public_id.clone();
     if my_public_id.is_empty() {
@@ -7828,6 +7863,7 @@ fn dispatch_event(
                     let mut r = bridge.as_mut().rust_mut();
                     r.voice_supernode_id = supernode_id.clone();
                     r.voice_room_id = room_id.clone();
+                    sync_voice_in_room(&mut bridge.as_mut());
                 }
                 if let Some(ref tx) = bridge.rust().call_cmd_tx {
                     let _ = tx.try_send(CallCommand::SetRoomMode {
@@ -8481,6 +8517,7 @@ fn dispatch_event(
                     }
                     clear_room_member_presence(&mut bridge.as_mut().rust_mut());
                     bridge.as_mut().set_voice_active(false);
+                    sync_voice_in_room(&mut bridge.as_mut());
                     bridge.as_mut().set_in_room(false);
                     bridge.as_mut().reset_inbound_video();
                 }

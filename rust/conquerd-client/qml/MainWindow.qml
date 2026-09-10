@@ -186,7 +186,7 @@ ApplicationWindow {
     /// that room's video, so collapse them here, the same housekeeping the
     /// Leave and End buttons do; the bridge cannot close QML windows.
     function beginDirectCall(peerId) {
-        if (backend.voice_active && backend.in_room) {
+        if (backend.voice_in_room) {
             root.closeAllVideoPopouts()
             root.expandedVideoPeers = []
         }
@@ -980,7 +980,7 @@ ApplicationWindow {
 
     /// Resolve a peer's display name from the active voice roster.
     function videoPeerName(peerId) {
-        var model = backend.voice_active && backend.in_room ? roomModel : directCallModel
+        var model = backend.voice_in_room ? roomModel : directCallModel
         if (model && model.rowCount) {
             for (var i = 0; i < model.rowCount(); i++) {
                 var row = model.get ? model.get(i) : null
@@ -2598,7 +2598,7 @@ ApplicationWindow {
                     item.videoActivePeers = Qt.binding(() => root.videoActivePeers)
                     item.videoStalledPeers = Qt.binding(() => root.videoStalledPeers)
                     item.participantModel = Qt.binding(() =>
-                        backend.voice_active && backend.in_room ? roomModel : directCallModel)
+                        backend.voice_in_room ? roomModel : directCallModel)
                     item.heightRatio = Qt.binding(() => root.videoRegionRatio)
                     item.collapseRequested.connect(root.collapseVideo)
                     item.popoutRequested.connect(root.popoutVideo)
@@ -2662,9 +2662,9 @@ ApplicationWindow {
                 youtubePreviewEnabled: settingsModel ? settingsModel.youtube_preview_enabled : true
                 youtubeInlineAck: settingsModel ? settingsModel.youtube_inline_ack : false
                 // Compare id + supernode, not the display name: two nodes can
-                // host rooms with the same name. Gated on voice_active so the
-                // never-cleared voiceRoomId cannot report a stale match.
-                voiceActiveHere: backend.voice_active && backend.in_room
+                // host rooms with the same name. `voice_in_room` is what keeps
+                // the never-cleared voiceRoomId from reporting a stale match.
+                voiceActiveHere: backend.voice_in_room
                                  && root.voiceRoomId !== ""
                                  && root.voiceRoomId === roomPanel.roomId
                                  && root.voiceSupernodeId === roomPanel.supernodeId
@@ -2797,18 +2797,18 @@ ApplicationWindow {
             videoActivePeers: root.videoActivePeers
 
             // Always the active voice session only (never the selected text room).
-            participantModel: backend.voice_active && backend.in_room
+            participantModel: backend.voice_in_room
                 ? roomModel
                 : directCallModel
-            contextName: backend.voice_active && backend.in_room
+            contextName: backend.voice_in_room
                 ? root.voiceRoomName
                 : (root.activeCallPeerHandle() || chatPanel.selectedPeerName || chatPanel.selectedPeerId || "Call")
-            supernodeId: backend.voice_active && backend.in_room ? root.voiceSupernodeId : ""
-            supernodeHandle: backend.voice_active && backend.in_room
+            supernodeId: backend.voice_in_room ? root.voiceSupernodeId : ""
+            supernodeHandle: backend.voice_in_room
                 ? root.supernodeHandleFor(root.voiceSupernodeId)
                 : ""
             callState: backend.call_state
-            inRoom: backend.voice_active && backend.in_room
+            inRoom: backend.voice_in_room
             connectionMode: backend.connection_mode
             durationSecs: backend.call_duration_secs
 
@@ -2818,7 +2818,7 @@ ApplicationWindow {
                 // that is about to stop.
                 root.closeAllVideoPopouts()
                 root.expandedVideoPeers = []
-                if (backend.voice_active && backend.in_room) {
+                if (backend.voice_in_room) {
                     backend.leaveRoom()
                     // Stay on the room text panel when a text room is still selected.
                     if (!roomPanel.roomId)
