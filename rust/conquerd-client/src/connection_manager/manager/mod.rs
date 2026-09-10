@@ -2349,7 +2349,11 @@ impl ConnectionManager {
             // contact every 30 seconds.
             return;
         }
-        for target in self.presence_targets() {
+        let targets = self.presence_targets();
+        if !targets.is_empty() {
+            debug!("[presence] announcing to {} peer(s)", targets.len());
+        }
+        for target in targets {
             self.send_presence_to(&target, false).await;
         }
     }
@@ -2441,9 +2445,20 @@ impl ConnectionManager {
             );
             return;
         };
+        // Announces repeat every `PRESENCE_INTERVAL_S`, so only the edges are
+        // worth a line — a peer coming or going is an event, the steady beat
+        // that keeps it there is not.
+        let was_present = self.peer_presence_seen.contains_key(&peer_id);
+        let short = &peer_id[..8.min(peer_id.len())];
         if status == "offline" {
+            if was_present {
+                info!("[presence] {short} went offline");
+            }
             self.peer_presence_seen.remove(&peer_id);
         } else {
+            if !was_present {
+                info!("[presence] {short} came online");
+            }
             self.peer_presence_seen
                 .insert(peer_id.clone(), Instant::now());
         }
@@ -2471,7 +2486,7 @@ impl ConnectionManager {
             .collect();
         for peer_id in stale {
             self.peer_presence_seen.remove(&peer_id);
-            debug!(
+            info!(
                 "[presence] {} aged out after {PRESENCE_TTL_S}s — offline",
                 &peer_id[..8.min(peer_id.len())]
             );
