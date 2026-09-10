@@ -131,4 +131,30 @@ class CoreModelsTest {
         assertEquals("failed", message.status)
         assertEquals("not delivered", message.statusNote)
     }
+
+    @Test
+    fun `a room roster keeps voice participants and chat members apart`() {
+        // `members` is the voice rail; `chat_members` is the supernode's full
+        // key-group roster (participants + text subscribers). Counting the
+        // former as "members" hides every peer reading the room without
+        // joining voice - which is what made the header disagree with the
+        // desktop's member panel.
+        val event = obj(
+            """{"event":"room_members_changed","room_id":"r1",
+                "members":["me"],"chat_members":["me","bobert"]}""",
+        )
+        assertEquals(listOf("me"), event.stringList("members"))
+        assertEquals(listOf("me", "bobert"), event.stringList("chat_members"))
+    }
+
+    @Test
+    fun `a roster with nobody in voice still has chat members`() {
+        // The all-text case: an empty voice rail must not read as an empty room.
+        val event = obj(
+            """{"event":"room_members_changed","room_id":"r1",
+                "members":[],"chat_members":["me","bobert"]}""",
+        )
+        assertTrue(event.stringList("members").isEmpty())
+        assertEquals(2, event.stringList("chat_members").size)
+    }
 }

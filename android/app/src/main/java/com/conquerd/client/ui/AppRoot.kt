@@ -213,6 +213,7 @@ fun AppRoot(viewModel: AppViewModel) {
                     avatars = state.avatars,
                     peers = state.peers,
                     members = state.roomMembers,
+                    chatMembers = state.roomChatMembers,
                     joined = state.roomJoined,
                     voiceActive = state.roomVoiceActive,
                     muted = state.muted,
@@ -1361,7 +1362,10 @@ private fun RoomChatScreen(
     messages: List<RoomMessage>,
     avatars: Map<String, AvatarArt>,
     peers: List<Peer>,
+    /** Voice participants - drives the "in voice" bar only. */
     members: List<String>,
+    /** Everyone in the room, voice or text - drives the header count. */
+    chatMembers: List<String>,
     joined: Boolean,
     voiceActive: Boolean,
     muted: Boolean,
@@ -1424,7 +1428,8 @@ private fun RoomChatScreen(
                     Text(room.roomName.ifBlank { room.roomId.take(12) })
                     Text(
                         if (joined) {
-                            "${members.size} " + if (members.size == 1) "member" else "members"
+                            "${chatMembers.size} " +
+                                if (chatMembers.size == 1) "member" else "members"
                         } else {
                             "joining..."
                         },

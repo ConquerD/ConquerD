@@ -75,8 +75,22 @@ data class AppState(
     val tab: HomeTab = HomeTab.PEERS,
     /** Live messages for the room currently open. Not persisted anywhere. */
     val roomMessages: List<RoomMessage> = emptyList(),
-    /** Participants in the open room, by peer id. */
+    /**
+     * Voice participants in the open room, by peer id.
+     *
+     * The voice rail only. A text-only subscriber never appears here, so this
+     * must not be used for a "members" count - see [roomChatMembers].
+     */
     val roomMembers: List<String> = emptyList(),
+    /**
+     * Everyone in the open room: voice participants plus text subscribers.
+     *
+     * This is the supernode's `chat_members` (its full key-group roster) and
+     * is what the desktop's text member panel shows. The room header counts
+     * this, not [roomMembers], or a peer reading the room without joining
+     * voice is invisible in the count.
+     */
+    val roomChatMembers: List<String> = emptyList(),
     /** True once the supernode has admitted us to the open room. */
     val roomJoined: Boolean = false,
     /** The one direct call in progress, if any. */
@@ -992,6 +1006,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 screen = Screen.RoomChat(room),
                 roomMessages = emptyList(),
                 roomMembers = emptyList(),
+                roomChatMembers = emptyList(),
                 roomJoined = false,
             )
         }
@@ -1056,6 +1071,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 screen = Screen.Home,
                 roomMessages = emptyList(),
                 roomMembers = emptyList(),
+                roomChatMembers = emptyList(),
                 roomJoined = false,
                 roomVoiceActive = false,
             )
@@ -1449,8 +1465,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "room_members_changed" -> {
                 if (!isOpenRoom(event)) return@onCoreEvent
                 val members = event.stringList("members")
+                val chatMembers = event.stringList("chat_members")
                 // Membership arriving at all means the supernode admitted us.
-                _state.update { it.copy(roomMembers = members, roomJoined = true) }
+                _state.update {
+                    it.copy(
+                        roomMembers = members,
+                        roomChatMembers = chatMembers,
+                        roomJoined = true,
+                    )
+                }
             }
 
             "room_join_rejected" -> {
