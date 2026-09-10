@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================================
-# build_macos.sh — Build ConquerD for macOS (Rust + Qt, .app + DMG)
+# build_macos.sh — Build DoubleSlash for macOS (Rust + Qt, .app + DMG)
 # ============================================================================
 # Produces:
-#   dist/ConquerD.app
-#   dist/ConquerD-X.X.X-macos-<arch>.dmg  (create-dmg or hdiutil)
-#   dist/ConquerD-X.X.X.dmg.sha256
+#   dist/DoubleSlash.app
+#   dist/DoubleSlash-X.X.X-macos-<arch>.dmg  (create-dmg or hdiutil)
+#   dist/DoubleSlash-X.X.X.dmg.sha256
 #
 # Prerequisites:
 #   1. Rust toolchain (cargo) on PATH (rustup).
@@ -50,7 +50,7 @@ export QMAKE="$QT_DIR/bin/qmake"
 
 # ── Read version ─────────────────────────────────────────────────────────────
 VERSION=$(grep -m1 '^version' "$RUST_DIR/conquerd-client/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
-echo "==> Building ConquerD v${VERSION} for macOS"
+echo "==> Building DoubleSlash v${VERSION} for macOS"
 
 PROFILE="debug"
 CARGO_FLAGS=""
@@ -77,7 +77,7 @@ INSTALLER_BIN="$RUST_DIR/target/$PROFILE/conquerd-installer"
 # ── Assemble .app bundle ───────────────────────────────────────────────────────
 DIST="$ROOT/dist"
 mkdir -p "$DIST"
-APP_BUNDLE="$DIST/ConquerD.app"
+APP_BUNDLE="$DIST/DoubleSlash.app"
 CONTENTS="$APP_BUNDLE/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
@@ -103,7 +103,7 @@ else
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key>              <string>ConquerD</string>
+  <key>CFBundleName</key>              <string>DoubleSlash</string>
   <key>CFBundleIdentifier</key>       <string>com.conquerd.client</string>
   <key>CFBundleVersion</key>          <string>${VERSION}</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
@@ -114,8 +114,8 @@ else
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
-      <key>CFBundleURLSchemes</key><array><string>conquerd</string></array>
-      <key>CFBundleURLName</key>   <string>ConquerD URL</string>
+      <key>CFBundleURLSchemes</key><array><string>d</string><string>conquerd</string></array>
+      <key>CFBundleURLName</key>   <string>DoubleSlash URL</string>
     </dict>
   </array>
 </dict>
@@ -152,11 +152,11 @@ case "$ARCH" in
     x86_64) PLATFORM_SUFFIX="macos-x86_64" ;;
     *)      PLATFORM_SUFFIX="macos-${ARCH}" ;;
 esac
-DMG="$DIST/ConquerD-${VERSION}-${PLATFORM_SUFFIX}.dmg"
+DMG="$DIST/DoubleSlash-${VERSION}-${PLATFORM_SUFFIX}.dmg"
 
 create_dmg_with_hdiutil() {
     echo "==> Creating DMG with hdiutil..."
-    hdiutil create -volname "ConquerD $VERSION" \
+    hdiutil create -volname "DoubleSlash $VERSION" \
         -srcfolder "$APP_BUNDLE" \
         -ov -format UDZO \
         "$DMG"
@@ -166,12 +166,12 @@ echo ""
 if command -v create-dmg &>/dev/null; then
     echo "==> Creating DMG with create-dmg..."
     CREATE_DMG_ARGS=(
-        --volname "ConquerD $VERSION"
+        --volname "DoubleSlash $VERSION"
         --window-pos 200 120
         --window-size 600 400
         --icon-size 100
-        --icon "ConquerD.app" 175 190
-        --hide-extension "ConquerD.app"
+        --icon "DoubleSlash.app" 175 190
+        --hide-extension "DoubleSlash.app"
         --app-drop-link 425 190
     )
     if [ -f "$ROOT/assets/dmg_background.png" ]; then

@@ -26,7 +26,7 @@ enabled = true
 From the native client Rooms sidebar, open the supernode portal and navigate to:
 
 ```
-conquerd://<supernode_id>/games/example/?room=lobby1
+d://<supernode_id>/games/example/?room=lobby1
 ```
 
 External HTTPS / browser tabs are not supported.

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-# install_uri_scheme.sh — Register the conquerd:// URI scheme on Linux
+# install_uri_scheme.sh — Register the d:// URI scheme on Linux
 # ============================================================================
 # Installs the .desktop file and registers it as the handler for
-# conquerd:// URLs so clicking invite links in a browser launches ConquerD.
+# d:// (and legacy conquerd://) URLs so clicking invite links launches DoubleSlash.
 #
 # Usage:
 #   ./packaging/install_uri_scheme.sh          # current user only
@@ -35,8 +35,9 @@ else
     update-desktop-database "$DEST" 2>/dev/null || true
 fi
 
-# Register as default handler for conquerd:// URIs
+# Register as default handler for d:// and legacy conquerd:// URIs
+xdg-mime default conquerd.desktop x-scheme-handler/d 2>/dev/null || true
 xdg-mime default conquerd.desktop x-scheme-handler/conquerd 2>/dev/null || true
 
-echo "Done. The conquerd:// URI scheme is now registered."
-echo "Test with: xdg-open 'conquerd://test'"
+echo "Done. The d:// URI scheme is now registered (legacy conquerd:// kept)."
+echo "Test with: xdg-open 'd://test'"

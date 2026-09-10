@@ -22,7 +22,7 @@ pub const ROOM_INVITE_SCHEMA: u32 = 1;
 /// own token TTL is authoritative; this just stops stale links from dialing.
 pub const ROOM_INVITE_TTL_SECS: u64 = 24 * 60 * 60;
 
-/// Decoded fields of a `conquerd://room#…` invite.
+/// Decoded fields of a `d://room#…` (or legacy `conquerd://room#…`) invite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomInvitePayload {
     pub supernode_id: String,
@@ -100,10 +100,10 @@ pub fn build_room_invite_url(
         }
     }
     let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-    format!("conquerd://room#{encoded}")
+    conquerd_features::mint_uri(&format!("room#{encoded}"))
 }
 
-/// Parse the base64url fragment of a `conquerd://room#…` invite (the part after
+/// Parse the base64url fragment of a `d://room#…` invite (the part after
 /// `room#`). Returns an error string suitable for `emit_invite_failed`.
 pub fn parse_room_invite(encoded: &str) -> Result<RoomInvitePayload, String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -209,7 +209,7 @@ impl ConnectionManager {
             }
         }
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        Some(format!("conquerd://invite#{encoded}"))
+        Some(conquerd_features::mint_uri(&format!("invite#{encoded}")))
     }
 
     /// Build a self-contained room invite URL for a room hosted on
@@ -473,15 +473,14 @@ impl ConnectionManager {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
-        const SCHEME: &str = "conquerd://";
-        let Some(rest) = invite_url.strip_prefix(SCHEME) else {
+        let Some(rest) = conquerd_features::strip_scheme(&invite_url) else {
             self.emit_invite_failed(format!("invalid scheme in '{invite_url}'"));
             return;
         };
 
         // Invite URLs carry an optional `action#` prefix before the base64url
-        // fragment: `conquerd://invite#<b64>`, `conquerd://room#<b64>`, or the
-        // bare legacy `conquerd://<b64>`. Split it off so the payload decodes.
+        // fragment: `d://invite#<b64>`, `d://room#<b64>`, or the
+        // bare legacy `d://<b64>` / `conquerd://<b64>`. Split it off so the payload decodes.
         let (action, encoded) = match rest.split_once('#') {
             Some((action, payload)) => (action, payload),
             None => ("", rest),

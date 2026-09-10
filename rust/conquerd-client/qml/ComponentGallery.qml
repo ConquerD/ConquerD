@@ -24,7 +24,7 @@ ScrollView {
             spacing: Theme.spacingXl
 
             Label {
-                text: "ConquerD Component Gallery"
+                text: "DoubleSlash Component Gallery"
                 color: Theme.text
                 font.pixelSize: Theme.fontSizeTitle
                 font.bold: true

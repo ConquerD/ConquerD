@@ -219,7 +219,7 @@ pub fn run_gui(config: GuiConfig) -> anyhow::Result<()> {
     };
 
     eframe::run_native(
-        "ConquerD Installer",
+        &format!("{} Installer", crate::brand::PRODUCT_NAME),
         options,
         Box::new(move |cc| {
             apply_dark_theme(&cc.egui_ctx);
@@ -385,7 +385,7 @@ impl InstallerApp {
         };
 
         ui.vertical_centered(|ui| {
-            ui.heading(format!("ConquerD v{version}"));
+            ui.heading(format!("DoubleSlash v{version}"));
             ui.add_space(15.0);
             ui.spinner();
             ui.add_space(10.0);
@@ -467,7 +467,7 @@ impl InstallerApp {
 
     fn show_welcome(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical_centered(|ui| {
-            ui.heading("Welcome to ConquerD");
+            ui.heading(format!("Welcome to {}", crate::brand::PRODUCT_NAME));
             ui.add_space(10.0);
 
             let (
@@ -572,7 +572,7 @@ impl InstallerApp {
                         }
                         ui.add_space(10.0);
                     }
-                    ui.label("This will reinstall ConquerD and create shortcuts.");
+                    ui.label("This will reinstall DoubleSlash and create shortcuts.");
                     ui.add_space(20.0);
                     ui.horizontal(|ui| {
                         if ui.button("   Reinstall   ").clicked() {
@@ -588,7 +588,7 @@ impl InstallerApp {
                         st.update_installer_too = update_installer_too;
                     }
                 } else {
-                    ui.label("This will install ConquerD and create shortcuts.");
+                    ui.label("This will install DoubleSlash and create shortcuts.");
                     ui.add_space(20.0);
                     if ui.button("   Install   ").clicked() {
                         self.start_install(ctx);
@@ -739,7 +739,7 @@ impl InstallerApp {
                 ui.add_space(15.0);
                 ui.label(&progress_text);
             } else if up_to_date_only {
-                ui.heading(format!("ConquerD v{version}"));
+                ui.heading(format!("DoubleSlash v{version}"));
                 ui.add_space(15.0);
                 ui.label("You\u{2019}re on the latest version.");
                 if !progress_text.is_empty() {
@@ -753,11 +753,11 @@ impl InstallerApp {
             } else if version.is_empty() {
                 ui.heading("Installation Complete!");
                 ui.add_space(15.0);
-                ui.label("ConquerD has been installed successfully.");
+                ui.label("DoubleSlash has been installed successfully.");
             } else {
-                ui.heading(format!("ConquerD v{version} Installed!"));
+                ui.heading(format!("DoubleSlash v{version} Installed!"));
                 ui.add_space(15.0);
-                ui.label("ConquerD has been installed successfully.");
+                ui.label("DoubleSlash has been installed successfully.");
             }
             ui.add_space(10.0);
 
@@ -778,7 +778,7 @@ impl InstallerApp {
                 }
             }
 
-            if ui.button("   Launch ConquerD   ").clicked() {
+            if ui.button("   Launch DoubleSlash   ").clicked() {
                 let st = self.state.lock().unwrap();
                 if let Some(dir) = st.install_state.current_path() {
                     let _ = crate::launch_app(dir);

@@ -101,9 +101,9 @@ Item {
         return "file://" + n
     }
 
-    /// First `conquerd://…` token in a chat body (peer, room, or legacy bare).
+    /// First `d://…` or legacy `conquerd://…` token in a chat body.
     function conquerdInviteUrl(value) {
-        var m = (value || "").match(/conquerd:\/\/[^\s<>"']+/i)
+        var m = (value || "").match(/(?:d|conquerd):\/\/[^\s<>"']+/i)
         return m ? m[0] : ""
     }
 
@@ -129,7 +129,7 @@ Item {
             return root.mine ? "Room invite shared" : "Room invite"
         if (root.inviteKind === "peer")
             return root.mine ? "Peer invite shared" : "Peer invite"
-        return root.mine ? "Invite shared" : "ConquerD invite"
+        return root.mine ? "Invite shared" : "DoubleSlash invite"
     }
 
     function inviteSubtitle() {
@@ -206,9 +206,9 @@ Item {
         text = text.replace(/\n/g, "<br>")
         text = text.replace(/(https?:\/\/[^\s<>"]+)/g,
             '<a href="$1" style="color:' + Theme.toHex(root.mine ? Theme.linkMine : Theme.linkPeer) + '">$1</a>')
-        // Linkify conquerd:// invites so a leftover URL still routes in-app
+        // Linkify d:// / conquerd:// invites so a leftover URL still routes in-app
         // (Accept embed is preferred when the full message is an invite).
-        text = text.replace(/(conquerd:\/\/[^\s<>"]+)/gi,
+        text = text.replace(/((?:d|conquerd):\/\/[^\s<>"]+)/gi,
             '<a href="$1" style="color:' + Theme.toHex(root.mine ? Theme.linkMine : Theme.linkPeer) + '">$1</a>')
         return text
     }
@@ -762,7 +762,8 @@ Item {
                     onLinkActivated: (link) => {
                         // Route conquerd:// through the invite path instead of
                         // the system browser (which cannot open the scheme).
-                        if ((link || "").toLowerCase().indexOf("conquerd://") === 0) {
+                        var href = (link || "").toLowerCase()
+                        if (href.indexOf("conquerd://") === 0 || href.indexOf("d://") === 0) {
                             if (typeof backend !== "undefined" && backend && backend.pasteInvite)
                                 backend.pasteInvite(link)
                             return
@@ -977,7 +978,7 @@ Item {
         Label {
             width: parent.width
             wrapMode: Text.Wrap
-            text: "Inline previews load the linked video provider directly in an off-the-record browser view. No data is sent to ConquerD servers."
+            text: "Inline previews load the linked video provider directly in an off-the-record browser view. No data is sent to DoubleSlash servers."
             color: Theme.text
             font.pixelSize: Theme.fontSizeBody
         }

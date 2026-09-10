@@ -1,7 +1,7 @@
 //! Well-known capability descriptors for first-party features.
 //!
 //! These constructors document the existing on-wire formats that today's
-//! Conquerd client and supernode already speak. They are the seed of the
+//! DoubleSlash client and supernode already speak. They are the seed of the
 //! capability catalogue and let Phase 1 advertise the current behavior
 //! without changing any byte on the wire.
 
@@ -448,7 +448,8 @@ pub fn room_file_v1() -> CapabilityDescriptor {
 /// `web.host.app.v1` — supernode in-app portal hosted over QUIC reliable
 /// streams. This surface is *not* reachable from a standard browser: the
 /// desktop client opens the portal in an embedded Chromium view via the
-/// custom `conquerd://<supernode_pub>/<path>` URL scheme, and the scheme
+/// custom `d://<supernode_pub>/<path>` URL scheme (legacy `conquerd://`
+/// is still accepted), and the scheme
 /// handler issues GET requests over a QUIC bidirectional stream tagged
 /// with `web.host.app.v1`.
 ///
@@ -470,7 +471,7 @@ pub fn room_file_v1() -> CapabilityDescriptor {
 pub fn web_host_app_v1() -> CapabilityDescriptor {
     CapabilityDescriptor::new("web.host.app.v1", "1.0", ChannelKind::Stream)
         .with_params(json!({
-            "scheme": "conquerd",
+            "scheme": "d",
             "framing": "u32be_len + json | u32be_len + bytes",
             "methods": ["GET"],
             "quota_bytes_per_sec": 4 * 1024 * 1024,

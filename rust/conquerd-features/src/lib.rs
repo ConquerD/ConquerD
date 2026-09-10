@@ -1,7 +1,7 @@
 //! conquerd-features — capability registry and feature module spine.
 //!
-//! This crate is the language-agnostic core of the Conquerd peer-connectivity
-//! framework. It defines:
+//! This crate is the language-agnostic core of the DoubleSlash (D://)
+//! peer-connectivity framework. It defines:
 //!
 //! * [`CapabilityDescriptor`] — a self-describing, on-wire feature record
 //!   advertised by peers and supernodes after handshake.
@@ -17,6 +17,7 @@
 //!
 //! See `FRAMEWORK_PLAN.md` at the repo root for the full design.
 
+pub mod brand;
 pub mod channel_frame;
 pub mod channel_tag;
 pub mod client_modules;
@@ -32,6 +33,12 @@ pub mod video_codec;
 pub mod web_app;
 pub mod wellknown;
 
+pub use brand::{
+    find_app_url, first_env, looks_like_app_url, mint_uri, strip_scheme, uri_prefix,
+    DEFAULT_PROFILE_DIR, ENV_HOME, ENV_HOME_LEGACY, ENV_KEY_DIR, ENV_KEY_DIR_LEGACY,
+    LEGACY_PROFILE_DIR, PRODUCT_NAME, PROTOCOL_NAME, URI_SCHEME, URI_SCHEME_LEGACY, WEBSITE,
+    WINDOWS_EXE, WINDOWS_EXE_LEGACY, WINDOWS_INSTALL_DIR, WINDOWS_INSTALL_DIR_LEGACY,
+};
 pub use channel_frame::{
     classify, decode_frame, encode_frame, feature_for_fixed_tag, fixed_tag_for, FrameClass,
     AUDIO_TAG, CHAT_TAG, CONTROL_TAG, FILE_TAG, GAME_RELAY_TAG, MAX_FIRST_PARTY_TAG,

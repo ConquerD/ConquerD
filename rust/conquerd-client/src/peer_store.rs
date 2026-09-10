@@ -623,19 +623,13 @@ mod tests {
 
     /// Manual diagnostic for a live profile (uses OS keyring unlock).
     /// Run: `cargo test -p conquerd-client --features manual-diagnostics dump_live_profile -- --nocapture`
-    /// Optional: `CONQUERD_HOME=C:\Users\YOU\.conquerd` to target a specific profile.
+    /// Optional: `DOUBLESLASH_HOME=C:\Users\YOU\.doubleslash` to target a specific profile.
     #[cfg(feature = "manual-diagnostics")]
     #[test]
     fn dump_live_profile() {
         use std::path::PathBuf;
-        let key_dir = std::env::var("CONQUERD_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".conquerd")
-            });
-        eprintln!("CONQUERD_HOME={}", key_dir.display());
+        let key_dir = crate::identity::Identity::default_key_dir();
+        eprintln!("DOUBLESLASH_HOME={}", key_dir.display());
         let (identity, _) =
             crate::identity::Identity::load_with_keyring_or_passphrase(b"", &key_dir)
                 .expect("unlock identity");

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
-# build_linux.sh — Build ConquerD for Linux (Rust + Qt, AppImage)
+# build_linux.sh — Build DoubleSlash for Linux (Rust + Qt, AppImage)
 # ============================================================================
 # Produces:
-#   dist/ConquerD-X.X.X-x86_64.AppImage
-#   dist/ConquerD-X.X.X-x86_64.AppImage.sha256
+#   dist/DoubleSlash-X.X.X-x86_64.AppImage
+#   dist/DoubleSlash-X.X.X-x86_64.AppImage.sha256
 #
 # Prerequisites:
 #   1. Rust toolchain (cargo) on PATH.
@@ -64,7 +64,7 @@ export QMAKE="$QT_DIR/bin/qmake"
 
 # ── Read version from Cargo.toml ─────────────────────────────────────────────
 VERSION=$(grep -m1 '^version' "$RUST_DIR/conquerd-client/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
-echo "==> Building ConquerD v${VERSION} for Linux"
+echo "==> Building DoubleSlash v${VERSION} for Linux"
 
 PROFILE="debug"
 CARGO_FLAGS=""
@@ -90,7 +90,7 @@ INSTALLER_BIN="$RUST_DIR/target/$PROFILE/conquerd-installer"
 
 # ── Assemble AppDir ───────────────────────────────────────────────────────────
 DIST="$ROOT/dist"
-APPDIR="$DIST/ConquerD.AppDir"
+APPDIR="$DIST/DoubleSlash.AppDir"
 echo ""
 echo "==> Assembling AppDir at $APPDIR..."
 
@@ -143,7 +143,7 @@ if [ -z "$APPIMAGETOOL" ]; then
     echo "Install from: https://github.com/AppImage/appimagetool/releases"
 else
     ARCH="x86_64"
-    APPIMAGE="$DIST/ConquerD-${VERSION}-${ARCH}.AppImage"
+    APPIMAGE="$DIST/DoubleSlash-${VERSION}-${ARCH}.AppImage"
     echo ""
     echo "==> Creating AppImage: $APPIMAGE"
     ARCH="$ARCH" "$APPIMAGETOOL" "$APPDIR" "$APPIMAGE"

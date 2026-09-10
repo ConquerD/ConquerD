@@ -1,5 +1,16 @@
 pub fn extract_conquerd_url(text: &str) -> Option<String> {
-    let start = text.find("conquerd://")?;
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("conquerd://").or_else(|| {
+        let mut i = 0;
+        while let Some(rel) = lower[i..].find("d://") {
+            let at = i + rel;
+            if at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric() {
+                return Some(at);
+            }
+            i = at + 1;
+        }
+        None
+    })?;
     let rest = &text[start..];
     let end = rest
         .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\n' || c == '\r')
@@ -28,6 +39,11 @@ mod tests {
         assert_eq!(
             extract_conquerd_url(text).as_deref(),
             Some("conquerd://abc123")
+        );
+        let minted = "invite ready: d://invite#abc trailing";
+        assert_eq!(
+            extract_conquerd_url(minted).as_deref(),
+            Some("d://invite#abc")
         );
     }
 }

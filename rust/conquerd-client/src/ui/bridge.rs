@@ -2445,7 +2445,7 @@ impl ffi::AppBridge {
             "expires_at": expires_at,
         });
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        let url = format!("conquerd://invite#{encoded}");
+        let url = conquerd_features::mint_uri(&format!("invite#{encoded}"));
 
         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(url.clone())) {
             Ok(_) => info!("Invite link copied to clipboard: {url}"),
@@ -2491,7 +2491,7 @@ impl ffi::AppBridge {
             "inviter_handle": inviter_handle,
         });
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        let url = format!("conquerd://invite#{encoded}");
+        let url = conquerd_features::mint_uri(&format!("invite#{encoded}"));
         self.as_mut().set_invite_url(QString::from(url.as_str()));
         QString::from(url.as_str())
     }
@@ -4231,7 +4231,7 @@ impl ffi::AppBridge {
         // handler can recover the canonical peer ID at fetch time.
         #[cfg(feature = "webengine")]
         crate::ui::scheme::register_portal_peer_id(&sn_id);
-        let url = format!("conquerd://{}/", sn_id);
+        let url = conquerd_features::mint_uri(&format!("{}/", sn_id));
         self.as_mut()
             .navigate_node_portal(QString::from(sn_id.as_str()), QString::from(url.as_str()));
     }
@@ -8206,7 +8206,7 @@ fn dispatch_event(
                     #[cfg(feature = "webengine")]
                     crate::ui::scheme::register_portal_peer_id(&sn_id);
                     // Access portal is a separate page from the full dashboard.
-                    let url = format!("conquerd://{}/access.html", sn_id);
+                    let url = conquerd_features::mint_uri(&format!("{}/access.html", sn_id));
                     bridge.as_mut().navigate_node_portal(
                         QString::from(sn_id.as_str()),
                         QString::from(url.as_str()),

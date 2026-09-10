@@ -1,8 +1,8 @@
-# Conquerd – Zero-Trust Invite-Only P2P Voice & Chat
+# DoubleSlash – Zero-Trust Invite-Only P2P Voice & Chat
 
-**Website**: [conquerd.com](https://conquerd.com)
+**Website**: [doubleslash.space](https://doubleslash.space)
 
-Conquerd is a privacy-first peer-to-peer voice and chat application. Identity, discovery, and trust live entirely on your device — there is no central server, no account, no sign-up. Peers connect through cryptographically signed invite links and communicate directly over encrypted QUIC channels.
+DoubleSlash is a privacy-first peer-to-peer voice and chat application (the **D://** protocol). Identity, discovery, and trust live entirely on your device — there is no central server, no account, no sign-up. Peers connect through cryptographically signed invite links and communicate directly over encrypted QUIC channels.
 
 No telemetry. No cloud accounts. No third-party infrastructure required.
 
@@ -60,14 +60,14 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - On a clustered deployment (multiple supernodes hosting the same room), voice now carries across every node in the cluster, matching how room chat already worked.
 
 ### In-App Supernode Portal & Browser Games
-- Supernodes with `web.host.app.v1` serve an in-app portal over a QUIC bidi-stream channel. The native client browses `conquerd://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no public game ports, and no public web TLS certificates.
+- Supernodes with `web.host.app.v1` serve an in-app portal over a QUIC bidi-stream channel. The native client browses `d://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no public game ports, and no public web TLS certificates.
 - **`game.relay.v1`** — opaque datagram relay for in-app portal games: the supernode fans raw QUIC-relay datagrams among peers that joined the same game session (identity path; no external browser / WebTransport). Three demo games are bundled: **cursor relay**, **brick breaker**, **shared drawing**.
-- Game pages are served from `<data_dir>/games/<slug>/` and reachable only via the native portal at `conquerd://<supernode_id>/games/<slug>/`. The `window.conquerd` JS bridge exposes channel APIs over the authenticated QUIC session.
+- Game pages are served from `<data_dir>/games/<slug>/` and reachable only via the native portal at `d://<supernode_id>/games/<slug>/`. The `window.conquerd` JS bridge exposes channel APIs over the authenticated QUIC session.
 - Portal requests use the identity-authenticated QUIC connection; there is no public HTTPS/WebTransport listener, game TLS certificate, or certificate fingerprint passed to portal pages.
 
 ### Security & Identity
 - Cryptographic identity via long-term Ed25519 keys with derived peer IDs (SHA-256).
-- Invite-only discovery through signed `conquerd://` links (timestamped, expiry-checked).
+- Invite-only discovery through signed `d://` links (timestamped, expiry-checked).
 - Forward-secret handshakes using ephemeral X25519 + HKDF + AES-GCM.
 - All signaling is Ed25519-signed, transcript-bound, freshness-checked, and protected by a per-sender replay guard keyed on message signatures.
 - Peer revocation with propagation (socket drop, relay eject, SFU eject).
@@ -93,7 +93,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Native Rust desktop binary with a Qt 6 / QML UI (via [CXX-Qt](https://kdab.github.io/cxx-qt/)).
 - Modern dark theme with DPI-aware scaling (125%, 150%, 200%+).
 - First-run onboarding wizard (display name, identity fingerprint + QR, optional supernode).
-- `conquerd://` URI scheme for one-click invite joining.
+- `d://` URI scheme for one-click invite joining.
 - Invite QR codes with toggle display and save-to-PNG.
 - System tray with badge notifications for unread messages and missed calls.
 - Collapsible event log panel (toggle with `Ctrl+B`); `Ctrl+K` creates a new invite, `Ctrl+,` opens Settings.
@@ -140,7 +140,7 @@ cd ..\..
 .\run_client.bat
 ```
 
-The build script `build_win64.ps1` produces a portable distribution under `dist\ConquerD\` plus a `dist\ConquerD-<version>-win64.7z` archive.
+The build script `build_win64.ps1` produces a portable distribution under `dist\DoubleSlash\` plus a `dist\DoubleSlash-<version>-win64.7z` archive.
 
 ### Connect Two Peers
 
@@ -164,23 +164,23 @@ On first launch, an onboarding wizard walks you through choosing a display name,
 
 | Platform | Package | URI Scheme |
 |----------|---------|------------|
-| Windows  | Rust installer or portable folder | Registry (`conquerd://`) |
+| Windows  | Rust installer or portable folder | Registry (`d://`) |
 | macOS    | `.app` bundle + `.dmg` | `CFBundleURLTypes` in Info.plist |
 | Linux    | AppImage | `.desktop` file + `xdg-mime` |
 
 ### Windows
-Run `conquerd-installer.exe` or extract the portable `conquerd/` folder. The installer registers the `conquerd://` URI scheme, creates Start Menu shortcuts, and supports silent upgrades (`--silent`) and uninstallation (`--uninstall`).
+Run `conquerd-installer.exe` or extract the portable `conquerd/` folder. The installer registers the `d://` URI scheme, creates Start Menu shortcuts, and supports silent upgrades (`--silent`) and uninstallation (`--uninstall`).
 
 ### macOS
-Open the `.dmg` and drag Conquerd to Applications. Grant microphone access when prompted.
+Open the `.dmg` and drag DoubleSlash to Applications. Grant microphone access when prompted.
 
 ### Linux
 ```bash
-chmod +x ConquerD-x86_64.AppImage
-./ConquerD-x86_64.AppImage
+chmod +x DoubleSlash-x86_64.AppImage
+./DoubleSlash-x86_64.AppImage
 ```
 
-To register the `conquerd://` URI scheme:
+To register the `d://` URI scheme:
 ```bash
 cp packaging/conquerd.desktop ~/.local/share/applications/
 update-desktop-database ~/.local/share/applications/
@@ -189,13 +189,13 @@ xdg-mime default conquerd.desktop x-scheme-handler/conquerd
 
 ### Uninstalling
 
-**Windows (installer):** Open *Add or Remove Programs* (Settings → Apps → Installed apps), search for **ConquerD**, and click Uninstall. Alternatively, run `conquerd-installer.exe --uninstall` from the command line for a silent uninstall.
+**Windows (installer):** Open *Add or Remove Programs* (Settings → Apps → Installed apps), search for **DoubleSlash**, and click Uninstall. Alternatively, run `conquerd-installer.exe --uninstall` from the command line for a silent uninstall.
 
 **Windows (portable):** Delete the extracted `conquerd\` folder. No registry keys are written by the portable version.
 
-**macOS:** Drag the ConquerD app from Applications to the Trash. User data in `~/.conquerd/` can be removed manually if desired.
+**macOS:** Drag the DoubleSlash app from Applications to the Trash. User data in `~/.doubleslash/` (or a pre-rebrand `~/.conquerd/`) can be removed manually if desired.
 
-**Linux (AppImage):** Delete the `.AppImage` file. If you registered the URI scheme, remove `~/.local/share/applications/conquerd.desktop` and run `update-desktop-database ~/.local/share/applications/`. User data in `~/.conquerd/` can be removed manually.
+**Linux (AppImage):** Delete the `.AppImage` file. If you registered the URI scheme, remove `~/.local/share/applications/conquerd.desktop` and run `update-desktop-database ~/.local/share/applications/`. User data in `~/.doubleslash/` (or a pre-rebrand `~/.conquerd/`) can be removed manually.
 
 ### System Requirements
 - **OS:** Windows 10+, macOS 10.15+, Linux (glibc 2.31+)
@@ -222,7 +222,7 @@ xdg-mime default conquerd.desktop x-scheme-handler/conquerd
 
 ### Language Boundaries
 
-Conquerd is Rust-first, with deliberate native and UI boundaries: Qt Quick screens are QML, CXX-Qt uses small C++ shims, the macOS camera backend has an Objective-C AVFoundation shim, portal/game code uses JavaScript, and the Opus/VP8 wrappers compile vendored C libraries. Identity, transport, feature negotiation, application state, cryptography, and media orchestration remain in Rust.
+DoubleSlash is Rust-first, with deliberate native and UI boundaries: Qt Quick screens are QML, CXX-Qt uses small C++ shims, the macOS camera backend has an Objective-C AVFoundation shim, portal/game code uses JavaScript, and the Opus/VP8 wrappers compile vendored C libraries. Identity, transport, feature negotiation, application state, cryptography, and media orchestration remain in Rust.
 
 | Layer | Crate / Runtime |
 |---|---|
@@ -242,7 +242,7 @@ Conquerd is Rust-first, with deliberate native and UI boundaries: Qt Quick scree
 - **Relay**: QUIC relay protocol on supernodes (transport-only; no app-layer decryption).
 
 ### Core Model
-- **Invite-only discovery**: peers connect only from signed `conquerd://` links.
+- **Invite-only discovery**: peers connect only from signed `d://` links.
 - **Zero trust relay**: relays forward signed/encrypted payloads only — no app-layer central services.
 - **Cryptographic identity**: long-term Ed25519 identity key; `peer_id` = SHA-256 of public key.
 - **Forward secrecy**: invite handshakes use ephemeral X25519 + HKDF + AES-GCM.
@@ -303,7 +303,7 @@ User types → ChatManager.send_message()
 
 ## Modular Framework
 
-Conquerd is structured as a **modular peer-connectivity framework**: chat, voice, files, rooms, and games are not hard-coded behaviors but **features** advertised and negotiated between peers and supernodes. The spine is the `conquerd-features` crate.
+DoubleSlash is structured as a **modular peer-connectivity framework**: chat, voice, files, rooms, and games are not hard-coded behaviors but **features** advertised and negotiated between peers and supernodes. The spine is the `conquerd-features` crate.
 
 For the precise runtime contract (auth tier enforcement order, quota symmetry across inbound/outbound and all transport paths, dispatch rules, negative-path requirements, and channel tag allocation), see `agents.md` → "Using the Modular Framework (Agent Contract)" and "Feature Module Reference (Agent Contract)". The material below is the human-oriented view suitable for operators and module authors.
 
@@ -340,7 +340,7 @@ For the precise runtime contract (auth tier enforcement order, quota symmetry ac
 | `room.audio.content.sfu` | datagram | room-member | supernode opaque relay fan-out (audio shared with room video) |
 | `room.chat.v1` | stream | room-member | supernode SFU/relay routing (`sfu.rs`, `main.rs`) |
 | `room.file.v1` | stream | room-member | supernode SFU file broadcast |
-| `web.host.app.v1` | stream | public | supernode QUIC bidi-stream portal (`conquerd://` pages for native client) |
+| `web.host.app.v1` | stream | public | supernode QUIC bidi-stream portal (`d://` pages for native client) |
 | `game.relay.v1` | datagram | room-member | opaque in-app portal game session relay over identity QUIC |
 
 ### Enabling Features on a Supernode
@@ -415,10 +415,10 @@ if !state.features.bind_module("x.acme.matchmaker", module.clone()) {
 Games run only inside the native client portal. The SDK is served at `/web-sdk/conquerd.mjs` and imported with a relative path:
 
 ```js
-import { ConquerdClient } from "../../web-sdk/conquerd.mjs";
+import { DoubleSlashClient } from "../../web-sdk/conquerd.mjs";
 
 // Games run only inside the native portal (window.conquerd).
-const client = new ConquerdClient({
+const client = new DoubleSlashClient({
   features: ["game.relay.v1"],
   room: "my-lobby",
 });
@@ -442,7 +442,7 @@ Three bundled game demos are deployed to `<data_dir>/games/` on first supernode 
 | `/games/brick-breaker/` | Brick breaker — multiplayer paddle game |
 | `/games/shared-drawing/` | Shared drawing — collaborative canvas with stroke broadcast |
 
-All three use `game.relay.v1` and open only via `conquerd://<supernode_id>/games/<slug>/` from the in-app portal (Rooms sidebar). External browsers are not supported.
+All three use `game.relay.v1` and open only via `d://<supernode_id>/games/<slug>/` from the in-app portal (Rooms sidebar). External browsers are not supported.
 
 The SDK also exports `ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, and `featureForFixedTag` for games that interoperate with first-party `core.*` channels.
 
@@ -456,7 +456,7 @@ Quota enforcement is **symmetric** — separate inbound and outbound token-bucke
 
 ## Connecting to Peers
 
-Conquerd uses an **invite-only** model. There is no user directory or friend search.
+DoubleSlash uses an **invite-only** model. There is no user directory or friend search.
 
 ### Creating an Invite
 1. Click the **"+"** button or use the invite dialog.
@@ -465,18 +465,18 @@ Conquerd uses an **invite-only** model. There is no user directory or friend sea
 
 ### Joining via Invite
 1. Receive an invite link from a peer.
-2. Paste it into the **Join** dialog in Conquerd.
+2. Paste it into the **Join** dialog in DoubleSlash.
 3. The handshake completes automatically — both peers verify each other's identity cryptographically.
 4. The peer appears in your left panel as a trusted contact.
 
 ### URI Launch
-If Conquerd is installed, clicking a `conquerd://invite/...` link opens the app and processes the invite automatically.
+If DoubleSlash is installed, clicking a `d://invite/...` link opens the app and processes the invite automatically.
 
 ---
 
 ## NAT Traversal
 
-Most consumer NATs silently drop unsolicited inbound connections. Conquerd employs a multi-layer connection strategy to maximise reachability — each layer is tried in sequence and the first to succeed wins.
+Most consumer NATs silently drop unsolicited inbound connections. DoubleSlash employs a multi-layer connection strategy to maximise reachability — each layer is tried in sequence and the first to succeed wins.
 
 | Priority | Strategy | Requires | Transport |
 |---|---|---|---|
@@ -526,7 +526,7 @@ A supernode is a volunteer peer that provides QUIC relay and SFU (group voice) h
 
 ### Connecting to a Supernode
 1. Get the supernode's invite link from the operator.
-2. Paste it into Conquerd's **Join** dialog.
+2. Paste it into DoubleSlash's **Join** dialog.
 3. The handshake completes — the supernode appears in the **Rooms** sidebar. Supernodes are intentionally excluded from the ordinary **Peers** list.
 4. Your session banner shows the connection mode:
 
@@ -547,9 +547,9 @@ Each supernode operator decides how peers gain relay access:
 | **Access Code** | A web page asks for a code provided by the operator (e.g. shared in a group chat). |
 | **Ad / timer** | A countdown page is shown; access is granted after the timer expires. |
 
-When a gated supernode requires portal access, Conquerd opens the supernode's web page in the in-app portal view. Complete the required step and relay access is granted automatically.
+When a gated supernode requires portal access, DoubleSlash opens the supernode's web page in the in-app portal view. Complete the required step and relay access is granted automatically.
 
-Operators can add custom access-controller code that integrates other verification or payment systems. No wallet or payment infrastructure is built into the Conquerd client itself.
+Operators can add custom access-controller code that integrates other verification or payment systems. No wallet or payment infrastructure is built into the DoubleSlash client itself.
 
 ---
 
@@ -637,7 +637,7 @@ Runtime access and portal-presentation settings are read from environment variab
 | `supernode_signaling_port` | `34935` | TCP port for WebSocket signaling. **Always set a fixed value** — changing it breaks firewall rules and stored peer endpoints |
 | `supernode_invite_ttl` | `-1` | Invite expiry in minutes. `-1` = never expires |
 | `supernode_host` | *(unset)* | Public DNS name or IP used in invite URLs and relay tickets for remote clients |
-| `CONQUERD_HOME` | `~/.conquerd` | Data directory for identity, settings, files |
+| `DOUBLESLASH_HOME` / `CONQUERD_HOME` | `~/.doubleslash` (falls back to existing `~/.conquerd`) | Data directory for identity, settings, files |
 
 #### Feature / process toggles
 
@@ -716,7 +716,7 @@ Create `/etc/systemd/system/conquerd-supernode.service`:
 
 ```ini
 [Unit]
-Description=Conquerd Supernode (QUIC relay + SFU)
+Description=DoubleSlash Supernode (QUIC relay + SFU)
 After=network-online.target
 Wants=network-online.target
 
@@ -793,23 +793,23 @@ The in-app QUIC portal exposes a `/health` page with live stats (uptime, version
 
 ## Updates
 
-Conquerd checks the GitHub Releases API in the background and offers in-app upgrade prompts when a newer signed release is available. The bundled `conquerd-installer` binary downloads, verifies, and applies the release.
+DoubleSlash checks the GitHub Releases API in the background and offers in-app upgrade prompts when a newer signed release is available. The bundled `conquerd-installer` binary downloads, verifies, and applies the release.
 
 - Before replacing files, the installer verifies the project Ed25519 release manifest and the archive SHA-256 recorded in it. Platform signatures (Windows SignPath / macOS Apple Developer ID) and Sigstore attestations are additional distribution checks when available.
 - `VERSION_ANNOUNCE` is still exchanged between peers so each side can show the other peer's version in the event log, but application code is **not** pushed peer-to-peer — a connected peer running an older build is informational only.
-- *Check for updates automatically* is on by default. When enabled, ConquerD checks at startup and once per hour while it remains open. Turning it off takes effect immediately and prevents automatic GitHub requests; an update already shown in the title bar can still be applied manually.
+- *Check for updates automatically* is on by default. When enabled, DoubleSlash checks at startup and once per hour while it remains open. Turning it off takes effect immediately and prevents automatic GitHub requests; an update already shown in the title bar can still be applied manually.
 
 ---
 
 ## Settings Reference
 
-Access settings via the gear icon in Conquerd.
+Access settings via the gear icon in DoubleSlash.
 
 ### Application
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Check for updates automatically | `true` | Check GitHub at startup and hourly while ConquerD is open (`update_check_enabled`) |
+| Check for updates automatically | `true` | Check GitHub at startup and hourly while DoubleSlash is open (`update_check_enabled`) |
 
 ### Network
 
@@ -856,7 +856,7 @@ Access settings via the gear icon in Conquerd.
 
 ## Data and Files
 
-All Conquerd data is stored under `CONQUERD_HOME` (default `~/.conquerd/`):
+All DoubleSlash data is stored under `DOUBLESLASH_HOME` / `CONQUERD_HOME` (default `~/.doubleslash/`, or an existing `~/.conquerd/` profile):
 
 | File | Purpose |
 |------|---------|
@@ -919,7 +919,7 @@ SFU **room state is not persisted** on the supernode — rooms exist in memory w
 
 | File | Purpose |
 |---|---|
-| `rust/conquerd-client/src/main.rs` | Desktop client entry. Initialises identity (keyring + passphrase), Qt `QGuiApplication`, the `AppBridge` QObject, and the QML engine. Handles `conquerd://` URIs on argv and single-instance forwarding. |
+| `rust/conquerd-client/src/main.rs` | Desktop client entry. Initialises identity (keyring + passphrase), Qt `QGuiApplication`, the `AppBridge` QObject, and the QML engine. Handles `d://` URIs on argv and single-instance forwarding. |
 | `rust/conquerd-supernode/src/main.rs` | Headless relay binary. Reads env / `supernode.toml`, starts QUIC relay + WebSocket signaling + in-app portal (`web.host.app.v1`) + game session fan-out. |
 | `rust/conquerd-installer/src/main.rs` | Standalone updater. Downloads and applies signed releases from GitHub. |
 
@@ -943,7 +943,7 @@ cargo build --release -p conquerd-installer
 cd rust
 cargo test --workspace
 
-# Conquerd-client (binary crate; tests run from its own workspace)
+# DoubleSlash-client (binary crate; tests run from its own workspace)
 cd conquerd-client
 cargo test
 
@@ -1014,7 +1014,7 @@ $env:USERPROFILE = "$PWD\.clientB"
 ### Portable Build
 
 ```powershell
-# Windows client: dist\ConquerD\ + dist\ConquerD-<version>-win64.7z
+# Windows client: dist\DoubleSlash\ + dist\DoubleSlash-<version>-win64.7z
 .\build_win64.ps1
 
 # Linux client AppImage
@@ -1035,7 +1035,7 @@ CONQUERD_RELEASE=1 ./scripts/build_supernode.sh   # dist/conquerd-supernode-<ver
 
 Release CI builds client artifacts plus supernode packages for **linux-x86_64**, **linux-aarch64**, and **win64** (see `.github/workflows/release.yml`).
 
-`build_win64.ps1` runs `cargo build --release --features qt-ui[,webengine]` for `conquerd-client`, `cargo build --release -p conquerd-installer`, then invokes `windeployqt6` to gather the Qt runtime DLLs into `dist\ConquerD\`. Set `QT_DIR` if Qt is not in one of the auto-detected default locations. Set `CONQUERD_DEBUG=1` for a debug build, or `CONQUERD_DEBUG_CONSOLE=1` to keep a console window attached.
+`build_win64.ps1` runs `cargo build --release --features qt-ui[,webengine]` for `conquerd-client`, `cargo build --release -p conquerd-installer`, then invokes `windeployqt6` to gather the Qt runtime DLLs into `dist\DoubleSlash\`. Set `QT_DIR` if Qt is not in one of the auto-detected default locations. Set `CONQUERD_DEBUG=1` for a debug build, or `CONQUERD_DEBUG_CONSOLE=1` to keep a console window attached.
 
 #### Code Signing (Windows, optional)
 
@@ -1115,7 +1115,7 @@ Version is set in `rust/conquerd-client/Cargo.toml`. **Keep `rust/conquerd-insta
 │   ├── conquerd-vpx/              # First-party VP8 wrapper over vendored libvpx (cross-platform video)
 │   └── conquerd-supernode-manager/ # Separate workspace: provisioning, cluster sync, deploy, remote exec
 ├── web-sdk/conquerd.mjs           # In-app portal game SDK (identity QUIC channel; no WebTransport)
-├── games/                         # Example portal games (conquerd:// only)
+├── games/                         # Example portal games (d:// only)
 ├── packaging/                     # Linux .desktop file, macOS Info.plist template, AppRun
 ├── scripts/check_version_sync.ps1 # Verify Cargo.toml versions stay aligned (PowerShell)
 ├── scripts/build_supernode.sh     # Package conquerd-supernode (.tar.gz; Linux/macOS hosts)
@@ -1193,7 +1193,7 @@ Free code signing provided by [SignPath.io](https://signpath.io), certificate by
 
 ### Bootstrap for Free OSS Code Signing
 
-ConquerD uses a project-controlled Ed25519 key for signing `releases_manifest.json` (verified by the installer for update integrity and build hashes). This key was generated locally with `openssl genpkey -algorithm Ed25519`.
+DoubleSlash uses a project-controlled Ed25519 key for signing `releases_manifest.json` (verified by the installer for update integrity and build hashes). This key was generated locally with `openssl genpkey -algorithm Ed25519`.
 
 The public key is committed in source (see `keys/release-signer-public.pem` and the hex constant in `rust/conquerd-installer/src/release_manifest.rs`).
 
@@ -1229,7 +1229,7 @@ Users downloading the very first release should verify the GitHub release page, 
 
 See [PRIVACY.md](PRIVACY.md) for the full privacy policy.
 
-ConquerD is a local-first application. All peer-to-peer communication (voice, chat, file transfer) travels directly between clients or through volunteer supernodes chosen by the user, and is end-to-end encrypted. ConquerD does not operate servers that store your identity, messages, or call data.
+DoubleSlash is a local-first application. All peer-to-peer communication (voice, chat, file transfer) travels directly between clients or through volunteer supernodes chosen by the user, and is end-to-end encrypted. DoubleSlash does not operate servers that store your identity, messages, or call data.
 
 The following network contacts occur automatically or on user action (see [PRIVACY.md](PRIVACY.md) for full detail):
 
@@ -1242,7 +1242,7 @@ The following network contacts occur automatically or on user action (see [PRIVA
 | **Supernode portal / gated relay** | The supernode operator you chose | When you open their portal or complete an access gate | Do not connect to that supernode |
 | **Installer download** | GitHub release assets + `releases_manifest.json` | When you apply an in-app update | Do not apply updates |
 
-No account credentials, message content, or contact lists are transmitted to ConquerD-operated servers (there are none). Build-attestation metadata (version / build id) may be exchanged directly between peers you connect to.
+No account credentials, message content, or contact lists are transmitted to DoubleSlash-operated servers (there are none). Build-attestation metadata (version / build id) may be exchanged directly between peers you connect to.
 
 **Local capture** (camera, screen or window, and audio shared with a video) starts only when you turn the camera on, open the Settings preview, or start a share — never in the background. Captured media goes to the peers in that call and nowhere else: it is not recorded, not written to disk, and room media is E2E-sealed before it reaches a supernode. Two things are worth reading before you share: a whole-screen share includes anything that pops up over it, and per-application audio capture needs Windows 10 build 20348 or later — on older builds it **falls back to whole-machine audio**. Full detail in [PRIVACY.md](PRIVACY.md#camera-screen-and-shared-audio-capture).
 
@@ -1252,16 +1252,16 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 
 ### 1.0 — Highlights
 
-- **Zero-trust P2P architecture** — direct peer-to-peer; no central server stores your data. Ed25519 identity with derived peer IDs, invite-only discovery via signed `conquerd://` links, forward-secret handshakes (ephemeral X25519 + HKDF + AES-GCM).
+- **Zero-trust P2P architecture** — direct peer-to-peer; no central server stores your data. Ed25519 identity with derived peer IDs, invite-only discovery via signed `d://` links, forward-secret handshakes (ephemeral X25519 + HKDF + AES-GCM).
 - **Chat-first UX** — text is the primary interaction after connecting; voice is opt-in per conversation. Per-conversation scroll persistence, typing indicators, unread badges on taskbar + tray.
 - **Voice calls** — low-latency Opus over QUIC, push-to-talk and voice activation, spectral-gate noise suppression, jitter buffer with de-click.
 - **Video and screen sharing** — negotiated H.264/VP8, pre-encode picture-in-picture, a separately-mixed synchronised track for audio shared with the video, and adaptive bitrate. Complete on Windows; camera capture on Linux and macOS is built but unvalidated, and screen capture is Windows-only (see [Known limitations](#known-limitations)).
 - **Rooms (multi-peer voice)** — client-owned room definitions (`my_rooms.dat`); supernodes host SFU sessions ephemerally over QUIC relay with chat/voice/file parity, idle GC, and reconnect materialization.
-- **Game relay & in-app portal**: `game.relay.v1` opaque datagrams over the identity QUIC relay; three bundled demos (cursor relay, brick breaker, shared drawing) under `<data_dir>/games/`, opened only from the native portal at `conquerd://<supernode_id>/games/<slug>/`. No public WebTransport port or TLS game certs.
+- **Game relay & in-app portal**: `game.relay.v1` opaque datagrams over the identity QUIC relay; three bundled demos (cursor relay, brick breaker, shared drawing) under `<data_dir>/games/`, opened only from the native portal at `d://<supernode_id>/games/<slug>/`. No public WebTransport port or TLS game certs.
 - **Supernode release binaries**: pre-built packages for Linux x86_64, Linux ARM64, and Windows x86_64 on GitHub Releases and nightlies (`scripts/build_supernode.sh` / `scripts/build_supernode.ps1`).
 - **NAT traversal** — UPnP port mapping, QUIC/WebSocket direct connect, ordered WebSocket candidates, and supernode QUIC relay fallback with auto-renewed tickets and an endpoint mailbox.
 - **Security** — signed, transcript-bound signaling with timestamp freshness checks and per-sender replay deduplication; peer revocation with propagation; release-signed P2P updates with Ed25519 + threshold validation; crash/installer logging.
-- **Desktop application** — DPI-aware dark theme, first-run onboarding wizard (display name, identity fingerprint + QR, supernode setup), `conquerd://` URI scheme for one-click invites, system tray with badges, collapsible event log, save-to-PNG invite QR codes.
+- **Desktop application** — DPI-aware dark theme, first-run onboarding wizard (display name, identity fingerprint + QR, supernode setup), `d://` URI scheme for one-click invites, system tray with badges, collapsible event log, save-to-PNG invite QR codes.
 
 ### Known limitations
 

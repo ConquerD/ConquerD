@@ -1,4 +1,4 @@
-# ConquerD on Android
+# DoubleSlash on Android
 
 The Android client runs the **same Rust core as the desktop client** — the same
 transport, crypto, stores and feature registry — behind a native Kotlin/Compose

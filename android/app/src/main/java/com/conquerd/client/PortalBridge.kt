@@ -37,7 +37,7 @@ class PortalBridge(
      */
     fun interceptRequest(request: WebResourceRequest): WebResourceResponse? {
         val url = request.url
-        if (url.scheme != SCHEME) return null
+        if (url.scheme != SCHEME && url.scheme != SCHEME_LEGACY) return null
 
         // The host is the supernode; everything after it is the page path.
         val path = url.path.orEmpty().ifEmpty { "/index.html" }
@@ -143,8 +143,8 @@ class PortalBridge(
               return Promise.resolve(parse(raw.closeChannel()));
             },
             fetch: function (path, opts) {
-              var base = 'conquerd://' + sn;
-              var url = path.charAt(0) === '/' ? base + path : base + '/' + path;
+              var origin = window.location.protocol + '//' + sn;
+              var url = path.charAt(0) === '/' ? origin + path : origin + '/' + path;
               return window.fetch(url, opts);
             }
           });
@@ -165,7 +165,7 @@ class PortalBridge(
               href = '';
             }
 
-            if (href.indexOf('conquerd:') !== 0) {
+            if (href.indexOf('conquerd:') !== 0 && href.indexOf('d://') !== 0) {
               if (!nativeFetch) return Promise.reject(new Error('fetch unavailable'));
               return nativeFetch(input, opts);
             }
@@ -221,7 +221,7 @@ class PortalBridge(
         fun fetchB64(rawUrl: String): String {
             val url = runCatching { android.net.Uri.parse(rawUrl) }.getOrNull()
                 ?: return failure("that is not a URL")
-            if (url.scheme != SCHEME) return failure("not a portal URL")
+            if (url.scheme != SCHEME && url.scheme != SCHEME_LEGACY) return failure("not a portal URL")
 
             val reply = runBlocking {
                 core.command("portal.fetch") {
@@ -296,7 +296,8 @@ class PortalBridge(
     }
 
     companion object {
-        const val SCHEME = "conquerd"
+        const val SCHEME = "d"
+        const val SCHEME_LEGACY = "conquerd"
         private const val TAG = "PortalBridge"
         private val HEAD_OPEN = Regex("<head[^>]*>", RegexOption.IGNORE_CASE)
 

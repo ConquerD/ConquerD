@@ -1,20 +1,21 @@
-# ConquerD Privacy Policy
+# DoubleSlash Privacy Policy
 
 **Effective date:** 2026-09-05
 
-ConquerD is a local-first, invite-only peer-to-peer application. Voice, video,
+DoubleSlash is a local-first, invite-only peer-to-peer application. Voice, video,
 chat, and file transfer travel directly between clients you connect to, or
 through volunteer supernodes you explicitly choose to trust. Application
 payloads are encrypted on the wire; supernodes relay signed/encrypted frames and
-cannot read message, audio, or video content. ConquerD does not operate any
+cannot read message, audio, or video content. DoubleSlash does not operate any
 central servers that store your identity, messages, or call data.
 
 ---
 
 ## Information stored on your device
 
-All persistent ConquerD data is written under `CONQUERD_HOME` (default
-`~/.conquerd/` on Linux/macOS, `%USERPROFILE%\.conquerd\` on Windows). This data
+All persistent DoubleSlash data is written under `DOUBLESLASH_HOME` or
+`CONQUERD_HOME` (default `~/.doubleslash/` on Linux/macOS, falling back to an
+existing `~/.conquerd/` profile so a rebrand does not strand identity). This data
 does not leave your device unless you explicitly connect to a peer or
 supernode and exchange it as part of normal operation, or you initiate an
 optional feature described below (updates, link previews, Ollama, and so on).
@@ -35,7 +36,7 @@ The desktop client logs to **stderr** via Rust `tracing` (controlled by the
 `RUST_LOG` environment variable). It does not write a persistent client log file
 by default.
 
-No telemetry, analytics, or usage reporting is collected by ConquerD.
+No telemetry, analytics, or usage reporting is collected by DoubleSlash.
 
 ---
 
@@ -71,7 +72,7 @@ apply an update, `conquerd-installer` downloads release archives, checksums, and
 
 ### UPnP port mapping
 
-**What:** When *Enable UPnP port mapping* is on (the default), ConquerD sends
+**What:** When *Enable UPnP port mapping* is on (the default), DoubleSlash sends
 SSDP discovery multicast on your **local area network** to locate a UPnP-capable
 router and requests a temporary port-forwarding rule. This can improve direct
 peer-to-peer reachability without a relay.
@@ -79,11 +80,11 @@ peer-to-peer reachability without a relay.
 **Servers contacted:** No external Internet servers are contacted. UPnP traffic
 stays on your LAN (multicast to `239.255.255.250`). Only your router responds.
 
-**What is disclosed:** Your internal IP address and the port ConquerD is
+**What is disclosed:** Your internal IP address and the port DoubleSlash is
 listening on are sent to your local router. Nothing leaves your network.
 
 **How to disable:** Uncheck *Enable UPnP port mapping* in Settings, or set
-`upnp_enabled` to `false` in `settings.json`. ConquerD falls back to direct
+`upnp_enabled` to `false` in `settings.json`. DoubleSlash falls back to direct
 QUIC/WebSocket candidates and supernode relay when needed.
 
 ---
@@ -95,7 +96,7 @@ QUIC/WebSocket candidates and supernode relay when needed.
 **What:** Nothing is captured until you start it. Turning your camera on in a
 call, opening the local preview in **Settings → Video**, or choosing a source
 from the **Share video** control starts capture; stopping the share or the call
-ends it. ConquerD does not capture in the background and does not capture
+ends it. DoubleSlash does not capture in the background and does not capture
 while idle.
 
 Three kinds of source can be captured, and they differ in how much they expose:
@@ -113,7 +114,7 @@ Three kinds of source can be captured, and they differ in how much they expose:
 - **Whole-machine audio capture picks up every sound the machine plays**,
   including notification chimes and audio from another call. Per-application
   capture is narrower, but it requires Windows 10 build 20348 or later; on older
-  builds ConquerD **falls back to whole-machine audio** rather than sharing
+  builds DoubleSlash **falls back to whole-machine audio** rather than sharing
   nothing. If you are on an older Windows build and picked a single application,
   assume system audio is what your peers hear.
 
@@ -125,7 +126,7 @@ flowing, its byte volume, and whether your camera is on or off — never the
 picture or the sound.
 
 **What is not done with it:** captured video and audio are not recorded, not
-written to disk, and not sent to any ConquerD service (there are none). Device
+written to disk, and not sent to any DoubleSlash service (there are none). Device
 enumeration for the settings list and the local preview stay on your machine.
 
 **How to disable:** turn the camera off, stop the share, or simply never start
@@ -145,11 +146,11 @@ acknowledgement, if shown) loads the embed in an embedded Chromium view
 
 **Servers contacted (only after you expand inline playback or open the link):**
 YouTube (`youtube.com`, `googlevideo.com`, `ytimg.com`, …), Vimeo
-(`vimeo.com`, `player.vimeo.com`, …), or the direct video host. ConquerD does
+(`vimeo.com`, `player.vimeo.com`, …), or the direct video host. DoubleSlash does
 **not** use `yt-dlp` for this feature.
 
 **What is disclosed:** The video host sees a normal browser/embed request from
-your IP. No chat message text is sent to ConquerD-operated servers (there are
+your IP. No chat message text is sent to DoubleSlash-operated servers (there are
 none).
 
 **How to disable:** Uncheck *Show YouTube preview cards in chat* in Settings
@@ -158,13 +159,13 @@ launches your system browser.
 
 ### Ollama AI assistant (optional plugin)
 
-**What:** When *Enable AI assistant* is on, ConquerD sends HTTP requests to the
+**What:** When *Enable AI assistant* is on, DoubleSlash sends HTTP requests to the
 Ollama base URL you configure (default `http://localhost:11434`) to list models
 and stream completions. Chat text you route to the assistant is included in
 those local requests.
 
 **Servers contacted:** Only the Ollama instance you configure — by default your
-own machine. No ConquerD cloud service is involved.
+own machine. No DoubleSlash cloud service is involved.
 
 **Peer visibility:** The `x.ollama.v1` capability may be advertised to
 connected peers as a presence signal; message content is not sent to peers
@@ -176,15 +177,15 @@ through the plugin.
 ### Supernode portal and gated relay pages
 
 **What:** When you connect to a supernode that exposes a portal or access gate,
-ConquerD may load operator-hosted pages inside the embedded browser (typically
-`conquerd://` over the QUIC portal, or HTTPS where configured). External links
+DoubleSlash may load operator-hosted pages inside the embedded browser (typically
+`d://` over the QUIC portal, or HTTPS where configured). External links
 from those pages open in your system browser.
 
-**Servers contacted:** The supernode operator you chose — not ConquerD.
+**Servers contacted:** The supernode operator you chose — not DoubleSlash.
 
 **What is disclosed:** The operator can see that you visited their portal and
 your IP address for any HTTPS content they host. Portal traffic over
-`conquerd://` is carried on your authenticated QUIC session to that supernode.
+`d://` is carried on your authenticated QUIC session to that supernode.
 
 ### Build attestation between peers
 
@@ -219,13 +220,13 @@ When you use a volunteer **supernode** for relay or group voice:
   volumes, but not message or audio content.
 
 Supernodes are configured by you and run by peers or operators you choose to
-trust. ConquerD does not operate any supernodes.
+trust. DoubleSlash does not operate any supernodes.
 
 ---
 
 ## Third-party components
 
-ConquerD bundles the following open-source components. They do not phone home
+DoubleSlash bundles the following open-source components. They do not phone home
 on their own; external contact happens only through the behaviors described
 above.
 
@@ -244,7 +245,7 @@ above.
 
 ## Children's privacy
 
-ConquerD is not directed at children under 13. It does not knowingly collect
+DoubleSlash is not directed at children under 13. It does not knowingly collect
 personal information from children.
 
 ---

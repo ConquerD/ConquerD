@@ -122,22 +122,27 @@ fn decompress_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Return the directory that contains `ConquerD.exe` inside an install tree.
+/// Return the directory that contains the client exe inside an install tree.
 fn bundle_root(install_dir: &Path) -> PathBuf {
-    let nested = install_dir.join("ConquerD");
-    if nested.join("ConquerD.exe").is_file() {
-        nested
-    } else {
-        install_dir.to_path_buf()
+    for folder in [
+        crate::brand::WINDOWS_INSTALL_DIR,
+        crate::brand::WINDOWS_INSTALL_DIR_LEGACY,
+    ] {
+        let nested = install_dir.join(folder);
+        if crate::brand::exe_in(&nested) {
+            return nested;
+        }
     }
+    install_dir.to_path_buf()
 }
 
-/// Ensure the extracted bundle contains the Qt runtime folders ConquerD needs.
+/// Ensure the extracted bundle contains the Qt runtime folders DoubleSlash needs.
 fn validate_bundle_layout(install_dir: &Path) -> Result<()> {
     let root = bundle_root(install_dir);
-    if !root.join("ConquerD.exe").is_file() {
+    if !crate::brand::exe_in(&root) {
         bail!(
-            "Extraction incomplete: ConquerD.exe not found under {}",
+            "Extraction incomplete: {} not found under {}",
+            crate::brand::WINDOWS_EXE,
             install_dir.display()
         );
     }
@@ -531,9 +536,18 @@ mod tests {
     }
 
     #[test]
+    fn bundle_root_prefers_nested_doubleslash_folder() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("DoubleSlash");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("DoubleSlash.exe"), b"x").unwrap();
+        assert_eq!(bundle_root(tmp.path()), nested);
+    }
+
+    #[test]
     fn bundle_root_falls_back_to_install_dir() {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("ConquerD.exe"), b"x").unwrap();
+        fs::write(tmp.path().join("DoubleSlash.exe"), b"x").unwrap();
         assert_eq!(bundle_root(tmp.path()), tmp.path());
     }
 
@@ -552,7 +566,7 @@ mod tests {
     fn validate_bundle_layout_accepts_complete_flat_bundle() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        fs::write(root.join("ConquerD.exe"), b"x").unwrap();
+        fs::write(root.join("DoubleSlash.exe"), b"x").unwrap();
         for folder in [
             "platforms",
             "qml",
@@ -576,9 +590,9 @@ mod tests {
         use std::io::BufWriter;
 
         let src = TempDir::new().unwrap();
-        let bundle = src.path().join("ConquerD");
+        let bundle = src.path().join("DoubleSlash");
         fs::create_dir_all(&bundle).unwrap();
-        fs::write(bundle.join("ConquerD.exe"), b"stub").unwrap();
+        fs::write(bundle.join("DoubleSlash.exe"), b"stub").unwrap();
         for folder in [
             "platforms",
             "qml",
@@ -606,8 +620,8 @@ mod tests {
         let dest = TempDir::new().unwrap();
         let hashes = extract_7z(&archive, dest.path()).expect("non-solid archive should extract");
         assert!(
-            hashes.keys().any(|path| path.ends_with("ConquerD.exe")),
-            "expected ConquerD.exe in extracted hashes, got: {:?}",
+            hashes.keys().any(|path| path.ends_with("DoubleSlash.exe")),
+            "expected DoubleSlash.exe in extracted hashes, got: {:?}",
             hashes.keys().collect::<Vec<_>>()
         );
         assert!(
@@ -660,12 +674,15 @@ mod tests {
     #[test]
     fn ordinary_entry_names_are_accepted() {
         for name in [
+            "DoubleSlash.exe",
             "ConquerD.exe",
+            "DoubleSlash/DoubleSlash.exe",
             "ConquerD/ConquerD.exe",
             "ConquerD/platforms/qwindows.dll",
             r"ConquerD\platforms\qwindows.dll",
             "a.b.c/d-e_f/g.h",
             // A curdir component cannot escape, and some writers emit it.
+            "./DoubleSlash.exe",
             "./ConquerD.exe",
             "ConquerD/./platforms/qwindows.dll",
         ] {

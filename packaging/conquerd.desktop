@@ -1,15 +1,15 @@
 [Desktop Entry]
 Type=Application
-Name=ConquerD
+Name=DoubleSlash
 GenericName=P2P Voice & Chat
 Comment=Privacy-first invite-only peer-to-peer voice and chat
 Exec=conquerd %u
 Icon=conquerd
 Terminal=false
 Categories=Network;Chat;InstantMessaging;AudioVideo;
-Keywords=voice;chat;p2p;privacy;encrypted;
+Keywords=voice;chat;p2p;privacy;encrypted;doubleslash;
 StartupWMClass=conquerd
 StartupNotify=true
 
-# conquerd:// URI scheme handler
-MimeType=x-scheme-handler/conquerd;
+# d:// URI scheme handler (legacy conquerd:// still accepted)
+MimeType=x-scheme-handler/d;x-scheme-handler/conquerd;

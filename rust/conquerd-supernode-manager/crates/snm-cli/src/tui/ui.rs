@@ -1074,7 +1074,19 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn styled_log_line(line: &str) -> Line<'static> {
-    let Some(start) = line.find("conquerd://") else {
+    let start = line.to_ascii_lowercase().find("conquerd://").or_else(|| {
+        let lower = line.to_ascii_lowercase();
+        let mut i = 0;
+        while let Some(rel) = lower[i..].find("d://") {
+            let at = i + rel;
+            if at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric() {
+                return Some(at);
+            }
+            i = at + 1;
+        }
+        None
+    });
+    let Some(start) = start else {
         return Line::from(line.to_string());
     };
     let rest = &line[start..];

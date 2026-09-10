@@ -1,15 +1,16 @@
-// scheme.cpp — conquerd:// custom URL scheme handler for QtWebEngine.
+// scheme.cpp — d:// (and legacy conquerd://) custom URL scheme handler
+// for QtWebEngine.
 //
 // Two entry points are exported with C linkage so Rust can call them:
 //
 //   conquerd_register_scheme()
 //     Must be called BEFORE QGuiApplication::new().
-//     Registers "conquerd" as a secure scheme so QtWebEngine treats it like
-//     https:// (allows CORS, service workers, secure context APIs).
+//     Registers "d" and "conquerd" as secure schemes so QtWebEngine treats
+//     them like https:// (allows CORS, service workers, secure context APIs).
 //
 //   conquerd_install_scheme_handler()
 //     Must be called AFTER QGuiApplication is created but BEFORE any
-//     WebEngineView loads a conquerd:// URL.
+//     WebEngineView loads a d:// / conquerd:// URL.
 //     Installs a ConquerdSchemeHandler on the default off-the-record
 //     QWebEngineProfile so every WebEngineView in the process shares it.
 //
@@ -119,19 +120,17 @@ public:
 
 // ── Public C entry points ─────────────────────────────────────────────────────
 
-extern "C" void conquerd_register_scheme()
+static void register_one_scheme(const char* name)
 {
-    // Must be called before QCoreApplication is constructed.
-    QWebEngineUrlScheme scheme("conquerd");
-    // `Syntax::Host` makes Chromium treat conquerd:// as a *standard* URL
+    QWebEngineUrlScheme scheme(name);
+    // `Syntax::Host` makes Chromium treat the URL as a *standard* URL
     // (like http://), which is required for relative-URL resolution to
     // preserve the authority — without this, `fetch('/foo')` from a page
-    // loaded at `conquerd://PEERID/` resolves to `conquerd:///foo` and
-    // drops the peer ID.  Chromium does lower-case the authority, which
-    // would destroy case-sensitive base64url peer IDs — we mitigate that
-    // by registering a `{lowercase_peer_id → original_peer_id}` lookup
-    // table in `scheme.rs::register_portal_peer_id` whenever a portal
-    // is opened.
+    // loaded at `d://PEERID/` resolves to `d:///foo` and drops the peer ID.
+    // Chromium does lower-case the authority, which would destroy
+    // case-sensitive base64url peer IDs — we mitigate that by registering
+    // a `{lowercase_peer_id → original_peer_id}` lookup table in
+    // `scheme.rs::register_portal_peer_id` whenever a portal is opened.
     scheme.setSyntax(QWebEngineUrlScheme::Syntax::Host);
     scheme.setDefaultPort(QWebEngineUrlScheme::PortUnspecified);
     scheme.setFlags(
@@ -144,6 +143,13 @@ extern "C" void conquerd_register_scheme()
     QWebEngineUrlScheme::registerScheme(scheme);
 }
 
+extern "C" void conquerd_register_scheme()
+{
+    // Must be called before QCoreApplication is constructed.
+    register_one_scheme("d");
+    register_one_scheme("conquerd");
+}
+
 extern "C" void conquerd_install_scheme_handler()
 {
     // Must be called after QCoreApplication; installs on the default profile.
@@ -152,12 +158,12 @@ extern "C" void conquerd_install_scheme_handler()
 
     // Configure the default profile itself — every WebEngineView created
     // without an explicit `profile:` binding uses this one, which is
-    // critical: only this profile carries the conquerd:// URL scheme
+    // critical: only this profile carries the d:// / conquerd:// URL scheme
     // handler installed below.  If a WebEngineView were to use a
     // different profile (e.g. an inline `WebEngineProfile { ... }`),
     // navigation to a registered-but-unhandled scheme falls back to
     // QDesktopServices::openUrl() — which on Windows fires the OS-
-    // registered conquerd:// handler and spawns a second ConquerD.exe.
+    // registered handler and spawns a second DoubleSlash.exe.
     profile->setHttpUserAgent(QStringLiteral(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -165,11 +171,12 @@ extern "C" void conquerd_install_scheme_handler()
     profile->setSpellCheckEnabled(false);
 
     // Guard: don't install twice (e.g. multiple calls after hot-reload).
-    if (profile->urlSchemeHandler("conquerd")) return;
-    auto* handler = new ConquerdSchemeHandler(profile);
-    profile->installUrlSchemeHandler("conquerd", handler);
-    qInfo("[conquerd-scheme] installed handler on QWebEngineProfile::defaultProfile()=%p",
-          static_cast<void*>(profile));
+    if (!profile->urlSchemeHandler("d")) {
+        profile->installUrlSchemeHandler("d", new ConquerdSchemeHandler(profile));
+        profile->installUrlSchemeHandler("conquerd", new ConquerdSchemeHandler(profile));
+        qInfo("[conquerd-scheme] installed handler on QWebEngineProfile::defaultProfile()=%p",
+              static_cast<void*>(profile));
+    }
 
 #ifdef CONQUERD_HAVE_QUICK_PROFILE
     // QtWebEngineQuick may surface its own default profile object to QML
@@ -178,11 +185,11 @@ extern "C" void conquerd_install_scheme_handler()
     // belt-and-suspenders to guarantee the handler is on whatever profile
     // the QML WebEngineView actually picks up.
     auto* qmlProfile = QQuickWebEngineProfile::defaultProfile();
-    if (qmlProfile != nullptr && !qmlProfile->urlSchemeHandler("conquerd")) {
+    if (qmlProfile != nullptr && !qmlProfile->urlSchemeHandler("d")) {
         qmlProfile->setHttpUserAgent(profile->httpUserAgent());
         qmlProfile->setSpellCheckEnabled(false);
-        qmlProfile->installUrlSchemeHandler(
-            "conquerd", new ConquerdSchemeHandler(qmlProfile));
+        qmlProfile->installUrlSchemeHandler("d", new ConquerdSchemeHandler(qmlProfile));
+        qmlProfile->installUrlSchemeHandler("conquerd", new ConquerdSchemeHandler(qmlProfile));
         qInfo("[conquerd-scheme] installed handler on QQuickWebEngineProfile=%p",
               static_cast<void*>(qmlProfile));
     } else if (qmlProfile != nullptr) {
@@ -191,24 +198,18 @@ extern "C" void conquerd_install_scheme_handler()
     }
 #endif
 
-    // ── window.conquerd bridge script ──────────────────────────────────────────
-    // Injected at DocumentCreation into every conquerd:// page.
-    // Defines window.conquerd with:
-    //   .supernodeId  — extracted from window.location.hostname (sync)
-    //   .ready        — Promise that resolves with the full API object
-    //       .myPeerId         our own Ed25519 public key (base64url)
-    //       .version          client version string
-    //       .nativeTransport  true → use identity-path game channel (no WT cert)
-    //       .openChannel(room) / sendDatagramB64 / pollDatagrams / closeChannel
-    //       .fetch(path)      fetch() relative to the current conquerd:// origin
-    //
-    // Portal pages should use:  conquerd.ready.then(api => { ... })
+    // ── window.conquerd / window.doubleslash bridge script ─────────────────
+    // Injected at DocumentCreation into every d:// and conquerd:// page.
+    // Fetch URLs use window.location.protocol so the page works under either
+    // origin. window.conquerd remains the primary name for existing games;
+    // window.doubleslash is an alias of the same object.
     static const QString kBridgeJs = QStringLiteral(
         "(function(){\n"
         "  var sn = window.location.hostname;\n"
-        "  var ctxUrl = 'conquerd://' + sn + '/_conquerd/ctx.json';\n"
+        "  var origin = window.location.protocol + '//' + sn;\n"
+        "  var ctxUrl = origin + '/_conquerd/ctx.json';\n"
         "  function ch(path, qs){\n"
-        "    var u = 'conquerd://' + sn + path;\n"
+        "    var u = origin + path;\n"
         "    if (qs) u += (path.indexOf('?') >= 0 ? '&' : '?') + qs;\n"
         "    return fetch(u).then(function(r){ return r.json(); });\n"
         "  }\n"
@@ -233,15 +234,17 @@ extern "C" void conquerd_install_scheme_handler()
         "          return ch('/_conquerd/channel/close');\n"
         "        },\n"
         "        fetch: function(path,opts){\n"
-        "          var base='conquerd://'+sn;\n"
-        "          var url=path.charAt(0)==='/'?base+path:base+'/'+path;\n"
+        "          var url=path.charAt(0)==='/'?origin+path:origin+'/'+path;\n"
         "          return window.fetch(url,opts);\n"
         "        }\n"
         "      });\n"
         "    });\n"
+        "  var api = Object.freeze({supernodeId:sn,ready:ready});\n"
         "  Object.defineProperty(window,'conquerd',{\n"
-        "    configurable:false,writable:false,\n"
-        "    value:Object.freeze({supernodeId:sn,ready:ready})\n"
+        "    configurable:false,writable:false,value:api\n"
+        "  });\n"
+        "  Object.defineProperty(window,'doubleslash',{\n"
+        "    configurable:false,writable:false,value:api\n"
         "  });\n"
         "})()"
     );

@@ -20,13 +20,13 @@ pub fn create_shortcuts_for_launcher(installer_exe: &Path) -> Result<()> {
     let start_menu =
         std::path::PathBuf::from(&appdata).join("Microsoft\\Windows\\Start Menu\\Programs");
     if start_menu.exists() {
-        let lnk = start_menu.join("ConquerD.lnk");
+        let lnk = start_menu.join("DoubleSlash.lnk");
         create_lnk_shortcut(&lnk, &exe_str, "--launch", &working_dir)?;
     }
 
     // Desktop shortcut
     if let Some(desktop) = dirs::desktop_dir() {
-        let lnk = desktop.join("ConquerD.lnk");
+        let lnk = desktop.join("DoubleSlash.lnk");
         create_lnk_shortcut(&lnk, &exe_str, "--launch", &working_dir)?;
     }
 
@@ -41,7 +41,7 @@ pub fn create_shortcuts_for_launcher(installer_exe: &Path) -> Result<()> {
         let desktop_entry = format!(
             "[Desktop Entry]\n\
              Type=Application\n\
-             Name=ConquerD\n\
+             Name=DoubleSlash\n\
              Comment=Private Voice & Chat\n\
              Exec={} --launch\n\
              Terminal=false\n\
@@ -63,7 +63,7 @@ fn create_lnk_shortcut(
     use std::process::Command;
 
     let script = format!(
-        r#"$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('{}'); $s.TargetPath = '{}'; $s.Arguments = '{}'; $s.WorkingDirectory = '{}'; $s.Description = 'ConquerD - Private Voice & Chat'; $s.Save()"#,
+        r#"$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('{}'); $s.TargetPath = '{}'; $s.Arguments = '{}'; $s.WorkingDirectory = '{}'; $s.Description = 'DoubleSlash - Private Voice & Chat'; $s.Save()"#,
         lnk_path.to_string_lossy().replace('\'', "''"),
         target.replace('\'', "''"),
         arguments.replace('\'', "''"),
@@ -89,18 +89,23 @@ fn create_lnk_shortcut(
 pub fn remove_shortcuts() -> Result<()> {
     // Desktop shortcut
     if let Some(desktop) = dirs::desktop_dir() {
-        let lnk = desktop.join("ConquerD.lnk");
-        if lnk.exists() {
-            std::fs::remove_file(&lnk)?;
+        for name in ["DoubleSlash.lnk", "ConquerD.lnk"] {
+            let lnk = desktop.join(name);
+            if lnk.exists() {
+                std::fs::remove_file(&lnk)?;
+            }
         }
     }
 
     // Start Menu shortcut
     let appdata = std::env::var("APPDATA").unwrap_or_default();
-    let start_menu = std::path::PathBuf::from(appdata)
-        .join("Microsoft\\Windows\\Start Menu\\Programs\\ConquerD.lnk");
-    if start_menu.exists() {
-        std::fs::remove_file(&start_menu)?;
+    let programs =
+        std::path::PathBuf::from(appdata).join("Microsoft\\Windows\\Start Menu\\Programs");
+    for name in ["DoubleSlash.lnk", "ConquerD.lnk"] {
+        let start_menu = programs.join(name);
+        if start_menu.exists() {
+            std::fs::remove_file(&start_menu)?;
+        }
     }
 
     Ok(())

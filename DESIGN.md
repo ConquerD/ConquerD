@@ -1,17 +1,17 @@
 ---
-name: ConquerD Design System
+name: DoubleSlash Design System
 version: 1.0.0
-theme: ConquerD Dark (Dracula/Discord-inspired)
+theme: DoubleSlash Dark (Dracula/Discord-inspired)
 primary_palette: Dark (with full light mode support)
 framework: Qt 6 + QML (Rust / CXX-Qt)
 status: Active
 last_updated: 2026-06-26
 ---
 
-# ConquerD Design System
+# DoubleSlash Design System
 
 ## Overview
-ConquerD is a high-information-density, privacy-focused P2P application. The UI emphasizes clarity, speed, and minimal distraction through:
+DoubleSlash is a high-information-density, privacy-focused P2P application. The UI emphasizes clarity, speed, and minimal distraction through:
 
 - A layered dark-first aesthetic with subtle depth (no heavy shadows).
 - Discord/Dracula-inspired color language.

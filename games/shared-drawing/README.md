@@ -9,7 +9,7 @@ Real-time collaborative canvas over opaque `game.relay.v1` datagrams.
 ## Open
 
 ```
-conquerd://<supernode_id>/games/shared-drawing/?room=my-room
+d://<supernode_id>/games/shared-drawing/?room=my-room
 ```
 
 Open only from the in-app portal. External browsers are not supported.

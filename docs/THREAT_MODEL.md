@@ -92,10 +92,10 @@
 - Injection of game datagrams into other sessions.
 
 **Mitigations (current):**  
-- Portal pages load only inside the native client (`conquerd://`); no external browser transport.  
+- Portal pages load only inside the native client (`d://`); no external browser transport.  
 - Pages use the **native peer's** identity — no page-local keypair or TLS cert.  
 - Game fan-out is scoped to `GameRelayJoin` sessions on the QUIC relay; payloads are opaque.  
-- Navigation is locked to `conquerd://` in portal mode; external links open outside the app.
+- Navigation is locked to `d://` in portal mode; external links open outside the app.
 
 **Residual:** A compromised supernode can serve hostile portal HTML (same class as any untrusted web host). Peers should only open portals of supernodes they already trust via invite.
 

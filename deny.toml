@@ -1,4 +1,4 @@
-# cargo-deny configuration for ConquerD
+# cargo-deny configuration for DoubleSlash
 # https://embarkstudios.github.io/cargo-deny/
 
 # This is a minimal config focused on security for a privacy-first P2P project.

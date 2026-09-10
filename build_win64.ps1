@@ -1,14 +1,14 @@
 ﻿<#
 .SYNOPSIS
-    Build ConquerD into a portable Windows distribution (Rust + Qt).
+    Build DoubleSlash into a portable Windows distribution (Rust + Qt).
 
 .DESCRIPTION
     Builds conquerd-client (--features qt-ui,webengine) and conquerd-installer with
     cargo, runs windeployqt6 to gather Qt runtime DLLs, optionally signs
     all binaries, then produces:
 
-        dist\ConquerD\                   — portable folder (copy and run)
-        dist\ConquerD-x.y.z-win64.7z    — redistributable archive
+        dist\DoubleSlash\                   — portable folder (copy and run)
+        dist\DoubleSlash-x.y.z-win64.7z    — redistributable archive
 
     Requirements:
       * Rust + cargo on PATH (msvc toolchain, x86_64-pc-windows-msvc)
@@ -39,7 +39,7 @@ $RUST_DIR  = Join-Path $ROOT "rust"
 $CLIENT_DIR = Join-Path $RUST_DIR "conquerd-client"
 $QML_DIR   = Join-Path $CLIENT_DIR "qml"
 $DIST      = Join-Path $ROOT "dist"
-$BUNDLE    = Join-Path $DIST "ConquerD"
+$BUNDLE    = Join-Path $DIST "DoubleSlash"
 
 $PROFILE_NAME = if ($env:CONQUERD_DEBUG -eq "1") { "debug" } else { "release" }
 [string[]]$CARGO_ARGS = if ($PROFILE_NAME -eq "release") { @("--release") } else { @() }
@@ -57,7 +57,7 @@ $_vLine = Select-String -Path $_cargoToml -Pattern '^version\s*=\s*"([^"]+)"' |
     Select-Object -First 1
 if (-not $_vLine) { Write-Error "Could not parse version from $_cargoToml" }
 $VERSION = $_vLine.Matches.Groups[1].Value
-Write-Host "==> ConquerD v$VERSION  (profile: $PROFILE_NAME)"
+Write-Host "==> DoubleSlash v$VERSION  (profile: $PROFILE_NAME)"
 
 # ── Locate Qt ─────────────────────────────────────────────────────────────────
 $QT_ROOT = $null
@@ -219,7 +219,7 @@ if (-not (Test-Path $INSTALLER_EXE)) {
 }
 
 # ── Prepare dist folder ───────────────────────────────────────────────────────
-Write-Host "`n==> Preparing dist\ConquerD\..."
+Write-Host "`n==> Preparing dist\DoubleSlash\..."
 $resolvedRoot = [System.IO.Path]::GetFullPath($ROOT).TrimEnd('\') + '\'
 $resolvedBundle = [System.IO.Path]::GetFullPath($BUNDLE)
 if (-not $resolvedBundle.StartsWith($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -228,12 +228,12 @@ if (-not $resolvedBundle.StartsWith($resolvedRoot, [System.StringComparison]::Or
 if (Test-Path $BUNDLE) {
     Remove-Item -LiteralPath $resolvedBundle -Recurse -Force
     if (Test-Path $BUNDLE) {
-        Write-Error "Failed to remove $BUNDLE -- close any running ConquerD processes and retry."
+        Write-Error "Failed to remove $BUNDLE -- close any running DoubleSlash processes and retry."
     }
 }
 New-Item -ItemType Directory -Path $BUNDLE | Out-Null
 
-$BUNDLE_EXE       = Join-Path $BUNDLE "ConquerD.exe"
+$BUNDLE_EXE       = Join-Path $BUNDLE "DoubleSlash.exe"
 $BUNDLE_INSTALLER = Join-Path $BUNDLE "conquerd-installer.exe"
 Copy-Item $CLIENT_EXE    $BUNDLE_EXE
 Copy-Item $INSTALLER_EXE $BUNDLE_INSTALLER
@@ -340,8 +340,8 @@ Write-Host "`n    Copied conquerd-installer.exe to dist\ (detect-archive entry p
 
 # ── Create .7z archive ────────────────────────────────────────────────────────
 # The installer downloads this 7z from GitHub Releases for updates.
-# It contains the full self-contained portable `ConquerD/` folder (exe + Qt runtime + QML + resources).
-$archiveName = "ConquerD-${VERSION}-win64.7z"
+# It contains the full self-contained portable `DoubleSlash/` folder (exe + Qt runtime + QML + resources).
+$archiveName = "DoubleSlash-${VERSION}-win64.7z"
 $archivePath = Join-Path $DIST $archiveName
 
 $sevenZip = Get-Command "7z" -ErrorAction SilentlyContinue
@@ -396,4 +396,4 @@ if (Test-Path $archivePath) {
 }
 
 Write-Host ""
-Write-Host "    ConquerD v${VERSION}" -ForegroundColor Cyan
+Write-Host "    DoubleSlash v${VERSION}" -ForegroundColor Cyan

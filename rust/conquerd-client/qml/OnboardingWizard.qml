@@ -19,7 +19,7 @@ Dialog {
     property bool copiedInvite: false
     property string setupStatus: ""
 
-    title: "Welcome to ConquerD"
+    title: "Welcome to DoubleSlash"
     modal: true
     closePolicy: Dialog.NoAutoClose
     width: 680
@@ -130,7 +130,7 @@ Dialog {
                     spacing: 2
 
                     Text {
-                        text: "Set Up ConquerD"
+                        text: "Set Up DoubleSlash"
                         color: Theme.text
                         font.pixelSize: Theme.fontSizeTitle
                         font.bold: true
@@ -391,7 +391,7 @@ Dialog {
                         }
 
                         Text {
-                            text: "ConquerD reuses this port when available and tries the next port if another local client already uses it."
+                            text: "DoubleSlash reuses this port when available and tries the next port if another local client already uses it."
                             color: Theme.muted
                             font.pixelSize: Theme.fontSizeCaption
                             wrapMode: Text.WordWrap
@@ -399,7 +399,7 @@ Dialog {
                         }
 
                         Text {
-                            text: "Firewall: allow ConquerD, or allow inbound and outbound UDP on this port. Prefer Private networks on a trusted LAN."
+                            text: "Firewall: allow DoubleSlash, or allow inbound and outbound UDP on this port. Prefer Private networks on a trusted LAN."
                             color: Theme.text
                             font.pixelSize: Theme.fontSizeCaption
                             wrapMode: Text.WordWrap
@@ -477,7 +477,7 @@ Dialog {
                         StyledTextField {
                             id: incomingInviteField
                             Layout.fillWidth: true
-                            placeholderText: "conquerd://invite#..."
+                            placeholderText: "d://invite#..."
                             Keys.onReturnPressed: if (text.trim().length > 0 && root.appBackend) root.appBackend.pasteInvite(text.trim())
                         }
 
@@ -598,7 +598,7 @@ Dialog {
 
                         CheckBox {
                             id: uriOption
-                            text: "Open conquerd:// links in ConquerD"
+                            text: "Open d:// links in DoubleSlash"
                             checked: root.isWindows
                             enabled: root.isWindows
                             font.pixelSize: Theme.fontSizeBody

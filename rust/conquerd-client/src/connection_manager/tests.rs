@@ -169,8 +169,8 @@ fn room_invite_url_round_trips() {
         "",
         "",
     );
-    assert!(url.starts_with("conquerd://room#"), "url = {url}");
-    let encoded = url.strip_prefix("conquerd://room#").unwrap();
+    assert!(url.starts_with("d://room#"), "url = {url}");
+    let encoded = url.strip_prefix("d://room#").unwrap();
     assert_eq!(
         parse_room_invite(encoded).unwrap(),
         RoomInvitePayload {
@@ -207,7 +207,7 @@ fn room_invite_carries_space_fields() {
         proof,
         grant,
     );
-    let encoded = url.strip_prefix("conquerd://room#").unwrap();
+    let encoded = url.strip_prefix("d://room#").unwrap();
     let got = parse_room_invite(encoded).unwrap();
     // Re-parse the extracted JSON text and compare structurally (key order may
     // differ after the round-trip, but the fields — and thus signatures — match).
@@ -229,7 +229,7 @@ fn room_invite_carries_space_fields() {
         "",
         "",
     );
-    let plain_got = parse_room_invite(plain.strip_prefix("conquerd://room#").unwrap()).unwrap();
+    let plain_got = parse_room_invite(plain.strip_prefix("d://room#").unwrap()).unwrap();
     assert!(plain_got.space_root.is_empty() && plain_got.space_proof.is_empty());
 }
 
@@ -263,7 +263,7 @@ fn room_invite_wire_fields_are_stable() {
         "",
         "",
     );
-    let encoded = url.strip_prefix("conquerd://room#").unwrap();
+    let encoded = url.strip_prefix("d://room#").unwrap();
     let json_bytes =
         base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded).unwrap();
     let obj: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
@@ -309,8 +309,8 @@ fn personal_invite_url_includes_ephemeral_and_lan_hint() {
     let url =
         t.cm.generate_invite_url()
             .expect("generate_invite_url should succeed with a QUIC endpoint");
-    assert!(url.starts_with("conquerd://invite#"), "url={url}");
-    let encoded = url.strip_prefix("conquerd://invite#").unwrap();
+    assert!(url.starts_with("d://invite#"), "url={url}");
+    let encoded = url.strip_prefix("d://invite#").unwrap();
     let bytes = base64::Engine::decode(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
         encoded.trim_end_matches('='),

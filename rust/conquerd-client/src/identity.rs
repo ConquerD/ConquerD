@@ -25,14 +25,15 @@ const KDF_M: u32 = 65536; // 64 MiB
 const KDF_P: u32 = 4;
 const KEYRING_SERVICE: &str = "conquerd";
 
-pub const DEFAULT_KEY_DIR_SUFFIX: &str = ".conquerd";
+pub const DEFAULT_KEY_DIR_SUFFIX: &str = conquerd_features::DEFAULT_PROFILE_DIR;
+pub const LEGACY_KEY_DIR_SUFFIX: &str = conquerd_features::LEGACY_PROFILE_DIR;
 pub const IDENTITY_FILENAME: &str = "identity.dat";
 
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
 
-/// Owner of a Conquerd Ed25519 keypair.
+/// Owner of a DoubleSlash Ed25519 keypair.
 ///
 /// The secret seed is held inside `SigningKey` which zeroizes on drop.
 pub struct Identity {
@@ -133,14 +134,31 @@ impl Identity {
 
     // -- persistence --------------------------------------------------------
 
-    /// Default key directory: `~/.conquerd`
+    /// Default key directory: `~/.doubleslash`, falling back to `~/.conquerd`
+    /// when that profile already exists so a rebrand does not strand identity.
+    ///
+    /// Resolution order: `DOUBLESLASH_KEY_DIR` / `CONQUERD_KEY_DIR` /
+    /// `DOUBLESLASH_HOME` / `CONQUERD_HOME` → existing `~/.doubleslash` →
+    /// existing `~/.conquerd` → create `~/.doubleslash`.
     pub fn default_key_dir() -> PathBuf {
-        if let Ok(path) =
-            std::env::var("CONQUERD_KEY_DIR").or_else(|_| std::env::var("CONQUERD_HOME"))
-        {
+        if let Some(path) = conquerd_features::first_env(&[
+            conquerd_features::ENV_KEY_DIR,
+            conquerd_features::ENV_KEY_DIR_LEGACY,
+            conquerd_features::ENV_HOME,
+            conquerd_features::ENV_HOME_LEGACY,
+        ]) {
             return PathBuf::from(path);
         }
-        dirs_or_home().join(DEFAULT_KEY_DIR_SUFFIX)
+        let home = dirs_or_home();
+        let current = home.join(DEFAULT_KEY_DIR_SUFFIX);
+        if current.exists() {
+            return current;
+        }
+        let legacy = home.join(LEGACY_KEY_DIR_SUFFIX);
+        if legacy.exists() {
+            return legacy;
+        }
+        current
     }
 
     /// Save as AES-256-GCM encrypted (`identity.dat`).
@@ -414,16 +432,25 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_key_dir = std::env::var("CONQUERD_KEY_DIR").ok();
         let old_home = std::env::var("CONQUERD_HOME").ok();
+        let old_ds_key = std::env::var("DOUBLESLASH_KEY_DIR").ok();
+        let old_ds_home = std::env::var("DOUBLESLASH_HOME").ok();
         let dir = tempdir().unwrap();
         let home_dir = dir.path().join("client_home");
         let key_dir = dir.path().join("client_keys");
 
         std::env::remove_var("CONQUERD_KEY_DIR");
+        std::env::remove_var("DOUBLESLASH_KEY_DIR");
+        std::env::remove_var("DOUBLESLASH_HOME");
         std::env::set_var("CONQUERD_HOME", &home_dir);
         assert_eq!(Identity::default_key_dir(), home_dir);
 
         std::env::set_var("CONQUERD_KEY_DIR", &key_dir);
         assert_eq!(Identity::default_key_dir(), key_dir);
+
+        std::env::remove_var("CONQUERD_KEY_DIR");
+        std::env::remove_var("CONQUERD_HOME");
+        std::env::set_var("DOUBLESLASH_HOME", &home_dir);
+        assert_eq!(Identity::default_key_dir(), home_dir);
 
         match old_key_dir {
             Some(value) => std::env::set_var("CONQUERD_KEY_DIR", value),
@@ -432,6 +459,14 @@ mod tests {
         match old_home {
             Some(value) => std::env::set_var("CONQUERD_HOME", value),
             None => std::env::remove_var("CONQUERD_HOME"),
+        }
+        match old_ds_key {
+            Some(value) => std::env::set_var("DOUBLESLASH_KEY_DIR", value),
+            None => std::env::remove_var("DOUBLESLASH_KEY_DIR"),
+        }
+        match old_ds_home {
+            Some(value) => std::env::set_var("DOUBLESLASH_HOME", value),
+            None => std::env::remove_var("DOUBLESLASH_HOME"),
         }
     }
 

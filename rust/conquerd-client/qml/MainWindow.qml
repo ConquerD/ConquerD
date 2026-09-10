@@ -12,7 +12,7 @@ import ConquerD.Client 1.0
 
 ApplicationWindow {
     id: root
-    title: ""
+    title: "DoubleSlash"
     width: 1100
     height: 700
     visible: false
@@ -740,7 +740,7 @@ ApplicationWindow {
             ToolTip.text: errorMessage !== ""
                 ? "Update failed to start: " + errorMessage + "\nClick to retry"
                 : (installing
-                    ? "Installing " + tag + "\u2026 ConquerD will restart"
+                    ? "Installing " + tag + "\u2026 DoubleSlash will restart"
                     : "Update " + tag + " ready \u2014 click to update and restart")
 
             onClicked: {
@@ -1439,7 +1439,7 @@ ApplicationWindow {
                 try {
                     var msg = JSON.parse(msgJson)
                     if (!msg.mine) {
-                        var sender = msg.sender || qsTr("ConquerD")
+                        var sender = msg.sender || qsTr("DoubleSlash")
                         var body = (msg.body || qsTr("New message")).substring(0, 80)
                         trayIcon.showMessage(sender, body,
                                              Platform.SystemTrayIcon.Information,
@@ -1451,7 +1451,7 @@ ApplicationWindow {
         // Show a tray balloon when a missed call is recorded.
         function onMissed_callsChanged() {
             if (backend.missed_calls > 0 && trayIcon.available) {
-                trayIcon.showMessage(qsTr("ConquerD"),
+                trayIcon.showMessage(qsTr("DoubleSlash"),
                                      qsTr("Missed call"),
                                      Platform.SystemTrayIcon.Warning,
                                      5000)
@@ -2927,11 +2927,11 @@ ApplicationWindow {
         id: trayIcon
         visible: true
         icon.source: "qrc:/assets/conquerd.ico"
-        tooltip: backend.session_banner.length > 0 ? backend.session_banner : "ConquerD"
+        tooltip: backend.session_banner.length > 0 ? backend.session_banner : "DoubleSlash"
 
         menu: Platform.Menu {
             Platform.MenuItem {
-                text: qsTr("Show ConquerD")
+                text: qsTr("Show DoubleSlash")
                 onTriggered: root.showFromTray()
             }
             Platform.MenuItem {
@@ -3013,7 +3013,7 @@ ApplicationWindow {
         root.hide()
         if (!root._trayHintShown && trayIcon.available) {
             trayIcon.showMessage(
-                qsTr("ConquerD is still running"),
+                qsTr("DoubleSlash is still running"),
                 qsTr("The window was minimized to the tray. Click the tray icon to restore it, or use Quit to exit."),
                 Platform.SystemTrayIcon.Information,
                 5000)
@@ -3023,7 +3023,7 @@ ApplicationWindow {
 
     // Closing the window quits the application — unless "Minimize to tray" is
     // enabled and a tray icon is available, in which case the window is hidden
-    // into the tray and ConquerD keeps running in the background. (Without the
+    // into the tray and DoubleSlash keeps running in the background. (Without the
     // setting, hiding on close surprised users who had no visible indication
     // the process was still alive.) The tray icon's Quit / Show items always
     // provide explicit control.

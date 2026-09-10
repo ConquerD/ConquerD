@@ -9,7 +9,7 @@ Multiplayer paddle game over opaque `game.relay.v1` datagrams.
 ## Open
 
 ```
-conquerd://<supernode_id>/games/brick-breaker/?room=my-lobby
+d://<supernode_id>/games/brick-breaker/?room=my-lobby
 ```
 
 Open only from the in-app portal. External browsers are not supported.

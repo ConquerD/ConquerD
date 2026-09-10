@@ -2,7 +2,7 @@
 name = "conquerd-client"
 version = "1.0.0"
 edition = "2021"
-description = "Native Rust desktop client for the Conquerd peer-connectivity framework."
+description = "Native Rust desktop client for the DoubleSlash (D://) peer-connectivity framework."
 
 [[bin]]
 name = "conquerd-client"

@@ -457,7 +457,7 @@ fn libc_alloc(src: &[u8]) -> *mut u8 {
     ptr
 }
 
-/// Parse `conquerd://<supernode_id>/<path>[?query]` into its components.
+/// Parse `d://<supernode_id>/<path>[?query]` (or legacy `conquerd://`) into its components.
 ///
 /// Chromium lower-cases the authority of every `scheme://` URL, so the
 /// `supernode_id` returned here is normalised through
@@ -465,14 +465,12 @@ fn libc_alloc(src: &[u8]) -> *mut u8 {
 /// [`register_portal_peer_id`], that canonical form is returned;
 /// otherwise the lower-cased authority is returned as-is.
 ///
-/// Also accepts `conquerd:/PEERID/path` (single slash, no authority) for
+/// Also accepts `d:/PEERID/path` (single slash, no authority) for
 /// robustness in case a relative-URL resolution produces it.
 ///
 /// Returns `None` if the URL does not match the expected structure.
 fn parse_conquerd_url(url: &str) -> Option<(String, String, Option<String>)> {
-    let rest = url
-        .strip_prefix("conquerd://")
-        .or_else(|| url.strip_prefix("conquerd:/"))?;
+    let rest = conquerd_features::strip_scheme(url)?;
     // authority = everything before the first '/'
     let (authority, path_and_query) = if let Some(idx) = rest.find('/') {
         (&rest[..idx], &rest[idx..])
@@ -507,6 +505,10 @@ mod tests {
 
     #[test]
     fn basic_parse() {
+        let (sn, path, q) = parse_conquerd_url("d://abc123/index.html").unwrap();
+        assert_eq!(sn, "abc123");
+        assert_eq!(path, "/index.html");
+        assert!(q.is_none());
         let (sn, path, q) = parse_conquerd_url("conquerd://abc123/index.html").unwrap();
         assert_eq!(sn, "abc123");
         assert_eq!(path, "/index.html");
@@ -515,14 +517,14 @@ mod tests {
 
     #[test]
     fn with_query() {
-        let (_, path, q) = parse_conquerd_url("conquerd://abc123/search?q=hello").unwrap();
+        let (_, path, q) = parse_conquerd_url("d://abc123/search?q=hello").unwrap();
         assert_eq!(path, "/search");
         assert_eq!(q.as_deref(), Some("q=hello"));
     }
 
     #[test]
     fn bare_authority_becomes_root() {
-        let (sn, path, q) = parse_conquerd_url("conquerd://abc123").unwrap();
+        let (sn, path, q) = parse_conquerd_url("d://abc123").unwrap();
         assert_eq!(sn, "abc123");
         assert_eq!(path, "/");
         assert!(q.is_none());
@@ -530,6 +532,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_authority() {
+        assert!(parse_conquerd_url("d:///index.html").is_none());
         assert!(parse_conquerd_url("conquerd:///index.html").is_none());
     }
 

@@ -29,6 +29,9 @@
 #  include <windowsx.h>
 #  include <dwmapi.h>
 #  pragma comment(lib, "dwmapi.lib")
+#  ifndef DWMWA_COLOR_NONE
+#    define DWMWA_COLOR_NONE ((COLORREF)0xFFFFFFFE)
+#  endif
 #endif
 
 namespace {
@@ -86,6 +89,15 @@ static void applySnapFriendlyStyle(HWND hwnd)
     MARGINS margins = {1, 1, 1, 1};
     DwmExtendFrameIntoClientArea(hwnd, &margins);
 
+    // Windows 11 still paints an immersive caption on WS_CAPTION windows
+    // even after WM_NCCALCSIZE claims the full client area. COLOR_NONE
+    // suppresses that overlay so only TitleBar.qml is visible.
+    const COLORREF noCaption = DWMWA_COLOR_NONE;
+    // 35 = DWMWA_CAPTION_COLOR, 36 = DWMWA_TEXT_COLOR (Win11). Numeric so
+    // older SDKs still compile; ignored on Windows 10.
+    DwmSetWindowAttribute(hwnd, 35, &noCaption, sizeof(noCaption));
+    DwmSetWindowAttribute(hwnd, 36, &noCaption, sizeof(noCaption));
+
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                  SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
                      | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
@@ -122,6 +134,13 @@ public:
                 *result = 0;
             }
             return true;
+        case WM_SHOWWINDOW:
+            // Qt reapplies window flags when the HWND is first shown, which
+            // can restore the native caption until the next frame change.
+            if (msg->wParam) {
+                applySnapFriendlyStyle(msg->hwnd);
+            }
+            return false;
         default:
             return false;
         }

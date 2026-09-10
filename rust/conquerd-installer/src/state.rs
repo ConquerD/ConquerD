@@ -137,13 +137,16 @@ pub fn version_dir(base_dir: &Path, version: &str) -> PathBuf {
     base_dir.join(format!("conquerd_{version}"))
 }
 
-/// Find the ConquerD executable inside a versioned install directory.
+/// Find the DoubleSlash executable inside a versioned install directory.
 pub fn find_exe(version_dir: &Path) -> Option<PathBuf> {
     let candidates = [
-        "ConquerD.exe",
+        crate::brand::WINDOWS_EXE,
+        crate::brand::WINDOWS_EXE_LEGACY,
         "conquerd.exe",
+        "DoubleSlash/DoubleSlash.exe",
         "ConquerD/ConquerD.exe",
         "ConquerD/conquerd.exe",
+        "DoubleSlash/conquerd.exe",
     ];
     for rel in &candidates {
         let p = version_dir.join(rel);
@@ -160,23 +163,27 @@ pub fn is_newer(remote: &str, local: &str) -> bool {
     parse(remote) > parse(local)
 }
 
-/// Kill all running ConquerD.exe processes (Windows).
+/// Kill all running DoubleSlash.exe / ConquerD.exe processes (Windows).
 #[cfg(windows)]
 pub fn kill_running_instances() {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/IM", "ConquerD.exe"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    for image in [crate::brand::WINDOWS_EXE, crate::brand::WINDOWS_EXE_LEGACY] {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", image])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 #[cfg(not(windows))]
 pub fn kill_running_instances() {
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "ConquerD"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    for pattern in ["DoubleSlash", "ConquerD"] {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", pattern])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// Installed launcher filename for the given update channel.

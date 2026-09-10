@@ -142,7 +142,7 @@ params = { allow_public_rooms = false, allow_private_rooms = true }
 ```
 
 ### In-app portal (`web.host.app.v1` + `game.relay.v1`)
-- `web.host.app.v1` ships enabled by default: portal pages for the desktop client's embedded browser (`conquerd://` scheme over QUIC bidi streams).
+- `web.host.app.v1` ships enabled by default: portal pages for the desktop client's embedded browser (`d://` scheme over QUIC bidi streams).
 - `game.relay.v1`: opaque game-session datagram fan-out on the identity QUIC relay (fixed channel tag). Games open only from the native portal — **no public HTTP/WebTransport port, no TLS certs**.
 - Static assets live in `<data_dir>/web/` and `<data_dir>/games/<slug>/` (seeded by the binary).
 

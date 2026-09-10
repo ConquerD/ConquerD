@@ -203,7 +203,7 @@ example"]
     WS -->|"WebSocket — signaling"| SIG
     QUIC -->|"QUIC datagrams — relay"| REL_S
     QUIC -->|"QUIC datagrams — SFU audio"| SFU_S
-    WAC -->|"HTTP / conquerd://"| WAM
+    WAC -->|"HTTP / d://"| WAM
 
     %% ── Supernode internals ──────────────────────────────
     SIG --> HS_S & PS_S & ACCESS
@@ -219,7 +219,7 @@ example"]
     %% ── In-app portal games ──────────────────────────────
     GAMES --> SDK
     SDK -->|"portal channel + QUIC relay"| REL_S
-    BP -.->|"renders conquerd:// pages"| GAMES
+    BP -.->|"renders d:// pages"| GAMES
 
     %% ── Installer ────────────────────────────────────────
     IGUI --> GH_API & EXTRACT
@@ -263,7 +263,7 @@ example"]
 | **conquerd-installer** | Cross-platform egui updater GUI; polls GitHub Releases |
 | **conquerd-supernode-manager** | Separate workspace: cluster provisioning, `cluster-sync`, `build-deploy`, remote `exec` |
 | **web-sdk** | In-app portal game SDK (identity QUIC channel APIs) |
-| **games/** | Demo multiplayer games opened only via `conquerd://` portal |
+| **games/** | Demo multiplayer games opened only via `d://` portal |
 
 ## Key Data Flows
 

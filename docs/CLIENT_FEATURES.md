@@ -116,12 +116,12 @@ The peer list is the client's own record of who it trusts.
 
 ### 3. Invites
 
-The only way a peer relationship starts. A `conquerd://` URL carrying an
+The only way a peer relationship starts. A `d://` URL carrying an
 ephemeral X25519 key; the handshake completes over the supernode.
 
 * **Core** — `connection_manager/manager/invite.rs`.
 * **Desktop** — `generateInvite`, `copyInvite`, `pasteInvite`.
-* **Android** — `invite.generate`, `invite.accept`, plus a `conquerd://` intent
+* **Android** — `invite.generate`, `invite.accept`, plus a `d://` intent
   filter so a tapped link opens the app. Links that arrive before unlock are
   held and replayed.
 
@@ -183,7 +183,7 @@ signed, and admission is proved against it rather than asserted.
   before you build this for another client. **Proof-carrying joins are handled
   by the core, not the client**: `handle_accept_room_invite` stashes the
   invite's space creds and `send_room_join` attaches them to the `SfuJoin`
-  single-use, so any client that forwards a `conquerd://…room#…` link to
+  single-use, so any client that forwards a `d://…room#…` link to
   `AcceptInvite` gets proof-based admission for free. And **`room.list`
   already carries the nesting** — `space_id` and `parent_id` are stamped onto
   the stored entry by `adopt_room_into_space` — so a flat list is a UI choice,
@@ -291,14 +291,14 @@ member must resolve to the same place, and sessions fail over between members.
 
 ### 14. Portal and web apps
 
-`conquerd://` pages hosted by a supernode, with a JS SDK that reaches the
+`d://` pages hosted by a supernode, with a JS SDK that reaches the
 client's QUIC channels — the multiplayer game demos run on this.
 
 * **Core** — `web_app_client.rs` (`web.host.app.v1`), `ui/scheme.rs`.
 * **Desktop** — `openNodePortal`, `ConquerdWebView.qml` (Qt WebEngine).
 * **Android** — a `WebView` reached from a supernode row in Settings.
   `portal.fetch` answers every request the WebView makes, because a
-  `conquerd://` URL is not fetchable by a browser: there is no such network
+  `d://` URL is not fetchable by a browser: there is no such network
   protocol, and the page is served over the identity QUIC relay. Bodies run to
   32 MB, so a fetch is written to a cache file and the reply carries the path —
   `shouldInterceptRequest` wants a stream anyway.

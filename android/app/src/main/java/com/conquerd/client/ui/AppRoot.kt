@@ -1885,7 +1885,7 @@ private fun PortalScreen(
 
                     }
 
-                    loadUrl("conquerd://$supernodeId/index.html")
+                    loadUrl("d://$supernodeId/index.html")
                 }
             },
         )
@@ -2456,7 +2456,7 @@ private fun AcceptInviteDialog(onDismiss: () -> Unit, onAccept: (String) -> Unit
             OutlinedTextField(
                 value = url,
                 onValueChange = { url = it },
-                label = { Text("conquerd:// link") },
+                label = { Text("d:// link") },
                 singleLine = false,
                 maxLines = 4,
             )

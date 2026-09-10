@@ -1,6 +1,6 @@
-// ConquerD in-app portal SDK — identity-path game channel.
+// DoubleSlash in-app portal SDK — identity-path game channel.
 //
-// Games load inside the native client (`conquerd://` + window.conquerd).
+// Games load inside the native client (`d://` + window.conquerd).
 // Datagrams ride the authenticated QUIC relay via portal channel APIs
 // (`/_conquerd/channel/*`). There is no WebTransport / self-signed TLS path.
 //
@@ -189,8 +189,8 @@ export class ConquerdClient {
     async connect() {
         if (typeof window === "undefined" || !window?.conquerd?.ready) {
             const err = new Error(
-                "ConquerD games require the native in-app portal " +
-                "(conquerd:// + window.conquerd). External browsers are not supported."
+                "DoubleSlash games require the native in-app portal " +
+                "(d:// + window.conquerd). External browsers are not supported."
             );
             this._emit("error", err);
             throw err;

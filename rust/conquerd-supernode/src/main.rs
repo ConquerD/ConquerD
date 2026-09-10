@@ -924,7 +924,7 @@ impl SupernodeState {
 
     /// Build the JSON payload for `SUPERNODE_INFO`. Always includes the
     /// advertised capability list. When `web.host.app.v1` is enabled we
-    /// also advertise the canonical `conquerd://` URL pointing at this
+    /// also advertise the canonical `d://` URL pointing at this
     /// node's identity; native clients use it to open the supernode's
     /// in-app portal in their embedded Chromium view.
     fn supernode_info_payload(&self) -> serde_json::Value {
@@ -942,7 +942,10 @@ impl SupernodeState {
             let obj = payload.as_object_mut().unwrap();
             obj.insert(
                 "app_url".into(),
-                json!(format!("conquerd://{}/", self.identity.public_id())),
+                json!(conquerd_features::mint_uri(&format!(
+                    "{}/",
+                    self.identity.public_id()
+                ))),
             );
         }
         // Advertise the signed cluster roster so a client can fail over to any
@@ -987,7 +990,7 @@ impl SupernodeState {
     /// Ensure a room-admitted peer can open the portal / room-audio QUIC path
     /// even when they never completed a full supernode invite handshake.
     ///
-    /// Room invites (`conquerd://room#…`) deliberately skip the handshake, so
+    /// Room invites (`d://room#…`) deliberately skip the handshake, so
     /// the peer is WS-connected and in the SFU ACL but not in `peers.json`.
     /// Without a relay ticket the client shows "Portal unavailable" because
     /// `web.host.app.v1` rides the identity QUIC relay only. Trusting the
@@ -3547,7 +3550,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Install the `web.host.app.v1` bidi-stream hook on the relay so the
     // embedded Chromium view in the desktop client can fetch
-    // `conquerd://<supernode_pub>/<path>` assets from `<data_dir>/web/`
+    // `d://<supernode_pub>/<path>` assets from `<data_dir>/web/`
     // and `<data_dir>/games/` over the already-identity-verified QUIC
     // session. The hook is fire-and-forget; the module spawns its own
     // per-stream task with a deadline so a slow client cannot pin us.

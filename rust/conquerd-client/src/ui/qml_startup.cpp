@@ -6,6 +6,7 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
+#include <QTimer>
 #include <QWindow>
 #include <cstdio>
 
@@ -36,6 +37,17 @@ static void qtLogToStderr(QtMsgType type, const QMessageLogContext &ctx, const Q
 
 extern "C" void conquerd_install_qt_message_handler(void) {
     qInstallMessageHandler(qtLogToStderr);
+}
+
+/// Product identity for the native caption, taskbar, and alt-tab. Must run
+/// after QGuiApplication exists and before the first window is shown; an
+/// empty ApplicationWindow title otherwise falls back to the executable
+/// basename (still `conquerd-client` from cargo).
+extern "C" void conquerd_set_app_identity(void) {
+    QGuiApplication::setApplicationName(QStringLiteral("DoubleSlash"));
+    QGuiApplication::setApplicationDisplayName(QStringLiteral("DoubleSlash"));
+    QGuiApplication::setOrganizationName(QStringLiteral("DoubleSlash"));
+    QGuiApplication::setOrganizationDomain(QStringLiteral("doubleslash.space"));
 }
 
 extern "C" void conquerd_qml_post_load_check(QQmlApplicationEngine *engine) {
@@ -69,6 +81,19 @@ extern "C" void conquerd_qml_post_load_check(QQmlApplicationEngine *engine) {
             // Force HWND creation then install snap-friendly frame chrome.
             (void)quickWin->winId();
             conquerd_enable_windows_snap(static_cast<QWindow *>(quickWin));
+            // Qt re-applies window flags at show(), which undoes GWL_STYLE
+            // until the next frame change (the user dragging the window).
+            // Re-arm chrome after the window becomes visible.
+            QObject::connect(quickWin, &QWindow::visibleChanged, quickWin,
+                             [quickWin](bool vis) {
+                                 if (!vis) {
+                                     return;
+                                 }
+                                 QTimer::singleShot(0, quickWin, [quickWin]() {
+                                     conquerd_enable_windows_snap(
+                                         static_cast<QWindow *>(quickWin));
+                                 });
+                             });
 #endif
         } else if (auto *win = qobject_cast<QWindow *>(obj)) {
             sawWindow = true;
@@ -82,6 +107,14 @@ extern "C" void conquerd_qml_post_load_check(QQmlApplicationEngine *engine) {
 #if defined(Q_OS_WIN)
             (void)win->winId();
             conquerd_enable_windows_snap(win);
+            QObject::connect(win, &QWindow::visibleChanged, win, [win](bool vis) {
+                if (!vis) {
+                    return;
+                }
+                QTimer::singleShot(0, win, [win]() {
+                    conquerd_enable_windows_snap(win);
+                });
+            });
 #endif
         }
     }

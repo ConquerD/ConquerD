@@ -104,7 +104,7 @@ Item {
                 return
             }
 
-            if (scheme === "conquerd") {
+            if (scheme === "d" || scheme === "conquerd") {
                 if (root.allowConquerd || root.allowAll) {
                     request.accept()
                 } else {

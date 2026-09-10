@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod brand;
 mod extract;
 mod github;
 mod gui;
@@ -77,7 +78,7 @@ fn attach_parent_console() {
 #[cfg(not(windows))]
 fn attach_parent_console() {}
 
-/// ConquerD Installer / Updater / Launcher
+/// DoubleSlash Installer / Updater / Launcher
 #[derive(Parser, Debug)]
 #[command(name = "conquerd-installer", version, about)]
 struct Cli {
@@ -85,7 +86,7 @@ struct Cli {
     #[arg(short, long)]
     archive: Option<PathBuf>,
 
-    /// Base installation directory (default: %LOCALAPPDATA%\ConquerD)
+    /// Base installation directory (default: %LOCALAPPDATA%\DoubleSlash)
     #[arg(short = 'd', long)]
     install_dir: Option<PathBuf>,
 
@@ -113,7 +114,7 @@ struct Cli {
     #[arg(long)]
     update_and_relaunch: bool,
 
-    /// Kill running ConquerD.exe processes before updating
+    /// Kill running DoubleSlash.exe processes before updating
     #[arg(long)]
     kill: bool,
 
@@ -128,13 +129,20 @@ struct Cli {
 }
 
 fn default_install_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ConquerD")
+    let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    let current = base.join(brand::WINDOWS_INSTALL_DIR);
+    if current.exists() {
+        return current;
+    }
+    let legacy = base.join(brand::WINDOWS_INSTALL_DIR_LEGACY);
+    if legacy.exists() {
+        return legacy;
+    }
+    current
 }
 
 /// Windows client archives published by our build scripts:
-/// `ConquerD-<version>-win64.7z` or `ConquerD-nightly-win64.7z`.
+/// `DoubleSlash-<version>-win64.7z` (legacy `ConquerD-…` still accepted).
 fn is_conquerd_client_archive(path: &std::path::Path) -> bool {
     if !path
         .extension()
@@ -147,16 +155,24 @@ fn is_conquerd_client_archive(path: &std::path::Path) -> bool {
     };
     // Windows-only `.7z` name; do not use `nightly_archive_name()` here — that
     // varies by target OS (AppImage, dmg, …) and breaks archive detection tests on Linux CI.
-    if stem.eq_ignore_ascii_case(github::WINDOWS_CLIENT_NIGHTLY_7Z.trim_end_matches(".7z")) {
+    if stem.eq_ignore_ascii_case(github::WINDOWS_CLIENT_NIGHTLY_7Z.trim_end_matches(".7z"))
+        || stem.eq_ignore_ascii_case("ConquerD-nightly-win64")
+    {
         return true;
     }
-    let prefix = "ConquerD-";
     let suffix = "-win64";
-    if !stem.starts_with(prefix) || !stem.ends_with(suffix) {
-        return false;
+    for prefix in ["DoubleSlash-", "ConquerD-"] {
+        if stem.len() > prefix.len() + suffix.len()
+            && stem[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && stem.ends_with(suffix)
+        {
+            let version = &stem[prefix.len()..stem.len() - suffix.len()];
+            if version_token_is_semver(version) {
+                return true;
+            }
+        }
     }
-    let version = &stem[prefix.len()..stem.len() - suffix.len()];
-    version_token_is_semver(version)
+    false
 }
 
 fn version_token_is_semver(token: &str) -> bool {
@@ -235,7 +251,10 @@ fn validate_sha256(archive: &std::path::Path) -> anyhow::Result<bool> {
 /// immediately before spawning to close the extract→exec TOCTOU window.
 fn launch_app(version_dir: &std::path::Path) -> anyhow::Result<()> {
     let exe = state::find_exe(version_dir).ok_or_else(|| {
-        anyhow::anyhow!("No ConquerD executable found in {}", version_dir.display())
+        anyhow::anyhow!(
+            "No DoubleSlash executable found in {}",
+            version_dir.display()
+        )
     })?;
     let working_dir = exe.parent().unwrap_or(version_dir);
 
@@ -743,10 +762,16 @@ mod tests {
     #[test]
     fn is_conquerd_client_archive_accepts_release_and_nightly_names() {
         assert!(is_conquerd_client_archive(std::path::Path::new(
+            "DoubleSlash-1.0.0-win64.7z"
+        )));
+        assert!(is_conquerd_client_archive(std::path::Path::new(
             "ConquerD-1.0.0-win64.7z"
         )));
         assert!(is_conquerd_client_archive(std::path::Path::new(
             "conquerd-nightly-win64.7z"
+        )));
+        assert!(is_conquerd_client_archive(std::path::Path::new(
+            "DoubleSlash-nightly-win64.7z"
         )));
     }
 

@@ -1,4 +1,4 @@
-// ConquerD Supernode — handshake.rs
+// DoubleSlash supernode — handshake.rs
 // Invite creation/validation and handshake protocol.
 // Handles INVITE_HANDSHAKE_INIT and produces INVITE_HANDSHAKE_ACCEPT.
 
@@ -13,7 +13,7 @@ use crate::identity::{generate_x25519_keypair, x25519_exchange, Identity};
 
 const SESSION_KEY_INFO: &[u8] = b"conquerd-invite-session-v2";
 
-/// An invite payload for the Conquerd invite/handshake protocol.
+/// An invite payload for the DoubleSlash invite/handshake protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvitePayload {
     pub inviter_peer_id: String,
@@ -155,11 +155,11 @@ impl InvitePayload {
         Identity::verify_with_pub(&pub_bytes, &sig_bytes, &canonical)
     }
 
-    /// Encode as conquerd:// URI.
+    /// Encode as a `d://` URI (legacy `conquerd://` is still accepted on parse).
     pub fn to_uri(&self) -> String {
         let json = serde_json::to_string(self).unwrap();
         let encoded = b64url_encode(json.as_bytes());
-        format!("conquerd://{encoded}")
+        conquerd_features::mint_uri(&encoded)
     }
 }
 
@@ -448,7 +448,7 @@ mod tests {
         let inv = mgr.create_invite(Some("TestNode"));
         assert!(inv.verify());
         let uri = inv.to_uri();
-        assert!(uri.starts_with("conquerd://"));
+        assert!(uri.starts_with("d://"));
     }
 
     #[test]

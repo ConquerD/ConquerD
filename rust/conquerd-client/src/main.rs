@@ -96,6 +96,7 @@ fn run_qt_ui() {
 
     extern "C" {
         fn conquerd_install_qt_message_handler();
+        fn conquerd_set_app_identity();
         fn conquerd_qml_post_load_check(engine: *mut std::ffi::c_void);
     }
 
@@ -134,6 +135,9 @@ fn run_qt_ui() {
     }
 
     let mut app = QGuiApplication::new();
+    unsafe {
+        conquerd_set_app_identity();
+    }
 
     // Set the application icon now that QGuiApplication exists.
     #[cfg(target_os = "windows")]
@@ -212,10 +216,8 @@ fn main() {
 
 #[cfg(not(feature = "qt-ui"))]
 async fn headless_main() {
-    // Resolve key directory (can be overridden via CONQUERD_KEY_DIR)
-    let key_dir = std::env::var("CONQUERD_KEY_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| Identity::default_key_dir());
+    // Resolve key directory (DOUBLESLASH_KEY_DIR / CONQUERD_KEY_DIR / HOME).
+    let key_dir = Identity::default_key_dir();
 
     // Ollama-only smoke (no identity / supernode). Prefer:
     //   scripts\test_ollama_auto_reply.ps1 -Profile .clientA
@@ -1045,16 +1047,7 @@ async fn handle_event(
             info!("Call accepted by {}", peer_id);
             platform::stop_ringtone();
             let va = std::fs::read_to_string(
-                std::env::var("CONQUERD_HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| {
-                        std::env::var("USERPROFILE")
-                            .or_else(|_| std::env::var("HOME"))
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                            .join(".conquerd")
-                    })
-                    .join("settings.json"),
+                Identity::default_key_dir().join("settings.json"),
             )
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())

@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const GITHUB_API: &str = "https://api.github.com";
-const USER_AGENT: &str = concat!("ConquerD-Installer/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("DoubleSlash-Installer/", env!("CARGO_PKG_VERSION"));
 const NIGHTLY_TAG: &str = "nightly";
 const NIGHTLY_DOWNLOAD_BASE: &str =
     "https://github.com/ConquerD/ConquerD/releases/download/nightly";
@@ -101,7 +101,7 @@ pub fn current_platform_id() -> &'static str {
 }
 
 /// Windows client nightly `.7z` published on the `nightly` GitHub release.
-pub const WINDOWS_CLIENT_NIGHTLY_7Z: &str = "ConquerD-nightly-win64.7z";
+pub const WINDOWS_CLIENT_NIGHTLY_7Z: &str = "DoubleSlash-nightly-win64.7z";
 
 /// Platform-specific nightly archive published on the `nightly` GitHub release.
 pub fn nightly_archive_name() -> &'static str {
@@ -111,15 +111,15 @@ pub fn nightly_archive_name() -> &'static str {
     }
     #[cfg(target_os = "macos")]
     {
-        "ConquerD-nightly-macos-arm64.dmg"
+        "DoubleSlash-nightly-macos-arm64.dmg"
     }
     #[cfg(target_os = "linux")]
     {
-        "ConquerD-nightly-x86_64.AppImage"
+        "DoubleSlash-nightly-x86_64.AppImage"
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
-        "ConquerD-nightly.7z"
+        "DoubleSlash-nightly.7z"
     }
 }
 

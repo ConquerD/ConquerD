@@ -1717,8 +1717,8 @@ Item {
                     SettingSwitch { title: "Enable notifications"; checked: root.settings ? root.settings.notifications_enabled : true; onChanged: if (root.settings) root.settings.notifications_enabled = checked }
                     SettingSwitch { title: "Auto-connect to known peers"; checked: root.settings ? root.settings.auto_connect : false; onChanged: if (root.settings) root.settings.auto_connect = checked }
                     SettingSwitch { title: "Start minimized"; checked: root.settings ? root.settings.start_minimized : false; onChanged: if (root.settings) root.settings.start_minimized = checked }
-                    SettingSwitch { title: "Minimize to tray on close"; description: "Keep ConquerD running in the system tray instead of quitting when the window is closed or minimized"; checked: root.settings ? root.settings.minimize_to_tray : false; onChanged: if (root.settings) root.settings.minimize_to_tray = checked }
-                    SettingSwitch { title: "Check for updates automatically"; description: "Check when ConquerD starts and once per hour while it is running"; checked: root.settings ? root.settings.update_check_enabled : true; onChanged: if (root.settings) root.settings.update_check_enabled = checked }
+                    SettingSwitch { title: "Minimize to tray on close"; description: "Keep DoubleSlash running in the system tray instead of quitting when the window is closed or minimized"; checked: root.settings ? root.settings.minimize_to_tray : false; onChanged: if (root.settings) root.settings.minimize_to_tray = checked }
+                    SettingSwitch { title: "Check for updates automatically"; description: "Check when DoubleSlash starts and once per hour while it is running"; checked: root.settings ? root.settings.update_check_enabled : true; onChanged: if (root.settings) root.settings.update_check_enabled = checked }
                     SettingSwitch { title: "Enable UPnP port mapping"; checked: root.settings ? root.settings.upnp_enabled : true; onChanged: if (root.settings) root.settings.upnp_enabled = checked }
                     SettingSwitch { title: "Verbose debug logging"; description: "Write detailed diagnostic logs for troubleshooting. Applies immediately; a RUST_LOG environment variable overrides this."; checked: root.settings ? root.settings.debug_logging : false; onChanged: if (root.settings) root.settings.debug_logging = checked }
 
@@ -1818,7 +1818,7 @@ Item {
                         title: "Enable AI assistant"
                         description: backend && backend.ollama_available
                                      ? "Plugin running — chat AI is available."
-                                     : "Uses your local Ollama server. Restart ConquerD after enabling so chat AI starts."
+                                     : "Uses your local Ollama server. Restart DoubleSlash after enabling so chat AI starts."
                         checked: root.settings ? root.settings.ollama_enabled : false
                         onChanged: {
                             if (!root.settings) return
@@ -2320,7 +2320,7 @@ Item {
                 SettingsCard {
                     title: "About"
 
-                    Label { text: "ConquerD - Privacy-first peer connectivity"; color: Theme.muted }
+                    Label { text: "DoubleSlash - Privacy-first peer connectivity"; color: Theme.muted }
                     Label { text: "Version " + Qt.application.version; color: Theme.muted }
 
                     RowLayout {

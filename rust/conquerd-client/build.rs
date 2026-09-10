@@ -159,12 +159,12 @@ fn main() {
     #[cfg(windows)]
     {
         let mut res = winresource::WindowsResource::new();
-        res.set("ProductName", "ConquerD");
+        res.set("ProductName", "DoubleSlash");
         res.set(
             "FileDescription",
-            "ConquerD — Privacy-First Peer Connectivity",
+            "DoubleSlash — Privacy-First Peer Connectivity",
         );
-        res.set("LegalCopyright", "ConquerD Project");
+        res.set("LegalCopyright", "DoubleSlash Project");
         res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
         res.set("FileVersion", env!("CARGO_PKG_VERSION"));
         res.set_icon("../../assets/conquerd.ico");

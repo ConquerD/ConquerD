@@ -4,7 +4,7 @@ fn main() {
         // Embed an explicit "asInvoker" execution-level manifest so that Windows
         // UAC heuristics (which auto-elevate binaries whose names contain words
         // like "install", "setup", or "update") do not trigger a UAC prompt.
-        // The installer writes only to %LOCALAPPDATA%\ConquerD and user-owned
+        // The installer writes only to %LOCALAPPDATA%\DoubleSlash and user-owned
         // shortcuts, so no elevation is required or desired.
         const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
@@ -25,9 +25,9 @@ fn main() {
 
         let mut res = winresource::WindowsResource::new();
         res.set_icon("../../assets/conquerd.ico");
-        res.set("ProductName", "ConquerD");
-        res.set("FileDescription", "ConquerD Installer / Updater");
-        res.set("LegalCopyright", "ConquerD Project");
+        res.set("ProductName", "DoubleSlash");
+        res.set("FileDescription", "DoubleSlash Installer / Updater");
+        res.set("LegalCopyright", "DoubleSlash Project");
         // Keep ProductVersion in sync with conquerd-client/Cargo.toml version.
         res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
         res.set("FileVersion", env!("CARGO_PKG_VERSION"));

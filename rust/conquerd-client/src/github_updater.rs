@@ -296,7 +296,8 @@ mod tests {
 
     #[test]
     fn installer_is_resolved_beside_client_for_this_platform() {
-        let client = Path::new("install").join(format!("ConquerD{}", std::env::consts::EXE_SUFFIX));
+        let client =
+            Path::new("install").join(format!("DoubleSlash{}", std::env::consts::EXE_SUFFIX));
         let expected = Path::new("install").join(format!(
             "conquerd-installer{}",
             std::env::consts::EXE_SUFFIX

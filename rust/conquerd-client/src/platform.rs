@@ -46,27 +46,29 @@ fn load_ringtone_bytes() -> Option<Vec<u8>> {
 // URI scheme
 // ---------------------------------------------------------------------------
 
-/// Registered custom URI scheme (`conquerd://`).
-pub const URI_SCHEME: &str = "conquerd";
+/// Registered custom URI scheme (`d://`). Legacy `conquerd://` is also accepted.
+pub const URI_SCHEME: &str = conquerd_features::URI_SCHEME;
+pub const URI_SCHEME_LEGACY: &str = conquerd_features::URI_SCHEME_LEGACY;
 
 // ---------------------------------------------------------------------------
 // Single-instance guard
 // ---------------------------------------------------------------------------
 
 /// Return `true` when this process should exit immediately because another
-/// `ConquerD.exe` instance is already running AND this invocation was started
-/// only to dispatch a `conquerd://` URL from the OS shell.
+/// `DoubleSlash.exe` instance is already running AND this invocation was started
+/// only to dispatch a `d://` / `conquerd://` URL from the OS shell.
 ///
-/// Background: at startup we register `conquerd://` with the Windows shell so
-/// invite links open the app.  Chromium's "external protocol handler" inside
-/// our embedded `WebEngineView` can also hand `conquerd://` URLs to the
-/// shell if a fetch fails for any reason — which would normally spawn a
-/// second `ConquerD.exe` at the unlock prompt and look like a stray popup.
+/// Background: at startup we register `d://` (and legacy `conquerd://`) with
+/// the Windows shell so invite links open the app.  Chromium's "external
+/// protocol handler" inside our embedded `WebEngineView` can also hand those
+/// URLs to the shell if a fetch fails for any reason — which would normally
+/// spawn a second `DoubleSlash.exe` at the unlock prompt and look like a
+/// stray popup.
 ///
 /// To prevent that, we acquire a per-user named mutex.  If another instance
-/// already holds it and our argv contains a `conquerd://` URL, we exit
-/// silently — the running instance keeps handling everything in-process via
-/// its own QtWebEngine scheme handler.
+/// already holds it and our argv contains a `d://` / `conquerd://` URL, we
+/// exit silently — the running instance keeps handling everything in-process
+/// via its own QtWebEngine scheme handler.
 ///
 /// Returns `false` on non-Windows platforms.
 pub fn should_exit_as_duplicate_instance() -> bool {
@@ -84,7 +86,9 @@ pub fn should_exit_as_duplicate_instance() -> bool {
 
         // Build a wide-char mutex name.  "Local\\" prefix scopes it to the
         // current logon session, matching our per-user identity model.
-        let name: Vec<u16> = "Local\\ConquerD-SingleInstance\0".encode_utf16().collect();
+        let name: Vec<u16> = "Local\\DoubleSlash-SingleInstance\0"
+            .encode_utf16()
+            .collect();
 
         unsafe {
             match CreateMutexW(None, false, PCWSTR(name.as_ptr())) {
@@ -98,10 +102,10 @@ pub fn should_exit_as_duplicate_instance() -> bool {
                         // otherwise the user intentionally double-launched
                         // and should still get a normal window.
                         let argv_has_uri =
-                            std::env::args().any(|a| a.starts_with(&format!("{URI_SCHEME}://")));
+                            std::env::args().any(|a| conquerd_features::looks_like_app_url(&a));
                         if argv_has_uri {
                             info!(
-                                "[single-instance] another ConquerD is running; \
+                                "[single-instance] another DoubleSlash is running; \
                                  exiting silently to avoid duplicate URL-handler popup"
                             );
                             return true;
@@ -122,18 +126,18 @@ pub fn should_exit_as_duplicate_instance() -> bool {
     }
 }
 
-/// Parse a `conquerd://` URI into its components.
+/// Parse a `d://` or legacy `conquerd://` URI into its components.
 ///
-/// Expected format: `conquerd://action/payload`
+/// Expected format: `d://action/payload`
 pub fn parse_uri(uri: &str) -> Option<(String, String)> {
-    let stripped = uri.strip_prefix(&format!("{URI_SCHEME}://"))?;
+    let stripped = conquerd_features::strip_scheme(uri)?;
     let (action, payload) = stripped.split_once('/').unwrap_or((stripped, ""));
     Some((action.to_string(), payload.to_string()))
 }
 
-/// Register the `conquerd://` URI scheme handler with the OS.
+/// Register the `d://` URI scheme handler with the OS (and keep `conquerd://`).
 ///
-/// - **Windows**: writes to `HKCU\Software\Classes\conquerd\...`
+/// - **Windows**: writes to `HKCU\Software\Classes\d\...` and `...\conquerd\...`
 /// - **macOS**: handled via `Info.plist` `CFBundleURLTypes` at build time
 /// - **Linux**: installs a `.desktop` file (see `packaging/install_uri_scheme.sh`)
 ///
@@ -160,14 +164,18 @@ fn register_uri_scheme_windows() -> bool {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    let base = format!("HKCU\\Software\\Classes\\{URI_SCHEME}");
-    let ok = Command::new("reg")
-        .args(["add", &base, "/ve", "/d", "URL:ConquerD Protocol", "/f"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
+    let mut any_ok = false;
+    for scheme in [URI_SCHEME, URI_SCHEME_LEGACY] {
+        let base = format!("HKCU\\Software\\Classes\\{scheme}");
+        let ok = Command::new("reg")
+            .args(["add", &base, "/ve", "/d", "URL:DoubleSlash Protocol", "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            continue;
+        }
         let cmd_key = format!("{base}\\shell\\open\\command");
         Command::new("reg")
             .args([
@@ -187,10 +195,10 @@ fn register_uri_scheme_windows() -> bool {
             .creation_flags(CREATE_NO_WINDOW)
             .status()
             .map(|s| s.success())
-            .unwrap_or(ok)
-    } else {
-        false
+            .unwrap_or(ok);
+        any_ok = true;
     }
+    any_ok
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +219,7 @@ pub fn set_taskbar_badge(count: u32) {
     {
         // Simple implementation via osascript (no extra deps)
         let script = format!(
-            r#"tell application "System Events" to set the dock tile of process "ConquerD" to {{label:"{}"}}"#,
+            r#"tell application "System Events" to set the dock tile of process "DoubleSlash" to {{label:"{}"}}"#,
             count
         );
         let _ = std::process::Command::new("osascript")
@@ -622,14 +630,14 @@ fn show_notification_windows(title: &str, body: &str) {
 #[cfg(target_os = "linux")]
 fn show_notification_linux(title: &str, body: &str) {
     let _ = std::process::Command::new("notify-send")
-        .args(["-a", "ConquerD", "-t", "4000", title, body])
+        .args(["-a", "DoubleSlash", "-t", "4000", title, body])
         .spawn();
 }
 
 #[cfg(target_os = "macos")]
 fn show_notification_macos(title: &str, body: &str) {
     let script = format!(
-        "display notification {} with title {} subtitle \"ConquerD\"",
+        "display notification {} with title {} subtitle \"DoubleSlash\"",
         serde_json::to_string(body).unwrap_or_default(),
         serde_json::to_string(title).unwrap_or_default()
     );
@@ -692,7 +700,7 @@ async fn try_add_port_mapping(
         .find_service(wan_ip_urn)
         .or_else(|| device.find_service(wan_ppp_urn))?;
 
-    let description = "ConquerD QUIC";
+    let description = "DoubleSlash QUIC";
     let internal_client = local_ip().unwrap_or_default();
 
     match add_port_mapping(
@@ -769,7 +777,7 @@ pub async fn release_upnp_mapping(external_port: u16) {
 // Desktop shortcuts
 // ---------------------------------------------------------------------------
 
-/// Create Start Menu and Desktop shortcuts for the ConquerD executable.
+/// Create Start Menu and Desktop shortcuts for the DoubleSlash executable.
 ///
 /// **Windows only** — no-op on other platforms.  Uses PowerShell
 /// `WScript.Shell` COM to write `.lnk` files into the user's Desktop and
@@ -791,7 +799,7 @@ pub fn remove_desktop_shortcuts() {
     info!("Desktop shortcuts removal skipped — not supported on this platform");
 }
 
-/// Return `true` if at least one ConquerD shortcut (Desktop or Start Menu)
+/// Return `true` if at least one DoubleSlash shortcut (Desktop or Start Menu)
 /// already exists.  **Windows only** — always returns `false` on other
 /// platforms.
 pub fn has_desktop_shortcuts() -> bool {
@@ -808,11 +816,11 @@ pub fn has_desktop_shortcuts() -> bool {
 #[cfg(target_os = "windows")]
 fn has_shortcuts_windows() -> bool {
     let appdata = std::env::var("APPDATA").unwrap_or_default();
-    let start_menu =
-        std::path::Path::new(&appdata).join(r"Microsoft\Windows\Start Menu\Programs\ConquerD.lnk");
+    let start_menu = std::path::Path::new(&appdata)
+        .join(r"Microsoft\Windows\Start Menu\Programs\DoubleSlash.lnk");
 
     let userprofile = std::env::var("USERPROFILE").unwrap_or_default();
-    let desktop = std::path::Path::new(&userprofile).join(r"Desktop\ConquerD.lnk");
+    let desktop = std::path::Path::new(&userprofile).join(r"Desktop\DoubleSlash.lnk");
 
     start_menu.exists() || desktop.exists()
 }
@@ -836,9 +844,9 @@ $paths = @( \
 ); \
 foreach ($dir in $paths) {{ \
     if (-not (Test-Path $dir)) {{ continue }}; \
-    $lnk = $ws.CreateShortcut("$dir\ConquerD.lnk"); \
+    $lnk = $ws.CreateShortcut("$dir\DoubleSlash.lnk"); \
     $lnk.TargetPath = "{exe}"; \
-    $lnk.Description = "ConquerD — Privacy-first peer connectivity"; \
+    $lnk.Description = "DoubleSlash — Privacy-first peer connectivity"; \
     $lnk.Save(); \
 }}"#
     );
@@ -864,7 +872,7 @@ fn remove_shortcuts_windows() {
     [Environment]::GetFolderPath('Programs') \
 ); \
 foreach ($dir in $paths) { \
-    $lnk = "$dir\ConquerD.lnk"; \
+    $lnk = "$dir\DoubleSlash.lnk"; \
     if (Test-Path $lnk) { Remove-Item $lnk -Force } \
 }"#;
     let _ = std::process::Command::new("powershell")
@@ -891,6 +899,9 @@ mod tests {
 
     #[test]
     fn parse_uri_invite() {
+        let (action, payload) = parse_uri("d://invite/abc123def456").unwrap();
+        assert_eq!(action, "invite");
+        assert_eq!(payload, "abc123def456");
         let (action, payload) = parse_uri("conquerd://invite/abc123def456").unwrap();
         assert_eq!(action, "invite");
         assert_eq!(payload, "abc123def456");
@@ -898,7 +909,7 @@ mod tests {
 
     #[test]
     fn parse_uri_no_payload() {
-        let (action, payload) = parse_uri("conquerd://open").unwrap();
+        let (action, payload) = parse_uri("d://open").unwrap();
         assert_eq!(action, "open");
         assert_eq!(payload, "");
     }

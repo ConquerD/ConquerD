@@ -1,4 +1,4 @@
-//! ConquerD client framework and desktop application services.
+//! DoubleSlash client framework and desktop application services.
 //!
 //! The executable in `main.rs` is one consumer of these modules. The Qt/QML
 //! frontend and headless integration mode select different parts of this

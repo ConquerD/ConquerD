@@ -1,7 +1,8 @@
-//! URI scheme registration — registers the `conquerd://` protocol handler.
+//! URI scheme registration — registers the `d://` protocol handler
+//! (and keeps legacy `conquerd://`).
 //!
-//! On Windows: writes to HKCU\Software\Classes\conquerd (no elevation needed).
-//! On other platforms: no-op.
+//! On Windows: writes to HKCU\Software\Classes\d and ...\conquerd
+//! (no elevation needed). On other platforms: no-op.
 
 #[cfg(not(target_os = "windows"))]
 use tracing::debug;
@@ -10,9 +11,11 @@ use tracing::debug;
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Register the `conquerd://` URI scheme handler for the current user.
+/// Register the `d://` URI scheme handler for the current user
+/// (and keep `conquerd://` working).
 ///
-/// On Windows, points to `conquerd-installer.exe` in `%LOCALAPPDATA%\ConquerD`
+/// On Windows, points to `conquerd-installer.exe` in
+/// `%LOCALAPPDATA%\DoubleSlash` (or the pre-rebrand `ConquerD` folder)
 /// if it exists, otherwise points to the current executable.
 ///
 /// Returns `Ok(true)` if registered, `Ok(false)` on non-Windows platforms.
@@ -28,7 +31,7 @@ pub fn register() -> std::io::Result<bool> {
     }
 }
 
-/// Unregister the `conquerd://` URI scheme handler.
+/// Unregister the `d://` and legacy `conquerd://` URI scheme handlers.
 ///
 /// Returns `Ok(true)` if the key was removed, `Ok(false)` on non-Windows.
 pub fn unregister() -> std::io::Result<bool> {
@@ -67,42 +70,48 @@ mod windows {
 
     fn exe_path() -> PathBuf {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let installer = PathBuf::from(&local)
-                .join("ConquerD")
-                .join("conquerd-installer.exe");
-            if installer.exists() {
-                return installer;
+            for folder in ["DoubleSlash", "ConquerD"] {
+                let installer = PathBuf::from(&local)
+                    .join(folder)
+                    .join("conquerd-installer.exe");
+                if installer.exists() {
+                    return installer;
+                }
             }
         }
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("conquerd.exe"))
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("DoubleSlash.exe"))
     }
 
-    const ROOT: &str = r"Software\Classes\conquerd";
+    const SCHEMES: &[&str] = &["d", "conquerd"];
+
+    fn root_for(scheme: &str) -> String {
+        format!(r"Software\Classes\{scheme}")
+    }
 
     pub fn is_registered() -> bool {
         // winreg is not a dependency — use raw registry APIs via std::process
         // to avoid pulling in the crate. Check existence by trying to read the
         // command value.
-        let key_path = format!(r"{ROOT}\shell\open\command");
-        matches!(
-            std::process::Command::new("reg")
-                .args(["query", &format!(r"HKCU\{key_path}"), "/ve"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output(),
-            Ok(out) if out.status.success()
-        )
+        SCHEMES.iter().any(|scheme| {
+            let key_path = format!(r"{}\shell\open\command", root_for(scheme));
+            matches!(
+                std::process::Command::new("reg")
+                    .args(["query", &format!(r"HKCU\{key_path}"), "/ve"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output(),
+                Ok(out) if out.status.success()
+            )
+        })
     }
 
-    pub fn register() -> std::io::Result<bool> {
-        let exe = exe_path();
-        let cmd = format!(r#""{}" "%1""#, exe.display());
-
-        let entries: &[(&str, &str, &str)] = &[
-            (ROOT, "", "URL:ConquerD Protocol"),
-            (ROOT, "URL Protocol", ""),
-            (&format!(r"{ROOT}\shell"), "", ""),
-            (&format!(r"{ROOT}\shell\open"), "", ""),
-            (&format!(r"{ROOT}\shell\open\command"), "", &cmd),
+    fn register_scheme(scheme: &str, cmd: &str) -> std::io::Result<bool> {
+        let root = root_for(scheme);
+        let entries: Vec<(String, &str, &str)> = vec![
+            (root.clone(), "", "URL:DoubleSlash Protocol"),
+            (root.clone(), "URL Protocol", ""),
+            (format!(r"{root}\shell"), "", ""),
+            (format!(r"{root}\shell\open"), "", ""),
+            (format!(r"{root}\shell\open\command"), "", cmd),
         ];
 
         for (key, name, value) in entries {
@@ -116,23 +125,36 @@ mod windows {
                 return Ok(false);
             }
         }
-
-        info!("[uri_scheme] conquerd:// registered → {}", exe.display());
         Ok(true)
     }
 
-    pub fn unregister() -> std::io::Result<bool> {
-        let hkcu_key = format!(r"HKCU\{ROOT}");
-        let status = std::process::Command::new("reg")
-            .args(["delete", &hkcu_key, "/f"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()?;
-        if status.success() {
-            info!("[uri_scheme] conquerd:// unregistered");
-            Ok(true)
-        } else {
-            Ok(false)
+    pub fn register() -> std::io::Result<bool> {
+        let exe = exe_path();
+        let cmd = format!(r#""{}" "%1""#, exe.display());
+        let mut any = false;
+        for scheme in SCHEMES {
+            if register_scheme(scheme, &cmd)? {
+                info!("[uri_scheme] {scheme}:// registered → {}", exe.display());
+                any = true;
+            }
         }
+        Ok(any)
+    }
+
+    pub fn unregister() -> std::io::Result<bool> {
+        let mut any = false;
+        for scheme in SCHEMES {
+            let hkcu_key = format!(r"HKCU\{}", root_for(scheme));
+            let status = std::process::Command::new("reg")
+                .args(["delete", &hkcu_key, "/f"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()?;
+            if status.success() {
+                info!("[uri_scheme] {scheme}:// unregistered");
+                any = true;
+            }
+        }
+        Ok(any)
     }
 }
 

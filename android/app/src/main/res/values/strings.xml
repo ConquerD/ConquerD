@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">ConquerD</string>
-    <string name="service_title">ConquerD is connected</string>
+    <string name="app_name">DoubleSlash</string>
+    <string name="service_title">DoubleSlash is connected</string>
     <string name="service_text">Holding your peer sessions open.</string>
-    <string name="service_title_call">ConquerD call in progress</string>
+    <string name="service_title_call">DoubleSlash call in progress</string>
     <string name="service_text_call">Your microphone is in use.</string>
     <string name="channel_name">Connection</string>
     <string name="channel_description">Shown while the client is connected to peers.</string>

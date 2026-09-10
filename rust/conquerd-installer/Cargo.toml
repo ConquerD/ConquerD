@@ -2,7 +2,7 @@
 name = "conquerd-installer"
 version = "1.0.0"
 edition = "2021"
-description = "ConquerD standalone installer and updater"
+description = "DoubleSlash standalone installer and updater"
 
 [[bin]]
 name = "conquerd-installer"

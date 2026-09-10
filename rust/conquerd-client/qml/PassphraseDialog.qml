@@ -66,8 +66,8 @@ Item {
 
             Text {
                 Layout.fillWidth: true
-                text: root.isNew ? "Create your ConquerD identity"
-                                 : "Unlock your ConquerD identity"
+                text: root.isNew ? "Create your DoubleSlash identity"
+                                 : "Unlock your DoubleSlash identity"
                 font.pixelSize: Theme.fontSizeDialog
                 font.bold: true
                 color: Theme.text
@@ -168,7 +168,7 @@ Item {
                     Layout.fillWidth: true
                     Layout.leftMargin: Theme.spacingLg
                     text: rememberBox.checked
-                          ? "On: ConquerD opens without asking for this passphrase again on this device. Your key is stored in " + root._keyringName + ", so anyone who can use your account here - or any program running as you - can open your identity. Your passphrase itself is never stored."
+                          ? "On: DoubleSlash opens without asking for this passphrase again on this device. Your key is stored in " + root._keyringName + ", so anyone who can use your account here - or any program running as you - can open your identity. Your passphrase itself is never stored."
                           : "Off: you type this passphrase every launch. Your identity file is useless to anyone who copies it without the passphrase."
                     font.pixelSize: Theme.fontSizeCaption
                     color: Theme.muted
