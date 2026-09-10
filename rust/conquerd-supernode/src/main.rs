@@ -3300,7 +3300,7 @@ async fn main() -> anyhow::Result<()> {
     let manifest = load_manifest(&config);
     manifest.apply_to_config(&mut config);
     info!(
-        "ConquerD Supernode v{} starting (signaling={}, relay={})",
+        "DoubleSlash supernode v{} starting (signaling={}, relay={})",
         APP_VERSION, config.signaling_port, config.relay_port
     );
 

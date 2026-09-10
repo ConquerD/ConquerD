@@ -275,7 +275,7 @@ impl ConnectionManager {
                             internal_port: candidate,
                             external_port: candidate,
                             protocol: crate::upnp::Protocol::Udp,
-                            description: "ConquerD QUIC".to_string(),
+                            description: "DoubleSlash QUIC".to_string(),
                         });
                     }
                     return true;

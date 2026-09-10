@@ -6,9 +6,14 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
-#include <QTimer>
 #include <QWindow>
+#include <QtCore/QString>
 #include <cstdio>
+#include <cstdlib>
+
+#if defined(Q_OS_WIN)
+#include <QtCore/QTimer>
+#endif
 
 #if defined(Q_OS_WIN)
 // Defined in window_chrome.cpp (linked only on Windows qt-ui builds).

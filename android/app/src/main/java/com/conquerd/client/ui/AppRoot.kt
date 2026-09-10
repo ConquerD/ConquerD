@@ -405,7 +405,7 @@ private fun UnlockScreen(
         )
         Spacer(Modifier.height(16.dp))
 
-        Text("ConquerD", style = MaterialTheme.typography.headlineLarge)
+        Text("DoubleSlash", style = MaterialTheme.typography.headlineLarge)
         Spacer(Modifier.height(8.dp))
         Text(
             "Your identity never leaves this device.",
@@ -482,7 +482,7 @@ private fun UnlockScreen(
                 Text("Stay unlocked on this device", style = MaterialTheme.typography.bodyMedium)
                 Text(
                     if (stayUnlocked) {
-                        "ConquerD will open without this passphrase. Your key is kept in " +
+                        "DoubleSlash will open without this passphrase. Your key is kept in " +
                             "the Android Keystore, so anyone who can use this phone can open " +
                             "your identity. Your passphrase itself is never stored."
                     } else {
@@ -1709,7 +1709,7 @@ private fun AppMenu(
                     modifier = Modifier.width(44.dp).height(20.dp),
                 )
                 Spacer(Modifier.width(8.dp))
-                Text("ConquerD", style = MaterialTheme.typography.titleSmall)
+                Text("DoubleSlash", style = MaterialTheme.typography.titleSmall)
             }
             Spacer(Modifier.height(4.dp))
             Text(
@@ -1810,10 +1810,10 @@ private fun LockIdentityDialog(
             Text(
                 if (stayUnlocked) {
                     "This signs out, disconnects your peers, and forgets the key kept " +
-                        "on this device. You will need your passphrase to open ConquerD again."
+                        "on this device. You will need your passphrase to open DoubleSlash again."
                 } else {
                     "This signs out and disconnects your peers. You will need your " +
-                        "passphrase to open ConquerD again."
+                        "passphrase to open DoubleSlash again."
                 },
             )
         },

@@ -422,7 +422,7 @@ fn unlock_identity(key_dir: &std::path::Path) -> error::Result<Identity> {
 /// Interactive first-launch setup: generate a new identity and encrypt it.
 #[cfg(not(feature = "qt-ui"))]
 fn first_launch_setup(key_dir: &std::path::Path) -> error::Result<Identity> {
-    eprintln!("\nWelcome to ConquerD!");
+    eprintln!("\nWelcome to DoubleSlash!");
     eprintln!("No identity found. A new one will be generated now.");
     eprintln!("Choose a passphrase to protect it (press Enter for no passphrase):\n");
 

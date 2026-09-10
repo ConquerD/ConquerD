@@ -208,18 +208,18 @@ jobs:
 
       - name: Copy installer for separate upload
         shell: pwsh
-        run: Copy-Item "dist\ConquerD\conquerd-installer.exe" "dist\conquerd-installer.exe"
+        run: Copy-Item "dist\DoubleSlash\conquerd-installer.exe" "dist\conquerd-installer.exe"
 
       - name: Verify artifacts
         shell: pwsh
         run: |
-          if (-not (Get-ChildItem "dist\ConquerD-*-win64.7z" -ErrorAction SilentlyContinue)) {
+          if (-not (Get-ChildItem "dist\DoubleSlash-*-win64.7z" -ErrorAction SilentlyContinue)) {
             throw "Release archive not found in dist/"
           }
           if (-not (Test-Path "dist\conquerd-installer.exe")) {
             throw "conquerd-installer.exe not found in dist/"
           }
-          $bundle = "dist\ConquerD"
+          $bundle = "dist\DoubleSlash"
           if (-not (Test-Path "$bundle\Qt6WebEngineCore.dll")) {
             throw "Qt6WebEngineCore.dll missing from $bundle — nightly portal will not load"
           }
@@ -238,8 +238,8 @@ jobs:
         with:
           name: windows-unsigned
           path: |
-            dist/ConquerD-*-win64.7z
-            dist/ConquerD-*-win64.7z.sha256
+            dist/DoubleSlash-*-win64.7z
+            dist/DoubleSlash-*-win64.7z.sha256
             dist/conquerd-installer.exe
 
   sign-windows:
@@ -262,7 +262,7 @@ jobs:
       - name: Recompute checksum after SignPath signing
         run: |
           cd signed
-          ARCHIVE=$(ls ConquerD-*-win64.7z | head -1)
+          ARCHIVE=$(ls DoubleSlash-*-win64.7z | head -1)
           sha256sum "$ARCHIVE" | tee "${ARCHIVE}.sha256"
           sha256sum -c "${ARCHIVE}.sha256"
 
@@ -286,7 +286,7 @@ jobs:
       - name: Verify unsigned archive checksum
         run: |
           cd artifacts
-          sha256sum -c ConquerD-*-win64.7z.sha256
+          sha256sum -c DoubleSlash-*-win64.7z.sha256
 
       - name: Upload as windows-release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -391,7 +391,7 @@ jobs:
         if: env.APPLE_NOTARY_KEY != '' && env.APPLE_NOTARY_KEY_ID != '' && env.APPLE_NOTARY_ISSUER != ''
         run: |
           VERSION=$(grep -m1 '^version' rust/conquerd-client/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          DMG="dist/ConquerD-${VERSION}-macos-arm64.dmg"
+          DMG="dist/DoubleSlash-${VERSION}-macos-arm64.dmg"
           KEY_PATH=$RUNNER_TEMP/notary-key.p8
           echo "$APPLE_NOTARY_KEY" | base64 --decode > "$KEY_PATH"
           xcrun notarytool submit "$DMG" --key "$KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER" --wait
@@ -400,7 +400,7 @@ jobs:
       - name: Generate and verify SHA-256
         run: |
           VERSION=$(grep -m1 '^version' rust/conquerd-client/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          FILE="dist/ConquerD-${VERSION}-macos-arm64.dmg"
+          FILE="dist/DoubleSlash-${VERSION}-macos-arm64.dmg"
           shasum -a 256 "$FILE" > "${FILE}.sha256"
           shasum -a 256 -c "${FILE}.sha256"
 
@@ -409,8 +409,8 @@ jobs:
         with:
           name: macos-release
           path: |
-            dist/ConquerD-*-macos-arm64.dmg
-            dist/ConquerD-*-macos-arm64.dmg.sha256
+            dist/DoubleSlash-*-macos-arm64.dmg
+            dist/DoubleSlash-*-macos-arm64.dmg.sha256
 
   build-linux:
     # preflight is only required for tagged releases. Develop/nightly builds run independently.
@@ -497,16 +497,16 @@ jobs:
 
       - name: Verify artifacts
         run: |
-          ls dist/ConquerD-*-x86_64.AppImage
-          ls dist/ConquerD-*-x86_64.AppImage.sha256
+          ls dist/DoubleSlash-*-x86_64.AppImage
+          ls dist/DoubleSlash-*-x86_64.AppImage.sha256
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-release
           path: |
-            dist/ConquerD-*-x86_64.AppImage
-            dist/ConquerD-*-x86_64.AppImage.sha256
+            dist/DoubleSlash-*-x86_64.AppImage
+            dist/DoubleSlash-*-x86_64.AppImage.sha256
 
   build-supernode-linux-arm64:
     runs-on: ubuntu-24.04-arm
@@ -691,10 +691,10 @@ jobs:
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: |
-            artifacts/ConquerD-*-win64.7z
+            artifacts/DoubleSlash-*-win64.7z
             artifacts/conquerd-installer.exe
-            artifacts/ConquerD-*-macos-arm64.dmg
-            artifacts/ConquerD-*-x86_64.AppImage
+            artifacts/DoubleSlash-*-macos-arm64.dmg
+            artifacts/DoubleSlash-*-x86_64.AppImage
 
   publish-release:
     needs: [attest, build-supernode-linux-arm64, build-supernode-linux-x86_64, build-supernode-windows]
@@ -824,17 +824,17 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
-          name: "ConquerD ${{ github.ref_name }}"
+          name: "DoubleSlash ${{ github.ref_name }}"
           draft: true
           generate_release_notes: true
           files: |
-            artifacts/ConquerD-*-win64.7z
-            artifacts/ConquerD-*-win64.7z.sha256
+            artifacts/DoubleSlash-*-win64.7z
+            artifacts/DoubleSlash-*-win64.7z.sha256
             artifacts/conquerd-installer.exe
-            artifacts/ConquerD-*-macos-arm64.dmg
-            artifacts/ConquerD-*-macos-arm64.dmg.sha256
-            artifacts/ConquerD-*-x86_64.AppImage
-            artifacts/ConquerD-*-x86_64.AppImage.sha256
+            artifacts/DoubleSlash-*-macos-arm64.dmg
+            artifacts/DoubleSlash-*-macos-arm64.dmg.sha256
+            artifacts/DoubleSlash-*-x86_64.AppImage
+            artifacts/DoubleSlash-*-x86_64.AppImage.sha256
             artifacts/conquerd-supernode-*-linux-aarch64.tar.gz
             artifacts/conquerd-supernode-*-linux-aarch64.tar.gz.sha256
             artifacts/conquerd-supernode-*-linux-x86_64.tar.gz
@@ -903,7 +903,7 @@ jobs:
 
           mkdir -p artifacts/_staging
           find artifacts -type f \
-            \( -name 'ConquerD-*' -o -name 'conquerd-installer*.exe' -o -name 'conquerd-supernode-*' \) \
+            \( -name 'DoubleSlash-*' -o -name 'conquerd-installer*.exe' -o -name 'conquerd-supernode-*' \) \
             -exec cp -f {} artifacts/_staging/ \;
           rm -rf artifacts/dist
           for f in artifacts/_staging/*; do
@@ -913,13 +913,13 @@ jobs:
 
           cd artifacts
           shopt -s nullglob
-          for f in ConquerD-*-win64.7z; do mv "$f" "ConquerD-nightly-win64.7z"; done
-          for f in ConquerD-*-win64.7z.sha256; do mv "$f" "ConquerD-nightly-win64.7z.sha256"; done
+          for f in DoubleSlash-*-win64.7z; do mv "$f" "DoubleSlash-nightly-win64.7z"; done
+          for f in DoubleSlash-*-win64.7z.sha256; do mv "$f" "DoubleSlash-nightly-win64.7z.sha256"; done
           [ -f "conquerd-installer.exe" ] && mv "conquerd-installer.exe" "conquerd-installer-nightly.exe"
-          for f in ConquerD-*-macos-arm64.dmg; do mv "$f" "ConquerD-nightly-macos-arm64.dmg"; done
-          for f in ConquerD-*-macos-arm64.dmg.sha256; do mv "$f" "ConquerD-nightly-macos-arm64.dmg.sha256"; done
-          for f in ConquerD-*-x86_64.AppImage; do mv "$f" "ConquerD-nightly-x86_64.AppImage"; done
-          for f in ConquerD-*-x86_64.AppImage.sha256; do mv "$f" "ConquerD-nightly-x86_64.AppImage.sha256"; done
+          for f in DoubleSlash-*-macos-arm64.dmg; do mv "$f" "DoubleSlash-nightly-macos-arm64.dmg"; done
+          for f in DoubleSlash-*-macos-arm64.dmg.sha256; do mv "$f" "DoubleSlash-nightly-macos-arm64.dmg.sha256"; done
+          for f in DoubleSlash-*-x86_64.AppImage; do mv "$f" "DoubleSlash-nightly-x86_64.AppImage"; done
+          for f in DoubleSlash-*-x86_64.AppImage.sha256; do mv "$f" "DoubleSlash-nightly-x86_64.AppImage.sha256"; done
           for f in conquerd-supernode-*-linux-aarch64.tar.gz; do mv "$f" "conquerd-supernode-nightly-linux-aarch64.tar.gz"; done
           for f in conquerd-supernode-*-linux-aarch64.tar.gz.sha256; do mv "$f" "conquerd-supernode-nightly-linux-aarch64.tar.gz.sha256"; done
           for f in conquerd-supernode-*-linux-x86_64.tar.gz; do mv "$f" "conquerd-supernode-nightly-linux-x86_64.tar.gz"; done
@@ -931,13 +931,13 @@ jobs:
           find . -maxdepth 1 -type f | sort
 
           REQUIRED=(
-            ConquerD-nightly-win64.7z
-            ConquerD-nightly-win64.7z.sha256
+            DoubleSlash-nightly-win64.7z
+            DoubleSlash-nightly-win64.7z.sha256
             conquerd-installer-nightly.exe
-            ConquerD-nightly-macos-arm64.dmg
-            ConquerD-nightly-macos-arm64.dmg.sha256
-            ConquerD-nightly-x86_64.AppImage
-            ConquerD-nightly-x86_64.AppImage.sha256
+            DoubleSlash-nightly-macos-arm64.dmg
+            DoubleSlash-nightly-macos-arm64.dmg.sha256
+            DoubleSlash-nightly-x86_64.AppImage
+            DoubleSlash-nightly-x86_64.AppImage.sha256
             conquerd-supernode-nightly-linux-aarch64.tar.gz
             conquerd-supernode-nightly-linux-aarch64.tar.gz.sha256
             conquerd-supernode-nightly-linux-x86_64.tar.gz
@@ -1031,13 +1031,13 @@ jobs:
 
             The `releases_manifest.json` is unsigned and provided for reference.
           files: |
-            artifacts/ConquerD-nightly-win64.7z
-            artifacts/ConquerD-nightly-win64.7z.sha256
+            artifacts/DoubleSlash-nightly-win64.7z
+            artifacts/DoubleSlash-nightly-win64.7z.sha256
             artifacts/conquerd-installer-nightly.exe
-            artifacts/ConquerD-nightly-macos-arm64.dmg
-            artifacts/ConquerD-nightly-macos-arm64.dmg.sha256
-            artifacts/ConquerD-nightly-x86_64.AppImage
-            artifacts/ConquerD-nightly-x86_64.AppImage.sha256
+            artifacts/DoubleSlash-nightly-macos-arm64.dmg
+            artifacts/DoubleSlash-nightly-macos-arm64.dmg.sha256
+            artifacts/DoubleSlash-nightly-x86_64.AppImage
+            artifacts/DoubleSlash-nightly-x86_64.AppImage.sha256
             artifacts/conquerd-supernode-nightly-linux-aarch64.tar.gz
             artifacts/conquerd-supernode-nightly-linux-aarch64.tar.gz.sha256
             artifacts/conquerd-supernode-nightly-linux-x86_64.tar.gz

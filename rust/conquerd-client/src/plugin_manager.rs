@@ -20,7 +20,7 @@ pub fn plugin_meta(plugin_id: &str) -> Option<PluginMeta> {
     match plugin_id {
         "x.ollama.v1" => Some(PluginMeta {
             name: "Ollama AI".into(),
-            description: "Query your local Ollama instance from within ConquerD. \
+            description: "Query your local Ollama instance from within DoubleSlash. \
                 Responses stream locally; no data is sent to or received from peers."
                 .into(),
         }),
