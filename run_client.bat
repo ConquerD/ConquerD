@@ -6,7 +6,7 @@ set "CONQUERD_HOME=%ROOT%.clientA"
 set "CONQUERD_KEY_DIR=%CONQUERD_HOME%"
 set "LEGACY_HOME=%ROOT%.clientA_home"
 set "LEGACY_PROFILE_LINK=%LEGACY_HOME%\.conquerd"
-set "BINARY=%ROOT%dist\ConquerD\ConquerD.exe"
+set "BINARY=%ROOT%dist\DoubleSlash\DoubleSlash.exe"
 
 :: HiDPI display scaling.  ConquerD sets QT_SCALE_FACTOR=0.75 automatically
 :: at runtime when Windows DPI > 96 (i.e. display scaling > 100%), so Material
@@ -16,10 +16,10 @@ set "BINARY=%ROOT%dist\ConquerD\ConquerD.exe"
 ::   set QT_SCALE_FACTOR=0.85   -- lighter reduction
 
 if not exist "%BINARY%" (
-    echo ConquerD client binary not found at:
+    echo DoubleSlash client binary not found at:
     echo   %BINARY%
     echo.
-    echo Build or package it first so dist\ConquerD\ConquerD.exe exists.
+    echo Build or package it first so dist\DoubleSlash\DoubleSlash.exe exists.
     exit /b 1
 )
 

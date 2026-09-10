@@ -22,7 +22,7 @@ set "LOG_FILE=%LOG_DIR%\conquerd-client.log"
 :: Prefer a freshly built binary (release, then debug), then the packaged dist client.
 set "RELEASE_BIN=%ROOT%rust\target\release\conquerd-client.exe"
 set "DEBUG_BIN=%ROOT%rust\target\debug\conquerd-client.exe"
-set "DIST_BIN=%ROOT%dist\ConquerD\ConquerD.exe"
+set "DIST_BIN=%ROOT%dist\DoubleSlash\DoubleSlash.exe"
 set "BINARY="
 set "BINARY_KIND="
 set "USE_DEBUG=0"
@@ -56,7 +56,7 @@ if not defined BINARY (
     echo Build with:
     echo   cd rust\conquerd-client
     echo   cargo build -p conquerd-client --features "qt-ui,webengine,console"
-    echo Or package via build_win64.ps1 so dist\ConquerD\ConquerD.exe exists.
+    echo Or package via build_win64.ps1 so dist\DoubleSlash\DoubleSlash.exe exists.
     exit /b 1
 )
 

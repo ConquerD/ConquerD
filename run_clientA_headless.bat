@@ -58,10 +58,10 @@ if not errorlevel 1 (
     goto :fail
 )
 
-tasklist /FI "IMAGENAME eq ConquerD.exe" 2>nul | find /I "ConquerD.exe" >nul
+tasklist /FI "IMAGENAME eq DoubleSlash.exe" 2>nul | find /I "DoubleSlash.exe" >nul
 if not errorlevel 1 (
     echo.
-    echo NOTE: ConquerD.exe GUI is running.
+    echo NOTE: DoubleSlash.exe GUI is running.
     echo   OK if that is your normal/other profile ^(not Bobert / run_client.bat^).
     echo.
 )
