@@ -1365,6 +1365,12 @@ pub struct AppBridgeRust {
     direct_connected_peer_ids: HashSet<String>,
     /// Peers currently in the same SFU voice room as us.
     room_present_peer_ids: HashSet<String>,
+    /// Peers whose relayed presence announce is still fresh.
+    ///
+    /// The third, independent source of "online". A direct session and a
+    /// shared voice room both prove liveness but neither exists on a
+    /// relay-only path, which is every pair behind CGNAT.
+    relay_present_peer_ids: HashSet<String>,
     /// Remote peer id for an active direct P2P call (identity_pub or peer_id).
     active_direct_call_peer_id: String,
 
@@ -1616,6 +1622,7 @@ impl Default for AppBridgeRust {
             in_call_peer_ids: HashSet::new(),
             direct_connected_peer_ids: HashSet::new(),
             room_present_peer_ids: HashSet::new(),
+            relay_present_peer_ids: HashSet::new(),
             active_direct_call_peer_id: String::new(),
             admitted_rooms: HashSet::new(),
             event_log: std::collections::VecDeque::with_capacity(300),
@@ -6107,22 +6114,54 @@ fn mark_peer_in_call(rust: &mut AppBridgeRust, pid: &str, in_call: bool) {
     }
 }
 
+/// True while any presence source still vouches for this peer.
+///
+/// Online is the union of three independent signals, so dropping one of them
+/// must never clear the dot on its own — losing a direct session while a
+/// relayed announce is still fresh means the peer is up, just not reachable
+/// directly.
+fn peer_present_elsewhere(rust: &AppBridgeRust, pid: &str, ignoring: PresenceSource) -> bool {
+    (ignoring != PresenceSource::Direct && rust.direct_connected_peer_ids.contains(pid))
+        || (ignoring != PresenceSource::Room && rust.room_present_peer_ids.contains(pid))
+        || (ignoring != PresenceSource::Relay && rust.relay_present_peer_ids.contains(pid))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresenceSource {
+    Direct,
+    Room,
+    Relay,
+}
+
 fn mark_direct_connected(rust: &mut AppBridgeRust, pid: &str, connected: bool) {
     if connected {
         rust.direct_connected_peer_ids.insert(pid.to_owned());
         rust.online_peer_ids.insert(pid.to_owned());
     } else {
         rust.direct_connected_peer_ids.remove(pid);
-        if !rust.room_present_peer_ids.contains(pid) {
+        if !peer_present_elsewhere(rust, pid, PresenceSource::Direct) {
+            rust.online_peer_ids.remove(pid);
+        }
+    }
+}
+
+/// Apply a relayed presence announce (or its expiry).
+fn mark_relay_present(rust: &mut AppBridgeRust, pid: &str, present: bool) {
+    if present {
+        rust.relay_present_peer_ids.insert(pid.to_owned());
+        rust.online_peer_ids.insert(pid.to_owned());
+    } else {
+        rust.relay_present_peer_ids.remove(pid);
+        if !peer_present_elsewhere(rust, pid, PresenceSource::Relay) {
             rust.online_peer_ids.remove(pid);
         }
     }
 }
 
 fn clear_room_member_presence(rust: &mut AppBridgeRust) {
-    for pid in rust.room_present_peer_ids.drain() {
+    for pid in std::mem::take(&mut rust.room_present_peer_ids) {
         rust.in_call_peer_ids.remove(&pid);
-        if !rust.direct_connected_peer_ids.contains(&pid) {
+        if !peer_present_elsewhere(rust, &pid, PresenceSource::Room) {
             rust.online_peer_ids.remove(&pid);
         }
     }
@@ -6164,7 +6203,8 @@ fn set_active_direct_call_presence(
         rust.active_direct_call_peer_id.clear();
         if let Some(pid) = resolved_pid {
             mark_peer_in_call(rust, &pid, false);
-            if !rust.direct_connected_peer_ids.contains(&pid)
+            if !rust.relay_present_peer_ids.contains(&pid)
+                && !rust.direct_connected_peer_ids.contains(&pid)
                 && !rust.room_present_peer_ids.contains(&pid)
             {
                 rust.online_peer_ids.remove(&pid);
@@ -8869,7 +8909,7 @@ fn dispatch_event(
                     return;
                 }
                 if let Some(pid) = lookup_list_peer_id(bridge.rust(), &peer_id) {
-                    mark_peer_online(&mut bridge.as_mut().rust_mut(), &pid, online);
+                    mark_relay_present(&mut bridge.as_mut().rust_mut(), &pid, online);
                 }
                 emit_peers_updated(bridge.as_mut());
             });

@@ -57,6 +57,18 @@ use room_session::RoomCreateRequest;
 // ---- shared constants -----------------------------------------------------
 
 pub(super) const PING_INTERVAL_S: u64 = 30;
+/// How often we announce ourselves to trusted peers over the relay.
+///
+/// Presence is the only liveness signal that survives a relay-only path: a
+/// direct QUIC session proves a peer is up, but two peers behind CGNAT never
+/// get one, and chat still flows through the supernode. Without this the peer
+/// dot reports "do I have a direct session" rather than "is this peer up".
+pub(super) const PRESENCE_INTERVAL_S: u64 = 30;
+/// Drop a peer back to offline after this long without an announce.
+///
+/// Three missed beats plus slack. A peer that closes its laptop sends no
+/// farewell, so the only thing that can retire its dot is a timeout.
+pub(super) const PRESENCE_TTL_S: u64 = 95;
 /// How often the elected keyer re-sends un-acked `SfuGroupKey` envelopes.
 pub(super) const GROUP_KEY_RETRY_INTERVAL_MS: u64 = 750;
 /// Stop resealing to a member after this many send attempts (incl. first).
@@ -187,6 +199,10 @@ pub struct ConnectionManager {
     replay_guard: ReplayGuard,
     /// Latest QUIC transport stats keyed by peer id.
     transport_stats: HashMap<String, PeerTransportStats>,
+    /// Last relayed presence announce per peer, keyed by canonical
+    /// `PeerRecord::peer_id`. Entries older than `PRESENCE_TTL_S` are retired
+    /// by `expire_stale_presence`.
+    peer_presence_seen: HashMap<String, Instant>,
     /// WS Ping/Pong RTT trackers keyed by supernode identity pubkey.
     supernode_ping: HashMap<String, SupernodePingTracker>,
     /// `supernode_id:room_id` → count of in-flight materialize-only creates.
@@ -449,6 +465,7 @@ impl ConnectionManager {
             pending_portal_relays: HashMap::new(),
             replay_guard: ReplayGuard::new(Self::MAX_MESSAGE_AGE_SECS),
             transport_stats: HashMap::new(),
+            peer_presence_seen: HashMap::new(),
             supernode_ping: HashMap::new(),
             pending_materialize: HashMap::new(),
             pending_private_room_joins: HashSet::new(),
@@ -505,6 +522,20 @@ impl ConnectionManager {
         }
         let (_cmd_tx, event_rx, mgr) = Self::construct(identity, peer_store, feature_registry);
         (mgr, event_rx)
+    }
+
+    /// Test-only: backdate a peer's last presence announce so the TTL sweep
+    /// can be exercised without waiting `PRESENCE_TTL_S` in real time.
+    #[cfg(test)]
+    pub(super) fn test_set_presence_age(&mut self, peer_id: &str, age: Duration) {
+        self.peer_presence_seen
+            .insert(peer_id.to_owned(), Instant::now() - age);
+    }
+
+    /// Test-only: whether a peer currently counts as present via the relay.
+    #[cfg(test)]
+    pub(super) fn test_presence_is_fresh(&self, peer_id: &str) -> bool {
+        self.peer_presence_seen.contains_key(peer_id)
     }
 
     /// Test-only: register a fake, already-connected supernode WS session and
@@ -836,6 +867,8 @@ impl ConnectionManager {
         file_pump_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut transfer_gc_interval = tokio::time::interval(Duration::from_secs(60));
         transfer_gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut presence_interval = tokio::time::interval(Duration::from_secs(PRESENCE_INTERVAL_S));
+        presence_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -1376,6 +1409,10 @@ impl ConnectionManager {
                 }
                 _ = file_pump_interval.tick() => {
                     self.pump_room_file_streams().await;
+                }
+                _ = presence_interval.tick() => {
+                    self.broadcast_presence().await;
+                    self.expire_stale_presence();
                 }
                 _ = transfer_gc_interval.tick() => {
                     // Neither map used to be pruned, so every payload ever sent
@@ -2292,6 +2329,141 @@ impl ConnectionManager {
         msg.payload
             .insert("handle".to_owned(), Value::String(handle.to_owned()));
         self.dispatch_outbound(msg).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Presence
+    // -----------------------------------------------------------------------
+
+    /// Announce ourselves to every trusted peer, over whatever path exists.
+    ///
+    /// `dispatch_outbound` prefers a direct QUIC session and falls back to the
+    /// supernode relay, which is the case that matters: two peers behind CGNAT
+    /// never get a direct session, so the relay is the only place their
+    /// liveness can be observed at all.
+    pub(super) async fn broadcast_presence(&mut self) {
+        for target in self.presence_targets() {
+            self.send_presence_to(&target, false).await;
+        }
+    }
+
+    /// Trusted, non-supernode peers to announce to, addressed the way the
+    /// relay routes.
+    ///
+    /// Deliberately `identity_pub` and not `peer_id`: the supernode keys its
+    /// peer sockets by identity, so a `peer_id` target (a hex SHA-256 of the
+    /// key, not an encoding of it) resolves to nothing there and the announce
+    /// is silently dropped.
+    pub(super) fn presence_targets(&self) -> Vec<String> {
+        let store = self.peer_store.read();
+        store
+            .list_non_supernode_peers()
+            .into_iter()
+            .filter(|r| !r.blocked && !r.revoked)
+            .map(|r| {
+                if r.identity_pub.is_empty() {
+                    r.peer_id.clone()
+                } else {
+                    r.identity_pub.clone()
+                }
+            })
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// Send a single presence announce.
+    ///
+    /// `reply` marks an answer to somebody else's announce, so a peer that has
+    /// just arrived on a new network is seen at once instead of after a full
+    /// interval. Replies are never themselves answered — that is what keeps
+    /// two clients from trading announces forever.
+    pub(super) async fn send_presence_to(&mut self, target: &str, reply: bool) {
+        if target.is_empty() || target == self.identity.public_id() {
+            return;
+        }
+        let sender = self.identity.public_id();
+        let mut msg = SignalingMessage::new(MessageType::PresenceUpdate, sender);
+        msg.target = Some(target.to_owned());
+        msg.payload
+            .insert("status".to_owned(), Value::String("online".to_owned()));
+        if reply {
+            msg.payload.insert("reply".to_owned(), Value::Bool(true));
+        }
+        self.dispatch_outbound(msg).await;
+    }
+
+    /// Map a wire id onto the canonical `PeerRecord::peer_id` the UIs key on.
+    ///
+    /// `msg.sender` is an `identity_pub` (base64url of the public key) while
+    /// peer lists are keyed by `peer_id` (hex SHA-256 *of* that key). They are
+    /// different encodings rather than variants of one string, so a UI
+    /// comparing a raw sender against its list matches nothing. The trailing
+    /// `=` fallback covers the relay/signaling padding split, where the same
+    /// key travels padded on one path and bare on the other.
+    pub(super) fn resolve_presence_peer_id(&self, wire_id: &str) -> Option<String> {
+        let store = self.peer_store.read();
+        if let Some(record) = store.get(wire_id) {
+            return Some(record.peer_id.clone());
+        }
+        if let Some(record) = store.get_by_identity(wire_id) {
+            return Some(record.peer_id.clone());
+        }
+        let bare = wire_id.trim_end_matches('=');
+        store
+            .list_peers()
+            .into_iter()
+            .find(|r| r.identity_pub.trim_end_matches('=') == bare)
+            .map(|r| r.peer_id.clone())
+    }
+
+    /// Record an inbound announce and emit the UI edge for it.
+    pub(super) async fn note_peer_presence(&mut self, wire_id: &str, status: &str, is_reply: bool) {
+        let Some(peer_id) = self.resolve_presence_peer_id(wire_id) else {
+            debug!(
+                "[presence] announce from unknown peer {} — ignored",
+                &wire_id[..8.min(wire_id.len())]
+            );
+            return;
+        };
+        if status == "offline" {
+            self.peer_presence_seen.remove(&peer_id);
+        } else {
+            self.peer_presence_seen
+                .insert(peer_id.clone(), Instant::now());
+        }
+        self.emit_event(ConnectionEvent::PresenceUpdated {
+            peer_id,
+            status: status.to_owned(),
+        });
+        if !is_reply && status != "offline" {
+            self.send_presence_to(wire_id, true).await;
+        }
+    }
+
+    /// Retire peers whose last announce aged out.
+    ///
+    /// A client that loses power or closes its laptop sends no farewell, so a
+    /// timeout is the only thing that can ever turn its dot off.
+    pub(super) fn expire_stale_presence(&mut self) {
+        let ttl = Duration::from_secs(PRESENCE_TTL_S);
+        let now = Instant::now();
+        let stale: Vec<String> = self
+            .peer_presence_seen
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) >= ttl)
+            .map(|(peer_id, _)| peer_id.clone())
+            .collect();
+        for peer_id in stale {
+            self.peer_presence_seen.remove(&peer_id);
+            debug!(
+                "[presence] {} aged out after {PRESENCE_TTL_S}s — offline",
+                &peer_id[..8.min(peer_id.len())]
+            );
+            self.emit_event(ConnectionEvent::PresenceUpdated {
+                peer_id,
+                status: "offline".to_owned(),
+            });
+        }
     }
 
     /// Broadcast our avatar config to a single trusted peer.

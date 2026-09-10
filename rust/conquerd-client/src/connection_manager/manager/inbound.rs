@@ -1396,10 +1396,16 @@ impl ConnectionManager {
                     .and_then(Value::as_str)
                     .unwrap_or("online")
                     .to_owned();
-                self.emit_event(ConnectionEvent::PresenceUpdated {
-                    peer_id: msg.sender.clone(),
-                    status,
-                });
+                // An answer to our own announce; answering it back would loop.
+                let is_reply = msg
+                    .payload
+                    .get("reply")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                // Resolves `msg.sender` to the canonical peer id and emits the
+                // event, so both UIs can match it against their peer lists.
+                self.note_peer_presence(&msg.sender, &status, is_reply)
+                    .await;
             }
             // ── Invite handshake (inviter side: we receive INIT from the joiner) ──
             MessageType::InviteHandshakeInit => {

@@ -1,3 +1,4 @@
+use super::events::ConnectionEvent;
 use super::internal::{host_from_url, is_loopback_or_wildcard};
 use super::manager::{
     accept_group_key_epoch, build_room_invite_url, is_elected_keyer, may_send_room_e2e_content,
@@ -1218,6 +1219,177 @@ fn peer_reconnect_backoff_doubles_then_caps() {
 // direct-call → private-room fallback flow, driven against a real
 // ConnectionManager with fake supernode WS sessions (no network).
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Presence
+// ---------------------------------------------------------------------------
+
+/// Build a peer whose `peer_id` and `identity_pub` differ the way real ones do:
+/// a hex SHA-256 of the key versus base64url of the key itself.
+fn presence_peer(peer_id: &str, identity_pub: &str) -> crate::peer_store::PeerRecord {
+    crate::peer_store::PeerRecord {
+        peer_id: peer_id.to_owned(),
+        identity_pub: identity_pub.to_owned(),
+        auto_connect: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn presence_from_an_identity_key_resolves_to_the_list_peer_id() {
+    let mut context = harness::test_cm();
+    context
+        .store
+        .write()
+        .upsert(presence_peer("hexpeerid", "base64identity"));
+
+    // A reply, so the manager records it without answering back.
+    context
+        .cm
+        .note_peer_presence("base64identity", "online", true)
+        .await;
+
+    let event = context.events.try_recv().expect("presence event");
+    match event {
+        ConnectionEvent::PresenceUpdated { peer_id, status } => {
+            // The UIs key their lists on peer_id; emitting the raw sender here
+            // is the bug this test exists to catch — it matches nothing.
+            assert_eq!(peer_id, "hexpeerid");
+            assert_eq!(status, "online");
+        }
+        other => panic!("expected PresenceUpdated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn presence_tolerates_the_relay_padding_split() {
+    let mut context = harness::test_cm();
+    // Stored padded, announced bare — the relay strips `=` while signaling
+    // keeps it, so the same key arrives both ways depending on the path.
+    context
+        .store
+        .write()
+        .upsert(presence_peer("hexpeerid", "base64identity=="));
+
+    context
+        .cm
+        .note_peer_presence("base64identity", "online", true)
+        .await;
+
+    match context.events.try_recv().expect("presence event") {
+        ConnectionEvent::PresenceUpdated { peer_id, .. } => assert_eq!(peer_id, "hexpeerid"),
+        other => panic!("expected PresenceUpdated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn presence_from_an_unknown_peer_is_ignored() {
+    let mut context = harness::test_cm();
+    context
+        .cm
+        .note_peer_presence("nobody-we-know", "online", true)
+        .await;
+    assert!(
+        context.events.try_recv().is_err(),
+        "an untrusted announce must not create a peer-list entry"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_that_stops_announcing_ages_out() {
+    let mut context = harness::test_cm();
+    context
+        .store
+        .write()
+        .upsert(presence_peer("hexpeerid", "base64identity"));
+    context
+        .cm
+        .note_peer_presence("base64identity", "online", true)
+        .await;
+    let _ = context.events.try_recv();
+
+    // Still inside the window: nothing retires.
+    context.cm.test_set_presence_age(
+        "hexpeerid",
+        Duration::from_secs(super::manager::PRESENCE_TTL_S / 2),
+    );
+    context.cm.expire_stale_presence();
+    assert!(context.events.try_recv().is_err());
+    assert!(context.cm.test_presence_is_fresh("hexpeerid"));
+
+    // Past it: a peer that closed its laptop sends no farewell, so only the
+    // sweep can ever turn the dot off.
+    context.cm.test_set_presence_age(
+        "hexpeerid",
+        Duration::from_secs(super::manager::PRESENCE_TTL_S + 1),
+    );
+    context.cm.expire_stale_presence();
+    match context.events.try_recv().expect("offline event") {
+        ConnectionEvent::PresenceUpdated { peer_id, status } => {
+            assert_eq!(peer_id, "hexpeerid");
+            assert_eq!(status, "offline");
+        }
+        other => panic!("expected PresenceUpdated, got {other:?}"),
+    }
+    assert!(!context.cm.test_presence_is_fresh("hexpeerid"));
+}
+
+#[tokio::test]
+async fn an_announce_is_answered_once_and_an_answer_is_not() {
+    let mut context = harness::test_cm();
+    context
+        .store
+        .write()
+        .upsert(presence_peer("hexpeerid", "base64identity"));
+    let mut outbound = context.cm.test_add_supernode_session("supernode");
+
+    // First contact: answer immediately so the peer sees us without waiting
+    // out a full interval.
+    context
+        .cm
+        .note_peer_presence("base64identity", "online", false)
+        .await;
+    assert!(
+        outbound.try_recv().is_ok(),
+        "a first-contact announce must be answered"
+    );
+
+    // Answering an answer is what would loop forever.
+    context
+        .cm
+        .note_peer_presence("base64identity", "online", true)
+        .await;
+    assert!(
+        outbound.try_recv().is_err(),
+        "an answer must not be answered back"
+    );
+}
+
+#[tokio::test]
+async fn presence_is_addressed_to_the_identity_the_relay_routes_on() {
+    let context = harness::test_cm();
+    context
+        .store
+        .write()
+        .upsert(presence_peer("hexpeerid", "base64identity"));
+    context.store.write().upsert(crate::peer_store::PeerRecord {
+        peer_id: "hexblocked".to_owned(),
+        identity_pub: "base64blocked".to_owned(),
+        blocked: true,
+        ..Default::default()
+    });
+    context.store.write().upsert(crate::peer_store::PeerRecord {
+        peer_id: "hexsupernode".to_owned(),
+        identity_pub: "base64supernode".to_owned(),
+        is_supernode: true,
+        ..Default::default()
+    });
+
+    let targets = context.cm.presence_targets();
+    // identity_pub, not peer_id: the supernode keys its sockets by identity,
+    // so a peer_id target resolves to nothing and is dropped in silence.
+    assert_eq!(targets, vec!["base64identity".to_owned()]);
+}
 
 mod harness {
     use super::super::events::ConnectionEvent;

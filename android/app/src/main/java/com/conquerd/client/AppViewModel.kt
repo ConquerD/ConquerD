@@ -55,8 +55,22 @@ data class AppState(
     val rooms: List<Room> = emptyList(),
     val messages: List<ChatMessage> = emptyList(),
     val connectionMode: ConnectionMode = ConnectionMode.OFFLINE,
-    /** Peers with a live session, so the list can show who is reachable now. */
+    /**
+     * Peers the list shows as online — the union of [directPeers] and
+     * [relayPresentPeers], never assigned directly.
+     */
     val onlinePeers: Set<String> = emptySet(),
+    /** Peers with a live direct QUIC session. */
+    val directPeers: Set<String> = emptySet(),
+    /**
+     * Peers whose relayed presence announce is still fresh.
+     *
+     * Separate from [directPeers] because a relay-only pair — both behind
+     * CGNAT — never gets a direct session, and the dot has to light anyway.
+     * Kept apart so losing one source does not clear a peer the other still
+     * vouches for.
+     */
+    val relayPresentPeers: Set<String> = emptySet(),
     val inviteUrl: String? = null,
     val tab: HomeTab = HomeTab.PEERS,
     /** Live messages for the room currently open. Not persisted anywhere. */
@@ -87,6 +101,25 @@ data class AppState(
     val avatars: Map<String, AvatarArt> = emptyMap(),
     /** Known supernodes, for the management screen. */
     val supernodeInfo: List<SupernodeInfo> = emptyList(),
+)
+
+/**
+ * Update one presence source and recompute [AppState.onlinePeers] from all of
+ * them.
+ *
+ * The union is derived here rather than assigned at each call site so the dot
+ * cannot drift from its sources — the bug this replaced was a direct
+ * disconnect clearing a peer that the relay still reported as up.
+ */
+internal fun AppState.withPresence(
+    direct: Set<String> = directPeers,
+    relay: Set<String> = relayPresentPeers,
+    connectionMode: ConnectionMode = this.connectionMode,
+): AppState = copy(
+    directPeers = direct,
+    relayPresentPeers = relay,
+    onlinePeers = direct + relay,
+    connectionMode = connectionMode,
 )
 
 /** An inbound offer: nothing arrives until it is accepted. */
@@ -1194,8 +1227,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "peer_connected" -> {
                 val id = event.stringOrEmpty("peer_id")
                 _state.update {
-                    it.copy(
-                        onlinePeers = it.onlinePeers + id,
+                    it.withPresence(
+                        direct = it.directPeers + id,
                         // Any live peer session means we are reachable; the
                         // relay/direct distinction refines it below.
                         connectionMode = maxOf(it.connectionMode, ConnectionMode.RELAY),
@@ -1205,7 +1238,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
             "peer_disconnected" -> {
                 val id = event.stringOrEmpty("peer_id")
-                _state.update { it.copy(onlinePeers = it.onlinePeers - id) }
+                // Only the direct session ended. A fresh relayed announce still
+                // means the peer is up, so the dot is left to the union.
+                _state.update { it.withPresence(direct = it.directPeers - id) }
             }
 
             "session_state" -> {
@@ -1314,7 +1349,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "invite_failed" ->
                 _state.update { it.copy(error = event.string("reason") ?: "invite failed") }
 
-            "handle_updated", "presence_updated" -> refreshPeers()
+            // Carries the canonical peer id (the core resolves the sender's
+            // identity key to it), so it matches the ids the peer list uses.
+            "presence_updated" -> {
+                val id = event.stringOrEmpty("peer_id")
+                val present = event.stringOrEmpty("status") != "offline"
+                _state.update {
+                    it.withPresence(
+                        relay = if (present) {
+                            it.relayPresentPeers + id
+                        } else {
+                            it.relayPresentPeers - id
+                        },
+                    )
+                }
+            }
+
+            "handle_updated" -> refreshPeers()
 
             "room_created", "room_invite_ready" -> refreshRooms()
 
