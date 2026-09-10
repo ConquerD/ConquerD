@@ -324,7 +324,31 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             rust/target
-          key: macos-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}-${{ hashFiles('rust/conquerd-client/Cargo.lock') }}
+          # github.repository is in the key because cxx-qt-build 0.8.1 writes
+          # absolute Unix include symlinks under rust/target. Restoring a cache
+          # from a previous workspace path (repo rename ConquerD → DoubleSlash)
+          # leaves those links dangling and panics:
+          # "Could not create symlink for include_prefix cxx-qt".
+          key: macos-cargo-${{ github.repository }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}-${{ hashFiles('rust/conquerd-client/Cargo.lock') }}
+
+      - name: Drop rust/target if cxx-qt include symlinks are dangling
+        run: |
+          # cxx-qt-build 0.8.1 panics on Unix when a cached include symlink
+          # no longer resolves (workspace path change). Wipe the target tree
+          # rather than trying to rebuild around a poisoned cache.
+          stale=0
+          if [ -d rust/target ]; then
+            while IFS= read -r -d '' link; do
+              if [ ! -e "$link" ]; then
+                echo "dangling symlink: $link"
+                stale=1
+              fi
+            done < <(find rust/target -type l -print0 2>/dev/null)
+          fi
+          if [ "$stale" = 1 ]; then
+            echo "Removing rust/target"
+            rm -rf rust/target
+          fi
 
       - name: Cache Opus DNN model weights
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -435,7 +459,31 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             rust/target
-          key: linux-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}-${{ hashFiles('rust/conquerd-client/Cargo.lock') }}
+          # github.repository is in the key because cxx-qt-build 0.8.1 writes
+          # absolute Unix include symlinks under rust/target. Restoring a cache
+          # from a previous workspace path (repo rename ConquerD → DoubleSlash)
+          # leaves those links dangling and panics:
+          # "Could not create symlink for include_prefix cxx-qt".
+          key: linux-cargo-${{ github.repository }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('rust/Cargo.lock') }}-${{ hashFiles('rust/conquerd-client/Cargo.lock') }}
+
+      - name: Drop rust/target if cxx-qt include symlinks are dangling
+        run: |
+          # cxx-qt-build 0.8.1 panics on Unix when a cached include symlink
+          # no longer resolves (workspace path change). Wipe the target tree
+          # rather than trying to rebuild around a poisoned cache.
+          stale=0
+          if [ -d rust/target ]; then
+            while IFS= read -r -d '' link; do
+              if [ ! -e "$link" ]; then
+                echo "dangling symlink: $link"
+                stale=1
+              fi
+            done < <(find rust/target -type l -print0 2>/dev/null)
+          fi
+          if [ "$stale" = 1 ]; then
+            echo "Removing rust/target"
+            rm -rf rust/target
+          fi
 
       - name: Cache Opus DNN model weights
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
