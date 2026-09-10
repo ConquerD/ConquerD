@@ -632,7 +632,7 @@ fn configure_qt_cpp_build(build: &mut cc::Build, qt_prefix: &std::path::Path, mo
         header_roots.push(headers.clone());
     }
     let prefix_include = qt_prefix.join("include");
-    if prefix_include.is_dir() && prefix_include != headers {
+    if prefix_include.is_dir() && !header_roots.iter().any(|p| p == &prefix_include) {
         header_roots.push(prefix_include);
     }
     for root in &header_roots {
@@ -644,10 +644,10 @@ fn configure_qt_cpp_build(build: &mut cc::Build, qt_prefix: &std::path::Path, mo
             }
         }
     }
-    for module in modules {
-        #[cfg(target_os = "macos")]
-        {
-            // Short includes like <QGuiApplication> live in the framework Headers dir.
+    #[cfg(target_os = "macos")]
+    {
+        // Short includes like <QGuiApplication> live in the framework Headers dir.
+        for module in modules {
             let fw_headers = qt_prefix
                 .join("lib")
                 .join(format!("{module}.framework"))
@@ -655,10 +655,6 @@ fn configure_qt_cpp_build(build: &mut cc::Build, qt_prefix: &std::path::Path, mo
             if fw_headers.is_dir() {
                 build.include(fw_headers);
             }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = module;
         }
     }
 
