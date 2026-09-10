@@ -75,6 +75,15 @@ pub trait GroupKeySource: Send + Sync {
 #[derive(Debug, Default, Clone)]
 struct GroupState {
     current: u8,
+    /// Highest epoch seen on the wire for this conversation, including epochs
+    /// we hold no key for.
+    ///
+    /// A peer that kept running while we restarted is ahead of us, and its
+    /// frames are the only evidence of how far. Minting starts above this so a
+    /// restarted keyer never offers an epoch the room has already passed - an
+    /// offer every member would refuse, since `accept_group_key_epoch` cannot
+    /// tell a restart from a rollback.
+    seen_high: Option<u8>,
     keys: BTreeMap<u8, [u8; GROUP_KEY_LEN]>,
 }
 
@@ -86,12 +95,35 @@ impl GroupState {
         // Treat the just-installed epoch as newest (owner rotates monotonically
         // and members receive increasing epochs within a session).
         self.current = epoch;
+        self.note_seen(epoch);
         while self.keys.len() > MAX_RETAINED_EPOCHS {
             // Drop the lowest-numbered (oldest) retained epoch.
             if let Some(&oldest) = self.keys.keys().next() {
                 self.keys.remove(&oldest);
             }
         }
+    }
+
+    fn note_seen(&mut self, epoch: u8) {
+        self.seen_high = Some(match self.seen_high {
+            Some(high) if high >= epoch => high,
+            _ => epoch,
+        });
+    }
+
+    /// Real key material, as opposed to an entry that only records what we have
+    /// seen. Keeps an observation from masquerading as a key.
+    fn has_keys(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    /// The epoch to mint next: above both what we hold and what we have seen.
+    fn next_epoch(&self) -> u8 {
+        let floor = match self.seen_high {
+            Some(high) if high >= self.current => high,
+            _ => self.current,
+        };
+        floor.wrapping_add(1)
     }
 }
 
@@ -121,10 +153,46 @@ impl SenderKeysGroup {
     /// replacing any existing state. Returns `(epoch, key)` to seal to members.
     pub fn new_owner_epoch(&mut self, conv_id: &str) -> (u8, [u8; GROUP_KEY_LEN]) {
         let key = random_key();
-        let mut state = GroupState::default();
-        state.install(0, key);
+        // Epoch 0 only when this conversation is genuinely new to us. If we
+        // have seen the room at a higher epoch - a member kept running while we
+        // restarted - start above it. Offering 0 to a member already past it is
+        // refused as a rollback, and since the offer is refused silently the
+        // keyer retries the same doomed epoch until it gives up.
+        let epoch = self
+            .groups
+            .get(conv_id)
+            .map(GroupState::next_epoch)
+            .unwrap_or(0);
+        let mut state = GroupState {
+            seen_high: self.groups.get(conv_id).and_then(|s| s.seen_high),
+            ..GroupState::default()
+        };
+        state.install(epoch, key);
         self.groups.insert(conv_id.to_owned(), state);
-        (0, key)
+        (epoch, key)
+    }
+
+    /// Record an epoch seen on the wire that we hold no key for.
+    ///
+    /// Pure observation: it never creates key material, so the deterministic
+    /// fallback and every `has_real_key` gate behave exactly as before. It only
+    /// raises the floor the next mint starts above.
+    pub fn note_observed_epoch(&mut self, conv_id: &str, epoch: u8) {
+        self.groups
+            .entry(conv_id.to_owned())
+            .or_default()
+            .note_seen(epoch);
+    }
+
+    /// True when the room has moved to an epoch we cannot open.
+    ///
+    /// The signal for an elected keyer to catch up: it restarted, minted from
+    /// scratch, and is now behind members that never went away.
+    pub fn is_behind(&self, conv_id: &str) -> bool {
+        self.groups.get(conv_id).is_some_and(|s| match s.seen_high {
+            Some(high) => !s.keys.contains_key(&high),
+            None => false,
+        })
     }
 
     /// Owner: bump to the next epoch with a fresh random key (rekey on member
@@ -135,7 +203,7 @@ impl SenderKeysGroup {
         let Some(state) = self.groups.get_mut(conv_id) else {
             return self.new_owner_epoch(conv_id);
         };
-        let next = state.current.wrapping_add(1);
+        let next = state.next_epoch();
         let key = random_key();
         state.install(next, key);
         (next, key)
@@ -162,7 +230,7 @@ impl SenderKeysGroup {
     /// elected-keyer logic) and whether the deterministic fallback below is
     /// still in play for `conv_id`.
     pub fn has_real_key(&self, conv_id: &str) -> bool {
-        self.groups.contains_key(conv_id)
+        self.groups.get(conv_id).is_some_and(GroupState::has_keys)
     }
 
     /// Forget any distributed key material for `conv_id` (the deterministic
@@ -178,11 +246,15 @@ impl GroupKeySource for SenderKeysGroup {
         // 0 (the deterministic fallback epoch) when no real key has been
         // generated/received yet for this conversation — e.g. the brief window
         // right after joining before the elected keyer's `SfuGroupKey` arrives.
-        self.groups.get(conv_id).map(|s| s.current).unwrap_or(0)
+        self.groups
+            .get(conv_id)
+            .filter(|s| s.has_keys())
+            .map(|s| s.current)
+            .unwrap_or(0)
     }
 
     fn epoch_key(&self, conv_id: &str, epoch: u8) -> Option<[u8; GROUP_KEY_LEN]> {
-        if let Some(state) = self.groups.get(conv_id) {
+        if let Some(state) = self.groups.get(conv_id).filter(|s| s.has_keys()) {
             // We hold real key material for this conversation — use it, even
             // at epoch 0 (a real owner-generated epoch-0 key, not the
             // deterministic one). A requested epoch we don't hold (evicted or
@@ -727,5 +799,136 @@ mod tests {
         assert_eq!(keys.current_epoch(CONV), 0);
         assert_eq!(keys.epoch_key(CONV, 0), Some(deterministic_room_key(CONV)));
         assert_eq!(keys.epoch_key(CONV, 1), None);
+    }
+
+    // ── Restarted keyer / epoch monotonicity ────────────────────────────────
+
+    /// The deadlock this exists for.
+    ///
+    /// Keys are in-memory by design, so a keyer that restarts has no epoch
+    /// state and used to mint 0. Every member still running holds a higher
+    /// epoch and refuses 0 as a rollback, silently, so the keyer retried a
+    /// doomed epoch until it gave up and the room stayed wedged - nobody else
+    /// would mint, because the keyer is the elected one.
+    #[test]
+    fn a_restarted_keyer_mints_above_the_epoch_it_has_seen() {
+        let mut restarted = SenderKeysGroup::new();
+        // All a restarted keyer knows is the epoch on frames it cannot open.
+        restarted.note_observed_epoch(CONV, 4);
+
+        let (epoch, _) = restarted.new_owner_epoch(CONV);
+
+        assert_eq!(epoch, 5, "must mint above the room, not below it");
+    }
+
+    /// And the offer has to be one a member will actually take: the whole point
+    /// is that `accept_group_key_epoch` sees an ordinary forward rotation.
+    #[test]
+    fn a_member_accepts_what_a_restarted_keyer_offers() {
+        let member_epoch = 4u8;
+
+        let mut restarted = SenderKeysGroup::new();
+        restarted.note_observed_epoch(CONV, member_epoch);
+        let (offered, _) = restarted.new_owner_epoch(CONV);
+
+        assert!(
+            crate::connection_manager::manager::accept_group_key_epoch(true, member_epoch, offered),
+            "member at epoch {member_epoch} refused the restarted keyer's epoch {offered}",
+        );
+        // The old behaviour, kept here as the thing that must never come back.
+        assert!(
+            !crate::connection_manager::manager::accept_group_key_epoch(true, member_epoch, 0),
+            "epoch 0 must still read as a rollback",
+        );
+    }
+
+    /// A fresh conversation is still epoch 0 - the catch-up must not inflate
+    /// epochs for rooms that never went anywhere.
+    #[test]
+    fn an_unseen_conversation_still_starts_at_zero() {
+        let mut group = SenderKeysGroup::new();
+        assert_eq!(group.new_owner_epoch(CONV).0, 0);
+    }
+
+    /// Observing an epoch must not look like holding a key. `has_real_key`
+    /// gates outbound sends and the deterministic fallback, so an observation
+    /// leaking into either would either send under a key nobody has or disable
+    /// the fallback that covers the gap before real keying lands.
+    #[test]
+    fn an_observation_is_not_key_material() {
+        let mut group = SenderKeysGroup::new();
+        group.note_observed_epoch(CONV, 3);
+
+        assert!(!group.has_real_key(CONV), "an observation is not a key");
+        assert!(
+            !crate::connection_manager::manager::may_send_room_e2e_content(
+                group.has_real_key(CONV)
+            ),
+            "outbound must stay closed on an observation alone",
+        );
+        assert_eq!(group.current_epoch(CONV), 0);
+        assert_eq!(
+            group.epoch_key(CONV, 0),
+            Some(deterministic_room_key(CONV)),
+            "the deterministic fallback must survive an observation",
+        );
+    }
+
+    /// `is_behind` is the trigger for catching up, so it must fire only when
+    /// the room really has moved past what we can open.
+    #[test]
+    fn is_behind_only_when_an_epoch_is_out_of_reach() {
+        let mut group = SenderKeysGroup::new();
+        assert!(
+            !group.is_behind(CONV),
+            "nothing seen, nothing to catch up to"
+        );
+
+        group.new_owner_epoch(CONV);
+        assert!(!group.is_behind(CONV), "our own epoch is not ahead of us");
+
+        group.note_observed_epoch(CONV, 7);
+        assert!(group.is_behind(CONV), "epoch 7 is unopenable");
+
+        group.install(CONV, 7, [9u8; GROUP_KEY_LEN]);
+        assert!(!group.is_behind(CONV), "installing 7 caught us up");
+    }
+
+    /// Rotation has to clear the backlog too: a keyer that learned of epoch 6
+    /// and then rekeys on a membership change must land above 6, not at 1.
+    #[test]
+    fn rotate_also_clears_a_backlog() {
+        let mut group = SenderKeysGroup::new();
+        group.new_owner_epoch(CONV);
+        group.note_observed_epoch(CONV, 6);
+
+        let (epoch, key) = group.rotate(CONV);
+
+        assert_eq!(epoch, 7);
+        assert_eq!(group.epoch_key(CONV, 7), Some(key));
+        assert!(!group.is_behind(CONV));
+    }
+
+    /// Catching up must leave the room readable: frames sealed under the new
+    /// epoch open, which is the outcome all of the above is for.
+    #[test]
+    fn a_caught_up_keyer_and_member_can_talk_again() {
+        let mut keyer = SenderKeysGroup::new();
+        keyer.note_observed_epoch(CONV, 4);
+        let (epoch, key) = keyer.new_owner_epoch(CONV);
+
+        // The member installs it as an ordinary forward rotation.
+        let mut member = SenderKeysGroup::new();
+        member.install(CONV, 4, [1u8; GROUP_KEY_LEN]);
+        assert!(crate::connection_manager::manager::accept_group_key_epoch(
+            true,
+            member.current_epoch(CONV),
+            epoch
+        ));
+        member.install(CONV, epoch, key);
+
+        let sealed = seal_chat_body(&keyer, CONV, SENDER, "mid-1", b"back again").unwrap();
+        let opened = open_chat_body(&member, CONV, SENDER, "mid-1", sealed.0, &sealed.1);
+        assert_eq!(opened.as_deref(), Some(&b"back again"[..]));
     }
 }

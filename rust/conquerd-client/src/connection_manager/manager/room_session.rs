@@ -780,6 +780,53 @@ impl ConnectionManager {
         // else: elected but alone (or still no real key and no others) — wait.
     }
 
+    /// Catch up when the room has moved to an epoch we cannot open.
+    ///
+    /// A keyer holds its epochs in memory by design - room chat is re-encrypted
+    /// at rest and audio is ephemeral, so nothing needs to survive a restart.
+    /// But `accept_group_key_epoch` cannot tell a restarted keyer from a
+    /// rollback attempt, so a keyer that comes back at epoch 0 offers something
+    /// every member still running refuses, silently, until it gives up. The
+    /// room is then wedged: the keyer keeps offering an epoch nobody will take
+    /// and nobody else will mint, because the keyer is elected.
+    ///
+    /// The way out is to stay monotonic rather than to persist keys. A frame we
+    /// cannot open tells us the epoch the room is actually on, so the keyer
+    /// mints above it and distributes. Members accept that as the ordinary
+    /// `current + 1` rotation, which is exactly what it is.
+    ///
+    /// No-op unless we are the elected keyer and genuinely behind.
+    pub(super) async fn rekey_room_if_behind(&mut self, room_id: &str) {
+        if !self.group_keys.is_behind(room_id) {
+            return;
+        }
+        let me = self.identity.public_id();
+        let union = union_members_for_room(&self.room_group_members, room_id);
+        let mut present: Vec<String> = union.iter().cloned().collect();
+        present.push(me.clone());
+        if !is_elected_keyer(&present, &me) {
+            // Someone else keys this room; they will distribute and we will be
+            // sent the epoch we are missing.
+            return;
+        }
+        if union.is_empty() {
+            // Alone. Minting here is the dual-keyer bootstrap race again.
+            return;
+        }
+
+        let (epoch, key) = self.group_keys.rotate(room_id);
+        info!(
+            "[group-key] room {} moved ahead of us; minting epoch {} for {} member(s)",
+            &room_id[..8.min(room_id.len())],
+            epoch,
+            union.len()
+        );
+        // Anything pending was for an epoch the room has already passed.
+        self.pending_group_key_acks.retain(|(r, _), _| r != room_id);
+        let all: Vec<String> = union.iter().cloned().collect();
+        self.distribute_group_key(room_id, epoch, &key, &all).await;
+    }
+
     /// Request a relay grant for `supernode_id` so room audio can ride QUIC
     /// datagrams. No-op when a live relay session already exists. The grant
     /// flow (`RelayGranted` → background connect) is best-effort; room audio

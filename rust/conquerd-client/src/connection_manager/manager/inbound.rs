@@ -807,6 +807,13 @@ impl ConnectionManager {
                             &msg.sender[..8.min(msg.sender.len())],
                             &room_id[..12.min(room_id.len())]
                         );
+                        // This frame is the only evidence of where the room actually
+                        // is. Record it so a restarted keyer mints above that epoch
+                        // rather than below it, and catch up now if keying is ours.
+                        if let Some(e) = epoch_u8 {
+                            self.group_keys.note_observed_epoch(&room_id, e);
+                            self.rekey_room_if_behind(&room_id).await;
+                        }
                         return;
                     }
                 };
