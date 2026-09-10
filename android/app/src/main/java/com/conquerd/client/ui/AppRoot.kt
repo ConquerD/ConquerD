@@ -209,6 +209,7 @@ fun AppRoot(viewModel: AppViewModel) {
                 is Screen.RoomChat -> RoomChatScreen(
                     room = screen.room,
                     messages = state.roomMessages,
+                    avatars = state.avatars,
                     members = state.roomMembers,
                     joined = state.roomJoined,
                     voiceActive = state.roomVoiceActive,
@@ -1356,6 +1357,7 @@ private fun MessageBubble(
 private fun RoomChatScreen(
     room: Room,
     messages: List<RoomMessage>,
+    avatars: Map<String, AvatarArt>,
     members: List<String>,
     joined: Boolean,
     voiceActive: Boolean,
@@ -1506,7 +1508,9 @@ private fun RoomChatScreen(
                     modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    items(messages, key = { it.messageId }) { RoomMessageBubble(it) }
+                    items(messages, key = { it.messageId }) {
+                        RoomMessageBubble(it, avatars[it.senderId])
+                    }
                 }
 
                 JumpToCurrentButton(visible = scrolledAway) {
@@ -1601,7 +1605,7 @@ private fun VoiceRail(
 }
 
 @Composable
-private fun RoomMessageBubble(message: RoomMessage) {
+private fun RoomMessageBubble(message: RoomMessage, avatar: AvatarArt?) {
     val alignment = if (message.isSelf) Alignment.End else Alignment.Start
     val container = if (message.isSelf) {
         MaterialTheme.colorScheme.primaryContainer
@@ -1609,28 +1613,64 @@ private fun RoomMessageBubble(message: RoomMessage) {
         MaterialTheme.colorScheme.surfaceVariant
     }
 
-    Column(Modifier.fillMaxWidth(), horizontalAlignment = alignment) {
-        // Unlike a 1:1 chat, a room has many senders, so each message has to
-        // say who wrote it.
+    // Rooms only, matching the desktop: in a 1:1 chat the same two faces beside
+    // every line are noise, but in a room the face is how you tell speakers
+    // apart at a glance, ahead of reading the name.
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (message.isSelf) Arrangement.End else Arrangement.Start,
+        verticalAlignment = Alignment.Top,
+    ) {
         if (!message.isSelf) {
+            RoomAvatarSlot(avatar)
+            Spacer(Modifier.width(8.dp))
+        }
+        Column(horizontalAlignment = alignment) {
+            // Unlike a 1:1 chat, a room has many senders, so each message has to
+            // say who wrote it.
+            if (!message.isSelf) {
+                Text(
+                    message.senderHandle.ifBlank { message.senderId.take(10) },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+            }
+            Card(colors = CardDefaults.cardColors(containerColor = container)) {
+                Text(message.body, modifier = Modifier.padding(10.dp))
+            }
             Text(
-                message.senderHandle.ifBlank { message.senderId.take(10) },
+                formatTime(message.timestamp),
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 4.dp),
             )
         }
-        Card(colors = CardDefaults.cardColors(containerColor = container)) {
-            Text(message.body, modifier = Modifier.padding(10.dp))
+        if (message.isSelf) {
+            Spacer(Modifier.width(8.dp))
+            RoomAvatarSlot(avatar)
         }
-        Text(
-            formatTime(message.timestamp),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 4.dp),
-        )
     }
 }
+
+/**
+ * One avatar beside a room message, holding its space while the art loads.
+ *
+ * Avatars arrive asynchronously - the core renders the SVG on request - so an
+ * absent one reserves the same box rather than collapsing, which would shuffle
+ * every bubble sideways the moment it appeared.
+ */
+@Composable
+private fun RoomAvatarSlot(avatar: AvatarArt?) {
+    if (avatar != null) {
+        Avatar(avatar, Modifier.size(ROOM_AVATAR_SIZE))
+    } else {
+        Spacer(Modifier.size(ROOM_AVATAR_SIZE))
+    }
+}
+
+/** Matches the desktop's 32px room avatar. */
+private val ROOM_AVATAR_SIZE = 32.dp
 
 // ── App menu ───────────────────────────────────────────────────────────────
 

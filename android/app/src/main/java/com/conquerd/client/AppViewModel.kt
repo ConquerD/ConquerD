@@ -1001,7 +1001,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val history = reply.decodeList<ChatMessage>(core, "messages").map {
             RoomMessage(
                 messageId = it.id,
-                senderId = it.peerId,
+                // `sender`, not `peerId`: for a room message the conversation
+                // key is the room itself, so reading the author off it gave
+                // every message in the room the same sender.
+                senderId = it.sender,
                 senderHandle = it.senderHandle,
                 body = it.body,
                 timestamp = it.timestamp,
@@ -1009,6 +1012,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
         _state.update { it.copy(roomMessages = history) }
+        refreshAvatars(history.map { msg -> msg.senderId }.distinct())
     }
 
     fun closeRoom() {
@@ -1378,6 +1382,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     timestamp = event.number("timestamp"),
                     isSelf = sender.sameIdentityAs(_state.value.identity.publicId),
                 )
+                refreshAvatars(listOf(sender))
                 _state.update {
                     // The supernode can legitimately deliver a room frame more
                     // than once when we are attached to several cluster

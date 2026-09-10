@@ -31,6 +31,14 @@ data class Peer(
 data class ChatMessage(
     val id: String = "",
     @SerialName("peer_id") val peerId: String = "",
+    /**
+     * Who wrote it, as their `public_id`.
+     *
+     * Distinct from [peerId], which is the *conversation* key - for a room
+     * message that is the room, not a person. Reading the sender off [peerId]
+     * gave every message in a room the same author.
+     */
+    val sender: String = "",
     val body: String = "",
     val timestamp: Double = 0.0,
     @SerialName("is_self") val isSelf: Boolean = false,
