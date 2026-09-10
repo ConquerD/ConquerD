@@ -624,14 +624,27 @@ fn qt_install_headers(qt_prefix: &std::path::Path) -> std::path::PathBuf {
 #[cfg(feature = "qt-ui")]
 fn configure_qt_cpp_build(build: &mut cc::Build, qt_prefix: &std::path::Path, modules: &[&str]) {
     let headers = qt_install_headers(qt_prefix);
+    // qmake's QT_INSTALL_HEADERS and <prefix>/include can disagree on aqt
+    // layouts (Linux gcc_64 vs macOS frameworks). Add both so <QTimer> and
+    // <QtCore/QTimer> resolve.
+    let mut header_roots = Vec::new();
     if headers.is_dir() {
-        build.include(&headers);
+        header_roots.push(headers.clone());
+    }
+    let prefix_include = qt_prefix.join("include");
+    if prefix_include.is_dir() && prefix_include != headers {
+        header_roots.push(prefix_include);
+    }
+    for root in &header_roots {
+        build.include(root);
+        for module in modules {
+            let sub = root.join(module);
+            if sub.is_dir() {
+                build.include(sub);
+            }
+        }
     }
     for module in modules {
-        let sub = headers.join(module);
-        if sub.is_dir() {
-            build.include(sub);
-        }
         #[cfg(target_os = "macos")]
         {
             // Short includes like <QGuiApplication> live in the framework Headers dir.
@@ -642,6 +655,10 @@ fn configure_qt_cpp_build(build: &mut cc::Build, qt_prefix: &std::path::Path, mo
             if fw_headers.is_dir() {
                 build.include(fw_headers);
             }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = module;
         }
     }
 
