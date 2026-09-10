@@ -63,6 +63,40 @@ class PresenceTest {
     }
 
     @Test
+    fun `a room headcount unions the nodes that reported it`() {
+        // A cluster hosts one logical room on several members, and two peers
+        // routinely subscribe on different ones - so no single node sees them
+        // both. The badge unions instead of trusting one node.
+        val rosters = mapOf(
+            "nodeA:room1" to listOf("desktop"),
+            "nodeB:room1" to listOf("phone"),
+        )
+        assertEquals(2, rosters.roomHeadcount("room1"))
+    }
+
+    @Test
+    fun `a multi-homed peer is counted once`() {
+        // The same peer legitimately appears in two nodes' rosters; summing
+        // counts would report two people where there is one.
+        val rosters = mapOf(
+            "nodeA:room1" to listOf("phone"),
+            "nodeB:room1" to listOf("phone"),
+        )
+        assertEquals(1, rosters.roomHeadcount("room1"))
+    }
+
+    @Test
+    fun `headcounts do not bleed between rooms`() {
+        val rosters = mapOf(
+            "nodeA:room1" to listOf("a"),
+            "nodeA:room2" to listOf("a", "b"),
+        )
+        assertEquals(1, rosters.roomHeadcount("room1"))
+        assertEquals(2, rosters.roomHeadcount("room2"))
+        assertEquals(0, rosters.roomHeadcount("room3"))
+    }
+
+    @Test
     fun `updating one source never disturbs the other`() {
         val state = base
             .withPresence(direct = setOf("ada"))

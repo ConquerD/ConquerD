@@ -103,6 +103,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.conquerd.client.AppViewModel
+import com.conquerd.client.roomHeadcount
 import com.conquerd.client.R
 import com.conquerd.client.ChatMessage
 import kotlinx.coroutines.launch
@@ -627,6 +628,8 @@ private fun HomeScreen(viewModel: AppViewModel) {
                 HomeTab.ROOMS -> RoomsList(
                     rooms = state.rooms,
                     showHidden = state.showHiddenRooms,
+                    voiceRosters = state.roomVoiceRosters,
+                    textRosters = state.roomTextRosters,
                     onOpenRoom = viewModel::openRoom,
                     onSetHidden = viewModel::setRoomHidden,
                 )
@@ -729,11 +732,62 @@ private fun PeersList(
     }
 }
 
+/**
+ * The two room-occupancy pills, matching the desktop sidebar's bubbles.
+ *
+ * Voice and text are separate populations - a peer reading a room over text
+ * never appears in the voice roster - so one number cannot stand for both.
+ * A room no node has reported on yet shows nothing rather than a
+ * possibly-wrong zero, which is the desktop's "-" placeholder in spirit.
+ */
+@Composable
+private fun RoomCountBadges(voice: Int, text: Int) {
+    if (voice == 0 && text == 0) return
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (voice > 0) {
+            CountPill(Icons.Filled.Phone, "in voice", voice, MaterialTheme.colorScheme.primary)
+        }
+        if (text > 0) {
+            CountPill(Icons.Filled.Person, "in room", text, MaterialTheme.colorScheme.secondary)
+        }
+    }
+}
+
+@Composable
+private fun CountPill(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    description: String,
+    count: Int,
+    tint: Color,
+) {
+    Surface(
+        shape = RoundedCornerShape(11.dp),
+        color = tint.copy(alpha = 0.16f),
+        contentColor = tint,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+        ) {
+            Icon(icon, contentDescription = description, modifier = Modifier.size(13.dp))
+            Text("$count", style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun RoomsList(
     rooms: List<Room>,
     showHidden: Boolean,
+    /** Per-node voice rosters, unioned per room for the badge. */
+    voiceRosters: Map<String, List<String>>,
+    /** Per-node chat rosters (voice plus text subscribers), same shape. */
+    textRosters: Map<String, List<String>>,
     onOpenRoom: (Room) -> Unit,
     onSetHidden: (Room, Boolean) -> Unit,
 ) {
@@ -781,6 +835,12 @@ private fun RoomsList(
                             if (room.hidden) append(" - hidden, long-press to restore")
                         },
                         style = MaterialTheme.typography.bodySmall,
+                    )
+                },
+                trailingContent = {
+                    RoomCountBadges(
+                        voice = voiceRosters.roomHeadcount(room.roomId),
+                        text = textRosters.roomHeadcount(room.roomId),
                     )
                 },
                 // Long-press toggles. Purely local either way: the room stays

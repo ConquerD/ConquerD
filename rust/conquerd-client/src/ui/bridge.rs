@@ -1356,6 +1356,14 @@ pub struct AppBridgeRust {
     /// Pending chat-member rosters keyed `supernode_id:room_id` for rooms we
     /// are not currently viewing (applied when that text room is selected).
     pending_chat_rosters: std::collections::HashMap<String, Vec<String>>,
+    /// Last chat roster seen from each node, keyed `supernode_id:room_id`.
+    ///
+    /// A supernode's `chat_count` counts only the subscribers on *that* node,
+    /// but a cluster hosts one logical room on several members and two peers
+    /// routinely subscribe on different ones — so no single node ever sees
+    /// them both. The sidebar badge unions these instead, the same way
+    /// `union_members_for_room` does for keyer election.
+    chat_roster_by_node: std::collections::HashMap<String, Vec<String>>,
 
     /// Canonical peer-list keys (`PeerRecord::peer_id`) currently considered online.
     online_peer_ids: HashSet<String>,
@@ -1618,6 +1626,7 @@ impl Default for AppBridgeRust {
             room_display_handles: std::collections::HashMap::new(),
             pending_room_rosters: std::collections::HashMap::new(),
             pending_chat_rosters: std::collections::HashMap::new(),
+            chat_roster_by_node: std::collections::HashMap::new(),
             online_peer_ids: HashSet::new(),
             in_call_peer_ids: HashSet::new(),
             direct_connected_peer_ids: HashSet::new(),
@@ -6391,6 +6400,37 @@ fn sidebar_supernode_id(bridge: &AppBridgeRust, event_supernode_id: &str) -> Opt
     Some(bridge.resolve_supernode_node_id_str(&rep).unwrap_or(rep))
 }
 
+/// Cluster-wide chat-member count per room id, unioned across every node.
+///
+/// Keys are `"{supernode_id}:{room_id}"` and neither half contains `':'`
+/// (base64url and hex), so matching the `":{room_id}"` suffix is exact.
+fn cluster_chat_counts(rust: &AppBridgeRust) -> std::collections::HashMap<String, usize> {
+    cluster_chat_counts_from(&rust.chat_roster_by_node)
+}
+
+/// The union itself, split out so it can be tested without a live bridge.
+fn cluster_chat_counts_from(
+    rosters: &std::collections::HashMap<String, Vec<String>>,
+) -> std::collections::HashMap<String, usize> {
+    let mut per_room: std::collections::HashMap<String, HashSet<String>> =
+        std::collections::HashMap::new();
+    for (key, members) in rosters {
+        // Split once from the left: the supernode id is base64url and cannot
+        // contain ':', so everything after the first one is the room id.
+        let Some((_, room_id)) = key.split_once(':') else {
+            continue;
+        };
+        let entry = per_room.entry(room_id.to_owned()).or_default();
+        for m in members {
+            entry.insert(m.clone());
+        }
+    }
+    per_room
+        .into_iter()
+        .map(|(room_id, members)| (room_id, members.len()))
+        .collect()
+}
+
 fn room_roster_key(supernode_id: &str, room_id: &str) -> String {
     format!("{supernode_id}:{room_id}")
 }
@@ -6994,6 +7034,7 @@ fn enrich_room_voice_participants(
     rooms: serde_json::Value,
     peer_store: Option<&crate::peer_store::PeerStore>,
     my_public_id: &str,
+    chat_counts: Option<&std::collections::HashMap<String, usize>>,
 ) -> serde_json::Value {
     let Some(arr) = rooms.as_array() else {
         return rooms;
@@ -7060,6 +7101,21 @@ fn enrich_room_voice_participants(
             let count_num = serde_json::Value::Number(serde_json::Number::from(voice_count as u64));
             obj.insert("voice_count".to_owned(), count_num.clone());
             obj.insert("member_count".to_owned(), count_num);
+            // Text badge: prefer the cluster-wide union over the single node's
+            // `chat_count`, which under-reports whenever the peers subscribed
+            // on different cluster members.
+            if let Some(counts) = chat_counts {
+                if let Some(n) = room
+                    .get("room_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|rid| counts.get(rid))
+                {
+                    obj.insert(
+                        "chat_count".to_owned(),
+                        serde_json::Value::Number(serde_json::Number::from(*n as u64)),
+                    );
+                }
+            }
             if has_id_list {
                 obj.insert(
                     "participant_ids".to_owned(),
@@ -7114,6 +7170,7 @@ fn room_voice_sidebar_patch(
             serde_json::Value::Array(vec![room]),
             Some(&peer_store),
             bridge.my_public_id.as_str(),
+            Some(&cluster_chat_counts(bridge)),
         );
         return Some(
             serde_json::json!({
@@ -7129,6 +7186,7 @@ fn room_voice_sidebar_patch(
         serde_json::Value::Array(vec![room]),
         None,
         bridge.my_public_id.as_str(),
+        Some(&cluster_chat_counts(bridge)),
     );
     Some(
         serde_json::json!({
@@ -8316,6 +8374,14 @@ fn dispatch_event(
                         .insert(format!("{}:{}", canon, room_id));
                 }
                 let key = room_roster_key(canon.as_str(), room_id.as_str());
+                // Record this node's view before any selected-room routing, so
+                // the sidebar can union across the cluster even for rooms that
+                // are not open.
+                bridge
+                    .as_mut()
+                    .rust_mut()
+                    .chat_roster_by_node
+                    .insert(key.clone(), chat_members.clone());
                 // Voice rail: only the active voice room's participant list.
                 if should_apply_voice_roster(bridge.rust(), canon.as_str(), room_id.as_str()) {
                     apply_room_roster_to_bridge(
@@ -8863,6 +8929,9 @@ fn dispatch_event(
                 let remote = serde_json::from_str::<serde_json::Value>(&rooms_json)
                     .unwrap_or(serde_json::Value::Array(vec![]));
                 let my_pub = bridge.rust().my_public_id.clone();
+                // Snapshot before the borrows below; the union is cheap and the
+                // sidebar needs it for every room in this list.
+                let chat_counts = cluster_chat_counts(bridge.rust());
                 let rooms = if let (Some(rs), Some(ps)) = (
                     bridge.rust().room_store.clone(),
                     bridge.rust().peer_store.clone(),
@@ -8879,10 +8948,20 @@ fn dispatch_event(
                     // (never chat subscribers) so join/leave can patch counts.
                     seed_voice_rosters_from_room_list(&mut bridge, &canon, &filtered);
                     let peer_store = ps.read();
-                    enrich_room_voice_participants(filtered, Some(&peer_store), my_pub.as_str())
+                    enrich_room_voice_participants(
+                        filtered,
+                        Some(&peer_store),
+                        my_pub.as_str(),
+                        Some(&chat_counts),
+                    )
                 } else {
                     seed_voice_rosters_from_room_list(&mut bridge, &canon, &remote);
-                    enrich_room_voice_participants(remote, None, my_pub.as_str())
+                    enrich_room_voice_participants(
+                        remote,
+                        None,
+                        my_pub.as_str(),
+                        Some(&chat_counts),
+                    )
                 };
                 let wrapped = serde_json::json!({
                     "supernode_id": canon,
@@ -9382,7 +9461,7 @@ fn dispatch_call_event(
 
 #[cfg(test)]
 mod room_voice_count_tests {
-    use super::{enrich_room_voice_participants, repad_public_id};
+    use super::{cluster_chat_counts_from, enrich_room_voice_participants, repad_public_id};
 
     #[test]
     fn repad_restores_canonical_padding() {
@@ -9407,7 +9486,7 @@ mod room_voice_count_tests {
             "member_count": 99,
             "participant_ids": ["p1", "p2"],
         }]);
-        let out = enrich_room_voice_participants(rooms, None, "me");
+        let out = enrich_room_voice_participants(rooms, None, "me", None);
         let room = &out.as_array().unwrap()[0];
         assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(2));
         assert_eq!(room.get("member_count").and_then(|v| v.as_u64()), Some(2));
@@ -9421,7 +9500,7 @@ mod room_voice_count_tests {
             "member_count": 5,
             "participant_ids": [],
         }]);
-        let out = enrich_room_voice_participants(rooms, None, "me");
+        let out = enrich_room_voice_participants(rooms, None, "me", None);
         let room = &out.as_array().unwrap()[0];
         assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(room.get("member_count").and_then(|v| v.as_u64()), Some(0));
@@ -9433,7 +9512,7 @@ mod room_voice_count_tests {
             "room_id": "a",
             "member_count": 3,
         }]);
-        let out = enrich_room_voice_participants(rooms, None, "me");
+        let out = enrich_room_voice_participants(rooms, None, "me", None);
         let room = &out.as_array().unwrap()[0];
         assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(3));
     }
@@ -9447,7 +9526,7 @@ mod room_voice_count_tests {
             "chat_members": ["speaker", "lurker", "lurker2"],
             "member_count": 1,
         }]);
-        let out = enrich_room_voice_participants(rooms, None, "me");
+        let out = enrich_room_voice_participants(rooms, None, "me", None);
         let room = &out.as_array().unwrap()[0];
         assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(1));
     }
@@ -9456,6 +9535,58 @@ mod room_voice_count_tests {
     /// voice-only badge) must survive enrichment untouched — this function
     /// only ever inserts/overwrites the voice-specific keys.
     #[test]
+    fn chat_counts_union_across_cluster_members() {
+        // The bug this exists for: a cluster hosts one logical room on several
+        // members, and two peers routinely subscribe on different ones. Each
+        // node's own `chat_count` is then 1, and the sidebar showed 1 while the
+        // member list showed both.
+        let mut rosters = std::collections::HashMap::new();
+        rosters.insert("nodeA:room1".to_owned(), vec!["desktop".to_owned()]);
+        rosters.insert("nodeB:room1".to_owned(), vec!["phone".to_owned()]);
+        let counts = cluster_chat_counts_from(&rosters);
+        assert_eq!(counts.get("room1"), Some(&2));
+    }
+
+    #[test]
+    fn chat_counts_do_not_double_count_a_peer_on_two_nodes() {
+        // Multi-homing means the same peer legitimately appears in two nodes'
+        // rosters; a sum would report 2 people where there is one.
+        let mut rosters = std::collections::HashMap::new();
+        rosters.insert("nodeA:room1".to_owned(), vec!["phone".to_owned()]);
+        rosters.insert("nodeB:room1".to_owned(), vec!["phone".to_owned()]);
+        assert_eq!(cluster_chat_counts_from(&rosters).get("room1"), Some(&1));
+    }
+
+    #[test]
+    fn chat_counts_keep_rooms_apart() {
+        let mut rosters = std::collections::HashMap::new();
+        rosters.insert("nodeA:room1".to_owned(), vec!["a".to_owned()]);
+        rosters.insert(
+            "nodeA:room2".to_owned(),
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        let counts = cluster_chat_counts_from(&rosters);
+        assert_eq!(counts.get("room1"), Some(&1));
+        assert_eq!(counts.get("room2"), Some(&2));
+    }
+
+    #[test]
+    fn enrich_prefers_the_cluster_union_over_one_node_chat_count() {
+        let rooms = serde_json::json!([{
+            "room_id": "room1",
+            "participant_ids": [],
+            "chat_count": 1,
+        }]);
+        let mut counts = std::collections::HashMap::new();
+        counts.insert("room1".to_owned(), 2usize);
+        let out = enrich_room_voice_participants(rooms, None, "me", Some(&counts));
+        let room = &out.as_array().unwrap()[0];
+        assert_eq!(room.get("chat_count").and_then(|v| v.as_u64()), Some(2));
+        // The voice badge must not move with it.
+        assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    #[test]
     fn enrich_preserves_chat_count() {
         let rooms = serde_json::json!([{
             "room_id": "a",
@@ -9463,7 +9594,7 @@ mod room_voice_count_tests {
             "member_count": 1,
             "chat_count": 3,
         }]);
-        let out = enrich_room_voice_participants(rooms, None, "me");
+        let out = enrich_room_voice_participants(rooms, None, "me", None);
         let room = &out.as_array().unwrap()[0];
         assert_eq!(room.get("voice_count").and_then(|v| v.as_u64()), Some(1));
         assert_eq!(room.get("chat_count").and_then(|v| v.as_u64()), Some(3));

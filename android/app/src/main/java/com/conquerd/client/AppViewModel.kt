@@ -93,6 +93,15 @@ data class AppState(
     val roomChatMembers: List<String> = emptyList(),
     /** True once the supernode has admitted us to the open room. */
     val roomJoined: Boolean = false,
+    /**
+     * Voice rosters for every room we hear about, keyed `"supernodeId:roomId"`.
+     *
+     * Kept per node and unioned for display: a cluster hosts one logical room
+     * on several members, so each node knows only the peers attached to it.
+     */
+    val roomVoiceRosters: Map<String, List<String>> = emptyMap(),
+    /** Chat rosters (participants + text subscribers), keyed the same way. */
+    val roomTextRosters: Map<String, List<String>> = emptyMap(),
     /** The one direct call in progress, if any. */
     val call: CallState? = null,
     /** Show rooms the user hid. Off by default, matching the desktop sidebar. */
@@ -135,6 +144,21 @@ internal fun AppState.withPresence(
     onlinePeers = direct + relay,
     connectionMode = connectionMode,
 )
+
+/**
+ * Cluster-wide headcount for one room across every node that reported it.
+ *
+ * Keys are `"supernodeId:roomId"`; the supernode id is base64url and carries
+ * no `':'`, so everything after the first one is the room id. A peer that is
+ * multi-homed appears in two nodes' rosters, so this unions ids rather than
+ * summing counts - summing would report two people where there is one.
+ */
+internal fun Map<String, List<String>>.roomHeadcount(roomId: String): Int =
+    entries.asSequence()
+        .filter { it.key.substringAfter(':', "") == roomId }
+        .flatMap { it.value.asSequence() }
+        .toSet()
+        .size
 
 /** An inbound offer: nothing arrives until it is accepted. */
 data class FileOffer(
@@ -1463,9 +1487,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             "room_members_changed" -> {
-                if (!isOpenRoom(event)) return@onCoreEvent
                 val members = event.stringList("members")
                 val chatMembers = event.stringList("chat_members")
+                // Record every room's roster, not just the open one. Rosters
+                // arrive for everything we subscribe to, and discarding the
+                // rest is why the room list could only show a count after you
+                // opened the room.
+                val key = event.stringOrEmpty("supernode_id") +
+                    ":" + event.stringOrEmpty("room_id")
+                _state.update {
+                    it.copy(
+                        roomVoiceRosters = it.roomVoiceRosters + (key to members),
+                        roomTextRosters = it.roomTextRosters + (key to chatMembers),
+                    )
+                }
+                if (!isOpenRoom(event)) return@onCoreEvent
                 // Membership arriving at all means the supernode admitted us.
                 _state.update {
                     it.copy(
