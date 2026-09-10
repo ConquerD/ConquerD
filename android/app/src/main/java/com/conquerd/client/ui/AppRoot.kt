@@ -119,6 +119,7 @@ import com.conquerd.client.HomeTab
 import com.conquerd.client.Room
 import com.conquerd.client.RoomMessage
 import com.conquerd.client.Peer
+import com.conquerd.client.roomSenderName
 import com.conquerd.client.Screen
 import java.text.DateFormat
 import java.util.Date
@@ -210,6 +211,7 @@ fun AppRoot(viewModel: AppViewModel) {
                     room = screen.room,
                     messages = state.roomMessages,
                     avatars = state.avatars,
+                    peers = state.peers,
                     members = state.roomMembers,
                     joined = state.roomJoined,
                     voiceActive = state.roomVoiceActive,
@@ -1358,6 +1360,7 @@ private fun RoomChatScreen(
     room: Room,
     messages: List<RoomMessage>,
     avatars: Map<String, AvatarArt>,
+    peers: List<Peer>,
     members: List<String>,
     joined: Boolean,
     voiceActive: Boolean,
@@ -1509,7 +1512,11 @@ private fun RoomChatScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     items(messages, key = { it.messageId }) {
-                        RoomMessageBubble(it, avatars[it.senderId])
+                        RoomMessageBubble(
+                            message = it,
+                            avatar = avatars[it.senderId],
+                            senderName = peers.roomSenderName(it.senderId, it.senderHandle),
+                        )
                     }
                 }
 
@@ -1605,7 +1612,7 @@ private fun VoiceRail(
 }
 
 @Composable
-private fun RoomMessageBubble(message: RoomMessage, avatar: AvatarArt?) {
+private fun RoomMessageBubble(message: RoomMessage, avatar: AvatarArt?, senderName: String) {
     val alignment = if (message.isSelf) Alignment.End else Alignment.Start
     val container = if (message.isSelf) {
         MaterialTheme.colorScheme.primaryContainer
@@ -1630,7 +1637,7 @@ private fun RoomMessageBubble(message: RoomMessage, avatar: AvatarArt?) {
             // say who wrote it.
             if (!message.isSelf) {
                 Text(
-                    message.senderHandle.ifBlank { message.senderId.take(10) },
+                    senderName,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(horizontal = 4.dp),

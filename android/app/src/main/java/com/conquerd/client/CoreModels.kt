@@ -27,6 +27,31 @@ data class Peer(
         get() = displayName.ifBlank { handle.ifBlank { peerId.take(12) } }
 }
 
+/**
+ * The name to show for whoever wrote a room message.
+ *
+ * A room frame carries a handle only when the sender had one set at the time
+ * it was written, so an older message - or one from a peer who set their name
+ * afterwards - arrives with nothing. Falling straight through to the id then
+ * showed a raw `VkR20VqcIw` next to every bubble even though the peer store
+ * knew the person perfectly well.
+ *
+ * Matched on either spelling: room frames carry the base64 `public_id` while
+ * peer rows are keyed by the hex `peer_id`, and the padded and un-padded forms
+ * of a public_id are the same identity.
+ */
+fun List<Peer>.roomSenderName(senderId: String, carriedHandle: String): String {
+    if (carriedHandle.isNotBlank()) return carriedHandle
+    if (senderId.isNotBlank()) {
+        val bare = senderId.trimEnd('=')
+        val known = firstOrNull { it.identityPub.trimEnd('=') == bare || it.peerId == senderId }
+        val name = known?.displayName?.ifBlank { known.handle }.orEmpty()
+        if (name.isNotBlank()) return name
+    }
+    // Nothing better to show. Deliberately last, not the default.
+    return senderId.take(10)
+}
+
 @Serializable
 data class ChatMessage(
     val id: String = "",
