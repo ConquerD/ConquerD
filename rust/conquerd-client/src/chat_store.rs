@@ -714,8 +714,7 @@ mod tests {
         // the question; ordering on arrival cannot.
         let dir = tempdir().expect("temp dir");
         let identity = Identity::generate();
-        let store =
-            ChatStore::open(&identity, Some(&dir.path().join("chat.db"))).expect("open");
+        let store = ChatStore::open(&identity, Some(&dir.path().join("chat.db"))).expect("open");
 
         let mut mine = make_msg("peer-1", "what time is it there?", true);
         mine.timestamp = 1_000.0;
@@ -742,8 +741,7 @@ mod tests {
         // conversation; `insert_new` leaves it where it was.
         let dir = tempdir().expect("temp dir");
         let identity = Identity::generate();
-        let store =
-            ChatStore::open(&identity, Some(&dir.path().join("chat.db"))).expect("open");
+        let store = ChatStore::open(&identity, Some(&dir.path().join("chat.db"))).expect("open");
 
         let first = make_msg("peer-1", "first", false);
         store.insert_new(&first).expect("insert first");
