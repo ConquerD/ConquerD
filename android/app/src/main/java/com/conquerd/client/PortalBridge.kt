@@ -5,6 +5,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.util.Log
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.put
 import java.io.File
 import java.io.FileInputStream
@@ -37,14 +38,13 @@ class PortalBridge(
      */
     fun interceptRequest(request: WebResourceRequest): WebResourceResponse? {
         val url = request.url
-        if (url.scheme != SCHEME && url.scheme != SCHEME_LEGACY) return null
+        if (!isPortalUrl(url)) return null
 
-        // The host is the supernode; everything after it is the page path.
         val path = url.path.orEmpty().ifEmpty { "/index.html" }
 
         val reply = runBlocking {
             core.command("portal.fetch") {
-                put("supernode_id", url.host ?: supernodeId)
+                put("supernode_id", supernodeOf(url))
                 put("path", path)
                 url.query?.let { put("query", it) }
             }
@@ -84,6 +84,29 @@ class PortalBridge(
         )
     }
 
+    /**
+     * Whether this is a request the portal answers.
+     *
+     * Both spellings stay live: [PORTAL_ORIGIN] is what the WebView loads and
+     * what every relative URL in a page resolves against, while `d://` and
+     * `conquerd://` still appear in hand-off links written by pages and by
+     * the desktop client.
+     */
+    private fun isPortalUrl(url: android.net.Uri): Boolean =
+        url.scheme == SCHEME ||
+            url.scheme == SCHEME_LEGACY ||
+            (url.scheme.equals("https", true) && url.host == PORTAL_HOST)
+
+    /**
+     * Which supernode a portal URL is asking about.
+     *
+     * A `d://` URL carries it as the authority. [PORTAL_ORIGIN] does not - it
+     * is one fixed host - so those resolve to the supernode this bridge was
+     * opened for, which is also the only one it is allowed to reach.
+     */
+    private fun supernodeOf(url: android.net.Uri): String =
+        if (url.host == PORTAL_HOST) supernodeId else url.host ?: supernodeId
+
     /** Put the bridge script ahead of anything the document might run. */
     private fun injectBridge(html: String): String {
         val tag = "<script>${bootstrapJs()}</script>"
@@ -116,12 +139,17 @@ class PortalBridge(
      * A page written against the desktop must not have to care which client it
      * is running in, so the names match exactly — `closeChannel`, not `close`.
      */
-    private fun bootstrapJs(): String = """
+    private fun bootstrapJs(): String {
+        // Quoted through the JSON encoder rather than by hand: this lands
+        // inside a JS string literal, and an id carrying a quote would
+        // otherwise close the literal and run as code.
+        val sn = JsonPrimitive(supernodeId).toString()
+        return """
         (function () {
           if (window.conquerd) return;
           var raw = window.__conquerdNative;
           if (!raw) return;
-          var sn = window.location.hostname;
+          var sn = $sn;
           var parse = function (s) {
             try { return JSON.parse(s); } catch (e) { return { ok: false, error: 'bad reply' }; }
           };
@@ -143,7 +171,10 @@ class PortalBridge(
               return Promise.resolve(parse(raw.closeChannel()));
             },
             fetch: function (path, opts) {
-              var origin = window.location.protocol + '//' + sn;
+              // The page's own origin, not one built out of `sn`: the portal
+              // is served from a fixed host and the supernode is implied by
+              // which portal is open, not spelled in the URL.
+              var origin = window.location.origin;
               var url = path.charAt(0) === '/' ? origin + path : origin + '/' + path;
               return window.fetch(url, opts);
             }
@@ -191,7 +222,8 @@ class PortalBridge(
             value: Object.freeze({ supernodeId: sn, ready: Promise.resolve(api) })
           });
         })();
-    """.trimIndent()
+        """.trimIndent()
+    }
 
     /** The object exposed to page JS, wrapped by the shim above. */
     inner class PortalApi {
@@ -221,11 +253,11 @@ class PortalBridge(
         fun fetchB64(rawUrl: String): String {
             val url = runCatching { android.net.Uri.parse(rawUrl) }.getOrNull()
                 ?: return failure("that is not a URL")
-            if (url.scheme != SCHEME && url.scheme != SCHEME_LEGACY) return failure("not a portal URL")
+            if (!isPortalUrl(url)) return failure("not a portal URL")
 
             val reply = runBlocking {
                 core.command("portal.fetch") {
-                    put("supernode_id", url.host ?: supernodeId)
+                    put("supernode_id", supernodeOf(url))
                     put("path", url.path.orEmpty().ifEmpty { "/" })
                     url.query?.let { put("query", it) }
                 }
@@ -298,6 +330,32 @@ class PortalBridge(
     companion object {
         const val SCHEME = "d"
         const val SCHEME_LEGACY = "conquerd"
+
+        /**
+         * The origin a portal is served from inside the WebView.
+         *
+         * Not `d://`, and that is the whole point. WebView has no equivalent
+         * of `QWebEngineUrlScheme::registerScheme`, so `d://` there is a
+         * non-standard scheme: Chromium gives it an opaque origin and refuses
+         * it outright for anything script-initiated. [PortalApi.fetchB64]
+         * papers over `fetch` and XHR by monkey-patching them, but an
+         * `<script type="module">` and the `import` graph under it are fetched
+         * by Chromium's module loader, which no page script can reach - so on
+         * `d://` every module in the portal silently never runs. The document
+         * and its stylesheets take the interceptor path and appear, which is
+         * why the result looks like a page that loaded and then did nothing.
+         *
+         * `https` is a registered, standard, secure scheme, so modules,
+         * workers and storage all behave. Requests never leave the device:
+         * [interceptRequest] answers this host and [PortalScreen] blocks
+         * everything else. The `.invalid` TLD is reserved by RFC 2606 and can
+         * never resolve, so a request that somehow escaped the interceptor
+         * fails closed rather than reaching a real server.
+         */
+        const val PORTAL_HOST = "portal.doubleslash.invalid"
+
+        /** Where [PortalScreen] points the WebView. */
+        const val PORTAL_ORIGIN = "https://$PORTAL_HOST"
         private const val TAG = "PortalBridge"
         private val HEAD_OPEN = Regex("<head[^>]*>", RegexOption.IGNORE_CASE)
 

@@ -1983,12 +1983,18 @@ private fun LockIdentityDialog(
 /**
  * A supernode's in-app portal.
  *
- * The WebView cannot load `conquerd://` itself - there is no such network
- * protocol - so every request is intercepted and answered by the core over the
- * identity QUIC relay. JavaScript is on because that is the entire point of
- * the portal; what makes it defensible is that the pages come from a supernode
- * the user has already trusted enough to relay their traffic, over an
- * authenticated channel, and the WebView is given no file or content access.
+ * There is no network protocol behind a portal - the supernode serves the
+ * pages over the identity QUIC relay - so every request is intercepted and
+ * answered by the core. The pages are served from
+ * [PortalBridge.PORTAL_ORIGIN] rather than `d://` because WebView cannot
+ * register a scheme's capabilities the way the desktop does, and Chromium
+ * refuses an unregistered scheme for module scripts; nothing reaches the
+ * network either way.
+ *
+ * JavaScript is on because that is the entire point of the portal; what makes
+ * it defensible is that the pages come from a supernode the user has already
+ * trusted enough to relay their traffic, over an authenticated channel, and
+ * the WebView is given no file or content access.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -2030,6 +2036,24 @@ private fun PortalScreen(
 
                     addJavascriptInterface(bridge.PortalApi(), "__conquerdNative")
 
+                    // A portal page had no way to report anything: with no
+                    // WebChromeClient, WebView drops every console message on
+                    // the floor, so a page that threw on load looked exactly
+                    // like a page that did nothing. These go to logcat under
+                    // the PortalPage tag.
+                    webChromeClient = object : android.webkit.WebChromeClient() {
+                        override fun onConsoleMessage(
+                            message: android.webkit.ConsoleMessage,
+                        ): Boolean {
+                            android.util.Log.i(
+                                "PortalPage",
+                                "${message.message()} " +
+                                    "(${message.sourceId()}:${message.lineNumber()})",
+                            )
+                            return true
+                        }
+                    }
+
                     webViewClient = object : android.webkit.WebViewClient() {
                         override fun shouldInterceptRequest(
                             view: android.webkit.WebView,
@@ -2037,7 +2061,7 @@ private fun PortalScreen(
                         ): android.webkit.WebResourceResponse? {
                             val intercepted = bridge.interceptRequest(request)
                             if (intercepted != null) return intercepted
-                            // Anything that is not d:// or conquerd:// would
+                            // Anything the portal does not answer would
                             // otherwise hit the network with the JS bridge
                             // still attached.
                             return android.webkit.WebResourceResponse(
@@ -2050,22 +2074,41 @@ private fun PortalScreen(
                             )
                         }
 
+                        override fun onReceivedError(
+                            view: android.webkit.WebView,
+                            request: android.webkit.WebResourceRequest,
+                            error: android.webkit.WebResourceError,
+                        ) {
+                            android.util.Log.w(
+                                "PortalPage",
+                                "load failed ${request.url}: ${error.description}",
+                            )
+                        }
+
                         override fun shouldOverrideUrlLoading(
                             view: android.webkit.WebView,
                             request: android.webkit.WebResourceRequest,
                         ): Boolean {
-                            val scheme = request.url.scheme.orEmpty()
+                            val url = request.url
+                            val scheme = url.scheme.orEmpty()
+                            // The portal's own origin and the hand-off
+                            // spellings stay in the WebView; everything else
+                            // is someone else's site and goes to the browser.
                             if (scheme.equals("d", true) ||
-                                scheme.equals("conquerd", true)
+                                scheme.equals("conquerd", true) ||
+                                url.host == com.conquerd.client.PortalBridge.PORTAL_HOST
                             ) {
                                 return false
                             }
-                            Legal.openUrl(view.context, request.url.toString())
+                            Legal.openUrl(view.context, url.toString())
                             return true
                         }
                     }
 
-                    loadUrl("d://$supernodeId/index.html")
+                    // Not `d://$supernodeId/...`: see PortalBridge.PORTAL_HOST.
+                    // WebView cannot register a custom scheme, so on `d://`
+                    // Chromium refuses every module script in the portal.
+                    loadUrl("${com.conquerd.client.PortalBridge.PORTAL_ORIGIN}/index.html")
                 }
             },
         )
