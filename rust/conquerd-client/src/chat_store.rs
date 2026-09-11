@@ -237,6 +237,11 @@ impl ChatStore {
             );
             CREATE INDEX IF NOT EXISTS idx_messages_peer_ts
                 ON messages (peer_id, timestamp);
+            -- History pages by rowid. Index entries under one peer_id key are
+            -- held in rowid order, so a page reads straight off this index
+            -- with no sort.
+            CREATE INDEX IF NOT EXISTS idx_messages_peer
+                ON messages (peer_id);
             "#,
         )?;
 
@@ -328,6 +333,46 @@ impl ChatStore {
         Ok(())
     }
 
+    /// Insert a message unless one with the same `id` is already stored.
+    /// Returns whether a row was written.
+    ///
+    /// For anything arriving from the network, where a duplicate delivery is
+    /// normal - multi-home fan-out hands us the same frame from every node
+    /// holding a route to us. [`Self::upsert`] would replace the row, and
+    /// `INSERT OR REPLACE` is a delete and re-insert, so the message would
+    /// take a fresh `rowid` and jump to the bottom of the conversation it had
+    /// been sitting quietly in the middle of. `OR IGNORE` keeps the original
+    /// row, and with it the original position.
+    pub fn insert_new(&self, msg: &ChatMessage) -> Result<bool> {
+        let body_blob = self.encrypt(&msg.body)?;
+        let handle_blob = self.encrypt(&msg.sender_handle)?;
+        let conn = self.conn.lock();
+        let rows = conn.execute(
+            r#"INSERT OR IGNORE INTO messages
+               (id, peer_id, sender, recipient, body, timestamp, is_self,
+                status, kind, attachment_name, attachment_path, size_str,
+                status_note, sender_handle)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"#,
+            params![
+                msg.id,
+                msg.peer_id,
+                msg.sender,
+                msg.recipient,
+                body_blob,
+                msg.timestamp,
+                msg.is_self as i64,
+                msg.status.as_str(),
+                msg.kind.as_str(),
+                msg.attachment_name,
+                msg.attachment_path,
+                msg.size_str,
+                msg.status_note,
+                handle_blob,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Upsert (insert or replace) a message.
     pub fn upsert(&self, msg: &ChatMessage) -> Result<()> {
         let body_blob = self.encrypt(&msg.body)?;
@@ -406,7 +451,15 @@ impl ChatStore {
 
     /// Fetch the most recent `PAGE_SIZE` messages for a peer conversation.
     ///
-    /// Returns messages ordered oldest-first (ascending timestamp).
+    /// Returns messages oldest-first in the order this device learned them,
+    /// which is `rowid` and deliberately not `timestamp`. Outbound messages
+    /// are stamped from our own clock and inbound ones carry the sender's, so
+    /// ordering on `timestamp` merges two unsynchronized wall clocks: let a
+    /// peer's clock sit behind ours by more than the round trip and their
+    /// reply sorts above the message it answers. `rowid` is a single local
+    /// sequence, so anything we observed stays in the order we observed it,
+    /// and the `timestamp` column is left to say what it is actually good
+    /// for - what time the author put on the message.
     pub fn get_history(&self, peer_id: &str, page: usize) -> Result<Vec<ChatMessage>> {
         let offset = page * PAGE_SIZE;
         let conn = self.conn.lock();
@@ -416,7 +469,7 @@ impl ChatStore {
                       size_str, status_note, sender_handle
                FROM messages
                WHERE peer_id = ?1
-               ORDER BY timestamp DESC
+               ORDER BY rowid DESC
                LIMIT ?2 OFFSET ?3"#,
         )?;
         let rows = stmt.query_map(params![peer_id, PAGE_SIZE as i64, offset as i64], |row| {
@@ -629,7 +682,7 @@ impl ChatStore {
             let n = conn.execute(
                 "DELETE FROM messages WHERE peer_id=?1 AND rowid NOT IN \
                  (SELECT rowid FROM messages WHERE peer_id=?1 \
-                  ORDER BY timestamp DESC LIMIT ?2)",
+                  ORDER BY rowid DESC LIMIT ?2)",
                 params![pid, keep],
             )?;
             total += n;
@@ -651,6 +704,66 @@ mod tests {
     use crate::identity::Identity;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[test]
+    fn history_orders_by_arrival_not_by_the_senders_clock() {
+        // The defect this pins: our own messages are stamped from our clock
+        // and inbound ones carry the sender's, so a peer whose clock sits
+        // behind ours sends a reply bearing an *earlier* time than the
+        // message it answers. Ordering on `timestamp` puts the answer above
+        // the question; ordering on arrival cannot.
+        let dir = tempdir().expect("temp dir");
+        let identity = Identity::generate();
+        let store =
+            ChatStore::open(&identity, Some(&dir.path().join("chat.db"))).expect("open");
+
+        let mut mine = make_msg("peer-1", "what time is it there?", true);
+        mine.timestamp = 1_000.0;
+        store.insert(&mine).expect("insert mine");
+
+        let mut theirs = make_msg("peer-1", "half past nine", false);
+        theirs.timestamp = 500.0; // their clock is eight minutes behind ours
+        store.insert(&theirs).expect("insert theirs");
+
+        let history = store.get_history("peer-1", 0).expect("history");
+        let bodies: Vec<&str> = history.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(
+            bodies,
+            vec!["what time is it there?", "half past nine"],
+            "the reply must stay below the message it answers"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_delivery_does_not_move_a_message() {
+        // Multi-home fan-out hands us the same frame from every node holding
+        // a route to us. `upsert` would delete and re-insert the row, which
+        // takes a fresh rowid and so moves the message to the bottom of the
+        // conversation; `insert_new` leaves it where it was.
+        let dir = tempdir().expect("temp dir");
+        let identity = Identity::generate();
+        let store =
+            ChatStore::open(&identity, Some(&dir.path().join("chat.db"))).expect("open");
+
+        let first = make_msg("peer-1", "first", false);
+        store.insert_new(&first).expect("insert first");
+        store
+            .insert_new(&make_msg("peer-1", "second", false))
+            .expect("insert second");
+
+        assert!(
+            !store.insert_new(&first).expect("re-deliver first"),
+            "a second delivery writes nothing"
+        );
+
+        let bodies: Vec<String> = store
+            .get_history("peer-1", 0)
+            .expect("history")
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(bodies, vec!["first", "second"]);
+    }
 
     #[test]
     fn room_conversation_id_ignores_the_host() {

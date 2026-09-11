@@ -993,7 +993,10 @@ async fn handle_event(
                 status_note: String::new(),
                 sender_handle,
             };
-            if let Err(e) = chat_store.upsert(&msg) {
+            // `insert_new`, not `upsert`: history is ordered by rowid, and a
+            // re-delivered frame replacing the row would re-key it to the end
+            // of the conversation.
+            if let Err(e) = chat_store.insert_new(&msg) {
                 error!("Failed to persist chat message: {}", e);
             }
             headless_maybe_auto_reply(
@@ -1143,7 +1146,8 @@ async fn handle_event(
                 status_note: String::new(),
                 sender_handle,
             };
-            if let Err(e) = chat_store.upsert(&msg) {
+            // As above - a duplicate delivery must not move the message.
+            if let Err(e) = chat_store.insert_new(&msg) {
                 error!("Failed to persist room chat: {e}");
             }
             if !mine {

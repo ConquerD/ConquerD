@@ -628,7 +628,9 @@ fn persist_if_file_complete(
         status_note: String::new(),
         sender_handle: String::new(),
     };
-    if let Err(e) = chat_store.upsert(&record) {
+    // Same reasoning as inbound chat: a re-delivered completion must not
+    // re-key the row and move the file to the bottom of the conversation.
+    if let Err(e) = chat_store.insert_new(&record) {
         warn!("could not record the received file in history: {e}");
     }
 
@@ -764,7 +766,10 @@ fn persist_if_chat(chat_store: &ChatStore, event: &ConnectionEvent) {
                 status_note: String::new(),
                 sender_handle: sender_handle.clone(),
             };
-            if let Err(e) = chat_store.upsert(&msg) {
+            // `insert_new`, not `upsert`: history is ordered by rowid, and a
+            // re-delivered frame replacing the row would re-key it to the end
+            // of the conversation.
+            if let Err(e) = chat_store.insert_new(&msg) {
                 warn!("could not persist inbound chat: {e}");
             }
         }

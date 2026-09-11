@@ -91,6 +91,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -1315,6 +1316,7 @@ private fun ChatScreen(
         listState = listState,
         conversationKey = peer.peerId,
         itemCount = messages.size,
+        latestKey = messages.lastOrNull()?.id,
     )
 
     // OpenDocument rather than GetContent: it returns a durable uri we can
@@ -1526,6 +1528,7 @@ private fun RoomChatScreen(
         listState = listState,
         conversationKey = room.key,
         itemCount = messages.size,
+        latestKey = messages.lastOrNull()?.messageId,
     )
 
     val pickFile = rememberLauncherForActivityResult(
@@ -2736,6 +2739,17 @@ private fun rememberPinnedToLatest(
     listState: LazyListState,
     conversationKey: String,
     itemCount: Int,
+    /**
+     * Id of the newest message, or null while there are none.
+     *
+     * The arrival trigger, and deliberately not [itemCount]: `chat.history`
+     * answers with at most one page, so a conversation past
+     * `chat_store::PAGE_SIZE` holds at exactly that many messages forever.
+     * Every new message slides the window - oldest off the front, newest onto
+     * the end - and a count keyed effect never fires again, which is every
+     * long conversation silently losing its follow.
+     */
+    latestKey: String?,
 ): PinnedToLatest {
     val scrolledAway = rememberScrolledAwayFromLatest(listState)
     val scope = rememberCoroutineScope()
@@ -2776,21 +2790,21 @@ private fun rememberPinnedToLatest(
         }
     }
 
-    LaunchedEffect(listState, conversationKey, itemCount) {
-        if (itemCount == 0) return@LaunchedEffect
+    LaunchedEffect(listState, conversationKey, latestKey) {
+        if (latestKey == null || itemCount == 0) return@LaunchedEffect
         if (!anchored) {
             listState.scrollToItem(itemCount - 1)
             anchored = true
         } else if (following) {
-            // Wait for the arrival to actually be measured before animating to
-            // it. This effect runs ahead of the frame's measure pass, so the
-            // list is still the old one: already at the bottom of it, with the
-            // new message not laid out yet. `animateScrollToItem` asks for a
-            // distance, gets nothing back because there is nowhere left to
-            // scroll, and takes that as its cue to give up - leaving the view
-            // one message short of the end, which is exactly the scroll the
-            // reader then has to do by hand.
-            snapshotFlow { listState.layoutInfo.totalItemsCount }.first { it >= itemCount }
+            // Let the arrival be laid out before animating to it. This effect
+            // runs ahead of the frame's measure pass, so right now the list is
+            // still the old one: already at the bottom of it, with the new
+            // message not placed yet. `animateScrollToItem` asks to scroll
+            // forward, gets nothing back because the old content has nowhere
+            // left to go, and takes that as its cue to give up - leaving the
+            // view one message short of the end, which is exactly the scroll
+            // the reader then has to do by hand.
+            withFrameNanos {}
             listState.animateScrollToItem(itemCount - 1)
         }
     }
