@@ -1311,12 +1311,22 @@ private fun ChatScreen(
 ) {
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val pinned = rememberPinnedToLatest(
+        listState = listState,
+        conversationKey = peer.peerId,
+        itemCount = messages.size,
+    )
 
     // OpenDocument rather than GetContent: it returns a durable uri we can
     // read from for the length of a copy, which GetContent does not promise.
     val pickFile = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
-    ) { uri -> uri?.let(onSendFile) }
+    ) { uri ->
+        uri?.let {
+            onSendFile(it)
+            pinned.jumpToLatest()
+        }
+    }
 
     // Ask at the point of use rather than on launch: a client that demands
     // the microphone before you have placed a call is asking for something it
@@ -1327,13 +1337,6 @@ private fun ChatScreen(
         title = MicRationaleTitle,
         body = MicRationaleBody,
         onGranted = onCall,
-    )
-
-    val scope = rememberCoroutineScope()
-    val scrolledAway by rememberPinnedToLatest(
-        listState = listState,
-        conversationKey = peer.peerId,
-        itemCount = messages.size,
     )
 
     Column(Modifier.fillMaxSize().imePadding()) {
@@ -1372,9 +1375,7 @@ private fun ChatScreen(
                 }
             }
 
-            JumpToCurrentButton(visible = scrolledAway) {
-                scope.launch { listState.animateScrollToItem(messages.lastIndex) }
-            }
+            JumpToCurrentButton(visible = pinned.scrolledAway.value, onClick = pinned.jumpToLatest)
         }
 
         // One bar per transfer in flight, sending or receiving. A file moving
@@ -1406,6 +1407,7 @@ private fun ChatScreen(
                 onClick = {
                     onSend(draft)
                     draft = ""
+                    pinned.jumpToLatest()
                 },
                 enabled = draft.isNotBlank(),
             ) {
@@ -1519,11 +1521,21 @@ private fun RoomChatScreen(
     onShare: () -> Unit,
 ) {
     var draft by remember { mutableStateOf("") }
+    val listState = rememberLazyListState()
+    val pinned = rememberPinnedToLatest(
+        listState = listState,
+        conversationKey = room.key,
+        itemCount = messages.size,
+    )
 
     val pickFile = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
-    ) { uri -> uri?.let(onSendFile) }
-    val listState = rememberLazyListState()
+    ) { uri ->
+        uri?.let {
+            onSendFile(it)
+            pinned.jumpToLatest()
+        }
+    }
     val context = LocalContext.current
 
     val requestMic = rememberExplainedPermission(
@@ -1543,13 +1555,6 @@ private fun RoomChatScreen(
             CameraCapture.start(context)
             onToggleVideo(true)
         },
-    )
-
-    val scope = rememberCoroutineScope()
-    val scrolledAway by rememberPinnedToLatest(
-        listState = listState,
-        conversationKey = room.key,
-        itemCount = messages.size,
     )
 
     Column(Modifier.fillMaxSize().imePadding()) {
@@ -1662,9 +1667,10 @@ private fun RoomChatScreen(
                     }
                 }
 
-                JumpToCurrentButton(visible = scrolledAway) {
-                    scope.launch { listState.animateScrollToItem(messages.lastIndex) }
-                }
+                JumpToCurrentButton(
+                    visible = pinned.scrolledAway.value,
+                    onClick = pinned.jumpToLatest,
+                )
             }
         }
 
@@ -1691,6 +1697,7 @@ private fun RoomChatScreen(
                 onClick = {
                     onSend(draft)
                     draft = ""
+                    pinned.jumpToLatest()
                 },
                 enabled = joined && draft.isNotBlank(),
             ) {
@@ -2710,13 +2717,28 @@ private fun rememberScrolledAwayFromLatest(listState: LazyListState): State<Bool
  * from: once the keyboard is up, a list that was pinned to the end looks
  * identical to one the reader had deliberately scrolled away from.
  */
+/** What a chat list needs to stay on its newest message. */
+private class PinnedToLatest(
+    /** True while the reader has moved off the newest message. */
+    val scrolledAway: State<Boolean>,
+    /**
+     * Put the reader back on the newest message and resume following it.
+     *
+     * The jump button's action, and also what sending does: posting a message
+     * is as plain a statement that you want to see the end of the conversation
+     * as tapping the button is, wherever you had scrolled to before.
+     */
+    val jumpToLatest: () -> Unit,
+)
+
 @Composable
 private fun rememberPinnedToLatest(
     listState: LazyListState,
     conversationKey: String,
     itemCount: Int,
-): State<Boolean> {
+): PinnedToLatest {
     val scrolledAway = rememberScrolledAwayFromLatest(listState)
+    val scope = rememberCoroutineScope()
 
     // Both reset per conversation: a newly opened room or peer starts on its
     // own newest message, wherever the last one was left.
@@ -2760,6 +2782,15 @@ private fun rememberPinnedToLatest(
             listState.scrollToItem(itemCount - 1)
             anchored = true
         } else if (following) {
+            // Wait for the arrival to actually be measured before animating to
+            // it. This effect runs ahead of the frame's measure pass, so the
+            // list is still the old one: already at the bottom of it, with the
+            // new message not laid out yet. `animateScrollToItem` asks for a
+            // distance, gets nothing back because there is nowhere left to
+            // scroll, and takes that as its cue to give up - leaving the view
+            // one message short of the end, which is exactly the scroll the
+            // reader then has to do by hand.
+            snapshotFlow { listState.layoutInfo.totalItemsCount }.first { it >= itemCount }
             listState.animateScrollToItem(itemCount - 1)
         }
     }
@@ -2778,14 +2809,23 @@ private fun rememberPinnedToLatest(
             }
     }
 
-    // Mid-drag the measured answer is the honest one - the button should show
-    // as soon as the end leaves the screen, not when the finger comes up.
-    // Keyed on the conversation as well as the list: a new key hands
-    // `following` a fresh state object, and a lambda remembered only against
-    // `listState` would go on reading the outgoing conversation's one.
-    return remember(listState, conversationKey) {
-        derivedStateOf { scrolledAway.value || !following }
-    }
+    return PinnedToLatest(
+        // Mid-drag the measured answer is the honest one - the button should
+        // show as soon as the end leaves the screen, not when the finger comes
+        // up. Keyed on the conversation as well as the list: a new key hands
+        // `following` a fresh state object, and a lambda remembered only
+        // against `listState` would go on reading the outgoing one.
+        scrolledAway = remember(listState, conversationKey) {
+            derivedStateOf { scrolledAway.value || !following }
+        },
+        jumpToLatest = {
+            following = true
+            scope.launch {
+                val last = listState.layoutInfo.totalItemsCount - 1
+                if (last >= 0) listState.animateScrollToItem(last)
+            }
+        },
+    )
 }
 
 /**
