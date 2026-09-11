@@ -1328,11 +1328,24 @@ private fun ChatScreen(
     val scrolledAway by rememberScrolledAwayFromLatest(listState)
     val scope = rememberCoroutineScope()
 
-    // Follow the conversation as it grows, the way every chat app does -
-    // unless the reader has scrolled back, where snatching the view to the end
-    // mid-sentence is the exact thing the jump button exists to prevent.
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty() && !scrolledAway) {
+    // The screen opens with no messages and history lands a moment later, so
+    // the first populated frame is the one that decides where the reader
+    // starts. It has to be placed with the instant `scrollToItem`: animating
+    // measures the distance from the layout it can still see, which is the
+    // empty one, so it settles at the top of the history instead of the end -
+    // and a list sitting at the top of its history reads as "scrolled away",
+    // which wedges the follow below off for the rest of the conversation.
+    var anchored by remember(peer.peerId) { mutableStateOf(false) }
+
+    LaunchedEffect(peer.peerId, messages.size) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        if (!anchored) {
+            listState.scrollToItem(messages.lastIndex)
+            anchored = true
+        } else if (!scrolledAway) {
+            // Follow the conversation as it grows, the way every chat app does
+            // - unless the reader has scrolled back, where snatching the view
+            // to the end mid-sentence is the thing the jump button prevents.
             listState.animateScrollToItem(messages.lastIndex)
         }
     }
@@ -1549,11 +1562,22 @@ private fun RoomChatScreen(
     val scrolledAway by rememberScrolledAwayFromLatest(listState)
     val scope = rememberCoroutineScope()
 
-    // Left alone once the reader has scrolled back; JumpToCurrentButton is the
-    // way forward again. A busy room otherwise drags the view off whatever is
-    // being read every time anyone speaks.
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty() && !scrolledAway) {
+    // Same reasoning as the direct-chat list: the first frame that has any
+    // messages in it gets the instant `scrollToItem`, because room frames
+    // can land several at a time - multi-home fan-out delivers a burst - and
+    // an animated scroll sized from the empty layout stops at the top.
+    var anchored by remember(room.key) { mutableStateOf(false) }
+
+    LaunchedEffect(room.key, messages.size) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        if (!anchored) {
+            listState.scrollToItem(messages.lastIndex)
+            anchored = true
+        } else if (!scrolledAway) {
+            // Left alone once the reader has scrolled back;
+            // JumpToCurrentButton is the way forward again. A busy room
+            // otherwise drags the view off whatever is being read every time
+            // anyone speaks.
             listState.animateScrollToItem(messages.lastIndex)
         }
     }
