@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -89,6 +90,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -106,6 +108,8 @@ import com.conquerd.client.AppViewModel
 import com.conquerd.client.roomHeadcount
 import com.conquerd.client.R
 import com.conquerd.client.ChatMessage
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import com.conquerd.client.AppState
 import com.conquerd.client.CallPhase
@@ -1325,30 +1329,12 @@ private fun ChatScreen(
         onGranted = onCall,
     )
 
-    val scrolledAway by rememberScrolledAwayFromLatest(listState)
     val scope = rememberCoroutineScope()
-
-    // The screen opens with no messages and history lands a moment later, so
-    // the first populated frame is the one that decides where the reader
-    // starts. It has to be placed with the instant `scrollToItem`: animating
-    // measures the distance from the layout it can still see, which is the
-    // empty one, so it settles at the top of the history instead of the end -
-    // and a list sitting at the top of its history reads as "scrolled away",
-    // which wedges the follow below off for the rest of the conversation.
-    var anchored by remember(peer.peerId) { mutableStateOf(false) }
-
-    LaunchedEffect(peer.peerId, messages.size) {
-        if (messages.isEmpty()) return@LaunchedEffect
-        if (!anchored) {
-            listState.scrollToItem(messages.lastIndex)
-            anchored = true
-        } else if (!scrolledAway) {
-            // Follow the conversation as it grows, the way every chat app does
-            // - unless the reader has scrolled back, where snatching the view
-            // to the end mid-sentence is the thing the jump button prevents.
-            listState.animateScrollToItem(messages.lastIndex)
-        }
-    }
+    val scrolledAway by rememberPinnedToLatest(
+        listState = listState,
+        conversationKey = peer.peerId,
+        itemCount = messages.size,
+    )
 
     Column(Modifier.fillMaxSize().imePadding()) {
         TopAppBar(
@@ -1559,28 +1545,12 @@ private fun RoomChatScreen(
         },
     )
 
-    val scrolledAway by rememberScrolledAwayFromLatest(listState)
     val scope = rememberCoroutineScope()
-
-    // Same reasoning as the direct-chat list: the first frame that has any
-    // messages in it gets the instant `scrollToItem`, because room frames
-    // can land several at a time - multi-home fan-out delivers a burst - and
-    // an animated scroll sized from the empty layout stops at the top.
-    var anchored by remember(room.key) { mutableStateOf(false) }
-
-    LaunchedEffect(room.key, messages.size) {
-        if (messages.isEmpty()) return@LaunchedEffect
-        if (!anchored) {
-            listState.scrollToItem(messages.lastIndex)
-            anchored = true
-        } else if (!scrolledAway) {
-            // Left alone once the reader has scrolled back;
-            // JumpToCurrentButton is the way forward again. A busy room
-            // otherwise drags the view off whatever is being read every time
-            // anyone speaks.
-            listState.animateScrollToItem(messages.lastIndex)
-        }
-    }
+    val scrolledAway by rememberPinnedToLatest(
+        listState = listState,
+        conversationKey = room.key,
+        itemCount = messages.size,
+    )
 
     Column(Modifier.fillMaxSize().imePadding()) {
         TopAppBar(
@@ -2715,6 +2685,108 @@ private fun rememberScrolledAwayFromLatest(listState: LazyListState): State<Bool
             info.totalItemsCount - 1 - last.index >= JUMP_TO_CURRENT_AFTER_ITEMS
         }
     }
+
+/**
+ * Keeps [listState] sitting on the newest message, and reports whether the
+ * reader has moved off it - the one boolean [JumpToCurrentButton] needs.
+ *
+ * Three separate things move a chat list, and each wants different handling:
+ *
+ *  - **History arriving.** The screen opens with an empty list and the store
+ *    answers a moment later, so the first populated frame is the one that
+ *    decides where the reader starts. It gets the instant `scrollToItem`,
+ *    because a launched effect runs before that frame's measure pass: an
+ *    animated scroll would size itself from the layout it can still see, which
+ *    is the empty one, and settle back at the top of the history.
+ *  - **A message arriving.** Followed only while the reader is on the end.
+ *    Snatching the view down mid-sentence is the thing the jump button exists
+ *    to prevent.
+ *  - **The viewport shrinking**, which on a phone means the keyboard. A
+ *    LazyColumn holds its *top* anchor across a resize, so without this the
+ *    newest message slides below the fold by exactly the keyboard's height.
+ *
+ * Whether to follow is remembered rather than measured when it is needed,
+ * because the resize changes the very geometry a measured answer would be read
+ * from: once the keyboard is up, a list that was pinned to the end looks
+ * identical to one the reader had deliberately scrolled away from.
+ */
+@Composable
+private fun rememberPinnedToLatest(
+    listState: LazyListState,
+    conversationKey: String,
+    itemCount: Int,
+): State<Boolean> {
+    val scrolledAway = rememberScrolledAwayFromLatest(listState)
+
+    // Both reset per conversation: a newly opened room or peer starts on its
+    // own newest message, wherever the last one was left.
+    var anchored by remember(conversationKey) { mutableStateOf(false) }
+    var following by remember(conversationKey) { mutableStateOf(true) }
+
+    // The two halves below each move `following` one way only, which is what
+    // keeps a reading taken mid-resize from doing damage: the keyboard's inset
+    // animates over many frames, and during those the list is genuinely
+    // clipped, so anything that could disarm on geometry alone would disarm
+    // exactly when the pinning is needed.
+
+    // Coming to rest on the end re-arms - that covers the jump button and a
+    // drag back down to the bottom without either having to say so, and a
+    // stray re-arm only pins a list that wanted pinning anyway.
+    LaunchedEffect(listState, conversationKey) {
+        snapshotFlow { listState.isScrollInProgress }.collect { moving ->
+            if (!moving && !scrolledAway.value) following = true
+        }
+    }
+
+    // Only the reader's own gesture disarms. Programmatic scrolls raise no
+    // drag interaction, so this cannot be tripped by our own pinning.
+    LaunchedEffect(listState, conversationKey) {
+        listState.interactionSource.interactions.collect { interaction ->
+            if (interaction !is DragInteraction.Stop &&
+                interaction !is DragInteraction.Cancel
+            ) {
+                return@collect
+            }
+            // A fling carries on well past the finger, so where the reader
+            // meant to leave the list is only knowable once it comes to rest.
+            snapshotFlow { listState.isScrollInProgress }.first { !it }
+            if (scrolledAway.value) following = false
+        }
+    }
+
+    LaunchedEffect(listState, conversationKey, itemCount) {
+        if (itemCount == 0) return@LaunchedEffect
+        if (!anchored) {
+            listState.scrollToItem(itemCount - 1)
+            anchored = true
+        } else if (following) {
+            listState.animateScrollToItem(itemCount - 1)
+        }
+    }
+
+    // The keyboard, and anything else that resizes the list. `drop(1)` skips
+    // the initial measurement, which is the anchoring effect's job, not a
+    // resize. Instant rather than animated for every frame of it: the inset
+    // animates over a good fraction of a second, and a scroll animation
+    // racing that one would visibly lag behind the keyboard on the way up.
+    LaunchedEffect(listState, conversationKey) {
+        snapshotFlow { listState.layoutInfo.viewportSize.height }
+            .drop(1)
+            .collect {
+                val last = listState.layoutInfo.totalItemsCount - 1
+                if (following && last >= 0) listState.scrollToItem(last)
+            }
+    }
+
+    // Mid-drag the measured answer is the honest one - the button should show
+    // as soon as the end leaves the screen, not when the finger comes up.
+    // Keyed on the conversation as well as the list: a new key hands
+    // `following` a fresh state object, and a lambda remembered only against
+    // `listState` would go on reading the outgoing conversation's one.
+    return remember(listState, conversationKey) {
+        derivedStateOf { scrolledAway.value || !following }
+    }
+}
 
 /**
  * The affordance back to the newest message, shown over the bottom of a chat
