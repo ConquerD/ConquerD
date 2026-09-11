@@ -3816,11 +3816,11 @@ fn check_ticket_renewals(state: &SupernodeState) {
     }
 }
 
-/// Seed default web assets into `data_dir` on first run.
+/// Seed or update the system-owned portal apps in `data_dir`.
 ///
 /// Files are embedded at compile time with `include_str!` so the binary
-/// is self-contained.  Each file is only written if it does not already
-/// exist, so operator customisations are never overwritten.
+/// is self-contained. Built-in assets update when their contents change;
+/// operator apps under other slugs are not touched.
 ///
 /// Directory layout seeded:
 /// ```text
@@ -3837,8 +3837,9 @@ fn check_ticket_renewals(state: &SupernodeState) {
 ///     brick-breaker/
 ///       index.html                   ← multiplayer breakout demo
 ///       brick-breaker.js
-///   web-sdk/
-///     conquerd.mjs                   ← browser SDK (imported by all game demos)
+///   web/web-sdk/
+///     conquerd.mjs                   ← native portal SDK
+///     demo-*                        ← shared example session and UI helpers
 /// ```
 ///
 /// The three game demos (`game.relay.v1`) run inside the native in-app portal
@@ -3863,6 +3864,11 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
     const BRICK_JS: &str = include_str!("../templates/games_brick_breaker_brick_breaker.js");
 
     const CONQUERD_MJS: &str = include_str!("../templates/web_sdk_conquerd.mjs");
+    const DEMO_SESSION: &str = include_str!("../templates/web_sdk_demo_session.mjs");
+    const DEMO_SHELL: &str = include_str!("../templates/web_sdk_demo_shell.mjs");
+    const DEMO_CSS: &str = include_str!("../templates/web_sdk_demo_shell.css");
+    const BRICK_WORLD: &str = include_str!("../templates/games_brick_breaker_world.mjs");
+    const DRAW_BOARD: &str = include_str!("../templates/games_shared_drawing_board.mjs");
 
     // Directories (always ensure they exist)
     let dirs: &[&[&str]] = &[
@@ -3884,12 +3890,17 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
         // Served at /web-sdk/conquerd.mjs — must live under web/ so that
         // the web_app_module route() function finds it via the web_root.
         (&["web", "web-sdk", "conquerd.mjs"], CONQUERD_MJS),
+        (&["web", "web-sdk", "demo-session.mjs"], DEMO_SESSION),
+        (&["web", "web-sdk", "demo-shell.mjs"], DEMO_SHELL),
+        (&["web", "web-sdk", "demo-shell.css"], DEMO_CSS),
         (&["games", "example", "index.html"], CURSOR_HTML),
         (&["games", "example", "game.js"], CURSOR_JS),
         (&["games", "shared-drawing", "index.html"], DRAW_HTML),
         (&["games", "shared-drawing", "drawing.js"], DRAW_JS),
+        (&["games", "shared-drawing", "board.mjs"], DRAW_BOARD),
         (&["games", "brick-breaker", "index.html"], BRICK_HTML),
         (&["games", "brick-breaker", "brick-breaker.js"], BRICK_JS),
+        (&["games", "brick-breaker", "world.mjs"], BRICK_WORLD),
     ];
 
     // No write-if-missing seeds remain; all built-in files are above.

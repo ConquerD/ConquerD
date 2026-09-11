@@ -99,6 +99,7 @@ class PortalNativeTransport {
         this._pollTimer = null;
         this.onDatagram = null; // (featureId, Uint8Array)
         this._closed = false;
+        this._polling = false;
     }
 
     async connect() {
@@ -111,9 +112,11 @@ class PortalNativeTransport {
     }
 
     async _poll() {
-        if (this._closed || !this.api.pollDatagrams) return;
+        if (this._closed || this._polling || !this.api.pollDatagrams) return;
+        this._polling = true;
         try {
             const res = await this.api.pollDatagrams();
+            if (this._closed) return;
             const frames = res?.frames || [];
             for (const b64 of frames) {
                 try {
@@ -122,6 +125,7 @@ class PortalNativeTransport {
                 } catch { /* skip bad frame */ }
             }
         } catch { /* transient poll errors */ }
+        finally { this._polling = false; }
     }
 
     async sendRawDatagram(_featureId, payload) {
@@ -140,7 +144,7 @@ class PortalNativeTransport {
             clearInterval(this._pollTimer);
             this._pollTimer = null;
         }
-        try { this.api.closeChannel?.(); } catch { /* ignore */ }
+        try { Promise.resolve(this.api.closeChannel?.()).catch(() => {}); } catch { /* ignore */ }
     }
 }
 

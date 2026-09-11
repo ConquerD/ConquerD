@@ -100,10 +100,10 @@ pub fn build_room_invite_url(
         }
     }
     let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-    conquerd_features::mint_uri(&format!("room#{encoded}"))
+    conquerd_features::mint_invite_https("room", &encoded)
 }
 
-/// Parse the base64url fragment of a `d://room#…` invite (the part after
+/// Parse the base64url fragment of a room invite (the part after
 /// `room#`). Returns an error string suitable for `emit_invite_failed`.
 pub fn parse_room_invite(encoded: &str) -> Result<RoomInvitePayload, String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -209,7 +209,7 @@ impl ConnectionManager {
             }
         }
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        Some(conquerd_features::mint_uri(&format!("invite#{encoded}")))
+        Some(conquerd_features::mint_invite_https("invite", &encoded))
     }
 
     /// Build a self-contained room invite URL for a room hosted on
@@ -473,14 +473,17 @@ impl ConnectionManager {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
-        let Some(rest) = conquerd_features::strip_scheme(&invite_url) else {
+        let Some(rest) = conquerd_features::normalize_app_url(&invite_url) else {
             self.emit_invite_failed(format!("invalid scheme in '{invite_url}'"));
             return;
         };
+        let rest = rest.as_ref();
 
-        // Invite URLs carry an optional `action#` prefix before the base64url
-        // fragment: `d://invite#<b64>`, `d://room#<b64>`, or the
-        // bare legacy `d://<b64>` / `conquerd://<b64>`. Split it off so the payload decodes.
+        // `normalize_app_url` has reduced every accepted form — the https
+        // share link, `d://`, `doubleslash://`, `conquerd://` — to the same
+        // remainder. It carries an optional `action#` prefix before the
+        // base64url fragment: `invite#<b64>`, `room#<b64>`, or a bare legacy
+        // `<b64>`. Split it off so the payload decodes.
         let (action, encoded) = match rest.split_once('#') {
             Some((action, payload)) => (action, payload),
             None => ("", rest),

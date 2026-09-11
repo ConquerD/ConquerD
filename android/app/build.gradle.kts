@@ -116,7 +116,7 @@ val cargoBuildRelease = registerCargoBuild("cargoBuildRelease", releaseProfile =
 
 android {
     namespace = "com.conquerd.client"
-    compileSdk = 35
+    compileSdk = 36
 
     // Pinned rather than "whatever is installed": the NDK version decides the
     // libc symbols the core links against, so a silent bump is a silent change
@@ -126,7 +126,7 @@ android {
     defaultConfig {
         applicationId = "com.conquerd.client"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0.0$conquerdBuildStamp"
 
@@ -137,10 +137,18 @@ android {
 
     // Left alone on a developer machine, where AGP's own debug keystore signs
     // the build exactly as it always has. CI replaces it so the APK it
-    // produces is installable over what is already on a test device.
+    // produces is installable over what is already on a test device. The same
+    // env vars sign `bundleRelease` when set, which is what Play Console
+    // accepts; an unset machine still produces an unsigned release bundle.
     if (signingKeystore != null) {
         signingConfigs {
             getByName("debug") {
+                storeFile = file(signingKeystore)
+                storePassword = signingStorePassword
+                keyAlias = signingKeyAlias
+                keyPassword = signingKeyPassword
+            }
+            create("release") {
                 storeFile = file(signingKeystore)
                 storePassword = signingStorePassword
                 keyAlias = signingKeyAlias
@@ -156,6 +164,9 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            if (signingKeystore != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

@@ -2,6 +2,7 @@ package com.conquerd.client
 
 import android.Manifest
 import android.app.Notification
+import android.app.Notification.Action
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -10,9 +11,47 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.put
+
+private const val TAG = "CoreService"
+
+/**
+ * The foreground types this process may claim right now.
+ *
+ * Always includes `specialUse` (holding the transport open is why the service
+ * exists). Adds microphone and camera only while a call needs them *and* their
+ * permission is held — Android 14 throws if those types are claimed without
+ * the matching runtime grant.
+ *
+ * `dataSync` is deliberately absent: Android 15 caps it at six hours and Play
+ * only accepts it for short user-initiated transfers, not a standing session.
+ */
+internal fun coreForegroundTypes(
+    microphoneActive: Boolean,
+    cameraActive: Boolean,
+    hasMicrophonePermission: Boolean,
+    hasCameraPermission: Boolean,
+): Int {
+    var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+    if (microphoneActive && hasMicrophonePermission) {
+        types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+    }
+    if (cameraActive && hasCameraPermission) {
+        types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+    }
+    return types
+}
 
 /**
  * Keeps the client core alive while the app is backgrounded.
@@ -39,14 +78,59 @@ class CoreService : Service() {
      */
     private val networkMonitor by lazy { NetworkMonitor(this, ConquerdCore.get(this)) }
 
+    /**
+     * Event pump for incoming calls. The ViewModel is gone when the activity
+     * is; this scope lives with the session so a ring can still be posted.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         networkMonitor.start()
+        IncomingCallNotifier.ensureLifecycleObserver()
+        scope.launch {
+            ConquerdCore.get(this@CoreService).events.collect { event ->
+                when (event.eventName()) {
+                    "call_request" -> {
+                        val peerId = event.stringOrEmpty("peer_id")
+                        if (peerId.isEmpty()) return@collect
+                        IncomingCallNotifier.show(
+                            this@CoreService,
+                            peerId,
+                            peerId.take(12),
+                        )
+                    }
+                    "call_accepted", "call_ended" ->
+                        IncomingCallNotifier.cancel(this@CoreService)
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_DISCONNECT) {
+            Log.i(TAG, "disconnect requested from the notification")
+            IncomingCallNotifier.cancel(this)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (intent?.action == IncomingCallNotifier.ACTION_DECLINE) {
+            val peerId = intent.getStringExtra(IncomingCallNotifier.EXTRA_PEER_ID)
+            if (!peerId.isNullOrEmpty()) {
+                IncomingCallNotifier.declined(this, peerId)
+                scope.launch {
+                    ConquerdCore.get(this@CoreService).command("call.reject") {
+                        put("peer_id", peerId)
+                    }
+                }
+            }
+            return START_STICKY
+        }
+
         createChannel()
 
         if (intent?.action == ACTION_SET_MEDIA) {
@@ -54,16 +138,45 @@ class CoreService : Service() {
             cameraActive = intent.getBooleanExtra(EXTRA_CAMERA, false)
         }
 
+        if (!ConquerdCore.get(this).isRunning) {
+            // Sticky restart after the process died, or a start with no
+            // session. A notification that says we are connected when the
+            // core is gone is a lie.
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         startInForeground()
 
-        // START_STICKY: if the system reclaims the process under memory
-        // pressure, bring the service back. The core re-reads its stores on
-        // start, so a restart resumes rather than losing state.
+        // START_STICKY: if the system reclaims the *service* under memory
+        // pressure while the process (and therefore the core) is still
+        // alive, bring the notification back. Process death is the other
+        // case and is rejected above because there is then no core to keep.
         return START_STICKY
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    override fun onTimeout(startId: Int) {
+        // API 34 short-service path. specialUse is not supposed to hit this,
+        // but failing to stop here is a crash rather than a logged timeout.
+        handleTimeout("unspecified")
+    }
+
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        handleTimeout(fgsType.toString())
+    }
+
+    private fun handleTimeout(type: String) {
+        Log.w(TAG, "foreground service timed out (type=$type); stopping")
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        scope.cancel()
+        IncomingCallNotifier.cancel(this)
         networkMonitor.stop()
         ConquerdCore.get(this).stop()
     }
@@ -74,6 +187,12 @@ class CoreService : Service() {
             0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
+        )
+        val disconnect = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, CoreService::class.java).setAction(ACTION_DISCONNECT),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
         val inCall = microphoneActive || cameraActive
@@ -87,6 +206,13 @@ class CoreService : Service() {
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(open)
             .setOngoing(true)
+            .addAction(
+                Action.Builder(
+                    Icon.createWithResource(this, R.drawable.ic_notification),
+                    getString(R.string.service_disconnect),
+                    disconnect,
+                ).build(),
+            )
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -101,23 +227,12 @@ class CoreService : Service() {
         }
     }
 
-    /**
-     * The foreground service types this process may legitimately claim now.
-     *
-     * Always includes `dataSync` (holding the transport open is the baseline
-     * reason this service exists); adds microphone and camera only while a
-     * call needs them *and* their permission is held.
-     */
-    private fun activeServiceTypes(): Int {
-        var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-        if (microphoneActive && hasPermission(Manifest.permission.RECORD_AUDIO)) {
-            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-        }
-        if (cameraActive && hasPermission(Manifest.permission.CAMERA)) {
-            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-        }
-        return types
-    }
+    private fun activeServiceTypes(): Int = coreForegroundTypes(
+        microphoneActive = microphoneActive,
+        cameraActive = cameraActive,
+        hasMicrophonePermission = hasPermission(Manifest.permission.RECORD_AUDIO),
+        hasCameraPermission = hasPermission(Manifest.permission.CAMERA),
+    )
 
     private fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
@@ -141,6 +256,7 @@ class CoreService : Service() {
         private const val CHANNEL_ID = "conquerd_core"
         private const val NOTIFICATION_ID = 1
         private const val ACTION_SET_MEDIA = "com.conquerd.client.SET_MEDIA"
+        private const val ACTION_DISCONNECT = "com.conquerd.client.DISCONNECT"
         private const val EXTRA_MICROPHONE = "microphone"
         private const val EXTRA_CAMERA = "camera"
 

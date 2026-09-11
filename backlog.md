@@ -456,13 +456,13 @@ exchanged, no message sent, no supernode reached from the device.
 9. **File transfer UI** over the Storage Access Framework — Android has no free-standing filesystem
    path to hand `SendFile`.
 
-10. **`ACCESS_LOCAL_NETWORK` before raising targetSdk to 36+.** Android 16 makes local-network
-   access a runtime permission, and a P2P client that cannot reach a LAN peer loses its direct
-   path and silently falls back to relay for everyone on the same Wi-Fi. On the Pixel 11 (API 37)
-   the app is currently granted it implicitly *because* targetSdk is 35 - `dumpsys` shows
-   `granted=true, flags=[REVOKE_WHEN_REQUESTED]`, meaning the grant evaporates the moment the app
-   asks properly. Raising targetSdk without adding the request and a rationale turns every direct
-   LAN session into a relayed one, with no error to explain it.
+10. **`ACCESS_LOCAL_NETWORK` before raising targetSdk to 37.** Official enforcement is
+   Android 17 / `targetSdk` 37: apps at 36 still get an implicit grant from `INTERNET`.
+   `targetSdk` is already 36 (Play's 2026 floor). On the Pixel 11 (API 37) a 35-targeted
+   build showed `granted=true, flags=[REVOKE_WHEN_REQUESTED]`, meaning the grant evaporates
+   the moment the app asks properly. Raising to 37 without adding the request and a
+   rationale turns every direct LAN session into a relayed one, with no error to explain
+   it. Do not declare the permission early — declaring it is what revokes the implicit grant.
 
 11. **Multi-device (one identity, several live endpoints).** Not supported, and the failure is
    silent rather than refused. `relay.rs` (`peers.insert`), `signaling.rs` (`register_quic_sender`)
@@ -480,7 +480,61 @@ exchanged, no message sent, no supernode reached from the device.
 
 13. **Release APK hardening.** R8 rules for the JNI surface and kotlinx.serialization are written
     (`app/proguard-rules.pro`) but a minified release build has never been run, so they are
-    untested. Signing config is also absent.
+    untested. `bundleRelease` signs from `CONQUERD_KEYSTORE` when that env is set; a Play
+    upload key has not been used yet.
+
+### Google Play listing — remaining (2026-09-10)
+
+App-side policy work for a first listing is in the tree: `targetSdk` 36, `specialUse` FGS
+(with `onTimeout` and a notification Disconnect), Android-accurate `PRIVACY.md` / `TERMS.md`,
+in-app terms gate, mic/camera/notification disclosures, peer/room Report, portal WebView
+locked to `d://` / `conquerd://`, and background incoming calls (`CallStyle` + full-screen
+intent). What is left is almost all Play Console, not more Kotlin.
+
+**Blocks a public listing (Console, not code):**
+
+1. **Signed AAB + Play App Signing.** `bundleRelease` with a real upload keystore in
+   `CONQUERD_KEYSTORE`. Package id `com.conquerd.client` is frozen at first upload.
+2. **`specialUse` declaration + a short video** of the persistent “connected” notification
+   and Disconnect. Play will not accept `dataSync` for a standing P2P session.
+3. **Full-screen intent declaration** for lock-screen incoming calls
+   (`USE_FULL_SCREEN_INTENT`).
+4. **Data Safety** matching `PRIVACY.md`: messages, audio, camera, files, handle; collected
+   on device; shared only with chosen peers; custom E2E in transit; locally deletable; no
+   ads, analytics, or advertising ID.
+5. **Photo and video permissions** declaration — camera is for calls, not a gallery scrape.
+6. **Encryption besides HTTPS** — yes (Ed25519 / X25519 / AES-GCM). US EAR
+   self-classification in the questionnaire.
+7. **IARC.** Chat + UGC typically Teen / 13+. Do not opt into Designed for Families.
+8. **Closed testing** (personal accounts: typically 14 days and enough opted-in testers)
+   before production.
+9. **Developer identity verification** — enforcement in several countries starts
+   2026-09-30.
+10. **Reviewer notes:** unlock passphrase + a working invite. The crawler dies on the lock
+    screen otherwise.
+
+Public policy URLs (only after these files are on `develop`):
+
+- https://github.com/ConquerD/DoubleSlash/blob/develop/PRIVACY.md
+- https://github.com/ConquerD/DoubleSlash/blob/develop/TERMS.md
+
+**First scan you cannot fake from the repo:** upload the AAB to an **internal testing**
+track and read Play Protect + the pre-launch report.
+
+**Optional later (not required to upload):**
+
+- Full Telecom `ConnectionService` / `phoneCall` FGS type (system dialer, unswipeable
+  CallStyle). Incoming already rings via `IncomingCallNotifier`.
+- A dedicated privacy email; GitHub issues is what `PRIVACY.md` lists today.
+- `ACCESS_LOCAL_NETWORK` — only when raising `targetSdk` to 37 (item 10 above). Do not
+  declare it at 36.
+
+**Deliberately not doing for Play:**
+
+- `RECEIVE_BOOT_COMPLETED` autostart (spyware-shaped).
+- In-app APK updater (Play violation if it sideloads like the desktop GitHub path).
+- A second HTML privacy page on `doubleslash.space`; the GitHub `PRIVACY.md` blob is the
+  public copy.
 
 ## Discovery / federation (speculative — only if demand appears)
 

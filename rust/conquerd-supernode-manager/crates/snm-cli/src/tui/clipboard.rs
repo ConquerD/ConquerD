@@ -1,16 +1,25 @@
+/// Pull the invite URL out of a supernode's log text.
+///
+/// A supernode logs an https invite (`https://doubleslash.space/i#…`); the
+/// `d://` and `conquerd://` scheme forms are still matched so older nodes and
+/// saved log dumps keep working. Mirrors `conquerd_features::find_app_url`,
+/// which this crate's workspace cannot depend on.
 pub fn extract_conquerd_url(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
-    let start = lower.find("conquerd://").or_else(|| {
-        let mut i = 0;
-        while let Some(rel) = lower[i..].find("d://") {
-            let at = i + rel;
-            if at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric() {
-                return Some(at);
+    let start = ["https://doubleslash.space/", "conquerd://"]
+        .iter()
+        .find_map(|needle| lower.find(needle))
+        .or_else(|| {
+            let mut i = 0;
+            while let Some(rel) = lower[i..].find("d://") {
+                let at = i + rel;
+                if at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric() {
+                    return Some(at);
+                }
+                i = at + 1;
             }
-            i = at + 1;
-        }
-        None
-    })?;
+            None
+        })?;
     let rest = &text[start..];
     let end = rest
         .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\n' || c == '\r')
@@ -44,6 +53,12 @@ mod tests {
         assert_eq!(
             extract_conquerd_url(minted).as_deref(),
             Some("d://invite#abc")
+        );
+        let https = "Invite URL: https://doubleslash.space/i#abc123
+";
+        assert_eq!(
+            extract_conquerd_url(https).as_deref(),
+            Some("https://doubleslash.space/i#abc123")
         );
     }
 }

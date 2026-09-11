@@ -67,7 +67,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 
 ### Security & Identity
 - Cryptographic identity via long-term Ed25519 keys with derived peer IDs (SHA-256).
-- Invite-only discovery through signed `d://` links (timestamped, expiry-checked).
+- Invite-only discovery through signed `https://doubleslash.space/i#…` links (timestamped, expiry-checked). The payload rides in the URL fragment, so the site never receives it.
 - Forward-secret handshakes using ephemeral X25519 + HKDF + AES-GCM.
 - All signaling is Ed25519-signed, transcript-bound, freshness-checked, and protected by a per-sender replay guard keyed on message signatures.
 - Peer revocation with propagation (socket drop, relay eject, SFU eject).
@@ -93,7 +93,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 - Native Rust desktop binary with a Qt 6 / QML UI (via [CXX-Qt](https://kdab.github.io/cxx-qt/)).
 - Modern dark theme with DPI-aware scaling (125%, 150%, 200%+).
 - First-run onboarding wizard (display name, identity fingerprint + QR, optional supernode).
-- `d://` URI scheme for one-click invite joining.
+- One-click invite joining: an https link the site hands off to the installed client.
 - Invite QR codes with toggle display and save-to-PNG.
 - System tray with badge notifications for unread messages and missed calls.
 - Collapsible event log panel (toggle with `Ctrl+B`); `Ctrl+K` creates a new invite, `Ctrl+,` opens Settings.
@@ -164,12 +164,12 @@ On first launch, an onboarding wizard walks you through choosing a display name,
 
 | Platform | Package | URI Scheme |
 |----------|---------|------------|
-| Windows  | Rust installer or portable folder | Registry (`d://`) |
+| Windows  | Rust installer or portable folder | Registry (`doubleslash://`, `d://`) |
 | macOS    | `.app` bundle + `.dmg` | `CFBundleURLTypes` in Info.plist |
 | Linux    | AppImage | `.desktop` file + `xdg-mime` |
 
 ### Windows
-Run `conquerd-installer.exe` or extract the portable `conquerd/` folder. The installer registers the `d://` URI scheme, creates Start Menu shortcuts, and supports silent upgrades (`--silent`) and uninstallation (`--uninstall`).
+Run `conquerd-installer.exe` or extract the portable `conquerd/` folder. The installer registers the `doubleslash://` and `d://` URI schemes (how an invite page opens the app), creates Start Menu shortcuts, and supports silent upgrades (`--silent`) and uninstallation (`--uninstall`).
 
 ### macOS
 Open the `.dmg` and drag DoubleSlash to Applications. Grant microphone access when prompted.
@@ -180,7 +180,7 @@ chmod +x DoubleSlash-x86_64.AppImage
 ./DoubleSlash-x86_64.AppImage
 ```
 
-To register the `d://` URI scheme:
+To register the URI schemes:
 ```bash
 cp packaging/conquerd.desktop ~/.local/share/applications/
 update-desktop-database ~/.local/share/applications/
@@ -242,7 +242,7 @@ DoubleSlash is Rust-first, with deliberate native and UI boundaries: Qt Quick sc
 - **Relay**: QUIC relay protocol on supernodes (transport-only; no app-layer decryption).
 
 ### Core Model
-- **Invite-only discovery**: peers connect only from signed `d://` links.
+- **Invite-only discovery**: peers connect only from signed invite links.
 - **Zero trust relay**: relays forward signed/encrypted payloads only — no app-layer central services.
 - **Cryptographic identity**: long-term Ed25519 identity key; `peer_id` = SHA-256 of public key.
 - **Forward secrecy**: invite handshakes use ephemeral X25519 + HKDF + AES-GCM.
@@ -434,15 +434,17 @@ client.sendDatagram("game.relay.v1", myPayload);
 
 `window.conquerd.ready` exposes portal channel APIs (`openChannel`, `sendDatagramB64`, `pollDatagrams`, `closeChannel`) and `myPeerId` from the native trust chain — no host/port/cert parameters.
 
-Three bundled game demos are deployed to `<data_dir>/games/` on first supernode start:
+Three bundled portal apps are deployed to `<data_dir>/games/` and updated on supernode start:
 
 | Path | Description |
 |------|-------------|
-| `/games/example/` | Cursor relay — real-time shared cursor canvas |
-| `/games/brick-breaker/` | Brick breaker — multiplayer paddle game |
-| `/games/shared-drawing/` | Shared drawing — collaborative canvas with stroke broadcast |
+| `/games/example/` | Presence Playground — live pointers and shared attention markers |
+| `/games/brick-breaker/` | Brick Breaker — cooperative paddles, smooth snapshots and peer host handoff |
+| `/games/shared-drawing/` | Shared Canvas — collaborative ink, erasing and late-join history replay |
 
 All three use `game.relay.v1` and open only via `d://<supernode_id>/games/<slug>/` from the in-app portal (Rooms sidebar). External browsers are not supported.
+
+The apps keep controls outside the canvas and share a Session panel with room selection, readiness, participants and measured traffic/round trips. Copy a session link to join from another device on the same supernode. Focus mode keeps the play area clear. These examples also show patterns for collaborative tools and dashboards; see the [portal app guide](games/README.md) for reuse, limits and tests.
 
 The SDK also exports `ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, and `featureForFixedTag` for games that interoperate with first-party `core.*` channels.
 
@@ -470,7 +472,7 @@ DoubleSlash uses an **invite-only** model. There is no user directory or friend 
 4. The peer appears in your left panel as a trusted contact.
 
 ### URI Launch
-If DoubleSlash is installed, clicking a `d://invite/...` link opens the app and processes the invite automatically.
+Invites are https links (`https://doubleslash.space/i#…`) so they linkify in chat clients and land somewhere useful when the app is missing. The payload is in the URL fragment, which browsers never send to a server: the site cannot read the invite, and a link scanner that pre-visits it cannot burn a single-use token. If DoubleSlash is installed, the page hands the invite to it over `doubleslash://` and it is processed automatically.
 
 ---
 
@@ -906,6 +908,7 @@ SFU **room state is not persisted** on the supernode — rooms exist in memory w
 - The `.bat`/`.sh` launchers keep the console window open after a crash so the trace is visible.
 
 ### Supernode troubleshooting
+- **Desktop portal fails with `file:///D://...`**: Chromium's Windows URL fixup reads the one-letter `d:` as a drive path. The portal works around it by navigating with the `conquerd://` alias internally, over the same authenticated QUIC connection — rebuild or update the desktop client if you see this. For the same reason, anything outside the app (an invite page opening the client) uses `doubleslash://`, never `d://`.
 - **Peers can't connect**: Verify both `supernode_port` (UDP) and `supernode_signaling_port` (TCP) are forwarded and open. Set `supernode_host` to the public DNS name or IP when remote peers need to connect.
 - **Port changes on restart**: Always set `supernode_signaling_port` to a fixed value (e.g. `34935`). Changing it breaks firewall rules and stored peer endpoints.
 - **Service fails with exit code 226/NAMESPACE**: LXC, OpenVZ, or some VPS hosts don't support mount namespaces. Comment out the hardening block in the systemd unit file and restart.
@@ -1227,7 +1230,13 @@ Users downloading the very first release should verify the GitHub release page, 
 
 ### Privacy Policy
 
-See [PRIVACY.md](PRIVACY.md) for the full privacy policy.
+See [PRIVACY.md](PRIVACY.md) for the full privacy policy (desktop and Android).
+The public URL for store listings is
+https://github.com/ConquerD/DoubleSlash/blob/develop/PRIVACY.md.
+User-generated content (chat, files, rooms, portal pages) is covered by
+[TERMS.md](TERMS.md). The Android client requires accepting those terms before
+the home screen, and offers an in-app report that sends identifiers — there is
+no DoubleSlash server that can take a message down.
 
 DoubleSlash is a local-first application. All peer-to-peer communication (voice, chat, file transfer) travels directly between clients or through volunteer supernodes chosen by the user, and is end-to-end encrypted. DoubleSlash does not operate servers that store your identity, messages, or call data.
 
@@ -1252,7 +1261,7 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 
 ### 1.0 — Highlights
 
-- **Zero-trust P2P architecture** — direct peer-to-peer; no central server stores your data. Ed25519 identity with derived peer IDs, invite-only discovery via signed `d://` links, forward-secret handshakes (ephemeral X25519 + HKDF + AES-GCM).
+- **Zero-trust P2P architecture** — direct peer-to-peer; no central server stores your data. Ed25519 identity with derived peer IDs, invite-only discovery via signed invite links (payload in the URL fragment, never sent to a server), forward-secret handshakes (ephemeral X25519 + HKDF + AES-GCM).
 - **Chat-first UX** — text is the primary interaction after connecting; voice is opt-in per conversation. Per-conversation scroll persistence, typing indicators, unread badges on taskbar + tray.
 - **Voice calls** — low-latency Opus over QUIC, push-to-talk and voice activation, spectral-gate noise suppression, jitter buffer with de-click.
 - **Video and screen sharing** — negotiated H.264/VP8, pre-encode picture-in-picture, a separately-mixed synchronised track for audio shared with the video, and adaptive bitrate. Complete on Windows; camera capture on Linux and macOS is built but unvalidated, and screen capture is Windows-only (see [Known limitations](#known-limitations)).
@@ -1261,7 +1270,7 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 - **Supernode release binaries**: pre-built packages for Linux x86_64, Linux ARM64, and Windows x86_64 on GitHub Releases and nightlies (`scripts/build_supernode.sh` / `scripts/build_supernode.ps1`).
 - **NAT traversal** — UPnP port mapping, QUIC/WebSocket direct connect, ordered WebSocket candidates, and supernode QUIC relay fallback with auto-renewed tickets and an endpoint mailbox.
 - **Security** — signed, transcript-bound signaling with timestamp freshness checks and per-sender replay deduplication; peer revocation with propagation; release-signed P2P updates with Ed25519 + threshold validation; crash/installer logging.
-- **Desktop application** — DPI-aware dark theme, first-run onboarding wizard (display name, identity fingerprint + QR, supernode setup), `d://` URI scheme for one-click invites, system tray with badges, collapsible event log, save-to-PNG invite QR codes.
+- **Desktop application** — DPI-aware dark theme, first-run onboarding wizard (display name, identity fingerprint + QR, supernode setup), one-click invite links, system tray with badges, collapsible event log, save-to-PNG invite QR codes.
 
 ### Known limitations
 

@@ -1,168 +1,75 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DoubleSlash — Shared Drawing • game.relay.v1</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: #0d1117;
-      color: #e6edf3;
-      font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
-      overflow: hidden;
-    }
-    #canvas {
-      display: block;
-      width: 100vw;
-      height: 100vh;
-      cursor: crosshair;
-      background: #161b22;
-      touch-action: none;
-    }
-    #canvas.eraser-cursor { cursor: cell; }
-    #overlay {
-      position: fixed;
-      top: 16px;
-      left: 16px;
-      background: rgba(13, 17, 23, 0.9);
-      border: 1px solid #30363d;
-      border-radius: 10px;
-      padding: 14px 18px;
-      font-size: 13px;
-      line-height: 1.5;
-      min-width: 240px;
-      max-width: 320px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-      z-index: 10;
-    }
-    #overlay h1 {
-      font-size: 15px;
-      color: #58a6ff;
-      margin-bottom: 6px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    #status { color: #8b949e; font-size: 12px; }
-    #status.connected { color: #3fb950; }
-    #status.error { color: #f85149; }
-    #overlay, #controls, #palette, #sizes { pointer-events: auto; }
-    #controls {
-      margin-top: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    #controls-row {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
-    #palette-label {
-      color: #8b949e;
-      font-size: 11px;
-    }
-    #palette, #sizes {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-    .size-btn {
-      width: 32px;
-      height: 32px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      border: 2px solid transparent;
-      border-radius: 6px;
-      padding: 0;
-      flex-shrink: 0;
-    }
-    .size-btn:hover { border-color: #484f58; }
-    .size-btn.active {
-      border-color: #e6edf3;
-      box-shadow: 0 0 0 1px #30363d;
-    }
-    .size-btn .dot {
-      display: block;
-      background: #e6edf3;
-      border-radius: 50%;
-    }
-    button {
-      background: #21262d;
-      color: #e6edf3;
-      border: 1px solid #30363d;
-      padding: 4px 10px;
-      border-radius: 6px;
-      font-size: 11px;
-      cursor: pointer;
-    }
-    button:hover { background: #30363d; }
-    .swatch {
-      width: 24px;
-      height: 24px;
-      border: 2px solid transparent;
-      border-radius: 4px;
-      padding: 0;
-      cursor: pointer;
-      flex-shrink: 0;
-    }
-    .swatch:hover { border-color: #484f58; }
-    .swatch.active {
-      border-color: #e6edf3;
-      box-shadow: 0 0 0 1px #30363d;
-    }
-    #palette.disabled { opacity: 0.45; pointer-events: none; }
-    #eraser.active {
-      background: #30363d;
-      border-color: #58a6ff;
-      color: #58a6ff;
-    }
-    #room-label {
-      color: #a5d6ff;
-      font-size: 11px;
-      margin-top: 6px;
-      word-break: break-all;
-    }
-    #hint {
-      margin-top: 10px;
-      color: #484f58;
-      font-size: 11px;
-      line-height: 1.4;
-    }
-    .peer-dot {
-      position: fixed;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      pointer-events: none;
-      z-index: 5;
-      box-shadow: 0 0 6px currentColor;
-    }
-  </style>
-</head>
-<body>
-  <canvas id="canvas"></canvas>
-  <div id="overlay">
-    <h1>🖌️ Shared Drawing</h1>
-    <div id="status">Connecting…</div>
-    <div id="room-label"></div>
-    <div id="controls">
-      <div id="palette-label">Color</div>
-      <div id="palette"></div>
-      <div id="palette-label">Stroke size</div>
-      <div id="sizes"></div>
-      <div id="controls-row">
-        <button id="eraser" type="button" title="Toggle eraser">Eraser</button>
-        <button id="clear" type="button">Clear Canvas</button>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Shared Canvas &middot; DoubleSlash Apps</title>
+    <link rel="stylesheet" href="../../web-sdk/demo-shell.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="app-header">
+        <a href="/" class="brand" aria-label="Back to portal">D://</a>
+        <div class="app-heading">
+          <div class="eyebrow">DoubleSlash Apps</div>
+          <h1>Shared Canvas</h1>
+        </div>
+        <div class="header-actions">
+          <button id="share">Copy link</button
+          ><button id="focus" aria-pressed="false">Focus</button
+          ><button
+            id="session-toggle"
+            aria-expanded="false"
+            aria-controls="session-panel"
+          >
+            Session
+          </button>
+        </div>
+      </header>
+      <div class="session-bar">
+        <span><i class="live-dot"></i><span id="room-label">lounge</span></span
+        ><span id="peers-count">0 here</span
+        ><span id="status" role="status">Connecting...</span
+        ><button id="exit-focus">Exit focus</button>
       </div>
-    </div>
-    <div id="hint">
-      Draw with your mouse. Toggle eraser to remove ink.<br>
-      Everyone in the same <code>?room=...</code> sees your strokes in real time.
-    </div>
-  </div>
-  <script type="module" src="drawing.js"></script>
-</body>
+      <div class="work-area">
+        <section class="workspace" aria-label="Shared Canvas">
+          <div class="toolbar">
+            <div class="toolbar-group">
+              <label>Ink</label>
+              <div id="palette"></div>
+            </div>
+            <div class="toolbar-group">
+              <label>Size</label>
+              <div id="sizes"></div>
+            </div>
+            <button id="eraser" aria-pressed="false">Eraser</button
+            ><span class="spacer"></span
+            ><button id="clear">Clear canvas</button>
+          </div>
+          <div class="stage">
+            <canvas
+              id="canvas"
+              width="800"
+              height="600"
+              tabindex="0"
+              aria-label="Shared Canvas interactive canvas"
+            ></canvas>
+          </div>
+        </section>
+        <aside
+          id="session-panel"
+          class="session-panel"
+          hidden
+          aria-label="Session and connection details"
+        ></aside>
+      </div>
+      <footer class="app-footer">
+        <span id="controls-hint"></span
+        ><span class="notice" id="notice" role="status"></span
+        ><span class="footer-detail">An app on your peer network</span>
+      </footer>
+    </main>
+    <script type="module" src="drawing.js"></script>
+  </body>
 </html>

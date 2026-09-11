@@ -130,27 +130,36 @@ fn build_conquerd_invite_url(root: &serde_json::Value) -> Result<String> {
         serde_json::from_value(invite.clone()).context("parse invite object")?;
     let json = serde_json::to_string(&payload).context("serialize invite payload")?;
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
-    Ok(format!("d://{encoded}"))
+    // Invites ship as https links so they linkify wherever they are pasted;
+    // the payload rides in the fragment and never reaches the site. Mirrors
+    // `conquerd_features::mint_invite_https`, which this workspace cannot
+    // depend on.
+    Ok(format!("https://doubleslash.space/i#{encoded}"))
 }
 
 fn looks_like_app_url(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.starts_with("d://") || lower.starts_with("conquerd://")
+    lower.starts_with("https://doubleslash.space/")
+        || lower.starts_with("d://")
+        || lower.starts_with("conquerd://")
 }
 
 fn extract_conquerd_url(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
-    let start = lower.find("conquerd://").or_else(|| {
-        let mut i = 0;
-        while let Some(rel) = lower[i..].find("d://") {
-            let at = i + rel;
-            if at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric() {
-                return Some(at);
+    let start = ["https://doubleslash.space/", "conquerd://"]
+        .iter()
+        .find_map(|needle| lower.find(needle))
+        .or_else(|| {
+            let mut i = 0;
+            while let Some(rel) = lower[i..].find("d://") {
+                let at = i + rel;
+                if at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric() {
+                    return Some(at);
+                }
+                i = at + 1;
             }
-            i = at + 1;
-        }
-        None
-    })?;
+            None
+        })?;
     let rest = &text[start..];
     let end = rest
         .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\n' || c == '\r')
@@ -192,11 +201,11 @@ mod tests {
     #[test]
     fn builds_conquerd_url_from_reusable_invite_json() {
         let url = parse_reusable_invite(SAMPLE_REUSABLE).unwrap();
-        assert!(url.starts_with("d://"));
+        assert!(url.starts_with("https://doubleslash.space/i#"));
         assert!(url.contains("eyJ"));
         assert_eq!(
             url,
-            "d://eyJpbnZpdGVyX3BlZXJfaWQiOiJjNDE2NmFhMDk2ZjE1OTJkOGE0YzQxMDY0NjVmZGEwNTFlNjQyN2ViNjMyMjE1MzMwNmFlODg3ZDJlMDg4NzQ4IiwiaW52aXRlcl9pZGVudGl0eV9wdWIiOiJaZGpuX1U2dG5yUEctSTFKRnlMNUc4bTI4eG9Ram1jWGtZVlRpVVBVMjQ4IiwiaW52aXRlX2lkIjoiMDhiMWFkMmNmYTJmOTYzN2JkNjkyN2QxMzBmYmQxMjQiLCJleHBpcmVzX2F0Ijo0OTM0ODc5MTQyLCJpbnZpdGVyX2VwaGVtZXJhbF9wdWIiOiJDWWRyRHlrRWREUTJ5MGF0aGUwZi0xZ1BNUW8wRjhMQkl6UEhmUnVqM3l3IiwicmVsYXlfaGludCI6IndzOi8vMTU1LjEzOC4yNDQuMTg5OjM1MDM1IiwiaW52aXRlcl9oYW5kbGUiOiJSZWxheSBOb2RlIiwiaXNfc3VwZXJub2RlIjp0cnVlLCJ0dXJuX2hpbnRzIjpbInR1cm46MTU1LjEzOC4yNDQuMTg5OjM1NzgiXSwic2lnbmF0dXJlIjoibmpFVXpzYlFSaWtmNjJMdWJZUDV4VTQ5cnE1a1NwMXo1dG85bnhEYlYwUE4tWmRudjExa3d3Z1JiTEktWmJWQm55ZDZ2eFZVS3VuTGFlSndETFItQmcifQ"
+            "https://doubleslash.space/i#eyJpbnZpdGVyX3BlZXJfaWQiOiJjNDE2NmFhMDk2ZjE1OTJkOGE0YzQxMDY0NjVmZGEwNTFlNjQyN2ViNjMyMjE1MzMwNmFlODg3ZDJlMDg4NzQ4IiwiaW52aXRlcl9pZGVudGl0eV9wdWIiOiJaZGpuX1U2dG5yUEctSTFKRnlMNUc4bTI4eG9Ram1jWGtZVlRpVVBVMjQ4IiwiaW52aXRlX2lkIjoiMDhiMWFkMmNmYTJmOTYzN2JkNjkyN2QxMzBmYmQxMjQiLCJleHBpcmVzX2F0Ijo0OTM0ODc5MTQyLCJpbnZpdGVyX2VwaGVtZXJhbF9wdWIiOiJDWWRyRHlrRWREUTJ5MGF0aGUwZi0xZ1BNUW8wRjhMQkl6UEhmUnVqM3l3IiwicmVsYXlfaGludCI6IndzOi8vMTU1LjEzOC4yNDQuMTg5OjM1MDM1IiwiaW52aXRlcl9oYW5kbGUiOiJSZWxheSBOb2RlIiwiaXNfc3VwZXJub2RlIjp0cnVlLCJ0dXJuX2hpbnRzIjpbInR1cm46MTU1LjEzOC4yNDQuMTg5OjM1NzgiXSwic2lnbmF0dXJlIjoibmpFVXpzYlFSaWtmNjJMdWJZUDV4VTQ5cnE1a1NwMXo1dG85bnhEYlYwUE4tWmRudjExa3d3Z1JiTEktWmJWQm55ZDZ2eFZVS3VuTGFlSndETFItQmcifQ"
         );
     }
 

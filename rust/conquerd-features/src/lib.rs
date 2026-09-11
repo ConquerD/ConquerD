@@ -34,10 +34,11 @@ pub mod web_app;
 pub mod wellknown;
 
 pub use brand::{
-    find_app_url, first_env, looks_like_app_url, mint_uri, strip_scheme, uri_prefix,
-    DEFAULT_PROFILE_DIR, ENV_HOME, ENV_HOME_LEGACY, ENV_KEY_DIR, ENV_KEY_DIR_LEGACY,
-    LEGACY_PROFILE_DIR, PRODUCT_NAME, PROTOCOL_NAME, URI_SCHEME, URI_SCHEME_LEGACY, WEBSITE,
-    WINDOWS_EXE, WINDOWS_EXE_LEGACY, WINDOWS_INSTALL_DIR, WINDOWS_INSTALL_DIR_LEGACY,
+    find_app_url, first_env, looks_like_app_url, mint_invite_https, mint_uri, normalize_app_url,
+    strip_scheme, uri_prefix, DEFAULT_PROFILE_DIR, ENV_HOME, ENV_HOME_LEGACY, ENV_KEY_DIR,
+    ENV_KEY_DIR_LEGACY, INVITE_HTTPS_HOST, LEGACY_PROFILE_DIR, PRODUCT_NAME, PROTOCOL_NAME,
+    URI_SCHEME, URI_SCHEMES, URI_SCHEME_ALT, URI_SCHEME_LEGACY, WEBSITE, WINDOWS_EXE,
+    WINDOWS_EXE_LEGACY, WINDOWS_INSTALL_DIR, WINDOWS_INSTALL_DIR_LEGACY,
 };
 pub use channel_frame::{
     classify, decode_frame, encode_frame, feature_for_fixed_tag, fixed_tag_for, FrameClass,

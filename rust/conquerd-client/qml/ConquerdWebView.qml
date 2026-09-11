@@ -45,7 +45,7 @@ Item {
     /// When true, all navigation is permitted (used by the browser panel).
     property bool allowAll: false
 
-    /// When true, navigation to conquerd:// URLs is permitted.
+    /// When true, navigation to d:// and conquerd:// URLs is permitted.
     /// Set this for the node-portal panel to allow supernode portal pages
     /// while still blocking outbound https:// navigation.
     property bool allowConquerd: false
@@ -62,10 +62,21 @@ Item {
     /// Expose page title.
     readonly property string pageTitle: _view.title
 
+    function isPortalUrl(url) {
+        return /^(d|doubleslash|conquerd):/i.test(url.toString())
+    }
+
+    function browserUrl(url) {
+        // Chromium's Windows URL fixup interprets a one-letter scheme as a
+        // drive even though Qt registered it. Use the existing portal alias
+        // before handing the URL to WebEngine; preserve its full remainder.
+        return url.toString().replace(/^(d|doubleslash):\/\//i, "conquerd://")
+    }
+
     /// Navigate to a new URL programmatically.
     function navigate(url) {
         console.log("[portal] ConquerdWebView.navigate url=" + url + " allowConquerd=" + root.allowConquerd + " allowAll=" + root.allowAll)
-        _view.url = url
+        _view.url = root.browserUrl(url)
     }
 
     /// Reload the current page.
@@ -83,13 +94,13 @@ Item {
 
         Component.onCompleted: {
             if (root.startUrl !== "")
-                _view.url = root.startUrl
+                root.navigate(root.startUrl)
         }
 
         onNavigationRequested: function(request) {
             var urlStr = request.url.toString()
             var colonIdx = urlStr.indexOf(":")
-            var scheme = colonIdx > 0 ? urlStr.substring(0, colonIdx) : ""
+            var scheme = colonIdx > 0 ? urlStr.substring(0, colonIdx).toLowerCase() : ""
             var host = ""
             if (urlStr.substring(colonIdx, colonIdx + 3) === "://") {
                 var rest = urlStr.substring(colonIdx + 3)
@@ -106,7 +117,12 @@ Item {
 
             if (scheme === "d" || scheme === "conquerd") {
                 if (root.allowConquerd || root.allowAll) {
-                    request.accept()
+                    if (scheme === "d") {
+                        request.reject()
+                        root.navigate(urlStr)
+                    } else {
+                        request.accept()
+                    }
                 } else {
                     request.reject()
                 }
@@ -214,7 +230,7 @@ Item {
                 Layout.fillWidth: true
                 text: root._errorUrl
                 visible: root._errorUrl !== "" &&
-                         !root._errorUrl.startsWith("conquerd:")
+                         !root.isPortalUrl(root._errorUrl)
                 color: Theme.muted
                 font.pixelSize: Theme.fontSizeMicro
                 wrapMode: Text.WrapAtWordBoundaryOrAnywhere
@@ -226,7 +242,7 @@ Item {
                 text: "Open in system browser"
                 primary: true
                 visible: root._errorUrl !== "" &&
-                         !root._errorUrl.startsWith("conquerd:")
+                         !root.isPortalUrl(root._errorUrl)
                 onClicked: Qt.openUrlExternally(root._errorUrl)
             }
         }

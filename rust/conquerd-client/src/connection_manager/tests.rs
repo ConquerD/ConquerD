@@ -156,6 +156,16 @@ fn host_from_url_variants() {
     assert_eq!(host_from_url(""), None);
 }
 
+/// Reduce a minted room invite to the base64url payload `parse_room_invite`
+/// consumes. Invites ship as https links, so the test cannot slice a scheme
+/// prefix off the front any more.
+fn room_payload(url: &str) -> String {
+    let rest = conquerd_features::normalize_app_url(url).expect("invite URL must normalize");
+    rest.strip_prefix("room#")
+        .expect("room invite action prefix")
+        .to_owned()
+}
+
 #[test]
 fn room_invite_url_round_trips() {
     let url = build_room_invite_url(
@@ -170,10 +180,13 @@ fn room_invite_url_round_trips() {
         "",
         "",
     );
-    assert!(url.starts_with("d://room#"), "url = {url}");
-    let encoded = url.strip_prefix("d://room#").unwrap();
+    assert!(
+        url.starts_with("https://doubleslash.space/r#"),
+        "url = {url}"
+    );
+    let encoded = room_payload(&url);
     assert_eq!(
-        parse_room_invite(encoded).unwrap(),
+        parse_room_invite(&encoded).unwrap(),
         RoomInvitePayload {
             supernode_id: "supernode-identity-pub".into(),
             supernode_hint: "wss://relay.example:443/sig".into(),
@@ -208,8 +221,8 @@ fn room_invite_carries_space_fields() {
         proof,
         grant,
     );
-    let encoded = url.strip_prefix("d://room#").unwrap();
-    let got = parse_room_invite(encoded).unwrap();
+    let encoded = room_payload(&url);
+    let got = parse_room_invite(&encoded).unwrap();
     // Re-parse the extracted JSON text and compare structurally (key order may
     // differ after the round-trip, but the fields — and thus signatures — match).
     let as_val = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
@@ -230,7 +243,7 @@ fn room_invite_carries_space_fields() {
         "",
         "",
     );
-    let plain_got = parse_room_invite(plain.strip_prefix("d://room#").unwrap()).unwrap();
+    let plain_got = parse_room_invite(&room_payload(&plain)).unwrap();
     assert!(plain_got.space_root.is_empty() && plain_got.space_proof.is_empty());
 }
 
@@ -264,9 +277,10 @@ fn room_invite_wire_fields_are_stable() {
         "",
         "",
     );
-    let encoded = url.strip_prefix("d://room#").unwrap();
+    let encoded = room_payload(&url);
     let json_bytes =
-        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded).unwrap();
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &encoded)
+            .unwrap();
     let obj: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
     for key in [
         "v",
@@ -310,8 +324,11 @@ fn personal_invite_url_includes_ephemeral_and_lan_hint() {
     let url =
         t.cm.generate_invite_url()
             .expect("generate_invite_url should succeed with a QUIC endpoint");
-    assert!(url.starts_with("d://invite#"), "url={url}");
-    let encoded = url.strip_prefix("d://invite#").unwrap();
+    // Shared invites are minted as https so chat clients linkify them; the
+    // payload still rides in the fragment, unchanged.
+    assert!(url.starts_with("https://doubleslash.space/i#"), "url={url}");
+    let rest = conquerd_features::normalize_app_url(&url).expect("invite URL must normalize");
+    let encoded = rest.strip_prefix("invite#").expect("invite action prefix");
     let bytes = base64::Engine::decode(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
         encoded.trim_end_matches('='),

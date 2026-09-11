@@ -145,12 +145,12 @@ Item {
                 ToolTip.visible: hovered
                 enabled: _webView.currentUrl !== "" &&
                          _webView.currentUrl !== "about:blank" &&
-                         !_webView.currentUrl.startsWith("conquerd:")
+                         !_webView.isPortalUrl(_webView.currentUrl)
                 opacity: enabled ? 1.0 : 0.4
                 onClicked: {
                     var u = _webView.currentUrl
                     if (u !== "" && u !== "about:blank" &&
-                        !u.startsWith("conquerd:"))
+                        !_webView.isPortalUrl(u))
                         Qt.openUrlExternally(u)
                 }
             }

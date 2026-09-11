@@ -155,11 +155,14 @@ impl InvitePayload {
         Identity::verify_with_pub(&pub_bytes, &sig_bytes, &canonical)
     }
 
-    /// Encode as a `d://` URI (legacy `conquerd://` is still accepted on parse).
+    /// Encode as a shareable https invite link. Operators copy this out of
+    /// the startup log and paste it into chat, where a `d://` link would be
+    /// dead text. The `d://` and `conquerd://` forms are still accepted on
+    /// parse, so previously published invites keep working.
     pub fn to_uri(&self) -> String {
         let json = serde_json::to_string(self).unwrap();
         let encoded = b64url_encode(json.as_bytes());
-        conquerd_features::mint_uri(&encoded)
+        conquerd_features::mint_invite_https("invite", &encoded)
     }
 }
 
@@ -448,7 +451,10 @@ mod tests {
         let inv = mgr.create_invite(Some("TestNode"));
         assert!(inv.verify());
         let uri = inv.to_uri();
-        assert!(uri.starts_with("d://"));
+        assert!(uri.starts_with("https://doubleslash.space/i#"), "uri={uri}");
+        // …and the client can still reduce it to the payload it parses.
+        let rest = conquerd_features::normalize_app_url(&uri).expect("normalize");
+        assert!(rest.starts_with("invite#"), "rest={rest}");
     }
 
     #[test]

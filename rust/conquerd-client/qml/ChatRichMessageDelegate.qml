@@ -101,9 +101,15 @@ Item {
         return "file://" + n
     }
 
-    /// First `d://…` or legacy `conquerd://…` token in a chat body.
+    /// First invite link in a chat body. Invites are minted as
+    /// `https://doubleslash.space/i#…`; the `d://` / `doubleslash://` hand-off
+    /// forms are still recognised so a link pasted from elsewhere routes too.
     function conquerdInviteUrl(value) {
-        var m = (value || "").match(/(?:d|conquerd):\/\/[^\s<>"']+/i)
+        var body = value || ""
+        var m = body.match(/https?:\/\/(?:www\.)?doubleslash\.space\/[ir]\/?#[^\s<>"']+/i)
+        if (m)
+            return m[0]
+        m = body.match(/(?:doubleslash|d):\/\/[^\s<>"']+/i)
         return m ? m[0] : ""
     }
 
@@ -111,11 +117,19 @@ Item {
         var u = (url || "").toLowerCase()
         if (u === "")
             return ""
-        if (u.indexOf("conquerd://room#") === 0 || u.indexOf("://room#") >= 0)
+        if (u.indexOf("doubleslash.space/r") >= 0 || u.indexOf("://room#") >= 0)
             return "room"
-        if (u.indexOf("conquerd://invite#") === 0 || u.indexOf("://invite#") >= 0)
+        if (u.indexOf("doubleslash.space/i") >= 0 || u.indexOf("://invite#") >= 0)
             return "peer"
         return "invite"
+    }
+
+    /// True when a link should go to the invite path rather than the browser.
+    function isInviteLink(url) {
+        var u = (url || "").toLowerCase()
+        if (u.indexOf("doubleslash://") === 0 || u.indexOf("d://") === 0)
+            return true
+        return /^https?:\/\/(?:www\.)?doubleslash\.space\/[ir]\/?#./.test(u)
     }
 
     function stripInviteUrl(value, url) {
@@ -206,9 +220,10 @@ Item {
         text = text.replace(/\n/g, "<br>")
         text = text.replace(/(https?:\/\/[^\s<>"]+)/g,
             '<a href="$1" style="color:' + Theme.toHex(root.mine ? Theme.linkMine : Theme.linkPeer) + '">$1</a>')
-        // Linkify d:// / conquerd:// invites so a leftover URL still routes in-app
-        // (Accept embed is preferred when the full message is an invite).
-        text = text.replace(/((?:d|conquerd):\/\/[^\s<>"]+)/gi,
+        // Linkify the hand-off schemes too, so a leftover URL still routes
+        // in-app (the Accept embed is preferred when the whole message is an
+        // invite). https invites are already linkified by the rule above.
+        text = text.replace(/((?:doubleslash|d):\/\/[^\s<>"]+)/gi,
             '<a href="$1" style="color:' + Theme.toHex(root.mine ? Theme.linkMine : Theme.linkPeer) + '">$1</a>')
         return text
     }
@@ -732,7 +747,7 @@ Item {
                 TextEdit {
                     id: bodyText
                     // Hide when media/file embeds take over, or when the body is
-                    // only a conquerd:// invite (the invite card / ignored line
+                    // only an invite link (the invite card / ignored line
                     // replaces the raw URL).
                     visible: {
                         if (root.kind === "image" || root.kind === "video" || root.kind === "file")
@@ -760,10 +775,9 @@ Item {
                     font.pixelSize: Theme.fontSizeBody
                     wrapMode: TextEdit.Wrap
                     onLinkActivated: (link) => {
-                        // Route conquerd:// through the invite path instead of
-                        // the system browser (which cannot open the scheme).
-                        var href = (link || "").toLowerCase()
-                        if (href.indexOf("conquerd://") === 0 || href.indexOf("d://") === 0) {
+                        // An invite already in DoubleSlash should join here, not
+                        // bounce out to a browser to be told to come back.
+                        if (root.isInviteLink(link)) {
                             if (typeof backend !== "undefined" && backend && backend.pasteInvite)
                                 backend.pasteInvite(link)
                             return

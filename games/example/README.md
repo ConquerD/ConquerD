@@ -1,8 +1,10 @@
-# Cursor Relay — `game.relay.v1` example
+# Presence Playground — `game.relay.v1` example
 
-A minimal in-app portal game that relays each participant's cursor position to
-other players in the same session via `game.relay.v1` over the **identity QUIC
-relay** (no external browser / WebTransport).
+A shared space with smooth pointers, click/tap ripples and idle presence via
+`game.relay.v1` over the **identity QUIC relay**. Temporary session IDs keep
+participants separate even when colors match. Session details sit beside the
+canvas, never over it. See the [shared app guide](../README.md) for reuse in
+collaborative tools, session controls and limits.
 
 ## Requirements
 

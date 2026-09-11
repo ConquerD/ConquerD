@@ -65,6 +65,21 @@ class AppSettings(context: Context) {
         get() = prefs.getString(KEY_THEME, THEME_SYSTEM) ?: THEME_SYSTEM
         set(value) = prefs.edit().putString(KEY_THEME, value).apply()
 
+    /**
+     * The [Legal.TERMS_VERSION] last accepted on this device, or 0.
+     *
+     * Play requires terms before user-generated content. Bumping
+     * [Legal.TERMS_VERSION] re-prompts.
+     */
+    var acceptedTermsVersion: Int
+        get() = prefs.getInt(KEY_ACCEPTED_TERMS, 0)
+        set(value) = prefs.edit().putInt(KEY_ACCEPTED_TERMS, value).apply()
+
+    /** True after the notification-permission explanation has been shown. */
+    var notificationRationaleShown: Boolean
+        get() = prefs.getBoolean(KEY_NOTIFICATION_RATIONALE, false)
+        set(value) = prefs.edit().putBoolean(KEY_NOTIFICATION_RATIONALE, value).apply()
+
     /** The camera id the core expects for the current preference. */
     val cameraDeviceId: String
         get() = if (frontCamera) "android:front" else "android:back"
@@ -82,5 +97,7 @@ class AppSettings(context: Context) {
         private const val KEY_OUTPUT_GAIN = "output_gain"
         private const val KEY_NOISE_STRENGTH = "noise_strength"
         private const val KEY_VOICE_BITRATE = "voice_bitrate"
+        private const val KEY_ACCEPTED_TERMS = "accepted_terms_version"
+        private const val KEY_NOTIFICATION_RATIONALE = "notification_rationale_shown"
     }
 }

@@ -287,15 +287,18 @@ Item {
                     Qt.callLater(function() { msgList.positionViewAtEnd() })
             }
 
-            // Lives in the list's content item, like the empty state above it,
-            // so its y is in content coordinates - hence tracking contentY to
-            // stay parked at the bottom of the viewport instead of scrolling
-            // away with the messages.
+            // A plain child of a ListView is parented to the view itself, not
+            // to its contentItem, so this is already in viewport coordinates -
+            // exactly like the empty state below. Anchoring parks it at the
+            // bottom of the viewport; adding contentY would push it that far
+            // past the bottom edge, where clip hides it at every scroll
+            // position but the very top.
             JumpToCurrentButton {
                 list: msgList
                 z: 2
-                x: Math.round((msgList.width - width) / 2)
-                y: msgList.contentY + msgList.height - height - Theme.spacingMd
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: Theme.spacingMd
             }
 
             ColumnLayout {

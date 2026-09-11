@@ -49,6 +49,19 @@ class ConquerdCore private constructor(context: Context) : NativeCore.EventSink 
 
     val isRunning: Boolean get() = handle != 0L
 
+    /**
+     * Fires once each time [stop] actually tears a core down.
+     *
+     * The notification Disconnect action (and an FGS timeout) stop the core
+     * from outside the ViewModel; this is how the UI learns to return to the
+     * unlock screen instead of sitting on a dead session.
+     */
+    private val _stopped = MutableSharedFlow<Unit>(
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val stopped: SharedFlow<Unit> = _stopped.asSharedFlow()
+
     private val _events = MutableSharedFlow<JsonObject>(
         replay = 0,
         extraBufferCapacity = 512,
@@ -109,7 +122,7 @@ class ConquerdCore private constructor(context: Context) : NativeCore.EventSink 
 
     /** Stop the core. Idempotent. */
     fun stop() {
-        synchronized(lifecycleLock) {
+        val didStop = synchronized(lifecycleLock) {
             val current = handle
             if (current == 0L) return
             // Clear first: a command racing this must fail against a zero
@@ -117,6 +130,10 @@ class ConquerdCore private constructor(context: Context) : NativeCore.EventSink 
             handle = 0L
             NativeCore.nativeStop(current)
             Log.i(TAG, "core stopped")
+            true
+        }
+        if (didStop) {
+            _stopped.tryEmit(Unit)
         }
     }
 

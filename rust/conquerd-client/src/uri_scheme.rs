@@ -82,7 +82,11 @@ mod windows {
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("DoubleSlash.exe"))
     }
 
-    const SCHEMES: &[&str] = &["d", "conquerd"];
+    /// Invites are https links; these exist so the landing page can open an
+    /// installed client. `doubleslash` is what the page actually navigates to
+    /// — Chromium reads the one-letter `d:` as drive D: on Windows — and `d`
+    /// is kept for the in-app portal's own links.
+    const SCHEMES: &[&str] = &["doubleslash", "d"];
 
     fn root_for(scheme: &str) -> String {
         format!(r"Software\Classes\{scheme}")

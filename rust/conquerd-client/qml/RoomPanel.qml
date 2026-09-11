@@ -275,13 +275,18 @@ Item {
                     Qt.callLater(function() { roomChat.positionViewAtEnd() })
             }
 
-            // In the list's content item, so y is in content coordinates and
-            // has to track contentY to stay parked at the viewport bottom.
+            // A plain child of a ListView is parented to the view itself, not
+            // to its contentItem, so this is already in viewport coordinates -
+            // exactly like the EmptyState below. Anchoring parks it at the
+            // bottom of the viewport; adding contentY would push it that far
+            // past the bottom edge, where clip hides it at every scroll
+            // position but the very top.
             JumpToCurrentButton {
                 list: roomChat
                 z: 2
-                x: Math.round((roomChat.width - width) / 2)
-                y: roomChat.contentY + roomChat.height - height - Theme.spacingMd
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: Theme.spacingMd
             }
 
             EmptyState {

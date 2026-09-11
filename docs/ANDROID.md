@@ -71,7 +71,7 @@ so a task would have to attach and detach around every single event.
 
 ```powershell
 # NDK + a CMake that libopus accepts (CMake 4 rejects its cmake_minimum_required)
-sdkmanager "ndk;28.2.13676358" "cmake;3.31.6" "platforms;android-35" "build-tools;35.0.0"
+sdkmanager "ndk;28.2.13676358" "cmake;3.31.6" "platforms;android-36" "build-tools;36.0.0"
 
 rustup target add aarch64-linux-android
 cargo install cargo-ndk
@@ -90,13 +90,15 @@ sdk.dir=C:/Users/you/AppData/Local/Android/Sdk
 ```powershell
 cd android
 ./gradlew assembleDebug          # or assembleRelease
+./gradlew bundleRelease          # Play Store artifact (.aab); needs CONQUERD_KEYSTORE
 ```
 
 Gradle runs `cargo ndk` itself — `cargoBuildDebug` / `cargoBuildRelease` are
 wired ahead of `mergeDebugJniLibFolders`, so one command builds the whole thing.
 The Android debug build maps to cargo's dev profile and release to release; a
 release APK carrying a dev-profile core would be unusably slow through the Opus
-and VP8 paths, which are pure C compiled without SIMD.
+and VP8 paths, which are pure C compiled without SIMD. AGP 8.9.3 (Gradle
+wrapper 8.11.1) is the floor that officially supports `compileSdk` 36.
 
 To build the core alone:
 
@@ -290,7 +292,31 @@ key. See the identity section of [CLIENT_FEATURES.md](CLIENT_FEATURES.md).
 
 **A foreground service owns the session.** A peer-to-peer client that dies when
 the screen turns off cannot hold a session or receive a message, so the core
-runs under a `dataSync` foreground service that upgrades to `microphone` before
-capture starts — Android 14+ refuses the type otherwise.
+runs under a `specialUse` foreground service that upgrades to `microphone` /
+`camera` before capture starts — Android 14+ refuses those types otherwise.
+`dataSync` is the wrong bucket: Android 15 caps it at six hours and Play only
+accepts it for short user-initiated transfers. The notification has a
+Disconnect action; `Service.onTimeout` stops the service rather than crashing.
+Play Console still needs a `specialUse` declaration (and a video of the
+notification) at upload time.
+
+`targetSdk` is 36, which Play requires of new apps as of 2026-08-31. Local-network
+access stays implicit until `targetSdk` 37; see backlog item 10 before that bump.
+
+**Play policy surfaces in the client.** Terms of use (`TERMS.md`) must be
+accepted after unlock before the Home screen; the version is stored in
+`AppSettings.acceptedTermsVersion`. Mic and camera prompts show an in-app
+disclosure first, because a call keeps capture running with the screen off.
+Peer and room long-press menus include **Report** (a share sheet — there is no
+report backend). The portal WebView loads only `d://` / `conquerd://`; anything
+else is blocked or opened in the system browser so the JS bridge cannot ride
+along. The public privacy policy is
+https://github.com/ConquerD/DoubleSlash/blob/develop/PRIVACY.md.
+
+**Incoming calls while backgrounded.** `IncomingCallNotifier` posts a
+`CallStyle` (API 31+) notification with Answer / Decline and a full-screen
+intent for the lock screen. Decline is handled by `CoreService` so the
+activity does not have to come up; Answer opens `MainActivity`. Play Console
+needs a **full-screen intent** declaration for calling apps (`USE_FULL_SCREEN_INTENT`).
 
 See `backlog.md` for the ordered list of what to build next.

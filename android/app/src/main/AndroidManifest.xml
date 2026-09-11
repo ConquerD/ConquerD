@@ -8,21 +8,24 @@
     <!--
       The core has to outlive the visible activity: a peer-to-peer client that
       dies when the screen turns off cannot hold a session or receive a
-      message. FOREGROUND_SERVICE_DATA_SYNC is the type that matches keeping a
-      transport connection open.
+      message. There is no central push server, so the honest foreground type
+      for "keep the QUIC session alive" is specialUse — dataSync is a 6-hour
+      user-initiated transfer bucket and Play rejects using it as a socket.
     -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!--
       Voice calls. From Android 14 a foreground service that captures audio
       must declare the `microphone` type as well, and the service may only
       claim that type once RECORD_AUDIO has actually been granted - so the
-      service starts as `dataSync` and upgrades when a call begins.
+      service starts as `specialUse` and upgrades when a call begins.
     -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Lock-screen incoming call. Play Console needs a calling-app declaration. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <!-- Video calls. Camera capture is opt-in per call, same as the mic. -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -37,8 +40,7 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/Theme.ConquerD"
-        android:extractNativeLibs="false">
+        android:theme="@style/Theme.ConquerD">
 
         <!--
           allowBackup is off deliberately: the identity key and the chat
@@ -57,24 +59,38 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Invite links open straight into the app. -->
-            <intent-filter>
+            <!--
+                Invite links open straight into the app. The https form is what
+                gets shared (chat clients only linkify http(s)); autoVerify
+                routes it without a chooser once /.well-known/assetlinks.json
+                on doubleslash.space lists this package and signing cert.
+            -->
+            <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="d" />
+                <data android:scheme="https" android:host="doubleslash.space" android:pathPrefix="/i" />
+                <data android:scheme="https" android:host="doubleslash.space" android:pathPrefix="/r" />
+                <data android:scheme="https" android:host="www.doubleslash.space" android:pathPrefix="/i" />
+                <data android:scheme="https" android:host="www.doubleslash.space" android:pathPrefix="/r" />
             </intent-filter>
+            <!-- Hand-off from the landing page when App Links cannot route. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="conquerd" />
+                <data android:scheme="doubleslash" />
+                <data android:scheme="d" />
             </intent-filter>
         </activity>
 
         <service
             android:name=".CoreService"
             android:exported="false"
-            android:foregroundServiceType="dataSync|microphone|camera" />
+            android:foregroundServiceType="specialUse|microphone|camera">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Holds invite-only peer-to-peer QUIC sessions so messages and calls can arrive without a central push server. Runs only while the identity is unlocked; stop from the notification or by locking in the app." />
+        </service>
     </application>
 </manifest>

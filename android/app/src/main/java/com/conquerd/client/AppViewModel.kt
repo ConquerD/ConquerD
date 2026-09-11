@@ -1,6 +1,9 @@
 package com.conquerd.client
 
+import android.Manifest
 import android.app.Application
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,6 +21,8 @@ import kotlinx.serialization.json.put
 /** Where the user is in the app. */
 sealed interface Screen {
     data object Unlock : Screen
+    /** Shown after unlock until [Legal.TERMS_VERSION] has been accepted. */
+    data object Terms : Screen
     data object Home : Screen
     data class Chat(val peer: Peer) : Screen
     data class RoomChat(val room: Room) : Screen
@@ -219,19 +224,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             core.events.collect(::onCoreEvent)
         }
-        _state.update {
-            it.copy(
-                prefs = Prefs(
-                    frontCamera = settings.frontCamera,
-                    voiceActivation = settings.voiceActivation,
-                    theme = settings.theme,
-                    inputGain = settings.inputGain,
-                    outputGain = settings.outputGain,
-                    noiseStrength = settings.noiseStrength,
-                    voiceBitrate = settings.voiceBitrate,
-                ),
-            )
+        viewModelScope.launch {
+            core.stopped.collect {
+                // A reconnect can land between emit and collect; don't wipe a
+                // session that is already running again.
+                if (!core.isRunning) resetUiToLocked()
+            }
         }
+        viewModelScope.launch {
+            IncomingCallNotifier.cleared.collect { peerId ->
+                _state.update { s ->
+                    if (s.call?.peerId == peerId && s.call.phase == CallPhase.INCOMING) {
+                        s.copy(call = null)
+                    } else {
+                        s
+                    }
+                }
+            }
+        }
+        _state.update { it.copy(prefs = prefsSnapshot()) }
         attemptAutoUnlock()
     }
 
@@ -468,21 +479,66 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun onCoreStarted() {
         CoreService.start(getApplication())
         applyAudioTuning()
-        _state.update { it.copy(busy = false, screen = Screen.Home) }
+        val next = if (settings.acceptedTermsVersion >= Legal.TERMS_VERSION) {
+            Screen.Home
+        } else {
+            Screen.Terms
+        }
+        _state.update { it.copy(busy = false, screen = next) }
         refreshIdentity()
         refreshPeers()
         refreshRooms()
 
+        // Invites wait until terms are accepted so a first-run tap cannot
+        // land in a room before the policy gate.
+        if (next == Screen.Home) {
+            pendingInvite?.let { url ->
+                pendingInvite = null
+                acceptInvite(url)
+            }
+        }
+    }
+
+    fun acceptTerms() {
+        settings.acceptedTermsVersion = Legal.TERMS_VERSION
+        _state.update { it.copy(screen = Screen.Home) }
         pendingInvite?.let { url ->
             pendingInvite = null
             acceptInvite(url)
         }
     }
 
+    fun declineTerms() = lock()
+
     fun lock() {
         CoreService.stop(getApplication())
         core.stop()
-        _state.value = AppState()
+        resetUiToLocked()
+    }
+
+    /** Device-local prefs as they stand now, not the defaults on a fresh [AppState]. */
+    private fun prefsSnapshot(): Prefs = Prefs(
+        frontCamera = settings.frontCamera,
+        voiceActivation = settings.voiceActivation,
+        theme = settings.theme,
+        inputGain = settings.inputGain,
+        outputGain = settings.outputGain,
+        noiseStrength = settings.noiseStrength,
+        voiceBitrate = settings.voiceBitrate,
+    )
+
+    /**
+     * Return to the unlock screen after the core has stopped.
+     *
+     * Called from [lock] and from the notification Disconnect / FGS-timeout
+     * path, which stop the core without going through the ViewModel. Theme
+     * and audio prefs live in [AppSettings], so they have to be copied back
+     * onto a fresh [AppState] or a disconnect would also reset the theme.
+     */
+    private fun resetUiToLocked() {
+        IncomingCallNotifier.cancel(getApplication())
+        CameraCapture.stop()
+        _state.value = AppState(prefs = prefsSnapshot())
     }
 
     /**
@@ -921,6 +977,48 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissInvite() = _state.update { it.copy(inviteUrl = null) }
 
+    /**
+     * Answer, decline, or surface a ringing call from the incoming-call
+     * notification / full-screen intent.
+     *
+     * The ViewModel may have been recreated (activity was gone while the
+     * service held the session), so the extras re-seed [CallState] first.
+     */
+    fun handleIncomingCallIntent(intent: android.content.Intent?) {
+        val action = intent?.action ?: return
+        if (action != IncomingCallNotifier.ACTION_SHOW &&
+            action != IncomingCallNotifier.ACTION_ANSWER &&
+            action != IncomingCallNotifier.ACTION_DECLINE
+        ) {
+            return
+        }
+        val peerId = intent.getStringExtra(IncomingCallNotifier.EXTRA_PEER_ID) ?: return
+        val label = intent.getStringExtra(IncomingCallNotifier.EXTRA_PEER_LABEL)
+            ?: peerId.take(12)
+
+        if (_state.value.call == null) {
+            _state.update {
+                it.copy(call = CallState(peerId, label, CallPhase.INCOMING))
+            }
+        }
+
+        when (action) {
+            IncomingCallNotifier.ACTION_ANSWER -> {
+                IncomingCallNotifier.cancel(getApplication())
+                if (hasMicrophonePermission()) acceptCall()
+                // Otherwise leave the overlay up so the mic disclosure can run.
+            }
+            IncomingCallNotifier.ACTION_DECLINE -> rejectCall()
+            IncomingCallNotifier.ACTION_SHOW -> { /* overlay is enough */ }
+        }
+    }
+
+    private fun hasMicrophonePermission(): Boolean =
+        ContextCompat.checkSelfPermission(
+            getApplication(),
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+
     // ── Calls ─────────────────────────────────────────────────────────────
 
     /**
@@ -954,6 +1052,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun acceptCall() {
         val call = _state.value.call ?: return
+        IncomingCallNotifier.cancel(getApplication())
         CoreService.setMediaActive(getApplication(), microphone = true, camera = false)
         _state.update { it.copy(call = call.copy(phase = CallPhase.ACTIVE)) }
 
@@ -968,12 +1067,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun rejectCall() {
         val call = _state.value.call ?: return
+        IncomingCallNotifier.cancel(getApplication())
         _state.update { it.copy(call = null) }
         viewModelScope.launch { core.command("call.reject") { put("peer_id", call.peerId) } }
     }
 
     fun endCall() {
         val call = _state.value.call ?: return
+        IncomingCallNotifier.cancel(getApplication())
         _state.update { it.copy(call = null) }
         viewModelScope.launch {
             core.command("call.end") { put("peer_id", call.peerId) }
@@ -1343,15 +1444,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (it.call != null) it
                     else it.copy(call = CallState(peerId, label, CallPhase.INCOMING))
                 }
+                if (_state.value.call?.peerId == peerId) {
+                    IncomingCallNotifier.show(getApplication(), peerId, label)
+                }
             }
 
             "call_accepted" -> {
+                IncomingCallNotifier.cancel(getApplication())
                 _state.update { s ->
                     s.call?.let { s.copy(call = it.copy(phase = CallPhase.ACTIVE)) } ?: s
                 }
             }
 
             "call_ended" -> {
+                IncomingCallNotifier.cancel(getApplication())
                 // Stop the camera too: a call that ends with video still
                 // running leaves the capture thread holding the device and the
                 // camera indicator lit with nothing to send to.

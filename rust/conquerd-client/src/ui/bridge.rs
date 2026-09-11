@@ -230,7 +230,8 @@ pub mod ffi {
         #[rust_name = "copy_invite"]
         fn copyInvite(self: Pin<&mut AppBridge>);
 
-        /// Accept an invite URL (conquerd://invite#…) or peer ID pasted by the user.
+        /// Accept an invite URL (https://doubleslash.space/i#… or the
+        /// `d://`/`conquerd://` scheme forms) or peer ID pasted by the user.
         #[qinvokable]
         #[rust_name = "paste_invite"]
         fn pasteInvite(self: Pin<&mut AppBridge>, url: &QString);
@@ -1407,6 +1408,12 @@ pub struct AppBridgeRust {
     /// Used to detect missed calls (CallEnded while flag is still set).
     has_incoming_call: bool,
 
+    /// True while the active direct call's audio is riding a temporary private
+    /// SFU room because direct QUIC never formed. Teardown then has to *leave
+    /// that room* rather than just stop audio, and this flag is what tells the
+    /// two apart from an ordinary room the user joined on their own.
+    call_via_fallback_room: bool,
+
     /// Direct-call fallback room carried by the last incoming `CallRequest`:
     /// `(peer_id, supernode_id, room_id, invite_token)`. When set, `accept_call`
     /// joins this temporary private SFU room instead of dialing direct QUIC.
@@ -1586,6 +1593,7 @@ impl Default for AppBridgeRust {
             call_duration_secs: 0,
             missed_calls: 0,
             has_incoming_call: false,
+            call_via_fallback_room: false,
             incoming_call_fallback: None,
             conn_cmd_tx: None,
             call_cmd_tx: None,
@@ -2224,29 +2232,19 @@ impl ffi::AppBridge {
     }
 
     fn end_call(mut self: Pin<&mut Self>) {
-        // Stop the camera before tearing the call down so a leftover capture
-        // thread cannot keep the hardware light on with nowhere to send.
-        self.as_mut().stop_local_video();
-        if let Some(ref tx) = self.rust().call_cmd_tx {
-            let _ = tx.try_send(CallCommand::StopAudio);
-        }
-        {
-            let active = self.rust().active_direct_call_peer_id.clone();
-            if !active.is_empty() {
-                let resolved = lookup_list_peer_id(self.rust(), &active);
-                set_active_direct_call_presence(
-                    &mut self.as_mut().rust_mut(),
-                    &active,
-                    false,
-                    resolved,
-                );
+        use crate::protocol::{MessageType, SignalingMessage};
+        // Tell the peer first: a hang-up that only stops local audio leaves the
+        // other side listening to silence with the call still on their screen.
+        let active = self.rust().active_direct_call_peer_id.clone();
+        if !active.is_empty() {
+            let sender = self.rust().my_public_id.clone();
+            if let Some(ref tx) = self.rust().conn_cmd_tx {
+                let mut msg = SignalingMessage::new(MessageType::CallEnd, sender);
+                msg.target = Some(active);
+                let _ = tx.try_send(ConnectionCommand::SendMessage(msg));
             }
         }
-        self.as_mut().set_call_state(QString::from("idle"));
-        self.as_mut().set_voice_active(false);
-        sync_voice_in_room(&mut self.as_mut());
-        self.as_mut().reset_inbound_video();
-        emit_peers_updated(self.as_mut());
+        teardown_call_locally(&mut self.as_mut());
     }
 
     fn leave_room(mut self: Pin<&mut Self>) {
@@ -2460,7 +2458,7 @@ impl ffi::AppBridge {
         let pub_key = identity.public_id().to_owned();
 
         // Build a minimal signed invite URL.
-        // Format: conquerd://invite#<base64url(JSON)>
+        // Format: https://doubleslash.space/i#<base64url(JSON)>
         let invite_id = uuid::Uuid::new_v4().to_string();
         let expires_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2475,7 +2473,7 @@ impl ffi::AppBridge {
             "expires_at": expires_at,
         });
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        let url = conquerd_features::mint_uri(&format!("invite#{encoded}"));
+        let url = conquerd_features::mint_invite_https("invite", &encoded);
 
         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(url.clone())) {
             Ok(_) => info!("Invite link copied to clipboard: {url}"),
@@ -2521,7 +2519,7 @@ impl ffi::AppBridge {
             "inviter_handle": inviter_handle,
         });
         let encoded = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        let url = conquerd_features::mint_uri(&format!("invite#{encoded}"));
+        let url = conquerd_features::mint_invite_https("invite", &encoded);
         self.as_mut().set_invite_url(QString::from(url.as_str()));
         QString::from(url.as_str())
     }
@@ -3715,6 +3713,7 @@ impl ffi::AppBridge {
                 let mut r = self.as_mut().rust_mut();
                 r.voice_supernode_id = supernode_id.clone();
                 r.voice_room_id = room_id.clone();
+                r.call_via_fallback_room = true;
                 sync_voice_in_room(&mut self.as_mut());
             }
             if let Some(ref tx) = self.rust().call_cmd_tx {
@@ -3738,6 +3737,9 @@ impl ffi::AppBridge {
                 port: None,
             });
         }
+        // We answered, so we are no longer ringing. Leaving this set is what
+        // made the peer's later hang-up look like a call we never picked up.
+        self.as_mut().rust_mut().has_incoming_call = false;
         self.as_mut().set_call_state(QString::from("in_call"));
         self.as_mut().set_voice_active(true);
         sync_voice_in_room(&mut self.as_mut());
@@ -3748,7 +3750,7 @@ impl ffi::AppBridge {
         emit_peers_updated(self.as_mut());
     }
 
-    fn reject_call(self: Pin<&mut Self>, peer_id: &QString) {
+    fn reject_call(mut self: Pin<&mut Self>, peer_id: &QString) {
         use crate::protocol::{MessageType, SignalingMessage};
         let pid = peer_id.to_string();
         let sender = self.rust().my_public_id.clone();
@@ -3757,6 +3759,11 @@ impl ffi::AppBridge {
             msg.target = Some(pid);
             let _ = tx.try_send(ConnectionCommand::SendMessage(msg));
         }
+        // Turning a call down is a decision, not a call you failed to reach, so
+        // it must not raise the missed-call badge -- and a flag left set here
+        // would mis-attribute the *next* call's end as missed.
+        self.as_mut().rust_mut().has_incoming_call = false;
+        self.as_mut().rust_mut().incoming_call_fallback = None;
     }
 
     fn join_room(mut self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) {
@@ -6521,6 +6528,50 @@ fn emit_member_list_json(
     }
 }
 
+/// Local-only teardown for a call that is over, shared by both hang-up paths.
+///
+/// [`end_call`](ffi::AppBridge::end_call) (we hung up) and the `CallEnded` event
+/// (they hung up) used to do different subsets of this, which is why a
+/// peer-initiated hang-up left the voice rail on screen with the microphone
+/// still live. Deliberately sends no signaling: the event path is already a
+/// *response* to the peer's `CallEnd`, and echoing one back would bounce
+/// between the two clients.
+fn teardown_call_locally(bridge: &mut Pin<&mut ffi::AppBridge>) {
+    {
+        let active = bridge.rust().active_direct_call_peer_id.clone();
+        if !active.is_empty() {
+            let resolved = lookup_list_peer_id(bridge.rust(), &active);
+            set_active_direct_call_presence(
+                &mut bridge.as_mut().rust_mut(),
+                &active,
+                false,
+                resolved,
+            );
+        }
+    }
+    if bridge.rust().call_via_fallback_room {
+        // The audio was riding a temporary private room, so leaving that room
+        // *is* the teardown: it stops audio, clears room mode and empties the
+        // rail. Tearing down by hand instead would leave us joined to a room
+        // nobody is left in.
+        bridge.as_mut().rust_mut().call_via_fallback_room = false;
+        bridge.as_mut().leave_room();
+    } else {
+        // Stop the camera before the rest so a leftover capture thread cannot
+        // keep the hardware light on with nowhere to send.
+        bridge.as_mut().stop_local_video();
+        if let Some(ref tx) = bridge.rust().call_cmd_tx {
+            let _ = tx.try_send(CallCommand::StopAudio);
+        }
+        bridge.as_mut().set_voice_active(false);
+        sync_voice_in_room(bridge);
+        bridge.as_mut().reset_inbound_video();
+    }
+    bridge.as_mut().set_call_state(QString::from("idle"));
+    bridge.as_mut().set_call_duration_secs(0);
+    emit_peers_updated(bridge.as_mut());
+}
+
 /// Recompute [`voice_in_room`] from the authoritative pair.
 ///
 /// Derived rather than set by hand at each transition: the two facts that
@@ -7863,6 +7914,7 @@ fn dispatch_event(
                     let mut r = bridge.as_mut().rust_mut();
                     r.voice_supernode_id = supernode_id.clone();
                     r.voice_room_id = room_id.clone();
+                    r.call_via_fallback_room = true;
                     sync_voice_in_room(&mut bridge.as_mut());
                 }
                 if let Some(ref tx) = bridge.rust().call_cmd_tx {
@@ -7881,30 +7933,33 @@ fn dispatch_event(
                     .set_session_banner(QString::from(banner.as_str()));
             });
         }
-        ConnectionEvent::CallEnded { .. } => {
+        ConnectionEvent::CallEnded { peer_id } => {
             call_timer_stop.take(); // stop the duration timer
-            let _ = qt_thread.queue(|mut bridge: Pin<&mut ffi::AppBridge>| {
+            let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 bridge.as_mut().rust_mut().incoming_call_fallback = None;
+                // Only a call still *ringing* here was missed. Once we answered,
+                // the peer hanging up is simply the end of the call.
                 if bridge.rust().has_incoming_call {
                     bridge.as_mut().rust_mut().has_incoming_call = false;
                     let mc = bridge.rust().missed_calls + 1;
                     bridge.as_mut().set_missed_calls(mc);
                 }
-                {
-                    let active = bridge.rust().active_direct_call_peer_id.clone();
-                    if !active.is_empty() {
-                        let resolved = lookup_list_peer_id(bridge.rust(), &active);
-                        set_active_direct_call_presence(
-                            &mut bridge.as_mut().rust_mut(),
-                            &active,
-                            false,
-                            resolved,
-                        );
-                    }
+                // Both `start_call` and `accept_call` set the active peer up
+                // front, so a live call always has one. Anything else -- a ring
+                // we never answered, or a stray CallEnd from a third peer --
+                // must not tear down audio, because a room voice session may be
+                // running alongside and has to survive this.
+                let ours = {
+                    let active = &bridge.rust().active_direct_call_peer_id;
+                    !active.is_empty() && *active == peer_id
+                };
+                if ours {
+                    teardown_call_locally(&mut bridge.as_mut());
+                } else {
+                    bridge.as_mut().set_call_state(QString::from("idle"));
+                    bridge.as_mut().set_call_duration_secs(0);
+                    emit_peers_updated(bridge.as_mut());
                 }
-                bridge.as_mut().set_call_state(QString::from("idle"));
-                bridge.as_mut().set_call_duration_secs(0);
-                emit_peers_updated(bridge);
             });
         }
         ConnectionEvent::SessionStateUpdate(state) => {

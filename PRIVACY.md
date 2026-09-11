@@ -1,6 +1,10 @@
 # DoubleSlash Privacy Policy
 
-**Effective date:** 2026-09-05
+**Effective date:** 2026-09-10
+
+This file is the privacy policy for the DoubleSlash **desktop** and **Android**
+clients. The public URL for store listings and in-app links is
+[github.com/ConquerD/DoubleSlash/blob/develop/PRIVACY.md](https://github.com/ConquerD/DoubleSlash/blob/develop/PRIVACY.md).
 
 DoubleSlash is a local-first, invite-only peer-to-peer application. Voice, video,
 chat, and file transfer travel directly between clients you connect to, or
@@ -8,6 +12,9 @@ through volunteer supernodes you explicitly choose to trust. Application
 payloads are encrypted on the wire; supernodes relay signed/encrypted frames and
 cannot read message, audio, or video content. DoubleSlash does not operate any
 central servers that store your identity, messages, or call data.
+
+There is no DoubleSlash account. Deleting the app, or purging local history in
+Settings, removes what this device holds. There is no server copy to request.
 
 ---
 
@@ -36,7 +43,25 @@ The desktop client logs to **stderr** via Rust `tracing` (controlled by the
 `RUST_LOG` environment variable). It does not write a persistent client log file
 by default.
 
-No telemetry, analytics, or usage reporting is collected by DoubleSlash.
+### Android
+
+On Android the same encrypted stores live in **app-private storage**
+(`filesDir/conquerd/`), not under `~/.doubleslash/`. Other apps cannot read
+that directory. Cloud backup is turned off (`allowBackup="false"`) so a
+device backup cannot copy the identity key or chat database off the phone.
+
+| Location | What it contains |
+|---|---|
+| App-private `conquerd/` | `identity.dat`, `peers.dat`, `chat_history.db`, `my_rooms.dat` — same encrypted formats as desktop |
+| Android Keystore + app-private preferences | Optional “stay unlocked” wrapping of the identity *file key* (never the passphrase). Off until you turn it on. A copy of that wrapped blob is useless without this device’s Keystore key. |
+| App cache (`cacheDir/outbound`) | Temporary copies of files you chose to send, because a Storage Access Framework `content://` URI is not a path the transfer can stream from |
+| App-private received files | Downloads stay in app storage until you export them with the system document picker |
+| Logcat (`ConquerD` tag) | Diagnostic logs on a USB-debuggable build. Not a persistent file. |
+
+Android does **not** run the desktop GitHub update checker or UPnP mapper.
+
+No telemetry, analytics, advertising ID, or usage reporting is collected by
+DoubleSlash on any platform.
 
 ---
 
@@ -46,11 +71,12 @@ The following network contacts can occur without an extra confirmation step
 beyond normal app use. No account credentials, message content, or contact lists
 are sent in these paths.
 
-### Update check (GitHub Releases API)
+### Update check (GitHub Releases API) — desktop only
 
 **What:** When *Check for updates automatically* is enabled (the default), the
 desktop client polls the GitHub Releases API at startup and once per hour while
-the app remains open to see whether a newer version is available.
+the app remains open to see whether a newer version is available. The Android
+client does not do this.
 
 **Endpoint:** `https://api.github.com/repos/vbawol/ConquerD/releases/latest`
 
@@ -70,12 +96,12 @@ can additionally block outbound HTTPS to `api.github.com`. When you choose to
 apply an update, `conquerd-installer` downloads release archives, checksums, and
 (when published) `releases_manifest.json` from GitHub.
 
-### UPnP port mapping
+### UPnP port mapping — desktop only
 
 **What:** When *Enable UPnP port mapping* is on (the default), DoubleSlash sends
 SSDP discovery multicast on your **local area network** to locate a UPnP-capable
 router and requests a temporary port-forwarding rule. This can improve direct
-peer-to-peer reachability without a relay.
+peer-to-peer reachability without a relay. The Android client does not use UPnP.
 
 **Servers contacted:** No external Internet servers are contacted. UPnP traffic
 stays on your LAN (multicast to `239.255.255.250`). Only your router responds.
@@ -103,9 +129,17 @@ Three kinds of source can be captured, and they differ in how much they expose:
 
 | Source | Platforms | What it captures |
 |---|---|---|
-| Camera | Windows, Linux, macOS | The camera device you select |
+| Camera | Windows, Linux, macOS, Android | The camera device you select |
+| Microphone (voice) | All platforms | The microphone only while a call or room voice session is active |
 | Screen or single window | **Windows only** (`Windows.Graphics.Capture`) | Everything visible on the chosen monitor, or the contents of the chosen window |
 | Audio shared with a video | **Windows only** (WASAPI loopback) | Either *all* sound this machine plays, or the sound of one application's process tree |
+
+On **Android**, a call that you have answered or placed keeps the microphone
+(and camera, if you turned video on) while the screen is off or another app is
+in front. A persistent notification (“DoubleSlash is connected” / “call in
+progress”) is shown for as long as that is true. Disconnect from the
+notification, or lock the identity in the app, to stop it. DoubleSlash does
+not capture when you are not in a call.
 
 **Two things worth knowing before you share:**
 
@@ -187,6 +221,25 @@ from those pages open in your system browser.
 your IP address for any HTTPS content they host. Portal traffic over
 `d://` is carried on your authenticated QUIC session to that supernode.
 
+On Android the portal runs in the system WebView with JavaScript enabled for
+the `window.conquerd` bridge. File and content-provider access are disabled.
+The page is fetched over the same authenticated QUIC session as desktop.
+
+### Android connection notification
+
+**What:** While the Android identity is unlocked, a foreground-service
+notification stays in the status bar so the process can hold peer sessions
+when the screen is off. There is no central push server; without this, the
+phone would drop the session when you leave the app.
+
+**How to stop:** tap **Disconnect** on the notification, or lock the identity
+in the app. The notification is not shown while the app is locked.
+
+**Permissions used:** `INTERNET`, `POST_NOTIFICATIONS` (the connection notice),
+`RECORD_AUDIO` and `CAMERA` only when you start a call or turn video on. Files
+use the system document picker; DoubleSlash does not request broad photo or
+storage access.
+
 ### Build attestation between peers
 
 **What:** After connecting, peers may exchange signed build-attestation
@@ -199,6 +252,12 @@ governed by the *Attestation policy* setting (`off` / `warn` / `strict`).
 ---
 
 ## Peer-to-peer communication
+
+Direct connections and supernode relays expose your **IP address** to the
+peer or operator on the other end of that path. That is how packet networks
+work; DoubleSlash has no first-party server that could hide it. Handles,
+public keys, and whatever you send are also visible to the people you chose
+to invite.
 
 When you connect to a peer, the following data is transmitted over encrypted
 signaling and session channels:
@@ -237,9 +296,29 @@ above.
 | [quinn](https://github.com/quinn-rs/quinn) | QUIC transport | None |
 | [libopus](https://opus-codec.org/) (vendored, `conquerd-opus`) | Voice and shared-audio codec | None |
 | [libvpx](https://www.webmproject.org/) (vendored, `conquerd-vpx`) | VP8 video codec on every platform | None |
-| OS media APIs (Media Foundation, `Windows.Graphics.Capture`, WASAPI, V4L2, AVFoundation) | Camera / screen / audio capture and H.264 encode | None — local device access only |
+| OS media APIs (Media Foundation, `Windows.Graphics.Capture`, WASAPI, V4L2, AVFoundation, CameraX, Oboe) | Camera / screen / audio capture and H.264 encode | None — local device access only |
 | [egui / eframe](https://github.com/emilk/egui) | Installer UI | None |
 | [Ollama](https://ollama.com/) (user-installed, optional) | Local AI backend | Only the URL you configure |
+| AndroidX / Jetpack Compose / CameraX | Android UI and camera | None from these libraries |
+
+---
+
+## Deleting data
+
+There is no DoubleSlash cloud account. To remove data on a device:
+
+- **Desktop:** Settings → Privacy (trim or purge stored messages). Deleting the
+  profile directory (`~/.doubleslash/` or `~/.conquerd/`) removes identity,
+  peers, rooms, and history. Clearing the OS keyring entry forgets the cached
+  unlock key.
+- **Android:** Settings can purge chat history. Uninstalling the app deletes
+  app-private storage, including identity. Turning off “stay unlocked” deletes
+  the Keystore wrapping key and the sealed blob. Disconnect or lock ends the
+  live session without wiping stores.
+
+Peers who already received a message, file, or call still have their own copy.
+A revoke of a room file offer stops further downloads; bytes already delivered
+cannot be un-sent.
 
 ---
 
@@ -260,5 +339,7 @@ Material changes will be noted in the
 
 ## Contact
 
-For privacy concerns, open an issue in the project repository or contact the
-maintainers via the repository's contact information.
+For privacy concerns, open an issue at
+[github.com/ConquerD/DoubleSlash/issues](https://github.com/ConquerD/DoubleSlash/issues).
+There is no DoubleSlash-operated support inbox and no personal data held on a
+server we could look up.

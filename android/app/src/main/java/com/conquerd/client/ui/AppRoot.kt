@@ -112,6 +112,7 @@ import com.conquerd.client.CallPhase
 import com.conquerd.client.CameraCapture
 import com.conquerd.client.CallState
 import com.conquerd.client.AppSettings
+import com.conquerd.client.Legal
 import com.conquerd.client.FileOffer
 import com.conquerd.client.SavedFile
 import com.conquerd.client.SupernodeInfo
@@ -165,6 +166,11 @@ fun AppRoot(viewModel: AppViewModel) {
                     autoUnlocking = state.autoUnlocking,
                     version = viewModel.coreVersion,
                     onUnlock = viewModel::unlock,
+                )
+
+                Screen.Terms -> TermsScreen(
+                    onAccept = viewModel::acceptTerms,
+                    onDecline = viewModel::declineTerms,
                 )
 
                 Screen.Home -> HomeScreen(viewModel = viewModel)
@@ -272,6 +278,10 @@ fun AppRoot(viewModel: AppViewModel) {
             },
         )
     }
+
+    if (state.screen is Screen.Home) {
+        NotificationPermissionPrompt(AppSettings(LocalContext.current))
+    }
 }
 
 /**
@@ -292,21 +302,29 @@ private fun CallOverlay(
 
     // CameraX has to be bound before the core asks for video: the native side
     // waits a few seconds for a first frame to learn the capture size, so
-    // binding afterwards would race that timeout.
-    val requestCamera = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        if (granted) {
+    // binding afterwards would race that timeout. The in-app explanation
+    // runs first: video continues with the screen off.
+    val requestCamera = rememberExplainedPermission(
+        permission = Manifest.permission.CAMERA,
+        title = CameraRationaleTitle,
+        body = CameraRationaleBody,
+        onGranted = {
             CameraCapture.start(context)
             onToggleVideo(true)
-        }
-    }
+        },
+    )
+    val requestMicToAnswer = rememberExplainedPermission(
+        permission = Manifest.permission.RECORD_AUDIO,
+        title = MicRationaleTitle,
+        body = MicRationaleBody,
+        onGranted = onAccept,
+    )
     if (call.phase == CallPhase.INCOMING) {
         AlertDialog(
             onDismissRequest = { /* a ringing call needs an explicit answer */ },
             title = { Text("Incoming call") },
             text = { Text(call.peerLabel) },
-            confirmButton = { TextButton(onClick = onAccept) { Text("Answer") } },
+            confirmButton = { TextButton(onClick = { requestMicToAnswer() }) { Text("Answer") } },
             dismissButton = { TextButton(onClick = onReject) { Text("Decline") } },
         )
         return
@@ -339,7 +357,7 @@ private fun CallOverlay(
                             onToggleVideo(false)
                             CameraCapture.stop()
                         } else {
-                            requestCamera.launch(Manifest.permission.CAMERA)
+                            requestCamera()
                         }
                     },
                 ) {
@@ -515,6 +533,12 @@ private fun UnlockScreen(
             }
         }
 
+        Spacer(Modifier.height(16.dp))
+        val context = LocalContext.current
+        TextButton(onClick = { Legal.openUrl(context, Legal.PRIVACY_URL) }) {
+            Text("Privacy policy")
+        }
+
         Spacer(Modifier.height(24.dp))
         Text(
             "core $version",
@@ -536,6 +560,8 @@ private fun HomeScreen(viewModel: AppViewModel) {
     var showAppMenu by remember { mutableStateOf(false) }
     var confirmLock by remember { mutableStateOf(false) }
     var confirmRemovePeer by remember { mutableStateOf<Peer?>(null) }
+    var reportPeer by remember { mutableStateOf<Peer?>(null) }
+    var reportRoom by remember { mutableStateOf<Room?>(null) }
     var showCreateRoom by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize()) {
@@ -623,6 +649,7 @@ private fun HomeScreen(viewModel: AppViewModel) {
                         viewModel.setPeerBlocked(peer.peerId, blocked)
                     },
                     onRemove = { peer -> confirmRemovePeer = peer },
+                    onReport = { peer -> reportPeer = peer },
                 )
 
                 HomeTab.ROOMS -> RoomsList(
@@ -632,6 +659,7 @@ private fun HomeScreen(viewModel: AppViewModel) {
                     textRosters = state.roomTextRosters,
                     onOpenRoom = viewModel::openRoom,
                     onSetHidden = viewModel::setRoomHidden,
+                    onReport = { room -> reportRoom = room },
                 )
             }
         }
@@ -673,6 +701,26 @@ private fun HomeScreen(viewModel: AppViewModel) {
         )
     }
 
+    reportPeer?.let { peer ->
+        ReportDialog(
+            kind = "peer",
+            targetId = peer.peerId,
+            targetLabel = peer.label,
+            onBlock = { viewModel.setPeerBlocked(peer.peerId, true) },
+            onDismiss = { reportPeer = null },
+        )
+    }
+
+    reportRoom?.let { room ->
+        ReportDialog(
+            kind = "room",
+            targetId = "${room.supernodeId}:${room.roomId}",
+            targetLabel = room.roomName.ifBlank { room.roomId.take(12) },
+            onBlock = null,
+            onDismiss = { reportRoom = null },
+        )
+    }
+
     if (showCreateRoom) {
         CreateRoomDialog(
             supernodes = state.supernodes,
@@ -705,6 +753,7 @@ private fun PeersList(
     onAcceptInvite: () -> Unit,
     onSetBlocked: (Peer, Boolean) -> Unit,
     onRemove: (Peer) -> Unit,
+    onReport: (Peer) -> Unit,
 ) {
     if (state.peers.isEmpty()) {
         EmptyPeers(onCreateInvite = onCreateInvite, onAcceptInvite = onAcceptInvite)
@@ -720,6 +769,7 @@ private fun PeersList(
                 onClick = { onOpenPeer(peer) },
                 onSetBlocked = { blocked -> onSetBlocked(peer, blocked) },
                 onRemove = { onRemove(peer) },
+                onReport = { onReport(peer) },
             )
             HorizontalDivider()
         }
@@ -790,6 +840,7 @@ private fun RoomsList(
     textRosters: Map<String, List<String>>,
     onOpenRoom: (Room) -> Unit,
     onSetHidden: (Room, Boolean) -> Unit,
+    onReport: (Room) -> Unit,
 ) {
     // Hidden is per-profile local state, so the desktop's choices arrive with
     // the room list and are honoured here rather than re-derived.
@@ -824,6 +875,8 @@ private fun RoomsList(
     LazyColumn(Modifier.fillMaxSize()) {
         items(visible, key = { it.room.key }) { node ->
             val room = node.room
+            var menuOpen by remember(room.key) { mutableStateOf(false) }
+            Box {
             ListItem(
                 headlineContent = { Text(room.roomName.ifBlank { room.roomId.take(12) }) },
                 supportingContent = {
@@ -832,7 +885,7 @@ private fun RoomsList(
                             append(room.roomType.ifBlank { "room" })
                             if (room.isCreator) append(" - yours")
                             if (room.spaceId.isNotBlank()) append(" - in a space")
-                            if (room.hidden) append(" - hidden, long-press to restore")
+                            if (room.hidden) append(" - hidden, long-press for options")
                         },
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -843,9 +896,6 @@ private fun RoomsList(
                         text = textRosters.roomHeadcount(room.roomId),
                     )
                 },
-                // Long-press toggles. Purely local either way: the room stays
-                // on the supernode and other members are unaffected.
-                //
                 // Depth is an indent rather than a drawn tree: nesting is
                 // rarely more than two deep, and an indent reads as "inside
                 // that one" without spending phone width on connectors.
@@ -853,9 +903,26 @@ private fun RoomsList(
                     .padding(start = (node.depth * 20).dp)
                     .combinedClickable(
                         onClick = { onOpenRoom(room) },
-                        onLongClick = { onSetHidden(room, !room.hidden) },
+                        onLongClick = { menuOpen = true },
                     ),
             )
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text(if (room.hidden) "Show in list" else "Hide from list") },
+                    onClick = {
+                        onSetHidden(room, !room.hidden)
+                        menuOpen = false
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text("Report") },
+                    onClick = {
+                        onReport(room)
+                        menuOpen = false
+                    },
+                )
+            }
+            }
             HorizontalDivider()
         }
     }
@@ -943,6 +1010,7 @@ private fun PeerRow(
     onClick: () -> Unit,
     onSetBlocked: (Boolean) -> Unit,
     onRemove: () -> Unit,
+    onReport: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
@@ -1021,6 +1089,13 @@ private fun PeerRow(
             text = { Text(if (peer.blocked) "Unblock" else "Block") },
             onClick = {
                 onSetBlocked(!peer.blocked)
+                menuOpen = false
+            },
+        )
+        DropdownMenuItem(
+            text = { Text("Report") },
+            onClick = {
+                onReport()
                 menuOpen = false
             },
         )
@@ -1241,10 +1316,14 @@ private fun ChatScreen(
 
     // Ask at the point of use rather than on launch: a client that demands
     // the microphone before you have placed a call is asking for something it
-    // cannot yet justify.
-    val requestMic = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted -> if (granted) onCall() }
+    // cannot yet justify. The in-app copy runs first because a call keeps
+    // the mic on with the screen off.
+    val requestMic = rememberExplainedPermission(
+        permission = Manifest.permission.RECORD_AUDIO,
+        title = MicRationaleTitle,
+        body = MicRationaleBody,
+        onGranted = onCall,
+    )
 
     val scrolledAway by rememberScrolledAwayFromLatest(listState)
     val scope = rememberCoroutineScope()
@@ -1273,7 +1352,7 @@ private fun ChatScreen(
                 }
             },
             actions = {
-                IconButton(onClick = { requestMic.launch(Manifest.permission.RECORD_AUDIO) }) {
+                IconButton(onClick = { requestMic() }) {
                     Icon(Icons.Filled.Phone, contentDescription = "Call")
                 }
             },
@@ -1448,20 +1527,24 @@ private fun RoomChatScreen(
     val listState = rememberLazyListState()
     val context = LocalContext.current
 
-    val requestMic = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted -> if (granted) onJoinVoice() }
+    val requestMic = rememberExplainedPermission(
+        permission = Manifest.permission.RECORD_AUDIO,
+        title = MicRationaleTitle,
+        body = MicRationaleBody,
+        onGranted = onJoinVoice,
+    )
 
     // CameraX must be bound before the core asks for video — the native side
     // waits for a first frame to learn the capture size.
-    val requestCamera = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        if (granted) {
+    val requestCamera = rememberExplainedPermission(
+        permission = Manifest.permission.CAMERA,
+        title = CameraRationaleTitle,
+        body = CameraRationaleBody,
+        onGranted = {
             CameraCapture.start(context)
             onToggleVideo(true)
-        }
-    }
+        },
+    )
 
     val scrolledAway by rememberScrolledAwayFromLatest(listState)
     val scope = rememberCoroutineScope()
@@ -1513,7 +1596,7 @@ private fun RoomChatScreen(
                         if (voiceActive) {
                             onLeaveVoice()
                         } else {
-                            requestMic.launch(Manifest.permission.RECORD_AUDIO)
+                            requestMic()
                         }
                     },
                 ) {
@@ -1541,7 +1624,7 @@ private fun RoomChatScreen(
                         onToggleVideo(false)
                         CameraCapture.stop()
                     } else {
-                        requestCamera.launch(Manifest.permission.CAMERA)
+                        requestCamera()
                     }
                 },
                 onLeave = onLeaveVoice,
@@ -1938,6 +2021,8 @@ private fun PortalScreen(
                     // bridge below.
                     settings.allowFileAccess = false
                     settings.allowContentAccess = false
+                    settings.mixedContentMode =
+                        android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
 
                     addJavascriptInterface(bridge.PortalApi(), "__conquerdNative")
 
@@ -1945,9 +2030,35 @@ private fun PortalScreen(
                         override fun shouldInterceptRequest(
                             view: android.webkit.WebView,
                             request: android.webkit.WebResourceRequest,
-                        ): android.webkit.WebResourceResponse? =
-                            bridge.interceptRequest(request)
+                        ): android.webkit.WebResourceResponse? {
+                            val intercepted = bridge.interceptRequest(request)
+                            if (intercepted != null) return intercepted
+                            // Anything that is not d:// or conquerd:// would
+                            // otherwise hit the network with the JS bridge
+                            // still attached.
+                            return android.webkit.WebResourceResponse(
+                                "text/plain",
+                                "utf-8",
+                                403,
+                                "Blocked",
+                                emptyMap(),
+                                ByteArray(0).inputStream(),
+                            )
+                        }
 
+                        override fun shouldOverrideUrlLoading(
+                            view: android.webkit.WebView,
+                            request: android.webkit.WebResourceRequest,
+                        ): Boolean {
+                            val scheme = request.url.scheme.orEmpty()
+                            if (scheme.equals("d", true) ||
+                                scheme.equals("conquerd", true)
+                            ) {
+                                return false
+                            }
+                            Legal.openUrl(view.context, request.url.toString())
+                            return true
+                        }
                     }
 
                     loadUrl("d://$supernodeId/index.html")
@@ -2210,6 +2321,20 @@ private fun SettingsScreen(
                     )
                     Text(label, Modifier.padding(start = 8.dp))
                 }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+
+            Text("Legal", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(4.dp))
+            val legalContext = LocalContext.current
+            TextButton(onClick = { Legal.openUrl(legalContext, Legal.PRIVACY_URL) }) {
+                Text("Privacy policy")
+            }
+            TextButton(onClick = { Legal.openUrl(legalContext, Legal.TERMS_URL) }) {
+                Text("Terms of use")
             }
 
             Spacer(Modifier.height(24.dp))
@@ -2521,7 +2646,7 @@ private fun AcceptInviteDialog(onDismiss: () -> Unit, onAccept: (String) -> Unit
             OutlinedTextField(
                 value = url,
                 onValueChange = { url = it },
-                label = { Text("d:// link") },
+                label = { Text("Invite link") },
                 singleLine = false,
                 maxLines = 4,
             )

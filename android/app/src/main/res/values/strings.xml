@@ -5,6 +5,12 @@
     <string name="service_text">Holding your peer sessions open.</string>
     <string name="service_title_call">DoubleSlash call in progress</string>
     <string name="service_text_call">Your microphone is in use.</string>
+    <string name="service_disconnect">Disconnect</string>
     <string name="channel_name">Connection</string>
     <string name="channel_description">Shown while the client is connected to peers.</string>
+    <string name="incoming_call_title">Incoming call</string>
+    <string name="incoming_call_answer">Answer</string>
+    <string name="incoming_call_decline">Decline</string>
+    <string name="incoming_call_channel">Incoming calls</string>
+    <string name="incoming_call_channel_description">Rings when a peer calls and DoubleSlash is in the background.</string>
 </resources>

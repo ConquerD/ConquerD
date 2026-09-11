@@ -477,7 +477,7 @@ Dialog {
                         StyledTextField {
                             id: incomingInviteField
                             Layout.fillWidth: true
-                            placeholderText: "d://invite#..."
+                            placeholderText: "https://doubleslash.space/i#..."
                             Keys.onReturnPressed: if (text.trim().length > 0 && root.appBackend) root.appBackend.pasteInvite(text.trim())
                         }
 
@@ -598,7 +598,7 @@ Dialog {
 
                         CheckBox {
                             id: uriOption
-                            text: "Open d:// links in DoubleSlash"
+                            text: "Open DoubleSlash invite links in the app"
                             checked: root.isWindows
                             enabled: root.isWindows
                             font.pixelSize: Theme.fontSizeBody
