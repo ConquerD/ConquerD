@@ -69,10 +69,14 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="doubleslash.space" android:pathPrefix="/i" />
-                <data android:scheme="https" android:host="doubleslash.space" android:pathPrefix="/r" />
-                <data android:scheme="https" android:host="www.doubleslash.space" android:pathPrefix="/i" />
-                <data android:scheme="https" android:host="www.doubleslash.space" android:pathPrefix="/r" />
+                <data android:scheme="https" android:host="doubleslash.space" android:path="/i" />
+                <data android:scheme="https" android:host="doubleslash.space" android:path="/i/" />
+                <data android:scheme="https" android:host="doubleslash.space" android:path="/r" />
+                <data android:scheme="https" android:host="doubleslash.space" android:path="/r/" />
+                <data android:scheme="https" android:host="www.doubleslash.space" android:path="/i" />
+                <data android:scheme="https" android:host="www.doubleslash.space" android:path="/i/" />
+                <data android:scheme="https" android:host="www.doubleslash.space" android:path="/r" />
+                <data android:scheme="https" android:host="www.doubleslash.space" android:path="/r/" />
             </intent-filter>
             <!-- Hand-off from the landing page when App Links cannot route. -->
             <intent-filter>
