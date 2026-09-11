@@ -16,7 +16,12 @@ workspace; on narrow screens it replaces the workspace until closed. Focus
 hides the header, tools and panel, with an Exit focus button and Escape shortcut.
 The play area is never underneath an information overlay.
 
-Open the same app and `?room=...` on the **same supernode** on both devices.
+Open the same app and `?room=...` on the **same supernode, or any member of
+its cluster**, on both devices. A game session is held by whichever member a
+client is connected to, and its frames are replicated to the other members
+holding part of the same session — so players spread across a cluster still
+meet, which they have to be able to do, because a cluster is presented to
+clients as a single node and there is no way to pick a member.
 Copy link includes the room. Each app namespaces its native session as
 `demo-v1:<app>:<room>` so unrelated example protocols cannot mix. A room name is
 a rendezvous label, not an authorization secret; the native feature's admission

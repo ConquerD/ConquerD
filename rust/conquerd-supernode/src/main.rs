@@ -223,6 +223,9 @@ struct SupernodeState {
     /// Dedup of replicated room messages (by `message_id`) to guard against
     /// duplicate delivery across cluster links.
     replication_seen: RwLock<cluster_link::SeenCache>,
+    /// Per-node counter behind the replication ids minted for game frames,
+    /// which carry none of their own. See [`Self::replicate_game_datagram`].
+    game_replication_seq: std::sync::atomic::AtomicU64,
     /// Highest verified Space root per `space_id` (authenticated room-set sync).
     /// Populated from client `SpaceRootAnnounce`, cluster `SpaceRoot` gossip, and
     /// client-carried roots on join. Used by proof-based admission.
@@ -379,6 +382,78 @@ impl SupernodeState {
         link.replicate(room_id, &audio_replication_id(msg), raw);
     }
 
+    /// Replicate a portal game-session broadcast to the cluster members that
+    /// hold the rest of the session.
+    ///
+    /// Rides the same `Replicate` transport as room chat and audio, keyed on
+    /// the `game:`-prefixed session id rather than a room id - so the existing
+    /// subscription routing already sends it only where it is wanted, and no
+    /// cluster wire format changes. `raw` is a small JSON envelope rather than
+    /// a signed client message, because a game payload is opaque binary from a
+    /// portal page and there is nothing to sign it with; the receiver treats it
+    /// as data and never re-replicates.
+    pub(crate) fn replicate_game_datagram(&self, session_id: &str, sender: &str, payload: &[u8]) {
+        let Some(link) = self.cluster_link.read().clone() else {
+            return;
+        };
+        use base64::Engine as _;
+        // A game frame carries no id of its own, so mint one. Per-origin
+        // counter plus this node's identity: unique across the cluster without
+        // hashing the payload, which would collapse two identical frames (a
+        // held key sending the same input twice) into one delivery.
+        let seq = self
+            .game_replication_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let message_id = format!("game:{}:{seq}", self.identity.public_id());
+        let raw = serde_json::json!({
+            "type": "game_relay_datagram",
+            "sender": sender,
+            "session_id": session_id,
+            "message_id": message_id,
+            "payload_b64": base64::engine::general_purpose::STANDARD.encode(payload),
+        })
+        .to_string();
+        link.replicate(session_id, &message_id, &raw);
+    }
+
+    /// Deliver a game frame replicated from another cluster member to this
+    /// node's local members of that session. Deduped by `message_id`; never
+    /// re-replicated.
+    ///
+    /// Skips the original sender in case they are multi-homed onto this node —
+    /// same contract as the chat and audio paths, and without it a player whose
+    /// client is attached to two members sees their own input echoed back.
+    fn deliver_replicated_game_datagram(&self, session_id: &str, message_id: &str, raw: &str) {
+        if !self.replication_seen.write().insert_new(message_id) {
+            return;
+        }
+        let Some(ref relay) = self.relay else {
+            return;
+        };
+        let Ok(env) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return;
+        };
+        let sender = env.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(b64) = env.get("payload_b64").and_then(|v| v.as_str()) else {
+            return;
+        };
+        use base64::Engine as _;
+        let Ok(payload) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+            return;
+        };
+        // BROADCAST_INDEX as the sender index, exactly as the replicated-audio
+        // path does: a peer on another member has no index in this node's
+        // table, and the demos identify each other by ids carried inside their
+        // own envelope rather than by the relay's index.
+        let fwd = crate::wire::build_forwarded_datagram(crate::wire::BROADCAST_INDEX, &payload);
+        for member in relay.game_session_members(session_id) {
+            if member.trim_end_matches('=') == sender.trim_end_matches('=') {
+                continue;
+            }
+            relay.send_feature_datagram(&member, "game.relay.v1", &fwd);
+        }
+    }
+
     /// Deliver a room chat replicated from another cluster member to this node's
     /// local recipients. Deduped by `message_id`; never re-replicated.
     ///
@@ -468,6 +543,13 @@ impl SupernodeState {
     /// Route an inbound cluster `Replicate` frame to chat or audio delivery
     /// based on the wire `type` of the opaque client envelope.
     fn deliver_replicated_room_frame(&self, room_id: &str, message_id: &str, raw: &str) {
+        // Game sessions share this channel under a `game:` prefix that a room
+        // id can never carry, so the key alone says which delivery path a
+        // frame belongs to.
+        if room_id.starts_with("game:") {
+            self.deliver_replicated_game_datagram(room_id, message_id, raw);
+            return;
+        }
         let is_audio = serde_json::from_str::<serde_json::Value>(raw)
             .ok()
             .and_then(|v| {
@@ -3414,6 +3496,7 @@ async fn main() -> anyhow::Result<()> {
             cluster_link: RwLock::new(None),
             // Sized for chat + multi-talker room audio (~50 Hz) dedup windows.
             replication_seen: RwLock::new(cluster_link::SeenCache::new(16_384)),
+            game_replication_seq: std::sync::atomic::AtomicU64::new(0),
             space_roots: RwLock::new(SpaceRootStore::default()),
             room_list_dirty: std::sync::atomic::AtomicBool::new(false),
             room_list_notify: tokio::sync::Notify::new(),
@@ -3461,9 +3544,21 @@ async fn main() -> anyhow::Result<()> {
         let local_rooms: cluster_link::LocalRoomsFn = {
             let weak = weak.clone();
             Arc::new(move || {
-                weak.upgrade()
-                    .and_then(|s| s.sfu.as_ref().map(|sfu| sfu.read().subscribed_room_ids()))
-                    .unwrap_or_default()
+                let Some(state) = weak.upgrade() else {
+                    return Vec::new();
+                };
+                let mut keys = state
+                    .sfu
+                    .as_ref()
+                    .map(|sfu| sfu.read().subscribed_room_ids())
+                    .unwrap_or_default();
+                // Portal game sessions ride the same subscription channel
+                // under their `game:` prefix, so a sibling replicates a
+                // session's frames only to members that hold some of it.
+                if let Some(ref relay) = state.relay {
+                    keys.extend(relay.active_game_sessions());
+                }
+                keys
             })
         };
         let local_room_roster: cluster_link::LocalRoomRosterFn = {
@@ -3605,6 +3700,25 @@ async fn main() -> anyhow::Result<()> {
                 "[features] room.chat.v1/room.file.v1 reliable broadcast over QUIC relay enabled"
             );
         }
+    }
+
+    // Install the game-session cluster bridge so a portal game frame reaches
+    // players attached to other cluster members. Without it a game session is
+    // whatever single member a client happened to connect to, while the client
+    // is shown the cluster as one node — so two players with the same app and
+    // the same room name sit in identically-named sessions on different
+    // members and never see each other.
+    if let Some(ref relay) = state.relay {
+        let weak = std::sync::Arc::downgrade(&state);
+        let bridge: relay::GameRelayBridgeHook = std::sync::Arc::new(
+            move |session_id: String, from_peer: String, payload: Vec<u8>| {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                state.replicate_game_datagram(&session_id, &from_peer, &payload);
+            },
+        );
+        relay.set_game_relay_bridge(bridge);
     }
 
     // Install the room-audio datagram bridge so `room.audio.sfu` frames a peer

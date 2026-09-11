@@ -1141,6 +1141,103 @@ mod tests {
         link_b.shutdown();
     }
 
+    /// A session id in the shape `handle_game_relay_join` mints, and the
+    /// envelope `replicate_game_datagram` wraps an opaque game payload in.
+    const GAME_SESSION: &str = "game:demo-v1:brick-breaker:lounge";
+    const GHOST_SESSION: &str = "game:demo-v1:brick-breaker:elsewhere";
+    const GAME_FRAME: &str =
+        r#"{"type":"game_relay_datagram","sender":"peer-a","payload_b64":"AAEC"}"#;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_node_cluster_replicates_a_game_session_over_quic() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let id_a = Identity::generate();
+        let id_b = Identity::generate();
+        let (a_pub, b_pub) = (id_a.public_id(), id_b.public_id());
+
+        // B records what it receives; A receives nothing in this test.
+        let received = Arc::new(parking_lot::Mutex::new(Vec::<ReplicatedMsg>::new()));
+        let on_b: OnReplicateFn = {
+            let r = received.clone();
+            Arc::new(move |m| r.lock().push(m))
+        };
+        let on_a: OnReplicateFn = Arc::new(|_| {});
+        let no_roster_rx: OnRoomRosterFn = Arc::new(|_| {});
+        let no_auth: OnPeerAuthFn = Arc::new(|_| {});
+        let no_root: OnSpaceRootFn = Arc::new(|_| {});
+
+        // Only B holds members of this game session. Session ids ride the
+        // same subscription channel as room ids under a `game:` prefix -
+        // which is the point of this test: a portal game session crosses
+        // the cluster with no change to the cluster wire format.
+        let a_rooms: LocalRoomsFn = Arc::new(Vec::new);
+        let b_rooms: LocalRoomsFn = Arc::new(|| vec![GAME_SESSION.to_string()]);
+
+        let (link_a, link_b) = start_two_node_link(
+            &a_pub,
+            &b_pub,
+            |mem_a| {
+                ClusterLink::new(
+                    id_a.clone(),
+                    mem_a,
+                    on_a.clone(),
+                    no_roster_rx.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            |mem_b| {
+                ClusterLink::new(
+                    id_b.clone(),
+                    mem_b,
+                    on_b.clone(),
+                    no_roster_rx.clone(),
+                    no_auth.clone(),
+                    no_root.clone(),
+                )
+            },
+            a_rooms,
+            no_roster(),
+            Arc::new(Vec::new),
+            b_rooms,
+            no_roster(),
+            Arc::new(Vec::new),
+        )
+        .await;
+
+        // Once the link is up and B's subscription has reached A, A's replicate
+        // routes the frame to B. Retry to absorb connect/propagation latency.
+        let mut delivered = false;
+        for _ in 0..100 {
+            link_a.replicate(GAME_SESSION, "g1", GAME_FRAME);
+            if !received.lock().is_empty() {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(delivered, "B never received the replicated game frame");
+        {
+            // Scope the guard — parking_lot mutexes are not reentrant, so it must
+            // be dropped before we lock again below.
+            let got = received.lock();
+            assert_eq!(got[0].room_id, GAME_SESSION);
+            assert_eq!(got[0].message_id, "g1");
+            assert_eq!(got[0].raw, GAME_FRAME);
+        }
+
+        // A session nobody holds members of routes nowhere, so an idle
+        // member never carries another member's game traffic.
+        link_a.replicate(GHOST_SESSION, "g2", "NOPE");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(received.lock().iter().all(|m| m.room_id != GHOST_SESSION));
+
+        // Tear down background tasks/endpoints so the test runtime exits cleanly.
+        link_a.shutdown();
+        link_b.shutdown();
+    }
+
     /// A freshly-established cluster link advertises the sender's durable rooms
     /// immediately, so a member that never had a room materialized (e.g. the
     /// client only pre-seeded other members) still learns it and can accept a

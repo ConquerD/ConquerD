@@ -214,6 +214,7 @@ pub struct QUICRelayServer {
     bidi_hook: Arc<RwLock<Option<BidiStreamHook>>>,
     signal_hook: Arc<RwLock<Option<SignalStreamHook>>>,
     room_audio_bridge: Arc<RwLock<Option<RoomAudioBridgeHook>>>,
+    game_relay_bridge: Arc<RwLock<Option<GameRelayBridgeHook>>>,
     features: Arc<FeatureRegistry>,
 }
 
@@ -246,6 +247,21 @@ pub type SignalStreamHook =
 /// leading target-index byte). See `install_room_audio_bridge` in `main.rs`.
 pub type RoomAudioBridgeHook = Arc<dyn Fn(String, u8, String, Vec<u8>) + Send + Sync + 'static>;
 
+/// Hook for a portal game-session broadcast, so the node can replicate it to
+/// the cluster members holding the rest of the session.
+///
+/// A game session lives only on whichever member a client happens to be
+/// talking to, and a cluster presents itself to clients as a single node - so
+/// two players who open the same app with the same room name land in
+/// identically-named sessions on different members and never hear each other.
+/// This is the same split [`RoomAudioBridgeHook`] exists for: the relay knows
+/// the session and the bytes, the node above knows the cluster.
+///
+/// Arguments: `(session_id, from_peer, payload)`, where `payload` is the bytes
+/// after the datagram's leading target-index byte - exactly what a local
+/// member is sent.
+pub type GameRelayBridgeHook = Arc<dyn Fn(String, String, Vec<u8>) + Send + Sync + 'static>;
+
 impl QUICRelayServer {
     pub fn new(identity_pub_id: String, features: Arc<FeatureRegistry>) -> Self {
         Self {
@@ -255,6 +271,7 @@ impl QUICRelayServer {
             bidi_hook: Arc::new(RwLock::new(None)),
             signal_hook: Arc::new(RwLock::new(None)),
             room_audio_bridge: Arc::new(RwLock::new(None)),
+            game_relay_bridge: Arc::new(RwLock::new(None)),
             features,
         }
     }
@@ -277,6 +294,38 @@ impl QUICRelayServer {
     /// inbound datagram, so registering it after `start` still applies.
     pub fn set_room_audio_bridge(&self, hook: RoomAudioBridgeHook) {
         *self.room_audio_bridge.write() = Some(hook);
+    }
+
+    /// Install (or replace) the game-session cluster bridge hook. Re-read per
+    /// inbound datagram, so registering it after `start` still applies.
+    pub fn set_game_relay_bridge(&self, hook: GameRelayBridgeHook) {
+        *self.game_relay_bridge.write() = Some(hook);
+    }
+
+    /// Session ids this node currently holds local members for.
+    ///
+    /// Advertised to cluster peers alongside room subscriptions so a sibling
+    /// replicates a session's traffic only to members that can use it. Session
+    /// ids are `game:`-prefixed and so cannot collide with the room ids that
+    /// share that channel.
+    pub fn active_game_sessions(&self) -> Vec<String> {
+        self.state
+            .read()
+            .game_sessions
+            .iter()
+            .filter(|(_, members)| !members.is_empty())
+            .map(|(session_id, _)| session_id.clone())
+            .collect()
+    }
+
+    /// Local members of `session_id` - the peers connected to *this* node.
+    pub fn game_session_members(&self, session_id: &str) -> Vec<String> {
+        self.state
+            .read()
+            .game_sessions
+            .get(session_id)
+            .map(|m| m.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Record which senders `subscriber` wants room video from.
@@ -302,6 +351,20 @@ impl QUICRelayServer {
     ///   error); the caller must NOT also send over WS, to avoid duplicate
     ///   delivery / double quota accounting.
     pub fn send_room_datagram(&self, recipient: &str, fwd: &[u8]) -> Option<bool> {
+        self.send_feature_datagram(recipient, "room.audio.sfu", fwd)
+    }
+
+    /// As [`Self::send_room_datagram`], charging `feature_id`'s quota instead.
+    ///
+    /// A replicated game frame has to be charged to `game.relay.v1`; billing it
+    /// to the audio feature would spend a quota the sender never asked for and
+    /// let game traffic push voice over its limit.
+    pub fn send_feature_datagram(
+        &self,
+        recipient: &str,
+        feature_id: &str,
+        fwd: &[u8],
+    ) -> Option<bool> {
         // Normalize: relay peers are keyed by the un-padded base64url id (see
         // `extract_peer_id`), but callers pass the SFU's padded `public_id`.
         // Without this strip the lookup misses and every relay-connected
@@ -314,7 +377,7 @@ impl QUICRelayServer {
         }
         if !self
             .features
-            .gate_through_feature("room.audio.sfu", recipient, fwd.len())
+            .gate_through_feature(feature_id, recipient, fwd.len())
         {
             return Some(false);
         }
@@ -512,6 +575,7 @@ impl QUICRelayServer {
         let bidi_hook = self.bidi_hook.clone();
         let signal_hook = self.signal_hook.clone();
         let room_audio_bridge = self.room_audio_bridge.clone();
+        let game_relay_bridge = self.game_relay_bridge.clone();
         let features = self.features.clone();
 
         // Accept loop
@@ -528,10 +592,20 @@ impl QUICRelayServer {
                         let hook = bidi_hook.clone();
                         let signal_hook = signal_hook.clone();
                         let room_audio_bridge = room_audio_bridge.clone();
+                        let game_relay_bridge = game_relay_bridge.clone();
                         let features = features.clone();
                         tokio::spawn(async move {
                             if let Err(e) =
-                                handle_connection(incoming, state, hook, signal_hook, room_audio_bridge, features).await
+                                handle_connection(
+                                    incoming,
+                                    state,
+                                    hook,
+                                    signal_hook,
+                                    room_audio_bridge,
+                                    game_relay_bridge,
+                                    features,
+                                )
+                                .await
                             {
                                 debug!("Relay connection error: {e}");
                             }
@@ -578,6 +652,7 @@ async fn handle_connection(
     bidi_hook: Arc<RwLock<Option<BidiStreamHook>>>,
     signal_hook: Arc<RwLock<Option<SignalStreamHook>>>,
     room_audio_bridge: Arc<RwLock<Option<RoomAudioBridgeHook>>>,
+    game_relay_bridge: Arc<RwLock<Option<GameRelayBridgeHook>>>,
     features: Arc<FeatureRegistry>,
 ) -> anyhow::Result<()> {
     let connection = incoming.await?;
@@ -739,6 +814,7 @@ async fn handle_connection(
     let peer_id_clone = peer_id.clone();
     let features_clone = features.clone();
     let room_audio_bridge_clone = room_audio_bridge.clone();
+    let game_relay_bridge_clone = game_relay_bridge.clone();
 
     // Datagram forwarding loop
     loop {
@@ -755,6 +831,7 @@ async fn handle_connection(
                                 &state_clone,
                                 &features_clone,
                                 &room_audio_bridge_clone,
+                                &game_relay_bridge_clone,
                                 &peer_id_clone,
                                 &data,
                             );
@@ -851,6 +928,7 @@ fn handle_datagram(
     state: &Arc<RwLock<RelayState>>,
     features: &FeatureRegistry,
     room_audio_bridge: &Arc<RwLock<Option<RoomAudioBridgeHook>>>,
+    game_relay_bridge: &Arc<RwLock<Option<GameRelayBridgeHook>>>,
     from_peer: &str,
     data: &[u8],
 ) {
@@ -947,14 +1025,22 @@ fn handle_datagram(
                         }
                     }
                 }
-                if relayed == 0 {
-                    return;
-                }
                 drop(st);
-                let mut st = state.write();
-                st.total_bytes_relayed += relayed;
-                if let Some(peer) = st.peers.get_mut(from_peer) {
-                    peer.bytes_relayed += relayed;
+                // Hand the frame to the cluster before deciding there was
+                // nobody to send it to: in a cluster the rest of the session
+                // is usually on another member, so a session with no local
+                // members but remote ones is the normal two-player case, not
+                // a dead end.
+                let bridge = game_relay_bridge.read().clone();
+                if let Some(bridge) = bridge {
+                    bridge(session_id, from_peer.to_owned(), payload.to_vec());
+                }
+                if relayed > 0 {
+                    let mut st = state.write();
+                    st.total_bytes_relayed += relayed;
+                    if let Some(peer) = st.peers.get_mut(from_peer) {
+                        peer.bytes_relayed += relayed;
+                    }
                 }
                 return;
             }
@@ -1706,6 +1792,38 @@ mod tests {
     }
 
     // ── QUICRelayServer (no live QUIC needed) ───────────────────────────────
+
+    #[test]
+    fn game_sessions_are_advertisable_and_addressable() {
+        // What the cluster bridge depends on: a node can name the sessions it
+        // holds (to advertise them as subscriptions) and list the local members
+        // of one (to deliver a replicated frame to them).
+        let srv = QUICRelayServer::new("test-id".into(), test_features());
+        let session = "game:demo-v1:brick-breaker:lounge";
+
+        srv.join_game_session("peer-a", session);
+        srv.join_game_session("peer-b", session);
+
+        assert_eq!(srv.active_game_sessions(), vec![session.to_string()]);
+        let mut members = srv.game_session_members(session);
+        members.sort();
+        assert_eq!(members, vec!["peer-a".to_string(), "peer-b".to_string()]);
+
+        // Membership is keyed un-padded, matching the relay's id space, so a
+        // padded id addresses the same member.
+        srv.join_game_session("peer-c==", session);
+        assert!(srv
+            .game_session_members(session)
+            .contains(&"peer-c".to_string()));
+
+        // An emptied session stops being advertised, so siblings stop
+        // replicating its traffic here.
+        srv.leave_game_session("peer-a");
+        srv.leave_game_session("peer-b");
+        srv.leave_game_session("peer-c");
+        assert!(srv.active_game_sessions().is_empty());
+        assert!(srv.game_session_members(session).is_empty());
+    }
 
     #[test]
     fn allow_and_revoke_peer() {
