@@ -170,9 +170,14 @@ function draw(now) {
 requestAnimationFrame(draw);
 session
   .connect()
-  .catch(() =>
+  .catch((err) => {
+    // The reason goes to the console as well as the status line. A bare
+    // `.catch` here made every failure look identical from outside the page,
+    // which on Android means nothing reaches logcat at all - the one place
+    // you can look when the portal is not cooperating.
+    console.error("[demo] session connect failed:", err);
     shell.setStatus(
       "Open in DoubleSlash through a connected supernode",
       "error",
-    ),
-  );
+    );
+  });

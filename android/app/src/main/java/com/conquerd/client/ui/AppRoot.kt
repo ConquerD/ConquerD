@@ -2021,9 +2021,44 @@ private fun PortalScreen(
         )
 
         AndroidView(
-            modifier = Modifier.fillMaxSize(),
+            // `weight`, not `fillMaxSize`: a Column measures a non-weighted
+            // child with an unbounded main axis, and the WebView below needs a
+            // bounded one to be given a definite height. See the layoutParams
+            // note in the factory for why a definite height matters so much.
+            modifier = Modifier.weight(1f).fillMaxWidth(),
             factory = { context ->
+                // Debuggable builds only, and it changes nothing the page can
+                // see: it exposes this WebView to Chrome DevTools over adb, so
+                // a portal page that misbehaves can be inspected directly
+                // instead of being guessed at from the outside. A release APK
+                // is not debuggable, so this stays off in shipped builds.
+                val debuggable = context.applicationInfo.flags and
+                    android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+                if (debuggable) {
+                    android.webkit.WebView.setWebContentsDebuggingEnabled(true)
+                }
+
                 android.webkit.WebView(context).apply {
+                    // Without this the WebView carries no LayoutParams, so
+                    // AndroidView treats it as WRAP_CONTENT and measures it
+                    // AT_MOST. Chromium reads that as "size to content" and
+                    // lays the document out against a zero-height viewport:
+                    // `html` comes out 0px tall while `clientHeight` still
+                    // reports the real 770, and every height that resolves
+                    // against the viewport - `vh`, `dvh`, `svh`, `lvh` and
+                    // percentages alike - computes to zero. Any portal page
+                    // that sizes itself off the viewport then collapses. The
+                    // demo shell's `.app { height: 100dvh }` became 0px and
+                    // the game canvas under it laid out 2px tall while
+                    // happily drawing into a 1600x1200 buffer, so the games
+                    // ran perfectly and were invisible.
+                    //
+                    // MATCH_PARENT plus the bounded constraint from `weight`
+                    // above makes AndroidView emit an EXACTLY spec instead.
+                    layoutParams = android.view.ViewGroup.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     // No local file or content-provider reach: a portal page is

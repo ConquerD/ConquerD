@@ -24,7 +24,7 @@ export function mountShell(
   document.querySelector("#room-label").textContent = session.room;
   document.querySelector("#controls-hint").textContent = controls;
   panel.innerHTML = `<h2>Session</h2><p class="description"></p>
-    <form id="room-form"><label for="room-input">Room name</label><input id="room-input" maxlength="48" required pattern="[A-Za-z0-9 _.-]+" autocomplete="off"><button type="submit">Join room</button><button id="new-room" type="button">New room</button></form>
+    <form id="room-form"><label for="room-input">Room name</label><input id="room-input" maxlength="48" required pattern="[A-Za-z0-9 _.\-]+" autocomplete="off"><button type="submit">Join room</button><button id="new-room" type="button">New room</button></form>
     <p>Use the same app, room name and supernode on another device.</p>
     <label id="copy-fallback" hidden>Session link<input id="link-copy" readonly aria-label="Session link to copy"></label>
     <button id="ready" type="button" aria-pressed="false">Mark ready</button>
