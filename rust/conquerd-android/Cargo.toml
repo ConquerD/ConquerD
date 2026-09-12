@@ -46,6 +46,16 @@ expect_used = "warn"
 # drag the server-side workspace (or its wayland-scanner patch) along.
 [workspace]
 
+# cpal 0.15.3 opens its Oboe streams with the default Usage::Media and no input
+# preset. Android routes a media-usage stream to the loudspeaker and ignores
+# AudioManager.setCommunicationDevice() for it, so earpiece/headset selection is
+# impossible and no platform echo canceller is attached to capture. The fork
+# sets Usage::VoiceCommunication + ContentType::Speech on output and
+# InputPreset::VoiceCommunication on input. Android-only in effect: the code it
+# touches lives in `src/host/oboe`, which no other target compiles.
+[patch.crates-io]
+cpal = { path = "../patches/cpal" }
+
 # Full DWARF for the whole dependency graph makes the debug .so ~230 MB, which
 # is slow to push over adb for very little gain: on-device debugging attaches
 # to Kotlin, and dropping DWARF while keeping the symbol table still leaves

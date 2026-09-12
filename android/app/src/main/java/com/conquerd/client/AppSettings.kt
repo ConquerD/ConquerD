@@ -45,6 +45,17 @@ class AppSettings(context: Context) {
         get() = prefs.getInt(KEY_OUTPUT_GAIN, 100)
         set(value) = prefs.edit().putInt(KEY_OUTPUT_GAIN, value.coerceIn(0, 200)).apply()
 
+    /**
+     * Play voice out of the loudspeaker rather than the earpiece.
+     *
+     * Off by default: the earpiece is the private choice, and a phone held to
+     * the ear is the one case where the speaker is actively wrong. A attached
+     * headset overrides this either way — see [AudioRouter].
+     */
+    var speakerphone: Boolean
+        get() = prefs.getBoolean(KEY_SPEAKERPHONE, false)
+        set(value) = prefs.edit().putBoolean(KEY_SPEAKERPHONE, value).apply()
+
     /** Noise gate: 0 off, 1 mild, 2 moderate, 3 aggressive, 4 max. */
     var noiseStrength: Int
         get() = prefs.getInt(KEY_NOISE_STRENGTH, 2)
@@ -96,6 +107,7 @@ class AppSettings(context: Context) {
         private const val KEY_INPUT_GAIN = "input_gain"
         private const val KEY_OUTPUT_GAIN = "output_gain"
         private const val KEY_NOISE_STRENGTH = "noise_strength"
+        private const val KEY_SPEAKERPHONE = "speakerphone"
         private const val KEY_VOICE_BITRATE = "voice_bitrate"
         private const val KEY_ACCEPTED_TERMS = "accepted_terms_version"
         private const val KEY_NOTIFICATION_RATIONALE = "notification_rationale_shown"

@@ -230,11 +230,14 @@ fun AppRoot(viewModel: AppViewModel) {
                     voiceActive = state.roomVoiceActive,
                     muted = state.muted,
                     videoActive = state.videoActive,
+                    speakerphone = state.speakerphone,
+                    headsetAttached = state.headsetAttached,
                     onBack = viewModel::closeRoom,
                     onSend = viewModel::sendRoomChat,
                     onJoinVoice = viewModel::joinRoomVoice,
                     onLeaveVoice = viewModel::leaveRoomVoice,
                     onToggleMute = viewModel::toggleMute,
+                    onToggleSpeaker = { viewModel.setSpeakerphone(!state.speakerphone) },
                     // No peer id: the supernode fans room video out to every
                     // participant, rather than it being addressed to one.
                     onToggleVideo = { wanted ->
@@ -274,10 +277,13 @@ fun AppRoot(viewModel: AppViewModel) {
         CallOverlay(
             call = call,
             videoActive = state.videoActive,
+            speakerphone = state.speakerphone,
+            headsetAttached = state.headsetAttached,
             onAccept = viewModel::acceptCall,
             onReject = viewModel::rejectCall,
             onEnd = viewModel::endCall,
             onToggleMute = viewModel::toggleMute,
+            onToggleSpeaker = { viewModel.setSpeakerphone(!state.speakerphone) },
             onToggleVideo = { wanted ->
                 if (wanted) viewModel.startVideo(call.peerId) else viewModel.stopVideo(call.peerId)
             },
@@ -297,10 +303,13 @@ fun AppRoot(viewModel: AppViewModel) {
 private fun CallOverlay(
     call: CallState,
     videoActive: Boolean,
+    speakerphone: Boolean,
+    headsetAttached: Boolean,
     onAccept: () -> Unit,
     onReject: () -> Unit,
     onEnd: () -> Unit,
     onToggleMute: () -> Unit,
+    onToggleSpeaker: () -> Unit,
     onToggleVideo: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
@@ -355,6 +364,17 @@ private fun CallOverlay(
                 }
                 TextButton(onClick = onToggleMute) {
                     Text(if (call.muted) "Unmute" else "Mute")
+                }
+                // A headset takes the audio regardless of this preference, so
+                // the control is disabled rather than silently ignored.
+                TextButton(onClick = onToggleSpeaker, enabled = !headsetAttached) {
+                    Text(
+                        when {
+                            headsetAttached -> "Headset"
+                            speakerphone -> "Speaker"
+                            else -> "Earpiece"
+                        }
+                    )
                 }
                 TextButton(
                     onClick = {
@@ -1512,11 +1532,14 @@ private fun RoomChatScreen(
     voiceActive: Boolean,
     muted: Boolean,
     videoActive: Boolean,
+    speakerphone: Boolean,
+    headsetAttached: Boolean,
     onBack: () -> Unit,
     onSend: (String) -> Unit,
     onJoinVoice: () -> Unit,
     onLeaveVoice: () -> Unit,
     onToggleMute: () -> Unit,
+    onToggleSpeaker: () -> Unit,
     onToggleVideo: (Boolean) -> Unit,
     transfers: Map<String, Float>,
     onSendFile: (android.net.Uri) -> Unit,
@@ -1620,7 +1643,10 @@ private fun RoomChatScreen(
                 members = members,
                 muted = muted,
                 videoActive = videoActive,
+                speakerphone = speakerphone,
+                headsetAttached = headsetAttached,
                 onToggleMute = onToggleMute,
+                onToggleSpeaker = onToggleSpeaker,
                 onToggleVideo = {
                     if (videoActive) {
                         onToggleVideo(false)
@@ -1722,7 +1748,10 @@ private fun VoiceRail(
     members: List<String>,
     muted: Boolean,
     videoActive: Boolean,
+    speakerphone: Boolean,
+    headsetAttached: Boolean,
     onToggleMute: () -> Unit,
+    onToggleSpeaker: () -> Unit,
     onToggleVideo: () -> Unit,
     onLeave: () -> Unit,
 ) {
@@ -1742,6 +1771,17 @@ private fun VoiceRail(
                 )
                 TextButton(onClick = onToggleMute) {
                     Text(if (muted) "Unmute" else "Mute")
+                }
+                // A headset takes the audio regardless of this preference, so
+                // the control is disabled rather than silently ignored.
+                TextButton(onClick = onToggleSpeaker, enabled = !headsetAttached) {
+                    Text(
+                        when {
+                            headsetAttached -> "Headset"
+                            speakerphone -> "Speaker"
+                            else -> "Earpiece"
+                        }
+                    )
                 }
                 TextButton(onClick = onToggleVideo) {
                     Text(if (videoActive) "Stop video" else "Video")

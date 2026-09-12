@@ -113,6 +113,10 @@ data class AppState(
     val showHiddenRooms: Boolean = false,
     /** True while capturing and sending audio into the open room. */
     val roomVoiceActive: Boolean = false,
+    /** Voice is playing out of the loudspeaker rather than the earpiece. */
+    val speakerphone: Boolean = false,
+    /** A wired/Bluetooth headset is attached, so it outranks [speakerphone]. */
+    val headsetAttached: Boolean = false,
     /** Local mute, shared by direct calls and room voice. */
     val muted: Boolean = false,
     /** True while the local camera is capturing and sending. */
@@ -205,6 +209,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Device-local preferences; the display name lives on the peer record. */
     private val settings = AppSettings(app)
+    private val audioRouter = AudioRouter(app)
 
     private val _state = MutableStateFlow(AppState())
     val state: StateFlow<AppState> = _state.asStateFlow()
@@ -1033,6 +1038,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // starts does not retroactively legalise it - Android just feeds
         // silence once the app is no longer foreground.
         CoreService.setMediaActive(getApplication(), microphone = true, camera = false)
+        enterVoiceRoute()
 
         _state.update {
             it.copy(call = CallState(peer.peerId, peer.label, CallPhase.OUTGOING))
@@ -1079,10 +1085,48 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             core.command("call.end") { put("peer_id", call.peerId) }
             CoreService.setMediaActive(getApplication(), microphone = false, camera = false)
+            leaveVoiceRoute()
         }
     }
 
     fun toggleMute() = setMuted(!_state.value.muted)
+
+    /**
+     * Move voice between the earpiece and the loudspeaker.
+     *
+     * Persisted, so the next call opens the way the last one ended. Takes
+     * effect immediately when a session is live and is applied on the next
+     * [enterVoiceRoute] otherwise.
+     */
+    fun setSpeakerphone(on: Boolean) {
+        settings.speakerphone = on
+        audioRouter.setSpeakerphone(on)
+        _state.update { it.copy(speakerphone = on) }
+    }
+
+    /** Claim the call audio route for a session that is starting. */
+    private fun enterVoiceRoute() {
+        audioRouter.activate(settings.speakerphone)
+        _state.update {
+            it.copy(
+                speakerphone = settings.speakerphone,
+                headsetAttached = audioRouter.headsetAttached(),
+            )
+        }
+    }
+
+    /**
+     * Hand the route back, but only once nothing else needs it — a call and
+     * room voice can overlap, and releasing on the first to end would drop the
+     * survivor back onto the media route mid-session.
+     */
+    private fun leaveVoiceRoute() {
+        val s = _state.value
+        if (s.call == null && !s.roomVoiceActive) {
+            audioRouter.release()
+            _state.update { it.copy(headsetAttached = false) }
+        }
+    }
 
     // ── Rooms ─────────────────────────────────────────────────────────────
 
@@ -1233,6 +1277,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun joinRoomVoice() {
         val room = (_state.value.screen as? Screen.RoomChat)?.room ?: return
         CoreService.setMediaActive(getApplication(), microphone = true, camera = false)
+        enterVoiceRoute()
 
         viewModelScope.launch {
             val reply = core.command("room.voice.join") {
@@ -1244,6 +1289,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } else {
                 _state.update { it.copy(error = reply.errorText) }
                 CoreService.setMediaActive(getApplication(), microphone = false, camera = false)
+                leaveVoiceRoute()
             }
         }
     }
@@ -1253,6 +1299,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             core.command("room.voice.leave")
             CoreService.setMediaActive(getApplication(), microphone = false, camera = false)
+            leaveVoiceRoute()
         }
     }
 
