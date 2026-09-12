@@ -8,7 +8,7 @@ that existing capability does not require an app to be a game.
 | --- | --- |
 | [Brick Breaker](brick-breaker/) | Cooperative paddles, a peer-owned simulation, interpolated snapshots, coordinator handoff |
 | [Shared Canvas](shared-drawing/) | Collaborative ink, erasing, ordered operations, peer replay for late arrivals |
-| [Presence Playground](example/) | Live pointers, idle presence, shared attention markers |
+| [Presence Playground](example/) | Live pointers, idle presence, shared attention markers, per-guest appearance, and a deterministic snake round with room-wide settings |
 
 The Session panel contains a room picker, readiness, a participant list, actual
 application traffic counters and measured peer round trips. It sits beside the
@@ -44,6 +44,10 @@ to reopen the page; their old wire formats are intentionally isolated.
 - At most 32 remote sessions are tracked; presence expires after 6.5 seconds.
   Envelopes are capped at 1,100 bytes, with at most four bridge sends in flight.
   Snapshots/presence repeat; missed drawing operations reconcile from open peers.
+- The playground's room settings resolve by Lamport clock and presser id, so a
+  dropped datagram costs a press, never agreement. Its snake board holds at most
+  six snakes of 40 cells, packed two base36 characters per cell so a full
+  snapshot still fits one envelope every tick.
 - Canvas history is capped at 3,000 operations; clear frees it. Data lives in open
   pages only. Closing the last page loses the drawing. Delivery is not a durable
   document guarantee. Readiness is informational and does not block launch.

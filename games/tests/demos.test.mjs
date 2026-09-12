@@ -6,6 +6,7 @@ import {
   decodePacket,
   PEER_TIMEOUT,
 } from "../../web-sdk/demo-session.mjs";
+import { peerColor } from "../../web-sdk/demo-shell.mjs";
 import {
   newWorld,
   step,
@@ -14,6 +15,28 @@ import {
   sampleBall,
 } from "../brick-breaker/world.mjs";
 import { Board, LIMIT } from "../shared-drawing/board.mjs";
+import {
+  MAX_SNAKES,
+  MAX_LEN,
+  GRID_W,
+  GRID_H,
+  PALETTE,
+  SHAPES,
+  newSettings,
+  mergeSettings,
+  change,
+  validSettings,
+  validLook,
+  defaultLook,
+  centerOffset,
+  worldFor,
+  newSnakeWorld,
+  joinSnake,
+  queueTurn,
+  stepSnake,
+  packWorld,
+  unpackWorld,
+} from "../example/playground.mjs";
 import { ConquerdClient } from "../../web-sdk/conquerd.mjs";
 
 const idA = "a".repeat(24),
@@ -238,6 +261,169 @@ test("full boards converge regardless of operation arrival order", () => {
   assert.equal(a.digest(), b.digest());
 });
 
+const at = (x, y) => y * GRID_W + x;
+const solo = (seed, body, dir, grow = 0) => {
+  const world = newSnakeWorld(seed);
+  world.food = [];
+  world.snakes = {
+    "00000001": { body, dir, want: dir, grow, score: 0, deaths: 0 },
+  };
+  return world;
+};
+
+test("room settings converge on the same answer whoever pressed first", () => {
+  const base = newSettings();
+  const mode = change(base, { mode: "snake" }, "aaaa"),
+    speed = change(base, { speed: 2 }, "bbbb");
+  // Concurrent presses: both devices resolve the tie the same way, and the
+  // loser is dropped rather than applied on one side only.
+  assert.deepEqual(mergeSettings(mode, speed), mergeSettings(speed, mode));
+  assert.equal(mergeSettings(mode, speed), speed);
+  const later = change(speed, { mode: "presence" }, "aaaa");
+  assert.equal(mergeSettings(mode, later), later);
+  assert.equal(mergeSettings(later, mode), later);
+  assert.equal(mergeSettings(base, { ...base, mode: "chaos", clock: 9 }), base);
+  assert.equal(validSettings({ ...base, by: "<script>" }), false);
+  assert.equal(validSettings({ ...base, speed: 9 }), false);
+  assert.equal(validSettings({ ...base, walls: "none" }), false);
+});
+
+test("appearance travels as bounded indexes and defaults match the session panel", () => {
+  assert.deepEqual(validLook({ c: 0, s: 0 }), { c: 0, s: 0 });
+  assert.equal(validLook({ c: PALETTE.length, s: 0 }), null);
+  assert.equal(validLook({ c: 0, s: "star" }), null);
+  assert.equal(validLook({ c: 1.5, s: 0 }), null);
+  assert.equal(validLook({ c: 0, s: 0, extra: "url(javascript:0)" }).s, 0);
+  const look = defaultLook(idA);
+  assert.equal(PALETTE[look.c], peerColor(idA));
+  assert.ok(look.s >= 0 && look.s < SHAPES.length);
+  // A snake is keyed by an id prefix; the fallback look must not shift with it.
+  assert.deepEqual(defaultLook(idA.slice(0, 8)), look);
+  assert.ok(Math.abs(centerOffset("arrow")[1]) > 0.1);
+  assert.ok(Math.abs(centerOffset("square")[0]) < 1e-9);
+});
+
+test("the same room and round deal the same board on every device", () => {
+  const layout = (room, round) => JSON.stringify(worldFor(room, round).food);
+  assert.equal(layout("lounge", 2), layout("lounge", 2));
+  assert.notEqual(layout("lounge", 2), layout("lounge", 3));
+  assert.notEqual(layout("lounge", 2), layout("other", 2));
+  const run = (order) => {
+    const world = worldFor("lounge", 1);
+    order.forEach((key) => joinSnake(world, key));
+    for (let i = 0; i < 30; i++) {
+      queueTurn(world, "aa11bb22", i % 2 ? 1 : 2);
+      stepSnake(world, "wrap");
+    }
+    return JSON.stringify(packWorld(world));
+  };
+  assert.equal(run(["aa11bb22", "cc33dd44"]), run(["cc33dd44", "aa11bb22"]));
+  const world = worldFor("lounge", 1);
+  for (let i = 0; i < MAX_SNAKES + 2; i++)
+    assert.equal(joinSnake(world, `0000000${i}`), i < MAX_SNAKES);
+  assert.equal(joinSnake(world, "00000000"), false);
+});
+
+test("snake collisions resolve simultaneously and edges follow the setting", () => {
+  const loop = [at(3, 0), at(4, 0), at(4, 1), at(3, 1)];
+  // Chasing a tail that moves out of the way is fine; growing into it is not.
+  assert.deepEqual(stepSnake(solo(7, loop, 2), "wrap"), []);
+  assert.deepEqual(stepSnake(solo(7, loop, 2, 1), "wrap"), ["00000001"]);
+  assert.deepEqual(stepSnake(solo(7, loop, 1), "wrap"), ["00000001"]);
+  const edge = (walls) => stepSnake(solo(9, [at(0, 0)], 0), walls);
+  assert.deepEqual(edge("solid"), ["00000001"]);
+  assert.deepEqual(edge("wrap"), []);
+  const wrapped = solo(9, [at(0, 0)], 0);
+  stepSnake(wrapped, "wrap");
+  assert.equal(wrapped.snakes["00000001"].body[0], at(0, GRID_H - 1));
+  // Two heads meeting kill each other whichever order the snakes are visited.
+  const pair = solo(11, [at(5, 5)], 1);
+  pair.snakes["00000002"] = {
+    body: [at(7, 5)],
+    dir: 3,
+    want: 3,
+    grow: 0,
+    score: 0,
+    deaths: 0,
+  };
+  assert.deepEqual(stepSnake(pair, "wrap").sort(), ["00000001", "00000002"]);
+  assert.equal(pair.snakes["00000001"].deaths, 1);
+  assert.equal(pair.snakes["00000001"].body.length, 1);
+  const eating = solo(13, [at(5, 5)], 1);
+  eating.food = [at(6, 5)];
+  stepSnake(eating, "wrap");
+  assert.equal(eating.snakes["00000001"].score, 1);
+  assert.equal(eating.food.length, 3);
+  assert.ok(!eating.food.includes(at(6, 5)));
+  const turning = solo(17, [at(5, 5), at(4, 5)], 1);
+  assert.equal(queueTurn(turning, "00000001", 3), false);
+  assert.equal(queueTurn(turning, "00000001", 0), true);
+  assert.equal(queueTurn(turning, "nobody00", 0), false);
+  assert.equal(queueTurn(turning, "00000001", 9), false);
+});
+
+test("a full snake board survives a snapshot and fits one session envelope", async () => {
+  const world = worldFor("lounge", 4);
+  for (let i = 0; i < MAX_SNAKES; i++) joinSnake(world, `0000000${i}`);
+  for (const key of Object.keys(world.snakes))
+    Object.assign(world.snakes[key], {
+      body: Array.from({ length: MAX_LEN }, (_, n) => n),
+      score: 9999,
+      deaths: 9999,
+    });
+  const packed = packWorld(world);
+  assert.deepEqual(packWorld(unpackWorld(packed)), packed);
+  const bad = (mutate) => {
+    const copy = JSON.parse(JSON.stringify(packed));
+    mutate(copy);
+    return unpackWorld(copy);
+  };
+  assert.equal(
+    bad((p) => (p.s[0][0] = "<script>")),
+    null,
+  );
+  assert.equal(
+    bad((p) => (p.s[0][1] = "zzzz")),
+    null,
+  );
+  assert.equal(
+    bad((p) => (p.s[0][1] = "0".repeat((MAX_LEN + 1) * 2))),
+    null,
+  );
+  assert.equal(
+    bad((p) => (p.s[0][2] = 7)),
+    null,
+  );
+  assert.equal(
+    bad((p) => p.s.push(p.s[0])),
+    null,
+  );
+  assert.equal(
+    bad((p) => (p.f = [-1])),
+    null,
+  );
+  assert.equal(unpackWorld(null), null);
+  // The worst case board still has to leave the coordinator every tick.
+  const client = new Client(),
+    session = new DemoSession("presence", {
+      id: idA,
+      room: "r",
+      client,
+    });
+  try {
+    await session.connect();
+    await flush();
+    const settings = change(newSettings(), { mode: "snake" }, idA);
+    assert.equal(
+      await session.send({ t: "state", w: packed, st: settings }),
+      true,
+    );
+    assert.equal(session.stats.errors, 0);
+  } finally {
+    session.disconnect();
+  }
+});
+
 test("SDK polls never overlap and discards a poll completed after disconnect", async () => {
   let polls = 0,
     resolvePoll,
@@ -275,6 +461,7 @@ test("embedded supernode assets match the editable examples", async () => {
   const pairs = [
     ["example/index.html", "games_example_index.html"],
     ["example/game.js", "games_example_game.js"],
+    ["example/playground.mjs", "games_example_playground.mjs"],
     ["brick-breaker/index.html", "games_brick_breaker_index.html"],
     ["brick-breaker/brick-breaker.js", "games_brick_breaker_brick_breaker.js"],
     ["brick-breaker/world.mjs", "games_brick_breaker_world.mjs"],

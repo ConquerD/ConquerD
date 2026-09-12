@@ -35,8 +35,24 @@
       <div class="work-area">
         <section class="workspace" aria-label="Presence Playground">
           <div class="toolbar">
-            <span>Move together. Click to send a ripple.</span
-            ><span class="spacer"></span
+            <div class="toolbar-group">
+              <label>Room</label>
+              <div id="modes"></div>
+            </div>
+            <div class="toolbar-group">
+              <label>You</label>
+              <div id="palette"></div>
+              <div id="shapes"></div>
+            </div>
+            <div class="toolbar-group" id="snake-tools" hidden>
+              <label>Speed</label>
+              <div id="speeds"></div>
+              <label>Edges</label>
+              <div id="walls"></div>
+              <button id="play" aria-pressed="false">Take a snake</button
+              ><button id="new-round">New round</button>
+            </div>
+            <span class="spacer"></span
             ><span id="activity">Your space is live</span>
           </div>
           <div class="stage">

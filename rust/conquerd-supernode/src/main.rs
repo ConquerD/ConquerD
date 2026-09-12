@@ -3967,8 +3967,9 @@ fn check_ticket_renewals(state: &SupernodeState) {
 ///     index.html                     ← portal dashboard (uses window.conquerd bridge)
 ///   games/
 ///     example/
-///       index.html                   ← cursor-relay demo UI
-///       game.js                      ← cursor-relay demo logic
+///       index.html                   ← presence playground demo UI
+///       game.js                      ← presence playground demo logic
+///       playground.mjs               ← appearance, room settings, snake rules
 ///     shared-drawing/
 ///       index.html                   ← collaborative canvas demo
 ///       drawing.js
@@ -3989,9 +3990,10 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
     const PORTAL_HTML: &str = include_str!("../templates/web_index.html");
     const ACCESS_HTML: &str = include_str!("../templates/web_access.html");
 
-    // Cursor relay (original example)
+    // Presence playground (original cursor-relay example)
     const CURSOR_HTML: &str = include_str!("../templates/games_example_index.html");
     const CURSOR_JS: &str = include_str!("../templates/games_example_game.js");
+    const CURSOR_PLAYGROUND: &str = include_str!("../templates/games_example_playground.mjs");
 
     // Shared drawing demo
     const DRAW_HTML: &str = include_str!("../templates/games_shared_drawing_index.html");
@@ -4033,6 +4035,7 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
         (&["web", "web-sdk", "demo-shell.css"], DEMO_CSS),
         (&["games", "example", "index.html"], CURSOR_HTML),
         (&["games", "example", "game.js"], CURSOR_JS),
+        (&["games", "example", "playground.mjs"], CURSOR_PLAYGROUND),
         (&["games", "shared-drawing", "index.html"], DRAW_HTML),
         (&["games", "shared-drawing", "drawing.js"], DRAW_JS),
         (&["games", "shared-drawing", "board.mjs"], DRAW_BOARD),

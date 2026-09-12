@@ -5,6 +5,7 @@ import { readFile, writeFile } from "node:fs/promises";
 const assets = [
   ["games/example/index.html", "games_example_index.html"],
   ["games/example/game.js", "games_example_game.js"],
+  ["games/example/playground.mjs", "games_example_playground.mjs"],
   ["games/brick-breaker/index.html", "games_brick_breaker_index.html"],
   [
     "games/brick-breaker/brick-breaker.js",
