@@ -17,6 +17,11 @@ Item {
     // flag - instead of a second, differently-stale list.
     property ListModel supernodeModel: null
 
+    // Per-node transport stats, keyed by node id (MainWindow's
+    // nodeConnectionStats). This card is the only place they surface now that
+    // the Rooms sidebar has no supernode row to hover.
+    property var supernodeStats: ({})
+
     // Section indices, in the order SettingsSidebar lists them and the order
     // the StackLayout below declares its pages. Named rather than inlined
     // because inserting a section shifts every later index — when Video was
@@ -80,6 +85,16 @@ Item {
     function shortNodeId(nodeId) {
         if (!nodeId) return ""
         return nodeId.length > 16 ? nodeId.substring(0, 16) + "…" : nodeId
+    }
+
+    // "Connected · 24 ms · AbC…" - ping only once the node has reported it.
+    function supernodeStatusLine(nodeId, connected) {
+        var parts = [connected ? "Connected" : "Offline"]
+        var stats = root.supernodeStats ? root.supernodeStats[nodeId] : null
+        if (connected && stats && stats.rtt_ms > 0)
+            parts.push(Math.round(stats.rtt_ms) + " ms")
+        parts.push(root.shortNodeId(nodeId))
+        return parts.join(" · ")
     }
 
     function indexOf(values, value, fallback) {
@@ -2060,8 +2075,8 @@ Item {
 
                                     Label {
                                         Layout.fillWidth: true
-                                        text: (nodeRow.connected ? "Connected" : "Offline")
-                                            + " · " + root.shortNodeId(nodeRow.node_id)
+                                        text: root.supernodeStatusLine(
+                                            nodeRow.node_id, nodeRow.connected)
                                         color: Theme.muted
                                         font.pixelSize: Theme.fontSizeCaption
                                         elide: Text.ElideRight
@@ -2072,6 +2087,12 @@ Item {
                                     text: "Open Portal"
                                     icon.source: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
                                     onClicked: if (backend) backend.openNodePortal(nodeRow.node_id)
+                                }
+
+                                StyledButton {
+                                    text: "Copy ID"
+                                    icon.source: "qrc:/qt/qml/ConquerD/Client/icons/clipboard.svg"
+                                    onClicked: if (backend) backend.copyToClipboard(nodeRow.node_id)
                                 }
 
                                 StyledButton {
