@@ -11,6 +11,12 @@ Item {
     property var settings: null
     property int currentTab: 0
 
+    // The Rooms sidebar's node list, handed in by MainWindow. Reused rather
+    // than queried again so the Supernodes card below shows exactly the nodes
+    // the sidebar shows - one row per cluster, with the same live connected
+    // flag - instead of a second, differently-stale list.
+    property ListModel supernodeModel: null
+
     // Section indices, in the order SettingsSidebar lists them and the order
     // the StackLayout below declares its pages. Named rather than inlined
     // because inserting a section shifts every later index — when Video was
@@ -67,6 +73,13 @@ Item {
                 return t.length === 1 ? t : ""
             }
         }
+    }
+
+    // Node ids are 43-char base64url keys; the head is enough to tell two
+    // supernodes apart, and the full id is a right-click away in the sidebar.
+    function shortNodeId(nodeId) {
+        if (!nodeId) return ""
+        return nodeId.length > 16 ? nodeId.substring(0, 16) + "…" : nodeId
     }
 
     function indexOf(values, value, fallback) {
@@ -1983,6 +1996,146 @@ Item {
                 spacing: Theme.spacingLg
 
                 SettingsSectionHeader { title: "Network" }
+
+                SettingsCard {
+                    id: supernodesCard
+                    title: "Supernodes"
+                    subtitle: "The servers that relay your traffic and host rooms."
+
+                    // Id of the node awaiting a second click to remove. Confirm
+                    // in place, like the Danger Zone in Privacy, so the row being
+                    // removed stays on screen while you read the warning.
+                    property string pendingRemoveId: ""
+
+                    Label {
+                        Layout.fillWidth: true
+                        visible: supernodeRepeater.count === 0
+                        text: "No supernodes yet."
+                        color: Theme.muted
+                        font.pixelSize: Theme.fontSizeBody
+                    }
+
+                    Repeater {
+                        id: supernodeRepeater
+                        model: root.supernodeModel
+
+                        delegate: ColumnLayout {
+                            id: nodeRow
+                            required property string node_id
+                            required property string title
+                            required property bool connected
+
+                            readonly property string displayName: nodeRow.title !== ""
+                                ? nodeRow.title
+                                : root.shortNodeId(nodeRow.node_id)
+                            readonly property bool confirming:
+                                supernodesCard.pendingRemoveId === nodeRow.node_id
+
+                            Layout.fillWidth: true
+                            spacing: Theme.spacingSm
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Theme.spacingMd
+
+                                Avatar {
+                                    id: nodeAvatar
+                                    peerId: nodeRow.node_id
+                                    size: 32
+                                    showRing: true
+                                    ringColor: nodeRow.connected ? Theme.online : nodeAvatar.tintColor
+                                }
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 0
+
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: nodeRow.displayName
+                                        color: Theme.text
+                                        font.pixelSize: Theme.fontSizeBody
+                                        elide: Text.ElideRight
+                                    }
+
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: (nodeRow.connected ? "Connected" : "Offline")
+                                            + " · " + root.shortNodeId(nodeRow.node_id)
+                                        color: Theme.muted
+                                        font.pixelSize: Theme.fontSizeCaption
+                                        elide: Text.ElideRight
+                                    }
+                                }
+
+                                StyledButton {
+                                    text: "Open Portal"
+                                    icon.source: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
+                                    onClicked: if (backend) backend.openNodePortal(nodeRow.node_id)
+                                }
+
+                                StyledButton {
+                                    visible: !nodeRow.confirming
+                                    text: "Remove"
+                                    danger: true
+                                    icon.source: "qrc:/qt/qml/ConquerD/Client/icons/trash.svg"
+                                    onClicked: supernodesCard.pendingRemoveId = nodeRow.node_id
+                                }
+                            }
+
+                            ColumnLayout {
+                                visible: nodeRow.confirming
+                                Layout.fillWidth: true
+                                spacing: Theme.spacingSm
+
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: "Remove " + nodeRow.displayName + "? You stop relaying "
+                                        + "through it and lose access to the rooms it hosts. "
+                                        + "Accepting an invite from its owner again adds it back."
+                                    color: Theme.danger
+                                    wrapMode: Text.WordWrap
+                                    font.pixelSize: Theme.fontSizeCaption
+                                }
+
+                                RowLayout {
+                                    spacing: Theme.spacingSm
+
+                                    StyledButton {
+                                        text: "Remove Supernode"
+                                        danger: true
+                                        onClicked: {
+                                            supernodesCard.pendingRemoveId = ""
+                                            if (backend) backend.removeSupernode(nodeRow.node_id)
+                                        }
+                                    }
+                                    StyledButton {
+                                        text: "Cancel"
+                                        onClicked: supernodesCard.pendingRemoveId = ""
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        visible: supernodeRepeater.count > 0
+                        Layout.fillWidth: true
+                        height: 1
+                        color: Theme.bg3
+                    }
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: "Supernodes are added by accepting a supernode invite from its "
+                            + "owner — there is nothing to type in here. Open the invite "
+                            + "link you were sent and the node joins this list."
+                        color: Theme.muted
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: Theme.fontSizeCaption
+                    }
+                }
 
                 SettingsCard {
                     title: "Direct P2P"
