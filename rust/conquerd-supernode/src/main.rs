@@ -1335,8 +1335,19 @@ impl SupernodeState {
             }
         };
 
+        // The relay keys room membership by the un-padded base64url id, while
+        // `new_peer` arrives as the padded `public_id` spelling off the
+        // signaling path. A raw `==` therefore never matches the new peer
+        // against itself: the peer is told to punch its own endpoint, and each
+        // real pair is announced to the *other* side under a spelling its
+        // roster can't resolve — so that side never binds the punch to the
+        // session and stays on relay while its peer goes direct. Compare and
+        // announce the canonical padded form. (`resolve_punch_endpoint` is
+        // already padding-insensitive, which is why this half-worked.)
+        let new_norm = sfu::normalize_peer_id(new_peer);
         for other_peer in &room_peers {
-            if other_peer == new_peer {
+            let other_norm = sfu::normalize_peer_id(other_peer);
+            if other_norm == new_norm {
                 continue;
             }
             let other_ep = match self.resolve_punch_endpoint(other_peer) {
@@ -1344,12 +1355,12 @@ impl SupernodeState {
                 None => {
                     debug!(
                         "[relay-punch] No endpoint for peer {} — skipping pair",
-                        &other_peer[..12.min(other_peer.len())]
+                        &other_norm[..12.min(other_norm.len())]
                     );
                     continue;
                 }
             };
-            self.send_punch_ready(new_peer, other_peer, &new_ep, &other_ep);
+            self.send_punch_ready(&new_norm, &other_norm, &new_ep, &other_ep);
         }
     }
 
@@ -1392,6 +1403,19 @@ impl SupernodeState {
     /// Handle a PUNCH_REGISTER message: store the registration, and if
     /// both peers have registered, send PUNCH_READY to both.
     fn handle_punch_register_msg(&self, sender: &str, target_peer: &str, sender_endpoint: &str) {
+        // `sender` arrives padded off signaling, while `target_peer` carries
+        // whatever spelling the client put in the payload — un-padded when it
+        // came from a relay-sourced roster. Left raw, the two halves of one
+        // pair sort into *different* `pending_punches` buckets, and the
+        // completion check below (which probes an endpoint map keyed by each
+        // registrant's own padded id) can never match the target. The pair
+        // then expires as stale every 30s forever: neither side is told to
+        // punch, so both sit on relay — or one goes direct off the room-join
+        // path while its peer stays on relay. Canonicalize before either id is
+        // used as a key.
+        let sender = &sfu::normalize_peer_id(sender);
+        let target_peer = &sfu::normalize_peer_id(target_peer);
+
         // Verify both peers are trusted
         if !self.peer_store.read().is_trusted(sender) {
             warn!(
@@ -4313,6 +4337,73 @@ mod multi_home_author_skip_tests {
         assert!(!is_room_frame_author(&padded, ""));
         let (other_bare, _) = key_pair(9);
         assert!(!is_room_frame_author(&padded, &other_bare));
+    }
+
+    /// The relay lists room members un-padded; the joiner arrives padded off
+    /// signaling. Pairing must normalize both before comparing, or the joiner
+    /// fails to exclude itself (punching its own endpoint) and each real pair
+    /// is announced under a spelling the peer's roster can't resolve — leaving
+    /// one side "direct" and the other stuck on "relay".
+    #[test]
+    fn relay_punch_pairing_is_padding_insensitive() {
+        let (joiner_bare, joiner_padded) = key_pair(31);
+        let (other_bare, other_padded) = key_pair(42);
+
+        // Relay-spelled membership, including the joiner's own un-padded id.
+        let room_peers = [joiner_bare.clone(), other_bare.clone()];
+
+        let new_norm = sfu::normalize_peer_id(&joiner_padded);
+        let paired: Vec<String> = room_peers
+            .iter()
+            .map(|p| sfu::normalize_peer_id(p))
+            .filter(|other_norm| *other_norm != new_norm)
+            .collect();
+
+        // Self-pair is gone despite the padding mismatch...
+        assert!(
+            !paired.contains(&joiner_padded),
+            "joiner must not be paired with itself across pad variants"
+        );
+        // ...and the surviving pair is announced in the canonical padded form
+        // the client's roster is keyed by.
+        assert_eq!(paired, vec![other_padded]);
+    }
+
+    /// Mirrors the bucket/completion logic of `handle_punch_register_msg`:
+    /// each side registers itself padded (off signaling) while naming the
+    /// *other* side with the un-padded spelling a relay-sourced roster gives
+    /// it. Un-normalized, the two registrations sort into different pair
+    /// buckets and the completion probe never matches, so the punch expires as
+    /// stale instead of firing.
+    #[test]
+    fn punch_register_pairs_across_pad_variants() {
+        let (a_bare, a_padded) = key_pair(51);
+        let (b_bare, b_padded) = key_pair(62);
+
+        let mut buckets: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
+        let mut fired = false;
+
+        for (sender_raw, target_raw) in [(&a_padded, &b_bare), (&b_padded, &a_bare)] {
+            let sender = sfu::normalize_peer_id(sender_raw);
+            let target = sfu::normalize_peer_id(target_raw);
+            let pair_key = if sender < target {
+                (sender.clone(), target.clone())
+            } else {
+                (target.clone(), sender.clone())
+            };
+            let entry = buckets.entry(pair_key).or_default();
+            entry.insert(sender.clone(), format!("{sender}:9325"));
+            if entry.contains_key(&sender) && entry.contains_key(&target) {
+                fired = true;
+            }
+        }
+
+        assert_eq!(
+            buckets.len(),
+            1,
+            "both halves of one pair must share a single bucket"
+        );
+        assert!(fired, "pair must complete once both sides have registered");
     }
 
     #[test]
