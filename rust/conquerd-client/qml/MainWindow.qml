@@ -2710,6 +2710,9 @@ ApplicationWindow {
                 visible: navIndex === 2
                 settings: settingsModel
                 currentTab: settingsTab
+                // Named differently from the id so the binding cannot resolve
+                // to the page's own property instead of the model.
+                supernodeModel: nodeListModel
                 // React to PTT setting changes at runtime
                 Connections {
                     target: settingsModel
