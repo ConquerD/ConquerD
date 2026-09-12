@@ -135,25 +135,6 @@ ApplicationWindow {
         nodeConnectionStats = next
     }
 
-    function supernodeAvatarTooltip(nodeId, connected) {
-        var id = canonicalNodeId(nodeId)
-        if (id === "") id = nodeId || ""
-        var lines = [id]
-        var stats = nodeConnectionStats[id]
-        if (stats && stats.rtt_ms > 0) {
-            lines.push("Ping: " + Math.round(stats.rtt_ms) + " ms")
-            lines.push("Packet loss: " + (stats.packet_loss_pct || 0).toFixed(1)
-                + "% · Jitter: " + Math.round(stats.jitter_ms || 0) + " ms")
-        } else if (connected) {
-            lines.push("Ping: —")
-            lines.push("Packet loss: — · Jitter: —")
-        }
-        lines.push("")
-        lines.push("Left click — open portal")
-        lines.push("Right click — options")
-        return lines.join("\n")
-    }
-
     function peerHandleFor(peerId) {
         if (!peerId || peerId === "") return ""
         for (var row = 0; row < peerModel.rowCount(); row++) {
@@ -1852,41 +1833,58 @@ ApplicationWindow {
                         }
                     }
 
+                    // Room creation used to hang off the supernode avatar's
+                    // context menu. With the avatar gone the host is no longer
+                    // implied by where you clicked, so it is asked for in the
+                    // dialog's picker instead (skipped when there is one node).
                     Menu {
-                        id: nodeContextMenu
-                        property string targetNodeId: ""
-                        property bool targetConnected: false
-                        property bool targetSfuEnabled: false
-                        property bool targetPublicRoomsEnabled: false
+                        id: createRoomMenu
 
                         MenuItem {
-                            text: qsTr("Create Public Room…")
-                            enabled: nodeContextMenu.targetConnected && nodeContextMenu.targetSfuEnabled && nodeContextMenu.targetPublicRoomsEnabled
-                            onTriggered: createRoomDialog.openForNode(
-                                nodeContextMenu.targetNodeId, "public")
+                            text: qsTr("Public Room…")
+                            onTriggered: createRoomDialog.openForNode("", "public")
                         }
                         MenuItem {
-                            text: qsTr("Create Private Room…")
-                            enabled: nodeContextMenu.targetConnected && nodeContextMenu.targetSfuEnabled
-                            onTriggered: createRoomDialog.openForNode(
-                                nodeContextMenu.targetNodeId, "private")
+                            text: qsTr("Private Room…")
+                            onTriggered: createRoomDialog.openForNode("", "private")
                         }
-                        MenuSeparator {}
-                        MenuItem {
-                            text: qsTr("Open Portal")
-                            onTriggered: {
-                                console.log("[portal] context menu node_id=" + nodeContextMenu.targetNodeId)
-                                backend.openNodePortal(nodeContextMenu.targetNodeId)
+                    }
+
+                    // Header, matching the Peers rail's.
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 36
+                        color: Theme.bg2
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: Theme.spacingMd
+                            anchors.rightMargin: Theme.spacingXs
+                            spacing: Theme.spacingSm
+
+                            Text {
+                                text: "Rooms"
+                                color: Theme.muted
+                                font.pixelSize: Theme.fontSizeCaption
+                                font.capitalization: Font.AllUppercase
+                                font.letterSpacing: 1.2
+                                font.bold: true
                             }
-                        }
-                        MenuItem {
-                            text: qsTr("Copy Node ID")
-                            onTriggered: backend.copyToClipboard(nodeContextMenu.targetNodeId)
-                        }
-                        MenuSeparator {}
-                        MenuItem {
-                            text: qsTr("Remove Supernode")
-                            onTriggered: backend.removeSupernode(nodeContextMenu.targetNodeId)
+
+                            Item { Layout.fillWidth: true }
+
+                            ToolButton {
+                                icon.source: "qrc:/qt/qml/ConquerD/Client/icons/plus.svg"
+                                icon.width: 16
+                                icon.height: 16
+                                icon.color: enabled ? Theme.text : Theme.muted
+                                flat: true
+                                // Nothing hosts a room without a supernode.
+                                enabled: nodeListModel.count > 0
+                                ToolTip.text: "Create a room"
+                                ToolTip.visible: hovered
+                                onClicked: createRoomMenu.popup()
+                            }
                         }
                     }
 
@@ -1902,18 +1900,16 @@ ApplicationWindow {
                             anchors.centerIn: parent
                             visible: nodeListModel.count === 0
                             width: Math.min(parent.width - Theme.spacingXl, 170)
-                            iconSource: "qrc:/qt/qml/ConquerD/Client/icons/globe.svg"
+                            iconSource: "qrc:/qt/qml/ConquerD/Client/icons/headphone.svg"
                             iconSize: 30
-                            title: "No supernodes"
-                            subtitle: "Connect to a supernode to browse rooms and portals."
+                            title: "No rooms"
+                            subtitle: "Accept a supernode invite to see the rooms it hosts."
                         }
 
                         delegate: Item {
                             id: roomGroup
                             required property string node_id
                             required property bool connected
-                            required property bool sfu_enabled
-                            required property bool public_rooms_enabled
                             required property string title
                             required property string rooms_json
 
@@ -1939,68 +1935,17 @@ ApplicationWindow {
                             width: roomsListView.width
                             height: visible ? groupHeight : 0
 
+                            // One group per supernode is still how rooms arrive,
+                            // but nothing marks the boundary any more: the list
+                            // reads as one flat set of rooms, and the nodes
+                            // themselves are managed in Settings › Network.
                             RowLayout {
                                 anchors.fill: parent
-                                anchors.leftMargin: Theme.spacingMd
+                                anchors.leftMargin: Theme.spacingSm
                                 anchors.rightMargin: Theme.spacingSm
                                 anchors.topMargin: Theme.spacingXs
                                 anchors.bottomMargin: Theme.spacingXs
                                 spacing: Theme.spacingSm
-
-                                Item {
-                                    Layout.alignment: Qt.AlignTop
-                                    Layout.topMargin: 4
-                                    width: 44
-                                    height: 44
-
-                                    Rectangle {
-                                        anchors.fill: parent
-                                        radius: Theme.radiusSm
-                                        color: groupSnHover.hovered ? Theme.bg3 : "transparent"
-                                        Behavior on color {
-                                            ColorAnimation { duration: Theme.animNormal }
-                                        }
-                                    }
-
-                                    Avatar {
-                                        id: groupAvatar
-                                        anchors.centerIn: parent
-                                        peerId: roomGroup.node_id
-                                        size: 36
-                                        showRing: true
-                                        ringColor: roomGroup.connected
-                                            ? Theme.online
-                                            : groupAvatar.tintColor
-                                    }
-
-                                    HoverHandler { id: groupSnHover }
-
-                                    ToolTip {
-                                        visible: groupSnHover.hovered
-                                        text: root.supernodeAvatarTooltip(
-                                            roomGroup.node_id, roomGroup.connected)
-                                        delay: 300
-                                        timeout: 5000
-                                    }
-
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        acceptedButtons: Qt.LeftButton | Qt.RightButton
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: (mouse) => {
-                                            if (mouse.button === Qt.RightButton) {
-                                                nodeContextMenu.targetNodeId = roomGroup.node_id
-                                                nodeContextMenu.targetConnected = roomGroup.connected
-                                                nodeContextMenu.targetSfuEnabled = roomGroup.sfu_enabled
-                                                nodeContextMenu.targetPublicRoomsEnabled = roomGroup.public_rooms_enabled
-                                                nodeContextMenu.popup()
-                                            } else {
-                                                console.log("[portal] node avatar clicked node_id=" + roomGroup.node_id)
-                                                backend.openNodePortal(roomGroup.node_id)
-                                            }
-                                        }
-                                    }
-                                }
 
                                 Column {
                                     id: roomColumn
@@ -2012,7 +1957,12 @@ ApplicationWindow {
                                         width: roomColumn.width
                                         height: 48
                                         verticalAlignment: Text.AlignVCenter
-                                        text: "No rooms"
+                                        // Named: with the node avatar gone, a
+                                        // bare "No rooms" would not say which
+                                        // supernode is the empty one.
+                                        text: roomGroup.title !== ""
+                                            ? "No rooms on " + roomGroup.title
+                                            : "No rooms"
                                         color: Theme.muted
                                         font.pixelSize: Theme.fontSizeCaption
                                         leftPadding: Theme.spacingXs
@@ -2713,6 +2663,7 @@ ApplicationWindow {
                 // Named differently from the id so the binding cannot resolve
                 // to the page's own property instead of the model.
                 supernodeModel: nodeListModel
+                supernodeStats: root.nodeConnectionStats
                 // React to PTT setting changes at runtime
                 Connections {
                     target: settingsModel
