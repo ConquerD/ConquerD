@@ -1360,12 +1360,23 @@ impl SupernodeState {
                     continue;
                 }
             };
-            self.send_punch_ready(&new_norm, &other_norm, &new_ep, &other_ep);
+            self.send_punch_ready(&new_norm, &other_norm, &new_ep, &other_ep, false);
         }
     }
 
     /// Send PUNCH_READY to both peers with coordinated timing.
-    fn send_punch_ready(&self, peer_a: &str, peer_b: &str, ep_a: &str, ep_b: &str) {
+    ///
+    /// `verified` distinguishes the two ways a pair can get here. The
+    /// PUNCH_REGISTER handshake means *both* peers asked to punch and both
+    /// endpoints were observed on their own live relay connections, so the
+    /// rendezvous is real. The room-join path only knows that two members are
+    /// relay-connected with endpoints on file — neither has agreed to punch,
+    /// and nothing has tested whether a path between them exists at all (two
+    /// members behind one NAT need hairpinning that most consumer routers do
+    /// not do). Sending both as the same directive invites a client to commit
+    /// to a direct path that was never established; an unverified pairing is a
+    /// candidate to probe, not a transport to adopt.
+    fn send_punch_ready(&self, peer_a: &str, peer_b: &str, ep_a: &str, ep_b: &str, verified: bool) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1380,6 +1391,7 @@ impl SupernodeState {
                 "peer_endpoint": ep_b,
                 "your_endpoint": ep_a,
                 "punch_at": punch_at,
+                "verified": verified,
             }),
         );
         self.send_signed(
@@ -1390,13 +1402,15 @@ impl SupernodeState {
                 "peer_endpoint": ep_a,
                 "your_endpoint": ep_b,
                 "punch_at": punch_at,
+                "verified": verified,
             }),
         );
         info!(
-            "[punch] PUNCH_READY sent to {} ↔ {} (punch_at={:.3})",
+            "[punch] PUNCH_READY sent to {} ↔ {} (punch_at={:.3}, verified={})",
             &peer_a[..12.min(peer_a.len())],
             &peer_b[..12.min(peer_b.len())],
             punch_at,
+            verified,
         );
     }
 
@@ -1497,7 +1511,7 @@ impl SupernodeState {
             punches.remove(&pair_key);
             drop(punches);
 
-            self.send_punch_ready(&pair_key.0, &pair_key.1, &ep_a, &ep_b);
+            self.send_punch_ready(&pair_key.0, &pair_key.1, &ep_a, &ep_b, true);
         } else {
             // Clean up stale entries (>30s old)
             let stale_keys: Vec<(String, String)> = punches

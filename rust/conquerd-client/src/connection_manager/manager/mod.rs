@@ -192,6 +192,18 @@ pub struct ConnectionManager {
     /// background connect succeeds. Used by [`ConnectionCommand::FetchWebApp`]
     /// to open `web.host.app.v1` streams.
     quic_relays: HashMap<String, Arc<QuicRelayClient>>,
+    /// Supernodes with a relay connect already spawned and not yet resolved.
+    ///
+    /// `quic_relays` is only populated once a connect *completes*, so it cannot
+    /// serve as the de-dupe guard: a burst of `RelayGranted` grants (one per
+    /// room join / ticket refresh) all observe an empty map and each spawns its
+    /// own dial. The supernode keeps only the newest of those connections and
+    /// drops the rest, while the client keeps whichever finished last — so the
+    /// two can settle on different connections and room-audio datagrams get
+    /// written into a socket the server already closed. Signaling rides the
+    /// WebSocket and keeps working, which makes it look like everyone is
+    /// present but no one can be heard.
+    relay_connects_in_flight: HashSet<String>,
     pending_portal_relays: HashMap<String, Vec<PortalRelayReply>>,
     /// Sliding-window replay guard for inbound signaling. Complements the
     /// timestamp freshness window by rejecting re-delivery of an already-seen
@@ -462,6 +474,7 @@ impl ConnectionManager {
             current_supernode_id: String::new(),
             chat_active_rooms: HashSet::new(),
             quic_relays: HashMap::new(),
+            relay_connects_in_flight: HashSet::new(),
             pending_portal_relays: HashMap::new(),
             replay_guard: ReplayGuard::new(Self::MAX_MESSAGE_AGE_SECS),
             transport_stats: HashMap::new(),
@@ -596,6 +609,12 @@ impl ConnectionManager {
     #[cfg(test)]
     pub(super) fn test_mint_group_key(&mut self, room_id: &str) {
         self.group_keys.new_owner_epoch(room_id);
+    }
+
+    /// Test-only: number of relay dials spawned but not yet resolved.
+    #[cfg(test)]
+    pub(super) fn test_relay_connects_in_flight(&self) -> usize {
+        self.relay_connects_in_flight.len()
     }
 
     /// Test-only forwarders for the media send paths, which live in the
@@ -1925,13 +1944,20 @@ impl ConnectionManager {
                         let _ = waiter.send(client.clone());
                     }
                 }
+                self.relay_connects_in_flight.remove(&supernode_id);
                 match client {
                     Some(c) => {
                         info!(
                             "[relay] QUIC relay ready for supernode {}",
                             &supernode_id[..12.min(supernode_id.len())]
                         );
-                        self.quic_relays.insert(supernode_id, c);
+                        // Close whatever this replaces instead of dropping the
+                        // handle on the floor. An overwritten-but-open
+                        // connection leaves the supernode holding a relay peer
+                        // we will never read from again.
+                        if let Some(old) = self.quic_relays.insert(supernode_id, c) {
+                            old.close();
+                        }
                     }
                     None => {
                         // Connect failure already logged by the spawned task;
@@ -2023,6 +2049,20 @@ impl ConnectionManager {
                 old.close();
             }
         }
+        // One dial at a time per supernode. Without this, the grants that
+        // arrive together on a room join each spawn their own connect, the
+        // supernode keeps only the last one it accepted, and the client keeps
+        // only the last one that finished — leaving media on a dead socket.
+        // Checked before the endpoint setup below; the marker itself is only
+        // taken once the dial is certain to be spawned, so a bailout here
+        // cannot strand it.
+        if self.relay_connects_in_flight.contains(&supernode_id) {
+            debug!(
+                "[relay] connect already in flight for {} — reusing it",
+                &supernode_id[..12.min(supernode_id.len())]
+            );
+            return;
+        }
         if !self.ensure_quic_endpoint(0) {
             error!("[relay] no QUIC endpoint — cannot connect to supernode relay");
             return;
@@ -2031,6 +2071,7 @@ impl ConnectionManager {
             error!("[relay] QUIC endpoint missing after ensure_quic_endpoint");
             return;
         };
+        self.relay_connects_in_flight.insert(supernode_id.clone());
         let endpoint = endpoint.clone();
         let internal_tx = self.internal_tx.clone();
         let relay_signaling_tx = self.relay_signaling_tx.clone();

@@ -1059,6 +1059,19 @@ impl ConnectionManager {
             return;
         };
 
+        // A pairing the supernode built from the PUNCH_REGISTER handshake is a
+        // real rendezvous: both peers asked for it and both endpoints were
+        // observed live. One built from room membership is only a candidate —
+        // nothing has established that a path between the two exists. Absent
+        // (older supernode) is treated as unverified, which is the weaker and
+        // therefore safe reading: a candidate is still dialed, it just never
+        // counts as a transport until the QUIC session is actually up.
+        let verified = msg
+            .payload
+            .get("verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
         // `punch_at` is absolute unix seconds decided by the supernode.
         // Trusting it blindly would let clock skew — or a hostile value — park
         // a dial far in the future, so the wait is clamped.
@@ -1085,9 +1098,10 @@ impl ConnectionManager {
                 .await;
         });
         debug!(
-            "[punch] {} scheduled in {:.0}ms",
+            "[punch] {} scheduled in {:.0}ms ({})",
             &peer_id[..8.min(peer_id.len())],
-            delay.as_secs_f64() * 1000.0
+            delay.as_secs_f64() * 1000.0,
+            if verified { "rendezvous" } else { "candidate" }
         );
     }
 }

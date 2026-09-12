@@ -2098,6 +2098,32 @@ async fn content_audio_does_not_fall_back_to_websocket() {
     );
 }
 
+/// A burst of relay grants must spawn exactly one dial.
+///
+/// `quic_relays` only fills in once a connect *completes*, so it cannot
+/// de-dupe concurrent dials: every grant in a join burst saw an empty map and
+/// spawned its own. The supernode keeps only the newest connection it accepts
+/// and the client only the last one to finish, so the two settle on different
+/// connections and room audio is written into a socket the server already
+/// dropped — while WebSocket signaling keeps working, making it look like
+/// everyone is present but nobody can be heard.
+#[tokio::test]
+async fn concurrent_relay_grants_spawn_a_single_dial() {
+    let mut t = harness::test_cm();
+
+    // Four grants back-to-back, as a room join produces. Nothing is awaited
+    // between them, so no spawned dial can resolve and clear its marker.
+    for _ in 0..4 {
+        t.cm.spawn_relay_client_connect("SN-AAAA".to_owned(), "127.0.0.1".to_owned(), 1, false);
+    }
+
+    assert_eq!(
+        t.cm.test_relay_connects_in_flight(),
+        1,
+        "a burst of grants must collapse to one in-flight dial"
+    );
+}
+
 /// Room voice and video are relay-datagram only. With no QUIC relay session
 /// they must drop rather than fall back to the WebSocket: the WS lane cannot
 /// carry binary media frames, and silently "succeeding" there would look like
