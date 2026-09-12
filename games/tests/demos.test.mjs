@@ -38,6 +38,26 @@ import {
   unpackWorld,
 } from "../example/playground.mjs";
 import { ConquerdClient } from "../../web-sdk/conquerd.mjs";
+import { SharedState } from "../../web-sdk/demo-state.mjs";
+import { defaults, validTask } from "../task-board/tasks.mjs";
+import {
+  newTimer,
+  validTimer,
+  remaining,
+  toggle,
+} from "../focus-timer/timer.mjs";
+import {
+  newGame as newFour,
+  boardFor,
+  winner,
+  drop,
+  validGame as validFour,
+} from "../four-in-a-row/rules.mjs";
+import {
+  newGame as newMemory,
+  flip,
+  validGame as validMemory,
+} from "../memory-match/rules.mjs";
 
 const idA = "a".repeat(24),
   idB = "b".repeat(24);
@@ -55,6 +75,151 @@ class Client {
   disconnect() {}
 }
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+test("shared rows repair dropped edits, converge on ties, and retain clear tombstones", () => {
+  const make = (id) => {
+    const session = { id, connected: true, on() {}, send() {} };
+    return new SharedState(session, defaults, (_, value) => validTask(value));
+  };
+  const a = make(idA),
+    b = make(idB);
+  a.set("task0", { text: "First idea", done: false });
+  b.set("task0", { text: "Other idea", done: false });
+  const old = a.records.get("task0"),
+    concurrent = b.records.get("task0");
+  a.merge(concurrent);
+  b.merge(old);
+  assert.deepEqual(a.get("task0"), b.get("task0"));
+  a.set("task0", { text: "", done: false });
+  a.set("task7", { text: "Ship it", done: true });
+  // No immediate delivery: periodic retransmission must repair the missed clear.
+  a.session.send = (record) => b.merge(record);
+  for (let i = 0; i < 8; i++) a.tick();
+  b.merge(concurrent);
+  assert.equal(b.get("task0").text, "");
+  assert.equal(b.get("task7").done, true);
+  const late = make("c".repeat(24));
+  b.session.send = (record) => late.merge(record);
+  for (let i = 0; i < 8; i++) b.tick();
+  assert.deepEqual([...late.records.values()], [...b.records.values()]);
+  for (const bad of [
+    null,
+    { ...old, key: "unknown" },
+    { ...old, clock: Infinity },
+    { ...old, clock: 1e12 + 1 },
+    { ...old, by: "<script>" },
+    { ...old, clock: 20, value: { text: "x".repeat(81), done: false } },
+  ])
+    assert.equal(a.merge(bad), false);
+  assert.equal(a.records.size, 8);
+  a.session.connected = false;
+  assert.equal(a.set("task0", { text: "Offline", done: false }), false);
+});
+
+test("timer pause/resume preserves remaining time and deadlines catch up after suspension", () => {
+  const start = toggle(newTimer(300), 1000);
+  assert.equal(remaining(start, 61000), 240);
+  const paused = toggle(start, 61000);
+  assert.equal(remaining(paused, 900000), 240);
+  const resumed = toggle(paused, 900000);
+  assert.equal(remaining(resumed, 1140000), 0);
+  assert.ok(validTimer(resumed));
+  assert.equal(remaining(start, -1000), 300);
+  for (const bad of [
+    null,
+    { ...start, end: NaN },
+    { ...start, duration: 0 },
+    { ...start, remaining: 301 },
+  ])
+    assert.equal(validTimer(bad), false);
+});
+
+test("four in a row enforces gravity, full columns and all win directions", () => {
+  for (const moves of [
+    [0, 1, 0, 1, 0, 1, 0],
+    [0, 0, 1, 1, 2, 2, 3],
+    [0, 1, 1, 2, 4, 2, 2, 3, 4, 3, 5, 3, 3],
+  ]) {
+    let game = newFour();
+    for (const col of moves) {
+      game = drop(game, col);
+      assert.ok(game);
+    }
+    assert.equal(winner(boardFor(game.moves)), 1);
+    assert.equal(drop(game, 6), null);
+    assert.equal(validFour({ moves: [...moves, 6] }), false);
+  }
+  const full = { moves: [0, 0, 0, 0, 0, 0] };
+  assert.ok(validFour(full));
+  assert.equal(drop(full, 0), null);
+  for (const moves of [[7], [-1], [1.5], ["2"], Array(43).fill(0)])
+    assert.equal(validFour({ moves }), false);
+  const diagonal = Array(42).fill(0);
+  [6, 12, 18, 24].forEach((i) => {
+    diagonal[i] = 2;
+  });
+  assert.equal(winner(diagonal), 2);
+});
+
+test("memory pairs score once, mismatches wait for hide, and shuffled deals remain valid", () => {
+  let game = newMemory(() => 0.37);
+  assert.ok(validMemory(game));
+  const first = game.cards[0],
+    pair = game.cards.lastIndexOf(first);
+  game = flip(game, 0);
+  assert.equal(flip(game, 0), null);
+  game = flip(game, pair);
+  assert.equal(game.matched.length, 2);
+  assert.equal(game.turns, 1);
+  assert.equal(flip(game, pair), null);
+  const a = game.cards.findIndex((_, i) => !game.matched.includes(i));
+  const b = game.cards.findIndex(
+    (v, i) => v !== game.cards[a] && !game.matched.includes(i),
+  );
+  game = flip(flip(game, a), b);
+  assert.ok(validMemory(game));
+  assert.equal(flip(game, 15), null);
+  game = { ...game, open: [] };
+  for (let symbol = 0; symbol < 8; symbol++) {
+    const pair = game.cards.flatMap((v, i) => (v === symbol ? [i] : []));
+    if (!game.matched.includes(pair[0]))
+      game = flip(flip(game, pair[0]), pair[1]);
+  }
+  assert.equal(game.matched.length, 16);
+  assert.ok(validMemory(game));
+  for (const bad of [
+    null,
+    { ...game, cards: Array(16).fill(0) },
+    { ...game, matched: [0] },
+    { ...game, open: [0] },
+    { ...game, turns: -1 },
+  ])
+    assert.equal(validMemory(bad), false);
+  for (let i = 0; i < 30; i++) assert.ok(validMemory(newMemory()));
+});
+
+test("new demo snapshots fit native session envelopes including Unicode tasks", async () => {
+  for (const [app, value] of [
+    ["task-board", { text: "界".repeat(80), done: false }],
+    ["focus-timer", toggle(newTimer())],
+    ["four-in-a-row", newFour()],
+    ["memory-match", newMemory()],
+  ]) {
+    const client = new Client(),
+      session = new DemoSession(app, { id: idA, room: "r", client });
+    try {
+      await session.connect();
+      await flush();
+      assert.equal(
+        await session.send({ key: "game", clock: 1e12, by: idB, value }),
+        true,
+      );
+      assert.ok(client.sent.every((bytes) => bytes.length <= 1100));
+    } finally {
+      session.disconnect();
+    }
+  }
+});
 
 test("session membership converges, readiness propagates, coordinator survives timeout", async () => {
   let clock = 100;
@@ -472,6 +637,24 @@ test("embedded supernode assets match the editable examples", async () => {
     ["../web-sdk/demo-session.mjs", "web_sdk_demo_session.mjs"],
     ["../web-sdk/demo-shell.mjs", "web_sdk_demo_shell.mjs"],
     ["../web-sdk/demo-shell.css", "web_sdk_demo_shell.css"],
+    ...["task-board", "focus-timer", "four-in-a-row", "memory-match"].flatMap(
+      (slug) =>
+        [
+          "index.html",
+          "app.mjs",
+          slug === "task-board"
+            ? "tasks.mjs"
+            : slug === "focus-timer"
+              ? "timer.mjs"
+              : "rules.mjs",
+        ].map((file) => [
+          `${slug}/${file}`,
+          `games_${slug.replaceAll("-", "_")}_${file}`,
+        ]),
+    ),
+    ["../web-sdk/demo-state.mjs", "web_sdk_demo_state.mjs"],
+    ["../web-sdk/demo-workspace.mjs", "web_sdk_demo_workspace.mjs"],
+    ["../web-sdk/demo-workspace.css", "web_sdk_demo_workspace.css"],
   ];
   for (const [src, dst] of pairs)
     assert.equal(

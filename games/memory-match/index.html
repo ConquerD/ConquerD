@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Memory Match &middot; DoubleSlash Apps</title>
+    <link rel="stylesheet" href="../../web-sdk/demo-shell.css" />
+    <link rel="stylesheet" href="../../web-sdk/demo-workspace.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="app-header">
+        <a href="/" class="brand" aria-label="Back to portal">D://</a>
+        <div class="app-heading">
+          <div class="eyebrow">DoubleSlash Apps</div>
+          <h1>Memory Match</h1>
+        </div>
+        <div class="header-actions">
+          <button id="share">Copy link</button
+          ><button id="focus" aria-pressed="false">Focus</button
+          ><button
+            id="session-toggle"
+            aria-expanded="false"
+            aria-controls="session-panel"
+          >
+            Session
+          </button>
+        </div>
+      </header>
+      <div class="session-bar">
+        <span><i class="live-dot"></i><span id="room-label">lounge</span></span
+        ><span id="peers-count">0 here</span
+        ><span id="status" role="status">Connecting...</span
+        ><button id="exit-focus">Exit focus</button>
+      </div>
+      <div class="work-area">
+        <section class="workspace" aria-label="Memory Match">
+          <div class="toolbar">
+            <span class="summary" id="result" role="status"></span
+            ><span class="spacer"></span
+            ><button id="reset">Shuffle &amp; restart</button>
+          </div>
+          <div class="stage content-stage">
+            <div class="demo-content">
+              <h2>Two minds. Eight pairs.</h2>
+              <p>
+                Turn over two cards and find their partners together. Missed a
+                pair? Take a look, then hide it to try again.
+              </p>
+              <div
+                class="memory-board"
+                id="board"
+                role="group"
+                aria-label="Memory cards"
+              ></div>
+              <button id="hide" class="primary">Hide missed pair</button>
+            </div>
+          </div>
+        </section>
+        <aside
+          id="session-panel"
+          class="session-panel"
+          hidden
+          aria-label="Session and connection details"
+        ></aside>
+      </div>
+      <footer class="app-footer">
+        <span id="controls-hint"></span
+        ><span class="notice" id="notice" role="status"></span
+        ><span class="footer-detail">An app on your peer network</span>
+      </footer>
+    </main>
+    <script type="module" src="app.mjs"></script>
+  </body>
+</html>

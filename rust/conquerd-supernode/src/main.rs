@@ -3711,7 +3711,7 @@ async fn main() -> anyhow::Result<()> {
             // customisations are never overwritten.
             seed_web_defaults(&state.config.data_dir);
             info!(
-                "[features] web.host.app.v1 serving assets from {}/web/, {}/games/ (example + shared-drawing + brick-breaker) and {}/web-sdk/",
+                "[features] web.host.app.v1 serving assets from {}/web/, {}/games/ (seven portal demos) and {}/web-sdk/",
                 state.config.data_dir.display(),
                 state.config.data_dir.display(),
                 state.config.data_dir.display()
@@ -3990,12 +3990,16 @@ fn check_ticket_renewals(state: &SupernodeState) {
 ///     brick-breaker/
 ///       index.html                   ← multiplayer breakout demo
 ///       brick-breaker.js
+///     task-board/                    ← shared checklist
+///     focus-timer/                   ← shared focus/break countdown
+///     four-in-a-row/                 ← open tabletop game
+///     memory-match/                  ← cooperative matching game
 ///   web/web-sdk/
 ///     conquerd.mjs                   ← native portal SDK
 ///     demo-*                        ← shared example session and UI helpers
 /// ```
 ///
-/// The three game demos (`game.relay.v1`) run inside the native in-app portal
+/// The seven app and game demos (`game.relay.v1`) run inside the native in-app portal
 /// over the identity QUIC relay (`window.conquerd` channel APIs).
 fn seed_web_defaults(data_dir: &std::path::Path) {
     // Embedded assets — all paths are relative to this source file and
@@ -4056,6 +4060,66 @@ fn seed_web_defaults(data_dir: &std::path::Path) {
         (&["games", "brick-breaker", "index.html"], BRICK_HTML),
         (&["games", "brick-breaker", "brick-breaker.js"], BRICK_JS),
         (&["games", "brick-breaker", "world.mjs"], BRICK_WORLD),
+        (
+            &["web", "web-sdk", "demo-state.mjs"],
+            include_str!("../templates/web_sdk_demo_state.mjs"),
+        ),
+        (
+            &["web", "web-sdk", "demo-workspace.mjs"],
+            include_str!("../templates/web_sdk_demo_workspace.mjs"),
+        ),
+        (
+            &["web", "web-sdk", "demo-workspace.css"],
+            include_str!("../templates/web_sdk_demo_workspace.css"),
+        ),
+        (
+            &["games", "task-board", "index.html"],
+            include_str!("../templates/games_task_board_index.html"),
+        ),
+        (
+            &["games", "task-board", "app.mjs"],
+            include_str!("../templates/games_task_board_app.mjs"),
+        ),
+        (
+            &["games", "task-board", "tasks.mjs"],
+            include_str!("../templates/games_task_board_tasks.mjs"),
+        ),
+        (
+            &["games", "focus-timer", "index.html"],
+            include_str!("../templates/games_focus_timer_index.html"),
+        ),
+        (
+            &["games", "focus-timer", "app.mjs"],
+            include_str!("../templates/games_focus_timer_app.mjs"),
+        ),
+        (
+            &["games", "focus-timer", "timer.mjs"],
+            include_str!("../templates/games_focus_timer_timer.mjs"),
+        ),
+        (
+            &["games", "four-in-a-row", "index.html"],
+            include_str!("../templates/games_four_in_a_row_index.html"),
+        ),
+        (
+            &["games", "four-in-a-row", "app.mjs"],
+            include_str!("../templates/games_four_in_a_row_app.mjs"),
+        ),
+        (
+            &["games", "four-in-a-row", "rules.mjs"],
+            include_str!("../templates/games_four_in_a_row_rules.mjs"),
+        ),
+        (
+            &["games", "memory-match", "index.html"],
+            include_str!("../templates/games_memory_match_index.html"),
+        ),
+        (
+            &["games", "memory-match", "app.mjs"],
+            include_str!("../templates/games_memory_match_app.mjs"),
+        ),
+        (
+            &["games", "memory-match", "rules.mjs"],
+            include_str!("../templates/games_memory_match_rules.mjs"),
+        ),
     ];
 
     // No write-if-missing seeds remain; all built-in files are above.

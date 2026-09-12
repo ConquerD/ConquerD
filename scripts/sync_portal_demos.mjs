@@ -15,6 +15,24 @@ const assets = [
   ["games/shared-drawing/index.html", "games_shared_drawing_index.html"],
   ["games/shared-drawing/drawing.js", "games_shared_drawing_drawing.js"],
   ["games/shared-drawing/board.mjs", "games_shared_drawing_board.mjs"],
+  ...["task-board", "focus-timer", "four-in-a-row", "memory-match"].flatMap(
+    (slug) =>
+      [
+        "index.html",
+        "app.mjs",
+        slug === "task-board"
+          ? "tasks.mjs"
+          : slug === "focus-timer"
+            ? "timer.mjs"
+            : "rules.mjs",
+      ].map((file) => [
+        `games/${slug}/${file}`,
+        `games_${slug.replaceAll("-", "_")}_${file}`,
+      ]),
+  ),
+  ["web-sdk/demo-state.mjs", "web_sdk_demo_state.mjs"],
+  ["web-sdk/demo-workspace.mjs", "web_sdk_demo_workspace.mjs"],
+  ["web-sdk/demo-workspace.css", "web_sdk_demo_workspace.css"],
   ["web-sdk/conquerd.mjs", "web_sdk_conquerd.mjs"],
   ["web-sdk/demo-session.mjs", "web_sdk_demo_session.mjs"],
   ["web-sdk/demo-shell.mjs", "web_sdk_demo_shell.mjs"],

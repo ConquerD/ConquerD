@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Focus Timer &middot; DoubleSlash Apps</title>
+    <link rel="stylesheet" href="../../web-sdk/demo-shell.css" />
+    <link rel="stylesheet" href="../../web-sdk/demo-workspace.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="app-header">
+        <a href="/" class="brand" aria-label="Back to portal">D://</a>
+        <div class="app-heading">
+          <div class="eyebrow">DoubleSlash Apps</div>
+          <h1>Focus Timer</h1>
+        </div>
+        <div class="header-actions">
+          <button id="share">Copy link</button
+          ><button id="focus" aria-pressed="false">Focus</button
+          ><button
+            id="session-toggle"
+            aria-expanded="false"
+            aria-controls="session-panel"
+          >
+            Session
+          </button>
+        </div>
+      </header>
+      <div class="session-bar">
+        <span><i class="live-dot"></i><span id="room-label">lounge</span></span
+        ><span id="peers-count">0 here</span
+        ><span id="status" role="status">Connecting...</span
+        ><button id="exit-focus">Exit focus</button>
+      </div>
+      <div class="work-area">
+        <section class="workspace" aria-label="Focus Timer">
+          <div class="toolbar">
+            <button data-minutes="25">25 min focus</button
+            ><button data-minutes="5">5 min break</button
+            ><button data-minutes="15">15 min reset</button>
+          </div>
+          <div class="stage content-stage">
+            <div class="demo-content">
+              <div class="timer-face">
+                <h2>A moment to focus.</h2>
+                <p id="phase" role="status"></p>
+                <output
+                  class="timer-digits"
+                  id="time"
+                  aria-label="Time remaining"
+                  aria-live="off"
+                  >25:00</output
+                ><progress
+                  class="timer-progress"
+                  id="progress"
+                  max="1"
+                  value="0"
+                  aria-label="Session progress"
+                ></progress>
+                <div class="timer-actions">
+                  <button id="toggle" class="primary">Start together</button
+                  ><button id="reset">Reset timer</button>
+                </div>
+                <p>Shared controls. No alarms. Keep this page open.</p>
+              </div>
+            </div>
+          </div>
+        </section>
+        <aside
+          id="session-panel"
+          class="session-panel"
+          hidden
+          aria-label="Session and connection details"
+        ></aside>
+      </div>
+      <footer class="app-footer">
+        <span id="controls-hint"></span
+        ><span class="notice" id="notice" role="status"></span
+        ><span class="footer-detail">An app on your peer network</span>
+      </footer>
+    </main>
+    <script type="module" src="app.mjs"></script>
+  </body>
+</html>

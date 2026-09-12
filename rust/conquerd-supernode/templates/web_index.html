@@ -157,6 +157,11 @@
     .presence-art>span { position:absolute; left:18%; top:18%; color:#6be4bc; font-size:29px; }.presence-art>span:nth-child(2){left:58%;top:32%;color:#c7a0ff;}.presence-art>span:nth-child(3){left:36%;top:60%;color:#87b7ff;}
     .presence-art small { font:10px system-ui,sans-serif; background:#243149; border-radius:4px; padding:3px 7px; margin-left:5px; }
     .app-possibilities { padding:18px 0; margin-top:16px; border-top:1px solid #2a3549; }.app-possibilities strong { font:600 14px system-ui,sans-serif; }.app-possibilities p { max-width:820px; margin-top:7px; }
+    .extra-art { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; color:#6be4bc; }
+    .mini-task { font:13px system-ui,sans-serif; padding:7px 16px; width:80%; border:1px solid #2a3549; border-radius:6px; }
+    .mini-clock { font:700 48px system-ui,sans-serif; letter-spacing:-2px; }
+    .mini-discs { font:22px/1.5 system-ui,sans-serif; letter-spacing:8px; }
+    .mini-cards { display:flex; gap:8px; }.mini-cards b { display:grid; place-items:center; width:38px; height:50px; border:1px solid #46657c; border-radius:7px; background:#1a2c49; font:22px system-ui,sans-serif; }
     @media(max-width:760px){.games-grid{grid-template-columns:1fr}.launch-heading{display:block}.app-native{display:inline-block;margin-top:12px}.game-card p{min-height:0}main{padding:16px}.launch-heading h2{font-size:23px}}
     @media(prefers-reduced-motion:reduce){.game-card{transition:none}.game-card:hover{transform:none}}
   </style>
@@ -211,8 +216,12 @@
         <a class="game-card play-card" href="/games/brick-breaker/?room=lounge" id="game-brick"><div class="app-art bricks-art" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><b></b><em></em></div><span class="app-kicker">Play together</span><h3>Brick Breaker <span aria-hidden="true">&nearr;</span></h3><p>One ball, every paddle. A shared world with smooth playback and peer host handoff.</p><div class="app-tags">Shared simulation &middot; Cooperative play</div></a>
         <a class="game-card" href="/games/shared-drawing/?room=lounge" id="game-drawing"><div class="app-art drawing-art" aria-hidden="true"><svg viewBox="0 0 280 110"><path d="M30 80 Q65 0 100 55 T175 35 T245 50"/><path d="M40 90 Q110 30 145 75 T250 35"/></svg></div><span class="app-kicker">Make something</span><h3>Shared Canvas <span aria-hidden="true">&nearr;</span></h3><p>A collaborative sketchpad. Shared ink, erasing and peer-supplied history for new arrivals.</p><div class="app-tags">Shared state &middot; Catch-up & replay</div></a>
         <a class="game-card" href="/games/example/?room=lounge" id="game-example"><div class="app-art presence-art" aria-hidden="true"><span>&nwarr;<small>You</small></span><span>&nwarr;<small>A guest</small></span><span>&nwarr;<small>A guest</small></span></div><span class="app-kicker">Be here, together</span><h3>Presence Playground <span aria-hidden="true">&nearr;</span></h3><p>Live pointers, shapes and colors of your own, and a snake round everyone shares. The small interactions that make a workspace feel alive.</p><div class="app-tags">Presence &middot; Attention signals &middot; Snake</div></a>
+        <a class="game-card" href="/games/task-board/?room=lounge" id="game-task-board" data-demo="task-board"><div class="app-art extra-art" aria-hidden="true"><span class="mini-task">&#10003; Pick an idea</span><span class="mini-task">&#9633; Make it happen</span></div><span class="app-kicker">Make a plan</span><h3>Task Board <span aria-hidden="true">&nearr;</span></h3><p>Eight next steps, one shared checklist. Write, check off and clear tasks together.</p><div class="app-tags">Shared tasks &middot; Late-join catch-up</div></a>
+        <a class="game-card" href="/games/focus-timer/?room=lounge" id="game-focus-timer" data-demo="focus-timer"><div class="app-art extra-art" aria-hidden="true"><strong class="mini-clock">25:00</strong></div><span class="app-kicker">Find your rhythm</span><h3>Focus Timer <span aria-hidden="true">&nearr;</span></h3><p>A quiet focus session or a short break. Start, pause and reset the clock for everyone.</p><div class="app-tags">Shared countdown &middot; Group controls</div></a>
+        <a class="game-card" href="/games/four-in-a-row/?room=lounge" id="game-four-in-a-row" data-demo="four-in-a-row"><div class="app-art extra-art" aria-hidden="true"><span class="mini-discs">&#9679; &#9675; &#9679; &#9675;<br>&#9679; &#9679; &#9679; &#9679;</span></div><span class="app-kicker">Take a turn</span><h3>Four in a Row <span aria-hidden="true">&nearr;</span></h3><p>Drop a disc and connect four. A friendly tabletop for two sides and the whole room.</p><div class="app-tags">Turn-based play &middot; Shared board</div></a>
+        <a class="game-card" href="/games/memory-match/?room=lounge" id="game-memory-match" data-demo="memory-match"><div class="app-art extra-art" aria-hidden="true"><span class="mini-cards"><b>?</b><b>&#9733;</b><b>&#9733;</b><b>?</b></span></div><span class="app-kicker">Think together</span><h3>Memory Match <span aria-hidden="true">&nearr;</span></h3><p>Sixteen cards, eight pairs. Share the flips, remember the symbols and clear the board together.</p><div class="app-tags">Cooperative puzzle &middot; Shared reveals</div></a>
       </div>
-      <div class="app-possibilities"><strong>More than games</strong><p>These same building blocks can support a tabletop lobby, a team planning board, a presentation remote or a shared monitoring view. The examples run on native portal channels; they do not need a separate web account service.</p></div>
+      <div class="app-possibilities"><strong>More than games</strong><p>Plan your next steps, focus together or start a friendly round. These examples run on native portal channels and keep their shared state in open pages. Closing the last page ends the session.</p></div>
     </section>
   </main>
 
@@ -266,7 +275,7 @@
         const roomInput = el("demo-room");
         const updateAppLinks = () => {
           const room = roomInput.value.trim() || "lounge";
-          for (const [id, slug] of [["game-example", "example"], ["game-drawing", "shared-drawing"], ["game-brick", "brick-breaker"]]) {
+          for (const [id, slug] of [["game-example", "example"], ["game-drawing", "shared-drawing"], ["game-brick", "brick-breaker"], ...Array.from(document.querySelectorAll("[data-demo]"), (card) => [card.id, card.dataset.demo])]) {
             el(id).href = "/games/" + slug + "/?room=" + encodeURIComponent(room);
           }
         };

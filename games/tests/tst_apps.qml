@@ -23,15 +23,16 @@ Item {
             return view
         }
         function test_layout_data() {
-            return [ { tag:"brick", app:"brick-breaker" }, { tag:"presence", app:"example" }, { tag:"canvas", app:"shared-drawing" } ]
+            return [ { tag:"brick", app:"brick-breaker" }, { tag:"presence", app:"example" }, { tag:"canvas", app:"shared-drawing" },
+                { tag:"tasks", app:"task-board" }, { tag:"timer", app:"focus-timer" }, { tag:"four", app:"four-in-a-row" }, { tag:"memory", app:"memory-match" } ]
         }
         function test_layout(data) {
             var view = open("layout-" + data.tag, data.app)
             verify(js(view, "!document.querySelector('#overlay')"))
             verify(js(view, "document.querySelector('.session-panel').hidden"))
-            verify(js(view, "(() => {const c=document.querySelector('canvas').getBoundingClientRect(),t=document.querySelector('.toolbar').getBoundingClientRect();return c.top>=t.bottom && c.bottom<=innerHeight && c.width>100 && c.height>100})()"))
+            verify(js(view, "(() => {const c=document.querySelector('.stage').getBoundingClientRect(),t=document.querySelector('.toolbar').getBoundingClientRect();return c.top>=t.bottom && c.bottom<=innerHeight && c.width>100 && c.height>100})()"))
             js(view, "document.querySelector('#session-toggle').click()")
-            verify(js(view, "(() => {const c=document.querySelector('canvas').getBoundingClientRect(),p=document.querySelector('.session-panel').getBoundingClientRect();return c.right<=p.left})()"))
+            verify(js(view, "(() => {const c=document.querySelector('.stage').getBoundingClientRect(),p=document.querySelector('.session-panel').getBoundingClientRect();return c.right<=p.left})()"))
             js(view, "document.querySelector('#focus').click()")
             verify(js(view, "document.querySelector('.app').classList.contains('focus-mode')"))
             js(view, "document.querySelector('#exit-focus').click()")
@@ -41,7 +42,7 @@ Item {
             js(view, "document.querySelector('#session-toggle').click()")
             wait(150)
             verify(js(view, "document.documentElement.scrollWidth<=innerWidth"))
-            verify(js(view, "document.querySelector('canvas').getBoundingClientRect().height>100"))
+            verify(js(view, "document.querySelector('.stage').getBoundingClientRect().height>100"))
         }
         function test_multiplayerBrick() {
             var a = open("brick-a", "brick-breaker"), b = open("brick-b", "brick-breaker")
@@ -71,9 +72,50 @@ Item {
             var view=createTemporaryObject(browser,root)
             view.url="conquerd://hub/"
             tryVerify(function(){return js(view,"document.querySelector('#main')?.classList.contains('visible')")},10000)
-            compare(js(view,"document.querySelectorAll('.game-card').length"),3)
+            compare(js(view,"document.querySelectorAll('.game-card').length"),7)
             js(view,"document.querySelector('#demo-room').value='Friday night';document.querySelector('#demo-room').dispatchEvent(new Event('input'))")
             verify(js(view,"document.querySelector('#game-brick').href.includes('room=Friday%20night')"))
+            verify(js(view,"Array.from(document.querySelectorAll('.game-card')).every(card=>card.href.includes('room=Friday%20night'))"))
+        }
+        function test_tasksCatchUpAndClear() {
+            var a = open("tasks-a", "task-board")
+            js(a, "const field=document.querySelector('#tasks input[type=text]');field.value='Ship the demo';field.dispatchEvent(new Event('change'))")
+            var b = open("tasks-b", "task-board")
+            tryVerify(function() { return js(b, "document.querySelector('#tasks input[type=text]').value") === "Ship the demo" }, 10000)
+            js(b, "document.querySelector('#tasks input[type=checkbox]').click()")
+            tryVerify(function() { return js(a, "document.querySelector('#result').textContent") === "1 of 1 complete" }, 5000)
+            js(a, "document.querySelector('#tasks button').click()")
+            tryVerify(function() { return js(b, "document.querySelector('#tasks input[type=text]').value") === "" }, 5000)
+        }
+        function test_sharedTimer() {
+            var a = open("timer-a", "focus-timer"), b = open("timer-b", "focus-timer")
+            js(a, "document.querySelector('[data-minutes=\"5\"]').click();document.querySelector('#toggle').click()")
+            tryVerify(function() { return js(b, "document.querySelector('#toggle').textContent") === "Pause together" }, 5000)
+            js(b, "document.querySelector('#toggle').click()")
+            tryVerify(function() { return js(a, "document.querySelector('#toggle').textContent") === "Start together" }, 5000)
+            js(a, "document.querySelector('#reset').click()")
+            tryVerify(function() { return js(b, "document.querySelector('#time').textContent") === "05:00" }, 5000)
+        }
+        function test_fourWinAndReset() {
+            var a = open("four-a", "four-in-a-row"), b = open("four-b", "four-in-a-row")
+            var moves = [0,1,0,1,0,1,0]
+            for (var i=0; i<moves.length; i++) {
+                js(i%2 ? b : a, "document.querySelector('#columns').children[" + moves[i] + "].click()")
+                var count=i+1
+                tryVerify(function() { return js(a, "document.querySelectorAll('.disc[data-side=\"1\"],.disc[data-side=\"2\"]').length") === count && js(b, "document.querySelectorAll('.disc[data-side=\"1\"],.disc[data-side=\"2\"]').length") === count }, 5000)
+            }
+            compare(js(b, "document.querySelector('#result').textContent"), "Mint wins!")
+            a.url = "about:blank"
+            js(b, "document.querySelector('#reset').click()")
+            compare(js(b, "document.querySelectorAll('.disc[data-side=\"0\"]').length"), 42)
+        }
+        function test_memorySharedReveal() {
+            var a = open("memory-a", "memory-match"), b = open("memory-b", "memory-match")
+            js(a, "document.querySelector('.memory-card').click()")
+            tryVerify(function() { return js(b, "document.querySelectorAll('.memory-card.revealed').length") === 1 }, 5000)
+            compare(js(a, "document.querySelector('.memory-card').textContent"), js(b, "document.querySelector('.memory-card').textContent"))
+            js(b, "document.querySelector('#reset').click()")
+            tryVerify(function() { return js(a, "document.querySelectorAll('.memory-card.revealed').length") === 0 }, 5000)
         }
     }
 }

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Four in a Row &middot; DoubleSlash Apps</title>
+    <link rel="stylesheet" href="../../web-sdk/demo-shell.css" />
+    <link rel="stylesheet" href="../../web-sdk/demo-workspace.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="app-header">
+        <a href="/" class="brand" aria-label="Back to portal">D://</a>
+        <div class="app-heading">
+          <div class="eyebrow">DoubleSlash Apps</div>
+          <h1>Four in a Row</h1>
+        </div>
+        <div class="header-actions">
+          <button id="share">Copy link</button
+          ><button id="focus" aria-pressed="false">Focus</button
+          ><button
+            id="session-toggle"
+            aria-expanded="false"
+            aria-controls="session-panel"
+          >
+            Session
+          </button>
+        </div>
+      </header>
+      <div class="session-bar">
+        <span><i class="live-dot"></i><span id="room-label">lounge</span></span
+        ><span id="peers-count">0 here</span
+        ><span id="status" role="status">Connecting...</span
+        ><button id="exit-focus">Exit focus</button>
+      </div>
+      <div class="work-area">
+        <section class="workspace" aria-label="Four in a Row">
+          <div class="toolbar">
+            <span class="summary" id="result" role="status"></span
+            ><span class="spacer"></span><button id="reset">New round</button>
+          </div>
+          <div class="stage content-stage">
+            <div class="demo-content">
+              <h2>One more disc.</h2>
+              <p>
+                Connect four in any direction. Take turns as mint (1) and lilac
+                (2); anyone can play either side.
+              </p>
+              <div
+                class="column-controls"
+                id="columns"
+                role="group"
+                aria-label="Choose a column"
+              ></div>
+              <div
+                class="four-board"
+                id="board"
+                role="group"
+                aria-label="Four in a Row board"
+              ></div>
+            </div>
+          </div>
+        </section>
+        <aside
+          id="session-panel"
+          class="session-panel"
+          hidden
+          aria-label="Session and connection details"
+        ></aside>
+      </div>
+      <footer class="app-footer">
+        <span id="controls-hint"></span
+        ><span class="notice" id="notice" role="status"></span
+        ><span class="footer-detail">An app on your peer network</span>
+      </footer>
+    </main>
+    <script type="module" src="app.mjs"></script>
+  </body>
+</html>

@@ -61,7 +61,7 @@ No telemetry. No cloud accounts. No third-party infrastructure required.
 
 ### In-App Supernode Portal & Browser Games
 - Supernodes with `web.host.app.v1` serve an in-app portal over a QUIC bidi-stream channel. The native client browses `d://` pages using an embedded Chromium view from the **Rooms** sidebar (supernode avatar click) — no external browser, no public game ports, and no public web TLS certificates.
-- **`game.relay.v1`** — opaque datagram relay for in-app portal games: the supernode fans raw QUIC-relay datagrams among peers that joined the same game session (identity path; no external browser / WebTransport). Three demo games are bundled: **cursor relay**, **brick breaker**, **shared drawing**.
+- **`game.relay.v1`** — opaque datagram relay for in-app portal games: the supernode fans raw QUIC-relay datagrams among peers that joined the same game session (identity path; no external browser / WebTransport). Seven demos are bundled: **Presence Playground**, **Brick Breaker**, **Shared Canvas**, **Task Board**, **Focus Timer**, **Four in a Row**, and **Memory Match**.
 - Game pages are served from `<data_dir>/games/<slug>/` and reachable only via the native portal at `d://<supernode_id>/games/<slug>/`. The `window.conquerd` JS bridge exposes channel APIs over the authenticated QUIC session.
 - Portal requests use the identity-authenticated QUIC connection; there is no public HTTPS/WebTransport listener, game TLS certificate, or certificate fingerprint passed to portal pages.
 
@@ -434,17 +434,21 @@ client.sendDatagram("game.relay.v1", myPayload);
 
 `window.conquerd.ready` exposes portal channel APIs (`openChannel`, `sendDatagramB64`, `pollDatagrams`, `closeChannel`) and `myPeerId` from the native trust chain — no host/port/cert parameters.
 
-Three bundled portal apps are deployed to `<data_dir>/games/` and updated on supernode start:
+Seven bundled portal apps are deployed to `<data_dir>/games/` and updated on supernode start:
 
 | Path | Description |
 |------|-------------|
 | `/games/example/` | Presence Playground — live pointers and shared attention markers |
 | `/games/brick-breaker/` | Brick Breaker — cooperative paddles, smooth snapshots and peer host handoff |
 | `/games/shared-drawing/` | Shared Canvas — collaborative ink, erasing and late-join history replay |
+| `/games/task-board/` | Task Board — eight shared tasks with completion and late-join catch-up |
+| `/games/focus-timer/` | Focus Timer — shared focus/break countdowns, pause and reset |
+| `/games/four-in-a-row/` | Four in a Row — alternating discs, win detection and shared rounds |
+| `/games/memory-match/` | Memory Match — cooperative card reveals, pair matching and shuffled rounds |
 
-All three use `game.relay.v1` and open only via `d://<supernode_id>/games/<slug>/` from the in-app portal (Rooms sidebar). External browsers are not supported.
+All seven use `game.relay.v1` and open only via `d://<supernode_id>/games/<slug>/` from the in-app portal (Rooms sidebar). External browsers are not supported.
 
-The apps keep controls outside the canvas and share a Session panel with room selection, readiness, participants and measured traffic/round trips. Copy a session link to join from another device on the same supernode. Focus mode keeps the play area clear. These examples also show patterns for collaborative tools and dashboards; see the [portal app guide](games/README.md) for reuse, limits and tests.
+The apps share a Session panel with room selection, readiness, participants and measured traffic/round trips. Copy a session link to join from another device on the same supernode or cluster. Focus mode keeps the workspace clear. Shared state lives in open pages only; concurrent edits in the four newer demos resolve to one value. See the [portal app guide](games/README.md) for reuse, limits and tests.
 
 The SDK also exports `ChannelTag`, `encodeFrame`, `decodeFrame`, `fixedTagFor`, and `featureForFixedTag` for games that interoperate with first-party `core.*` channels.
 
@@ -1266,7 +1270,7 @@ Detailed, per-version release notes are published with each [GitHub release](htt
 - **Voice calls** — low-latency Opus over QUIC, push-to-talk and voice activation, spectral-gate noise suppression, jitter buffer with de-click.
 - **Video and screen sharing** — negotiated H.264/VP8, pre-encode picture-in-picture, a separately-mixed synchronised track for audio shared with the video, and adaptive bitrate. Complete on Windows; camera capture on Linux and macOS is built but unvalidated, and screen capture is Windows-only (see [Known limitations](#known-limitations)).
 - **Rooms (multi-peer voice)** — client-owned room definitions (`my_rooms.dat`); supernodes host SFU sessions ephemerally over QUIC relay with chat/voice/file parity, idle GC, and reconnect materialization.
-- **Game relay & in-app portal**: `game.relay.v1` opaque datagrams over the identity QUIC relay; three bundled demos (cursor relay, brick breaker, shared drawing) under `<data_dir>/games/`, opened only from the native portal at `d://<supernode_id>/games/<slug>/`. No public WebTransport port or TLS game certs.
+- **Game relay & in-app portal**: `game.relay.v1` opaque datagrams over the identity QUIC relay; seven bundled app/game demos (Presence Playground, Brick Breaker, Shared Canvas, Task Board, Focus Timer, Four in a Row, Memory Match) under `<data_dir>/games/`, opened only from the native portal at `d://<supernode_id>/games/<slug>/`. No public WebTransport port or TLS game certs.
 - **Supernode release binaries**: pre-built packages for Linux x86_64, Linux ARM64, and Windows x86_64 on GitHub Releases and nightlies (`scripts/build_supernode.sh` / `scripts/build_supernode.ps1`).
 - **NAT traversal** — UPnP port mapping, QUIC/WebSocket direct connect, ordered WebSocket candidates, and supernode QUIC relay fallback with auto-renewed tickets and an endpoint mailbox.
 - **Security** — signed, transcript-bound signaling with timestamp freshness checks and per-sender replay deduplication; peer revocation with propagation; release-signed P2P updates with Ed25519 + threshold validation; crash/installer logging.
