@@ -29,6 +29,20 @@ Item {
     // Voice control hides instead of re-joining what you are already in.
     property bool voiceActiveHere: false
 
+    // Supporting nodes for this room: one row per cluster member (a standalone
+    // node is a cluster of one), as returned by backend.roomNodeStatus and
+    // refreshed while the panel is visible.
+    property var roomNodes: []
+    property bool _statsPanelOpen: false
+
+    readonly property var servingNode: root.pickServingNode(root.roomNodes)
+    readonly property int nodesUp: {
+        var n = 0
+        for (var i = 0; i < root.roomNodes.length; i++)
+            if (root.roomNodes[i].connected) n++
+        return n
+    }
+
     onRoomModelChanged: {
         participantCount = roomModel ? roomModel.participantCount() : 0
     }
@@ -118,8 +132,12 @@ Item {
             root.roomName = newName
             root.roomId = newRid
             root.supernodeId = newSn
+            root._statsPanelOpen = false
             if (newRid !== "" && newSn !== "" && backend)
                 backend.loadRoomChatHistory(newSn, newRid)
+            // Deferred so the caller's subscribe/join has already re-pointed
+            // the bridge at this room and its serving member is known.
+            Qt.callLater(root.refreshRoomNodes)
         } else {
             root.roomName = newName
             root.roomId = newRid || root.roomId
@@ -127,7 +145,232 @@ Item {
         }
     }
 
+    // The member whose stats the header reports: the one serving the room when
+    // it is up and has reported, else any reachable member that has. Rows
+    // arrive serving-first, then reachable, so the first match is the best.
+    function pickServingNode(rows) {
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].connected && rows[i].stats)
+                return rows[i]
+        }
+        return null
+    }
+
+    function refreshRoomNodes() {
+        var rows = []
+        if (root.roomId !== "" && root.supernodeId !== "" && backend) {
+            try {
+                rows = JSON.parse(backend.roomNodeStatus(root.supernodeId, root.roomId))
+            } catch (e) {
+                rows = []
+            }
+        }
+        root.roomNodes = rows
+        root.syncNodeModel(rows)
+        var serving = root.pickServingNode(rows)
+        connStatsPanel.applyStats(JSON.stringify(serving ? serving.stats : { rtt_ms: 0 }))
+    }
+
+    // Update rows in place: assigning a fresh array to a Repeater every tick
+    // would rebuild each delegate and regenerate its avatar.
+    function syncNodeModel(rows) {
+        while (nodeModel.count > rows.length)
+            nodeModel.remove(nodeModel.count - 1)
+        for (var i = 0; i < rows.length; i++) {
+            var n = rows[i]
+            var s = n.connected ? n.stats : null
+            var item = {
+                "nodeId": n.node_id,
+                "connected": !!n.connected,
+                "active": !!n.active,
+                "detail": root.nodeDetailLine(n),
+                "rttText": s && s.rtt_ms > 0 ? Math.round(s.rtt_ms) + " ms"
+                                             : (n.connected ? "—" : "down"),
+                "quality": root.nodeQuality(n)
+            }
+            if (i < nodeModel.count)
+                nodeModel.set(i, item)
+            else
+                nodeModel.append(item)
+        }
+    }
+
+    // Node ids are 43-char base64url keys; the head is enough to tell members apart.
+    function shortNodeId(nodeId) {
+        if (!nodeId) return ""
+        return nodeId.length > 12 ? nodeId.substring(0, 12) + "…" : nodeId
+    }
+
+    // Same thresholds as ConnectionStatsChip.
+    function nodeQuality(node) {
+        if (!node.connected) return "down"
+        var s = node.stats
+        if (!s || !(s.rtt_ms > 0)) return "none"
+        if (s.packet_loss_pct > 4 || s.rtt_ms > 300) return "bad"
+        if (s.packet_loss_pct > 1.5 || s.rtt_ms > 150) return "fair"
+        return "good"
+    }
+
+    function qualityColor(quality) {
+        switch (quality) {
+            case "down":
+            case "bad": return Theme.danger
+            case "fair": return Theme.warn
+            case "good": return Theme.online
+            default: return Theme.muted
+        }
+    }
+
+    // "155.138.244.189:3775 · QUIC + WS · 0.4% loss · 3 members here"
+    function nodeDetailLine(node) {
+        var parts = []
+        if (node.relay_addr) parts.push(node.relay_addr)
+        if (!node.connected) {
+            parts.push("unreachable")
+        } else {
+            // Room voice needs the QUIC relay session; text rides the WebSocket.
+            parts.push(node.stats && node.stats.relay ? "QUIC + WS" : "WS only")
+            if (node.stats && node.stats.packet_loss_pct > 0)
+                parts.push(node.stats.packet_loss_pct.toFixed(1) + "% loss")
+            if (node.room_members !== null && node.room_members !== undefined)
+                parts.push(node.room_members + (node.room_members === 1 ? " member here" : " members here"))
+        }
+        return parts.join(" · ")
+    }
+
     ListModel { id: roomChatModel }
+    ListModel { id: nodeModel }
+
+    // Matches the connection manager's 2s stats tick.
+    Timer {
+        interval: 2000
+        repeat: true
+        triggeredOnStart: true
+        running: root.visible && root.roomId !== "" && root.supernodeId !== ""
+        onTriggered: root.refreshRoomNodes()
+    }
+
+    StatsPanel {
+        id: connStatsPanel
+        z: 60
+        width: 320
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.margins: Theme.spacingMd
+        anchors.rightMargin: membersPanel.width + Theme.spacingMd
+        anchors.topMargin: Theme.touchTarget + Theme.spacingMd + Theme.spacingXs
+        visible: root._statsPanelOpen && root.roomId !== ""
+        title: "Room Connection"
+        modeText: {
+            if (!root.servingNode) return "Offline"
+            return root.servingNode.stats.relay ? "QUIC" : "WS only"
+        }
+        // Without the QUIC relay session room voice goes silent while text
+        // keeps working, so WS-only is only a warning while voice is live here.
+        modeColor: {
+            if (!root.servingNode) return Theme.danger
+            if (root.servingNode.stats.relay) return Theme.online
+            return root.voiceActiveHere ? Theme.warn : Theme.muted
+        }
+
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.topMargin: Theme.spacingXs
+            height: 1
+            color: Theme.divider
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+
+            Text {
+                text: root.roomNodes.length > 1 ? "Supporting nodes" : "Supporting node"
+                color: Theme.text
+                font.pixelSize: Theme.fontSizeCaption
+                font.bold: true
+                Layout.fillWidth: true
+            }
+            Text {
+                text: root.nodesUp + "/" + root.roomNodes.length + " reachable"
+                color: root.nodesUp === 0 ? Theme.danger
+                     : (root.nodesUp < root.roomNodes.length ? Theme.warn : Theme.muted)
+                font.pixelSize: Theme.fontSizeCaption
+            }
+        }
+
+        Repeater {
+            model: nodeModel
+
+            delegate: RowLayout {
+                id: nodeRow
+                required property string nodeId
+                required property bool connected
+                required property bool active
+                required property string detail
+                required property string rttText
+                required property string quality
+
+                Layout.fillWidth: true
+                spacing: Theme.spacingSm
+
+                Avatar {
+                    peerId: nodeRow.nodeId
+                    size: 22
+                    showRing: true
+                    ringColor: nodeRow.connected ? Theme.online : Theme.muted
+                    Layout.alignment: Qt.AlignVCenter
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.spacingXs
+
+                        Text {
+                            text: root.shortNodeId(nodeRow.nodeId)
+                            color: nodeRow.connected ? Theme.text : Theme.muted
+                            font.pixelSize: Theme.fontSizeCaption
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
+                        Text {
+                            visible: nodeRow.active
+                            text: "serving"
+                            color: Theme.accent
+                            font.pixelSize: Theme.fontSizeMicro
+                            font.bold: true
+                        }
+                    }
+
+                    Text {
+                        text: nodeRow.detail
+                        color: Theme.muted
+                        font.pixelSize: Theme.fontSizeMicro
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+                }
+
+                Text {
+                    Layout.alignment: Qt.AlignVCenter
+                    text: nodeRow.rttText
+                    color: root.qualityColor(nodeRow.quality)
+                    font.pixelSize: Theme.fontSizeCaption
+                    font.bold: true
+                }
+            }
+        }
+    }
+
+    MouseArea {
+        z: 55
+        anchors.fill: parent
+        visible: root._statsPanelOpen
+        onClicked: root._statsPanelOpen = false
+    }
 
     RowLayout {
         anchors.fill: parent
@@ -155,6 +398,21 @@ Item {
                     font.bold: true
                     Layout.fillWidth: true
                     elide: Text.ElideRight
+                }
+
+                // Same chip as peer chat, reporting the node serving this
+                // room; click it for every supporting node.
+                ConnectionStatsChip {
+                    Layout.alignment: Qt.AlignVCenter
+                    implicitHeight: 28
+                    peerId: root.roomId
+                    rttMs: connStatsPanel.rttMs
+                    packetLossPct: connStatsPanel.packetLossPct
+                    detailText: root.roomNodes.length > 1
+                        ? root.nodesUp + "/" + root.roomNodes.length + " nodes"
+                        : ""
+                    expanded: root._statsPanelOpen
+                    onToggleExpanded: root._statsPanelOpen = !root._statsPanelOpen
                 }
 
                 // Join Voice — the in-panel equivalent of double-clicking the

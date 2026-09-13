@@ -937,6 +937,7 @@ async fn handle_event(
         ConnectionEvent::ClusterMembersUpdated {
             supernode_id,
             members,
+            ..
         } => {
             let key = supernode_id.trim_end_matches('=').to_owned();
             info!(

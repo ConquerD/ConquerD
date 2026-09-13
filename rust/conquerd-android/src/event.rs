@@ -186,6 +186,7 @@ pub fn to_json(event: &ConnectionEvent) -> Option<Value> {
         E::ClusterMembersUpdated {
             supernode_id,
             members,
+            ..
         } => json!({
             "event": "cluster_members",
             "supernode_id": supernode_id,

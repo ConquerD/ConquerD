@@ -370,6 +370,7 @@ fn spawn_event_pump(
                 if let ConnectionEvent::ClusterMembersUpdated {
                     supernode_id,
                     members,
+                    ..
                 } = &ev
                 {
                     cluster_members

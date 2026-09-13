@@ -10,6 +10,8 @@ Rectangle {
     property real packetLossPct: 0
     property bool isRelay: false
     property bool expanded: false
+    // Optional trailing note, e.g. "3/4 nodes" for a clustered room.
+    property string detailText: ""
 
     signal toggleExpanded()
 
@@ -58,6 +60,14 @@ Rectangle {
             visible: root.isRelay
             text: "relay"
             color: Theme.warn
+            font.pixelSize: Theme.fontSizeMicro
+        }
+
+        Text {
+            anchors.verticalCenter: parent.verticalCenter
+            visible: root.detailText !== ""
+            text: root.detailText
+            color: Theme.muted
             font.pixelSize: Theme.fontSizeMicro
         }
     }

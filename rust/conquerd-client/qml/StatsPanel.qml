@@ -22,6 +22,17 @@ Rectangle {
     property real bandwidthKbps: 0
     property var _rttHistory: []
 
+    property string title: "Connection Stats"
+    // What the path badge says. Peer chat reads it as relay vs direct; a room
+    // overrides it with its serving node's transport.
+    property string modeText: root.isRelay ? "Relay" : "Direct"
+    property color modeColor: root.isRelay ? Theme.warn : Theme.online
+
+    // Extra rows appended below the sparkline (the room panel lists its
+    // supporting nodes here). Children declared in this file still go to the
+    // Rectangle itself; only children declared by a user of StatsPanel land here.
+    default property alias extraContent: contentCol.data
+
     function applyStats(jsonStr) {
         try {
             var s = JSON.parse(jsonStr)
@@ -52,7 +63,7 @@ Rectangle {
         RowLayout {
             Layout.fillWidth: true
             Text {
-                text: "Connection Stats"
+                text: root.title
                 color: Theme.text
                 font.pixelSize: Theme.fontSizeCaption
                 font.bold: true
@@ -60,11 +71,11 @@ Rectangle {
             }
             Rectangle {
                 width: 8; height: 8; radius: Theme.radiusPill
-                color: root.isRelay ? Theme.warn : Theme.online
+                color: root.modeColor
             }
             Text {
-                text: root.isRelay ? "Relay" : "Direct"
-                color: root.isRelay ? Theme.warn : Theme.online
+                text: root.modeText
+                color: root.modeColor
                 font.pixelSize: Theme.fontSizeCaption
             }
         }

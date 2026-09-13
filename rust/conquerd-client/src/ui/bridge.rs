@@ -1076,6 +1076,20 @@ pub mod ffi {
         #[rust_name = "cluster_representative_id"]
         fn clusterRepresentative(self: Pin<&mut AppBridge>, node_id: &QString) -> QString;
 
+        /// JSON array describing every node supporting a room: one row per
+        /// member of `supernode_id`'s cluster (a standalone node is a cluster
+        /// of one) with its live state, last transport stats, relay address,
+        /// and whether it is the member currently serving the room. The
+        /// sidebar folds a cluster onto one row, so this is the only per-member
+        /// view.
+        #[qinvokable]
+        #[rust_name = "room_node_status"]
+        fn roomNodeStatus(
+            self: Pin<&mut AppBridge>,
+            supernode_id: &QString,
+            room_id: &QString,
+        ) -> QString;
+
         /// True when `node_id` belongs to a trusted supernode in the peer store.
         #[qinvokable]
         #[rust_name = "is_known_supernode"]
@@ -1439,6 +1453,17 @@ pub struct AppBridgeRust {
     /// folded here rather than pushed to the sidebar individually.
     supernode_connected: std::collections::HashMap<String, bool>,
 
+    /// Last `connectionStats` row per supernode, keyed by pad-normalized
+    /// cluster member id. QML folds a cluster's rows onto its representative
+    /// (and drops roster-learned siblings entirely), so the room connection
+    /// panel's per-node detail is served from here instead.
+    supernode_stats: std::collections::HashMap<String, serde_json::Value>,
+
+    /// Relay attach address per cluster member (pad-normalized id), merged from
+    /// every verified roster — a member's own roster omits itself, a sibling's
+    /// does not.
+    cluster_member_addrs: std::collections::HashMap<String, String>,
+
     /// Hosts (pad-normalized) already rematerialized this session. Cleared on
     /// disconnect so a later reconnect still replays rooms. Stops
     /// ClusterMembersUpdated from re-firing CreateRoom → tray spam.
@@ -1657,6 +1682,8 @@ impl Default for AppBridgeRust {
             avatar_config_json: String::new(),
             cluster_siblings: std::collections::HashMap::new(),
             supernode_connected: std::collections::HashMap::new(),
+            supernode_stats: std::collections::HashMap::new(),
+            cluster_member_addrs: std::collections::HashMap::new(),
             rematerialized_hosts: HashSet::new(),
         }
     }
@@ -1782,6 +1809,70 @@ fn pick_live_cluster_member(
     }
     set.into_iter()
         .find(|m| connected.get(m).copied().unwrap_or(false))
+}
+
+/// Bridge state a room's node rows are built from, borrowed together so
+/// [`cluster_node_rows`] stays testable without a live bridge.
+struct ClusterNodeSources<'a> {
+    siblings: &'a ClusterSiblings,
+    connected: &'a MemberConnected,
+    stats: &'a std::collections::HashMap<String, serde_json::Value>,
+    addrs: &'a std::collections::HashMap<String, String>,
+    /// Per-node chat rosters keyed `"{supernode_id}:{room_id}"`.
+    rosters: &'a std::collections::HashMap<String, Vec<String>>,
+}
+
+/// One JSON row per member of `member`'s cluster for the room connection
+/// panel: the member serving the room (`active`) first, then reachable
+/// members, then by id.
+///
+/// Ids are pad-normalized and de-duplicated, because the full set can hold
+/// both the padded canonical id of a known supernode and the unpadded roster
+/// form of the same member. Stats and the per-node room roster are reported
+/// only for a connected member — both outlive a disconnect and would read as
+/// live.
+fn cluster_node_rows(
+    src: &ClusterNodeSources<'_>,
+    member: &str,
+    room_id: &str,
+    active: &str,
+) -> Vec<serde_json::Value> {
+    let active = active.trim_end_matches('=');
+    let mut ids: Vec<String> = cluster_full_set(src.siblings, member)
+        .iter()
+        .map(|m| m.trim_end_matches('=').to_owned())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let is_up = |id: &str| {
+        src.connected
+            .iter()
+            .any(|(k, up)| *up && k.trim_end_matches('=') == id)
+    };
+    let roster_len = |id: &str| {
+        src.rosters.iter().find_map(|(key, roster)| {
+            let (node, rid) = key.split_once(':')?;
+            (rid == room_id && node.trim_end_matches('=') == id).then_some(roster.len())
+        })
+    };
+    // Stable sort over the id-ordered list keeps ties in id order.
+    ids.sort_by_key(|id| (*id != active, !is_up(id)));
+    ids.iter()
+        .map(|id| {
+            let up = is_up(id);
+            let is_active = !active.is_empty() && *id == active;
+            let stats = if up { src.stats.get(id).cloned() } else { None };
+            let room_members = if up { roster_len(id) } else { None };
+            serde_json::json!({
+                "node_id": id,
+                "connected": up,
+                "active": is_active,
+                "relay_addr": src.addrs.get(id).cloned().unwrap_or_default(),
+                "stats": stats,
+                "room_members": room_members,
+            })
+        })
+        .collect()
 }
 
 impl Drop for AppBridgeRust {
@@ -3440,6 +3531,35 @@ impl ffi::AppBridge {
         let canon = self.rust().resolve_supernode_node_id_str(&id).unwrap_or(id);
         let rep = self.rust().cluster_representative(&canon);
         QString::from(rep.as_str())
+    }
+
+    fn room_node_status(self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) -> QString {
+        let r = self.rust();
+        let id = supernode_id.to_string();
+        let rid = room_id.to_string();
+        if id.is_empty() || rid.is_empty() {
+            return QString::from("[]");
+        }
+        let canon = r.resolve_supernode_node_id_str(&id).unwrap_or(id);
+        // The member actually carrying the room for us: the text host while it
+        // is the selected room, else the voice host while we are voicing it.
+        // Both follow failover (`RoomFailedOver`); the sidebar id does not.
+        let active = if is_selected_text_room(r, &canon, &rid) {
+            r.current_supernode_id.as_str()
+        } else if is_active_voice_room(r, &canon, &rid) {
+            r.voice_supernode_id.as_str()
+        } else {
+            ""
+        };
+        let src = ClusterNodeSources {
+            siblings: &r.cluster_siblings,
+            connected: &r.supernode_connected,
+            stats: &r.supernode_stats,
+            addrs: &r.cluster_member_addrs,
+            rosters: &r.chat_roster_by_node,
+        };
+        let rows = cluster_node_rows(&src, &canon, &rid, active);
+        QString::from(serde_json::Value::Array(rows).to_string().as_str())
     }
 
     fn is_known_supernode(self: Pin<&mut Self>, node_id: &QString) -> bool {
@@ -6886,6 +7006,11 @@ fn emit_cluster_node_connected(
     {
         let mut r = bridge.as_mut().rust_mut();
         r.supernode_connected.insert(member.to_owned(), connected);
+        if !connected {
+            // The manager stops reporting a dropped node; its last reading
+            // must not keep showing as live.
+            r.supernode_stats.remove(member.trim_end_matches('='));
+        }
     }
     let rep = bridge.rust().cluster_representative(member);
     let rollup = bridge.rust().cluster_rollup_connected(member);
@@ -8042,6 +8167,7 @@ fn dispatch_event(
         ConnectionEvent::ClusterMembersUpdated {
             supernode_id,
             members,
+            relay_addrs,
         } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 // Accept rosters from multi-home siblings (not only invite host).
@@ -8049,11 +8175,11 @@ fn dispatch_event(
                     .rust()
                     .resolve_supernode_node_id_str(&supernode_id)
                     .unwrap_or_else(|| supernode_id.trim_end_matches('=').to_owned());
-                bridge
-                    .as_mut()
-                    .rust_mut()
-                    .cluster_siblings
-                    .insert(key.clone(), members);
+                {
+                    let mut r = bridge.as_mut().rust_mut();
+                    r.cluster_siblings.insert(key.clone(), members);
+                    r.cluster_member_addrs.extend(relay_addrs);
+                }
                 // Roster often arrives *after* SupernodeConnected for a cold
                 // sibling. Rematerialize only hosts not yet done this session
                 // (see rematerialized_hosts) so we don't re-CreateRoom forever.
@@ -9377,7 +9503,7 @@ fn dispatch_event(
                 bridge.as_mut().file_failed(QString::from(json.as_str()));
             });
         }
-        ConnectionEvent::ConnectionStats { json, .. } => {
+        ConnectionEvent::ConnectionStats { peer_id, json } => {
             let _ = qt_thread.queue(move |mut bridge: Pin<&mut ffi::AppBridge>| {
                 // Feed transport loss/RTT into the call controller's adaptive
                 // bitrate control before forwarding the stats to QML.
@@ -9396,6 +9522,15 @@ fn dispatch_event(
                     // back-off as headroom and climb into it.
                     if let Some(sender) = bridge.as_mut().rust_mut().video_sender.as_mut() {
                         sender.apply_network_quality(loss_pct);
+                    }
+                    // Keep supernode rows per cluster member for the room
+                    // connection panel. Peer rows resolve to no member key.
+                    if let Some(key) = bridge.rust().cluster_member_key(&peer_id) {
+                        bridge
+                            .as_mut()
+                            .rust_mut()
+                            .supernode_stats
+                            .insert(key.trim_end_matches('=').to_owned(), v);
                     }
                 }
                 bridge
@@ -9696,9 +9831,11 @@ mod room_voice_count_tests {
 #[cfg(test)]
 mod cluster_grouping_tests {
     use super::{
-        cluster_full_set, cluster_representative, cluster_rollup_connected,
-        pick_live_cluster_member, pub_id_eq, ClusterSiblings, MemberConnected,
+        cluster_full_set, cluster_node_rows, cluster_representative, cluster_rollup_connected,
+        pick_live_cluster_member, pub_id_eq, ClusterNodeSources, ClusterSiblings,
+        MemberConnected,
     };
+    use std::collections::HashMap;
 
     /// A 3-member cluster where each member's verified roster lists the other
     /// two (siblings exclude self, as `verified_members` returns them).
@@ -9781,6 +9918,57 @@ mod cluster_grouping_tests {
         let s = abc_cluster();
         assert!(cluster_full_set(&s, "A").iter().any(|m| pub_id_eq(m, "C")));
         assert!(cluster_full_set(&s, "C").iter().any(|m| pub_id_eq(m, "A")));
+    }
+
+    #[test]
+    fn node_rows_put_serving_member_first_and_hide_stale_readings() {
+        // A is a known supernode, so its own roster and live state are keyed by
+        // the padded canonical id while its siblings name it unpadded.
+        let mut s = ClusterSiblings::new();
+        s.insert("A=".into(), vec!["B".into(), "C".into()]);
+        s.insert("B".into(), vec!["A".into(), "C".into()]);
+        s.insert("C".into(), vec!["A".into(), "B".into()]);
+        let c = connected(&[("A=", true), ("B", false), ("C", true)]);
+        let stats: HashMap<String, serde_json::Value> = [
+            ("A".to_owned(), serde_json::json!({ "rtt_ms": 20.0 })),
+            // B's last reading, still cached when it dropped.
+            ("B".to_owned(), serde_json::json!({ "rtt_ms": 90.0 })),
+            ("C".to_owned(), serde_json::json!({ "rtt_ms": 40.0 })),
+        ]
+        .into_iter()
+        .collect();
+        let addrs: HashMap<String, String> =
+            [("C".to_owned(), "10.0.0.3:3778".to_owned())].into_iter().collect();
+        let rosters: HashMap<String, Vec<String>> = [
+            ("C:room1".to_owned(), vec!["p1".to_owned(), "p2".to_owned()]),
+            ("C:other".to_owned(), vec!["p3".to_owned()]),
+            ("B:room1".to_owned(), vec!["p4".to_owned()]),
+        ]
+        .into_iter()
+        .collect();
+        let src = ClusterNodeSources {
+            siblings: &s,
+            connected: &c,
+            stats: &stats,
+            addrs: &addrs,
+            rosters: &rosters,
+        };
+
+        let rows = cluster_node_rows(&src, "B", "room1", "C");
+
+        // Serving member, then the other live one, then the dead one — and the
+        // padded and unpadded forms of A collapse to a single row.
+        let ids: Vec<&str> = rows.iter().map(|r| r["node_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["C", "A", "B"]);
+        assert_eq!(rows[0]["active"], true);
+        assert_eq!(rows[0]["relay_addr"], "10.0.0.3:3778");
+        assert_eq!(rows[0]["room_members"], 2);
+        assert_eq!(rows[1]["active"], false);
+        assert_eq!(rows[1]["stats"]["rtt_ms"], 20.0);
+        assert!(rows[1]["room_members"].is_null());
+        assert_eq!(rows[2]["connected"], false);
+        assert!(rows[2]["stats"].is_null());
+        assert!(rows[2]["room_members"].is_null());
     }
 }
 

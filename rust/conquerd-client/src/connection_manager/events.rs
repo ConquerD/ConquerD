@@ -92,6 +92,10 @@ pub enum ConnectionEvent {
     ClusterMembersUpdated {
         supernode_id: String,
         members: Vec<String>,
+        /// Relay attach address (`host:port`) per sibling in `members`, keyed
+        /// by the same pad-normalized id. Informational: the room connection
+        /// panel shows it so members sharing one title can be told apart.
+        relay_addrs: std::collections::HashMap<String, String>,
     },
     /// Session state update for a peer.
     SessionStateUpdate(PeerSessionState),

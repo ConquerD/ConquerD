@@ -254,9 +254,19 @@ impl ConnectionManager {
             .iter()
             .map(|m| m.identity_pub.trim_end_matches('=').to_owned())
             .collect();
+        let relay_addrs = members
+            .iter()
+            .map(|m| {
+                (
+                    m.identity_pub.trim_end_matches('=').to_owned(),
+                    m.relay_addr.clone(),
+                )
+            })
+            .collect();
         self.emit_event(ConnectionEvent::ClusterMembersUpdated {
             supernode_id: supernode_id.to_owned(),
             members: member_ids,
+            relay_addrs,
         });
     }
 
