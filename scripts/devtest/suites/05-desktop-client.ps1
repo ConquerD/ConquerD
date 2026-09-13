@@ -18,15 +18,29 @@ if (-not (Test-Path $logPath)) {
     return
 }
 
-$log = Get-Content $logPath -ErrorAction SilentlyContinue
-if ($null -eq $log) { $log = @() }
+$fullLog = @(Get-Content $logPath -ErrorAction SilentlyContinue)
+
+# Health checks read a recent window, not the whole file.
+#
+# The log is truncated at startup, so it is per-session - but a session runs
+# for hours, and counting from the top reports a problem that was fixed an
+# hour ago as though it were happening now. The window is what makes a red
+# result mean "this is wrong currently".
+$RecentWindow = 4000
+if ($fullLog.Count -gt $RecentWindow) {
+    $log = $fullLog[($fullLog.Count - $RecentWindow)..($fullLog.Count - 1)]
+} else {
+    $log = $fullLog
+}
 
 # ── Audio device selection ─────────────────────────────────────────────────
 #
 # Logged once per pipeline start. Worth asserting present because its absence
 # means audio never started at all, which otherwise looks like a network fault.
 
-$devices = @($log | Select-String -Pattern 'Audio devices:')
+# Startup-scoped: logged once per pipeline start, which is usually far above
+# the recent window, so this one deliberately reads the whole file.
+$devices = @($fullLog | Select-String -Pattern 'Audio devices:')
 if ($devices.Count -eq 0) {
     Skip-Test $Suite 'audio pipeline started' 'no Audio devices line (never joined voice)'
 } else {
@@ -85,7 +99,7 @@ Assert-NoMatch $Suite 'no punch self-pairing seen by client' $log `
 # a long session buries everything else under tens of thousands of lines. Not
 # a failure - surfaced so the count is visible when reading a log by hand.
 
-$replay = @($log | Select-String -Pattern 'replayed message').Count
+$replay = @($fullLog | Select-String -Pattern 'replayed message').Count
 if ($replay -gt 0) {
     Add-Result $Suite 'multi-home dedupe observed' 'Pass' "$replay duplicate(s) dropped (WARN-level noise)"
 }
