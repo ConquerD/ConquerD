@@ -44,6 +44,23 @@ data class CallState(
     val muted: Boolean = false,
 )
 
+/**
+ * The room voice is live in.
+ *
+ * Held apart from [Screen.RoomChat] because the two are independent: voice
+ * keeps running while the user reads another room, or no room at all. Carrying
+ * the name means the persistent rail can say *which* room is live without
+ * looking it up in a list that may not contain it any more.
+ */
+data class VoiceRoom(
+    val supernodeId: String,
+    val roomId: String,
+    val roomName: String,
+) {
+    /** Key into [AppState.roomVoiceRosters] / [AppState.roomTextRosters]. */
+    val rosterKey: String get() = "$supernodeId:$roomId"
+}
+
 data class AppState(
     val screen: Screen = Screen.Unlock,
     val busy: Boolean = false,
@@ -113,6 +130,14 @@ data class AppState(
     val showHiddenRooms: Boolean = false,
     /** True while capturing and sending audio into the open room. */
     val roomVoiceActive: Boolean = false,
+    /**
+     * The room voice is live in, independent of what is on screen.
+     *
+     * `null` when not in room voice. [roomVoiceActive] tracks the same thing
+     * as a boolean for the call sites that only need "is voice on"; this
+     * carries the identity the persistent rail needs.
+     */
+    val voiceRoom: VoiceRoom? = null,
     /** Voice is playing out of the loudspeaker rather than the earpiece. */
     val speakerphone: Boolean = false,
     /** A wired/Bluetooth headset is attached, so it outranks [speakerphone]. */
@@ -1234,7 +1259,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun closeRoom() {
         val room = (_state.value.screen as? Screen.RoomChat)?.room
-        val wasInVoice = _state.value.roomVoiceActive
+        // Voice deliberately survives closing the view. Reading another room —
+        // or none — is navigation, not hanging up, and the persistent rail is
+        // what keeps a live session reachable from wherever the user goes. The
+        // mic therefore stays claimed; only an explicit leave releases it.
+        val leavingVoiceRoom =
+            _state.value.roomVoiceActive && _state.value.voiceRoom?.roomId == room?.roomId
         _state.update {
             it.copy(
                 screen = Screen.Home,
@@ -1242,27 +1272,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 roomMembers = emptyList(),
                 roomChatMembers = emptyList(),
                 roomJoined = false,
-                roomVoiceActive = false,
             )
         }
         if (room == null) return
 
         viewModelScope.launch {
-            // Stop capture first: leaving the room while still in room mode
-            // would keep the microphone live for a room we are no longer in.
-            if (wasInVoice) {
-                core.command("room.voice.leave")
-                CoreService.setMediaActive(getApplication(), microphone = false, camera = false)
-            }
             // Deliberately no room.chat.unsubscribe here. Closing the view
             // is not leaving the room, and unsubscribing on the way out is
             // what removed us from the roster and let the remaining member
             // rotate the group key without us. The desktop keeps every room
             // it can see subscribed regardless of which one is selected;
             // leaving for real goes through hiding or removing the room.
-            core.command("room.leave") {
-                put("supernode_id", room.supernodeId)
-                put("room_id", room.roomId)
+            //
+            // `room.leave` is skipped while voice is live in this same room:
+            // it drops the SFU membership the voice session is riding on, so
+            // sending it here is what used to end the call on a back press.
+            if (!leavingVoiceRoom) {
+                core.command("room.leave") {
+                    put("supernode_id", room.supernodeId)
+                    put("room_id", room.roomId)
+                }
             }
         }
     }
@@ -1285,7 +1314,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 put("room_id", room.roomId)
             }
             if (reply.ok) {
-                _state.update { it.copy(roomVoiceActive = true, muted = false) }
+                _state.update {
+                    it.copy(
+                        roomVoiceActive = true,
+                        muted = false,
+                        voiceRoom = VoiceRoom(room.supernodeId, room.roomId, room.roomName),
+                    )
+                }
             } else {
                 _state.update { it.copy(error = reply.errorText) }
                 CoreService.setMediaActive(getApplication(), microphone = false, camera = false)
@@ -1295,7 +1330,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun leaveRoomVoice() {
-        _state.update { it.copy(roomVoiceActive = false) }
+        _state.update { it.copy(roomVoiceActive = false, voiceRoom = null) }
         viewModelScope.launch {
             core.command("room.voice.leave")
             CoreService.setMediaActive(getApplication(), microphone = false, camera = false)
@@ -1654,6 +1689,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         roomTextRosters = it.roomTextRosters + (key to chatMembers),
                     )
                 }
+                // The persistent voice rail draws faces, and it is visible from
+                // screens that never load a room. Fetching here — for every
+                // roster, not just the open room's — is what makes an avatar
+                // present the moment the rail appears. Already-known ids are
+                // filtered out inside, so this is cheap to call on each change.
+                refreshAvatars(members)
                 if (!isOpenRoom(event)) return@onCoreEvent
                 // Membership arriving at all means the supernode admitted us.
                 _state.update {

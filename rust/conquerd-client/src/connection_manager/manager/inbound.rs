@@ -944,6 +944,23 @@ impl ConnectionManager {
                             "[room.audio.sfu] failed to open E2E frame from {}; dropping",
                             &msg.sender[..8.min(msg.sender.len())]
                         );
+                        // Same recovery the chat path performs, and for the
+                        // same reason: this frame is the only evidence of where
+                        // the room's keying actually is, so record it and catch
+                        // up if keying is ours.
+                        //
+                        // Voice is the case that needs it most. Keys live only
+                        // in memory, so a restarted keyer has no idea the room
+                        // has moved on; without this it mints epoch 0 again,
+                        // every member holding a higher epoch refuses it (a
+                        // restart is indistinguishable from a rollback), and the
+                        // room splits permanently. A voice-only room has no chat
+                        // frames to heal it, so every one of these drops was the
+                        // evidence needed to converge, discarded.
+                        if let Some(e) = crate::group_key::media_frame_epoch(&raw) {
+                            self.group_keys.note_observed_epoch(room_id, e);
+                            self.rekey_room_if_behind(room_id).await;
+                        }
                         return;
                     }
                 };

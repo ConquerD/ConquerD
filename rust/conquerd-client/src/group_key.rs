@@ -430,6 +430,19 @@ pub fn open_voice_frame(
     open_media_frame(keys, MediaKind::Voice, conv_id, sender, sequence, frame)
 }
 
+/// The epoch a media frame was sealed under, without opening it.
+///
+/// A frame we *cannot* open is the only evidence of how far the room's keying
+/// has moved past us, so the epoch has to be readable independently of holding
+/// the key — that is what lets a restarted keyer mint above the room instead of
+/// below it. `None` for a frame too short to carry a header.
+pub fn media_frame_epoch(frame: &[u8]) -> Option<u8> {
+    if frame.len() < VOICE_HEADER_LEN {
+        return None;
+    }
+    frame.first().copied()
+}
+
 // ---------------------------------------------------------------------------
 // Room text-chat body codec
 // ---------------------------------------------------------------------------
@@ -819,6 +832,40 @@ mod tests {
         let (epoch, _) = restarted.new_owner_epoch(CONV);
 
         assert_eq!(epoch, 5, "must mint above the room, not below it");
+    }
+
+    /// The precondition that recovery depends on.
+    ///
+    /// `note_observed_epoch` can only be fed from frames we failed to open -
+    /// by definition we hold no key for them - so the epoch has to be readable
+    /// straight off the wire. Voice is where this matters: a voice-only room
+    /// has no chat frames to heal it, and every undecryptable audio frame is
+    /// the evidence needed to converge.
+    #[test]
+    fn a_frame_reveals_its_epoch_without_the_key() {
+        let mut keyer = SenderKeysGroup::new();
+        keyer.note_observed_epoch(CONV, 6);
+        let (epoch, _) = keyer.new_owner_epoch(CONV);
+        assert_eq!(epoch, 7);
+
+        let frame = seal_voice_frame(&keyer, CONV, "sender", 1, &[1, 2, 3])
+            .expect("sealing under a real key");
+
+        // A member holding nothing for this conversation still learns where
+        // the room is, which is the whole recovery path.
+        let stranger = SenderKeysGroup::new();
+        assert!(
+            open_voice_frame(&stranger, CONV, "sender", 1, &frame).is_none(),
+            "precondition: the frame must not be openable"
+        );
+        assert_eq!(media_frame_epoch(&frame), Some(epoch));
+    }
+
+    /// A truncated frame carries no epoch to trust.
+    #[test]
+    fn a_short_frame_has_no_epoch() {
+        assert_eq!(media_frame_epoch(&[]), None);
+        assert_eq!(media_frame_epoch(&[7u8; VOICE_HEADER_LEN - 1]), None);
     }
 
     /// And the offer has to be one a member will actually take: the whole point

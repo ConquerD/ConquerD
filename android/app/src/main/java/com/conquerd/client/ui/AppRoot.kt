@@ -8,6 +8,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -164,7 +165,36 @@ fun AppRoot(viewModel: AppViewModel) {
     Scaffold(
         snackbarHost = { SnackbarHost(snackbars) },
     ) { padding ->
-        Surface(modifier = Modifier.padding(padding).fillMaxSize()) {
+        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+            // Voice outlives the room view it was started from, so the rail
+            // lives above the navigating content rather than inside any one
+            // screen. Without this a live call is only reachable — and only
+            // visible — from the room it began in.
+            state.voiceRoom?.let { voice ->
+                VoiceRail(
+                    roomName = voice.roomName,
+                    // Rosters are per supernode and this room may be homed on
+                    // several, so the rail reads the one for the room voice is
+                    // actually in rather than whatever room is on screen.
+                    members = state.roomVoiceRosters[voice.rosterKey].orEmpty(),
+                    peers = state.peers,
+                    avatars = state.avatars,
+                    muted = state.muted,
+                    videoActive = state.videoActive,
+                    speakerphone = state.speakerphone,
+                    headsetAttached = state.headsetAttached,
+                    onToggleMute = viewModel::toggleMute,
+                    onToggleSpeaker = { viewModel.setSpeakerphone(!state.speakerphone) },
+                    onToggleVideo = {
+                        if (state.videoActive) {
+                            viewModel.stopVideo(null)
+                            CameraCapture.stop()
+                        }
+                    },
+                    onLeave = viewModel::leaveRoomVoice,
+                )
+            }
+            Surface(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when (val screen = state.screen) {
                 Screen.Unlock -> UnlockScreen(
                     busy = state.busy,
@@ -215,6 +245,7 @@ fun AppRoot(viewModel: AppViewModel) {
                     onCall = { viewModel.startCall(screen.peer) },
                     onRetry = { viewModel.retryMessage(it.id) },
                     onDelete = { viewModel.deleteMessage(it.id) },
+                    onAcceptInvite = viewModel::acceptInvite,
                     transfers = state.transfers,
                     onSendFile = viewModel::sendFile,
                 )
@@ -243,10 +274,12 @@ fun AppRoot(viewModel: AppViewModel) {
                     onToggleVideo = { wanted ->
                         if (wanted) viewModel.startVideo(null) else viewModel.stopVideo(null)
                     },
+                    onAcceptInvite = viewModel::acceptInvite,
                     transfers = state.transfers,
                     onSendFile = viewModel::sendRoomFile,
                     onShare = viewModel::generateRoomInvite,
                 )
+            }
             }
         }
     }
@@ -1327,6 +1360,7 @@ private fun ChatScreen(
     onCall: () -> Unit,
     onRetry: (ChatMessage) -> Unit,
     onDelete: (ChatMessage) -> Unit,
+    onAcceptInvite: (String) -> Unit,
     transfers: Map<String, Float>,
     onSendFile: (android.net.Uri) -> Unit,
 ) {
@@ -1393,6 +1427,7 @@ private fun ChatScreen(
                         message = message,
                         onRetry = { onRetry(message) },
                         onDelete = { onDelete(message) },
+                        onAcceptInvite = onAcceptInvite,
                     )
                 }
             }
@@ -1445,7 +1480,12 @@ private fun MessageBubble(
     message: ChatMessage,
     onRetry: () -> Unit,
     onDelete: () -> Unit,
+    onAcceptInvite: (String) -> Unit,
 ) {
+    val invite = remember(message.body) { findInviteUrl(message.body) }
+    // With the link lifted into the card, a message that was only a link has
+    // no text left worth a bubble.
+    val text = if (invite == null) message.body else bodyWithoutInvite(message.body, invite)
     var menuOpen by remember { mutableStateOf(false) }
     val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
     val alignment = if (message.isSelf) Alignment.End else Alignment.Start
@@ -1464,7 +1504,7 @@ private fun MessageBubble(
                     onLongClick = { menuOpen = true },
                 ),
             ) {
-                Text(message.body, modifier = Modifier.padding(10.dp))
+                Text(text, modifier = Modifier.padding(10.dp))
             }
 
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
@@ -1496,6 +1536,10 @@ private fun MessageBubble(
                     },
                 )
             }
+        }
+        invite?.let {
+            Spacer(Modifier.height(4.dp))
+            InviteEmbed(url = it, mine = message.isSelf, onAccept = onAcceptInvite)
         }
         // A failed send is the one status worth spending a line on — the rest
         // (sending, sent, delivered) resolve on their own within a second.
@@ -1541,6 +1585,7 @@ private fun RoomChatScreen(
     onToggleMute: () -> Unit,
     onToggleSpeaker: () -> Unit,
     onToggleVideo: (Boolean) -> Unit,
+    onAcceptInvite: (String) -> Unit,
     transfers: Map<String, Float>,
     onSendFile: (android.net.Uri) -> Unit,
     onShare: () -> Unit,
@@ -1638,27 +1683,6 @@ private fun RoomChatScreen(
             },
         )
 
-        if (voiceActive) {
-            VoiceRail(
-                members = members,
-                muted = muted,
-                videoActive = videoActive,
-                speakerphone = speakerphone,
-                headsetAttached = headsetAttached,
-                onToggleMute = onToggleMute,
-                onToggleSpeaker = onToggleSpeaker,
-                onToggleVideo = {
-                    if (videoActive) {
-                        onToggleVideo(false)
-                        CameraCapture.stop()
-                    } else {
-                        requestCamera()
-                    }
-                },
-                onLeave = onLeaveVoice,
-            )
-        }
-
         if (messages.isEmpty()) {
             Column(
                 modifier = Modifier.weight(1f).fillMaxWidth().padding(32.dp),
@@ -1692,6 +1716,7 @@ private fun RoomChatScreen(
                             message = it,
                             avatar = avatars[it.senderId],
                             senderName = peers.roomSenderName(it.senderId, it.senderHandle),
+                            onAcceptInvite = onAcceptInvite,
                         )
                     }
                 }
@@ -1745,7 +1770,10 @@ private fun RoomChatScreen(
  */
 @Composable
 private fun VoiceRail(
+    roomName: String,
     members: List<String>,
+    peers: List<Peer>,
+    avatars: Map<String, AvatarArt>,
     muted: Boolean,
     videoActive: Boolean,
     speakerphone: Boolean,
@@ -1763,12 +1791,22 @@ private fun VoiceRail(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(8.dp).clip(CircleShape).background(Color(0xFF16A34A)))
                 Spacer(Modifier.width(8.dp))
-                Text(
-                    "In voice - ${members.size} " +
-                        if (members.size == 1) "participant" else "participants",
-                    style = MaterialTheme.typography.labelLarge,
-                    modifier = Modifier.weight(1f),
-                )
+                Column(Modifier.weight(1f)) {
+                    // Names the live room: the rail is now visible from any
+                    // screen, so "in voice" alone would not say where.
+                    Text(
+                        roomName.ifBlank { "Voice" },
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${members.size} " +
+                            if (members.size == 1) "participant" else "participants",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 TextButton(onClick = onToggleMute) {
                     Text(if (muted) "Unmute" else "Mute")
                 }
@@ -1783,28 +1821,50 @@ private fun VoiceRail(
                         }
                     )
                 }
-                TextButton(onClick = onToggleVideo) {
-                    Text(if (videoActive) "Stop video" else "Video")
+                // Stop only. Starting video needs the camera-permission
+                // flow, which lives on the room screen; offering "Video" here
+                // would be a button that silently does nothing when the rail
+                // is shown over some other screen.
+                if (videoActive) {
+                    TextButton(onClick = onToggleVideo) { Text("Stop video") }
                 }
                 TextButton(onClick = onLeave) { Text("Leave") }
             }
 
             if (members.isNotEmpty()) {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    members.joinToString(", ") { it.take(10) },
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Spacer(Modifier.height(6.dp))
+                // Scrolls rather than wraps: the rail sits above every screen,
+                // so a busy room must not be able to grow it tall enough to
+                // push the content it is floating over off the display.
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    members.forEach { memberId ->
+                        VoiceParticipant(
+                            // Room rosters carry the base64 public_id, which is
+                            // also the spelling avatars are fetched under; the
+                            // helper bridges it to the hex-keyed peer store.
+                            name = peers.roomSenderName(memberId, ""),
+                            avatar = avatars[memberId],
+                        )
+                        Spacer(Modifier.width(10.dp))
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun RoomMessageBubble(message: RoomMessage, avatar: AvatarArt?, senderName: String) {
+private fun RoomMessageBubble(
+    message: RoomMessage,
+    avatar: AvatarArt?,
+    senderName: String,
+    onAcceptInvite: (String) -> Unit,
+) {
+    val invite = remember(message.body) { findInviteUrl(message.body) }
+    val text = if (invite == null) message.body else bodyWithoutInvite(message.body, invite)
     val alignment = if (message.isSelf) Alignment.End else Alignment.Start
     val container = if (message.isSelf) {
         MaterialTheme.colorScheme.primaryContainer
@@ -1835,8 +1895,14 @@ private fun RoomMessageBubble(message: RoomMessage, avatar: AvatarArt?, senderNa
                     modifier = Modifier.padding(horizontal = 4.dp),
                 )
             }
-            Card(colors = CardDefaults.cardColors(containerColor = container)) {
-                Text(message.body, modifier = Modifier.padding(10.dp))
+            if (text.isNotBlank()) {
+                Card(colors = CardDefaults.cardColors(containerColor = container)) {
+                    Text(text, modifier = Modifier.padding(10.dp))
+                }
+            }
+            invite?.let {
+                Spacer(Modifier.height(4.dp))
+                InviteEmbed(url = it, mine = message.isSelf, onAccept = onAcceptInvite)
             }
             Text(
                 formatTime(message.timestamp),
@@ -1851,6 +1917,30 @@ private fun RoomMessageBubble(message: RoomMessage, avatar: AvatarArt?, senderNa
         }
     }
 }
+
+/** One face in the voice rail: avatar beside handle, sized for a dense row. */
+@Composable
+private fun VoiceParticipant(name: String, avatar: AvatarArt?) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        if (avatar != null) {
+            Avatar(avatar, Modifier.size(VOICE_AVATAR_SIZE))
+        } else {
+            // Held open so names stay aligned while an avatar is still being
+            // fetched, rather than the row reflowing under them.
+            Spacer(Modifier.size(VOICE_AVATAR_SIZE))
+        }
+        Spacer(Modifier.width(5.dp))
+        Text(
+            name,
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/** Smaller than the 32dp message avatar: the rail is a strip, not a list. */
+private val VOICE_AVATAR_SIZE = 20.dp
 
 /**
  * One avatar beside a room message, holding its space while the art loads.

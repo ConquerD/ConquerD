@@ -48,12 +48,15 @@ class AppSettings(context: Context) {
     /**
      * Play voice out of the loudspeaker rather than the earpiece.
      *
-     * Off by default: the earpiece is the private choice, and a phone held to
-     * the ear is the one case where the speaker is actively wrong. A attached
-     * headset overrides this either way — see [AudioRouter].
+     * On by default, because that is where audio went before routing was
+     * controllable at all: every stream was Usage::Media and therefore always
+     * on the loudspeaker. Defaulting to the earpiece silently moves audio to a
+     * speaker the user is not holding to their ear, which reads as the app
+     * having gone silent. Earpiece is the opt-in. An attached headset
+     * overrides this either way — see [AudioRouter].
      */
     var speakerphone: Boolean
-        get() = prefs.getBoolean(KEY_SPEAKERPHONE, false)
+        get() = prefs.getBoolean(KEY_SPEAKERPHONE, true)
         set(value) = prefs.edit().putBoolean(KEY_SPEAKERPHONE, value).apply()
 
     /** Noise gate: 0 off, 1 mild, 2 moderate, 3 aggressive, 4 max. */
