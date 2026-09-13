@@ -122,8 +122,8 @@ pub use peer_session::{parse_quic_lan_hint, peer_quic_endpoint, peer_reconnect_b
 pub use room_session::{
     accept_group_key_epoch, is_elected_keyer, may_send_room_e2e_content, normalize_room_type,
     plan_cluster_failover, room_scope_key, should_auto_join_on_room_created,
-    should_mint_first_room_key, should_track_pending_materialize, should_use_private_room_invite,
-    union_members_for_room, FailoverPlan,
+    should_mint_first_room_key, should_reseal_to_lagging_member, should_track_pending_materialize,
+    should_use_private_room_invite, union_members_for_room, FailoverPlan, MAX_EPOCH_ADVANCE,
 };
 pub use routing::should_fanout_peer_relay;
 
@@ -609,6 +609,40 @@ impl ConnectionManager {
     #[cfg(test)]
     pub(super) fn test_mint_group_key(&mut self, room_id: &str) {
         self.group_keys.new_owner_epoch(room_id);
+    }
+
+    /// Test-only: rotate `room_id`'s group key without distributing it — the
+    /// state a rotation some member never heard about leaves behind.
+    #[cfg(test)]
+    pub(super) fn test_rotate_group_key(&mut self, room_id: &str) -> u8 {
+        self.group_keys.rotate(room_id).0
+    }
+
+    /// Test-only: the epoch this manager seals `room_id` traffic under.
+    #[cfg(test)]
+    pub(super) fn test_group_key_epoch(&self, room_id: &str) -> u8 {
+        crate::group_key::GroupKeySource::current_epoch(&self.group_keys, room_id)
+    }
+
+    /// Test-only: pretend `room_id`'s current epoch became current `by` ago.
+    #[cfg(test)]
+    pub(super) fn test_age_group_key(&mut self, room_id: &str, by: Duration) {
+        self.group_keys.backdate_current_epoch(room_id, by);
+    }
+
+    /// Test-only: record `members` as `supernode_id`'s snapshot of `room_id`,
+    /// without the keying a real `SfuMembers` would set off.
+    #[cfg(test)]
+    pub(super) fn test_set_room_members(
+        &mut self,
+        supernode_id: &str,
+        room_id: &str,
+        members: &[String],
+    ) {
+        self.room_group_members.insert(
+            format!("{supernode_id}:{room_id}"),
+            members.iter().cloned().collect(),
+        );
     }
 
     /// Test-only: number of relay dials spawned but not yet resolved.

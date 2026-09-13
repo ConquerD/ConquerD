@@ -5,8 +5,9 @@ use super::manager::{
     normalize_room_type, parse_quic_lan_hint, parse_room_invite, peer_quic_endpoint,
     peer_reconnect_backoff, plan_cluster_failover, room_scope_key,
     should_auto_join_on_room_created, should_fanout_peer_relay, should_mint_first_room_key,
-    should_track_pending_materialize, should_use_private_room_invite, union_members_for_room,
-    FailoverPlan, RoomInvitePayload, ROOM_INVITE_SCHEMA,
+    should_reseal_to_lagging_member, should_track_pending_materialize,
+    should_use_private_room_invite, union_members_for_room, FailoverPlan, RoomInvitePayload,
+    MAX_EPOCH_ADVANCE, ROOM_INVITE_SCHEMA,
 };
 use super::ConnectionManager;
 use crate::protocol::MessageType;
@@ -753,25 +754,214 @@ fn accept_group_key_requires_elected_keyer() {
     assert!(!is_elected_keyer(&members, "bob"));
 }
 
-/// Epoch policy for installing a sealed SfuGroupKey (security: no hostile jumps).
+/// Epoch policy for installing a sealed SfuGroupKey from the elected keyer.
 #[test]
-fn accept_group_key_epoch_allows_bootstrap_and_adjacent_only() {
+fn accept_group_key_epoch_allows_bootstrap_and_forward_only() {
     // No real key yet → first install accepts any offered epoch.
     assert!(accept_group_key_epoch(false, 0, 0));
     assert!(accept_group_key_epoch(false, 0, 7));
     assert!(accept_group_key_epoch(false, 0, 255));
 
-    // With real key at epoch 3: same epoch (reseal) and +1 (rotation) only.
+    // With real key at epoch 3: same epoch (reseal) and anything ahead in reach.
     assert!(accept_group_key_epoch(true, 3, 3));
     assert!(accept_group_key_epoch(true, 3, 4));
-    assert!(!accept_group_key_epoch(true, 3, 5));
+    assert!(accept_group_key_epoch(true, 3, 5));
+    assert!(accept_group_key_epoch(true, 3, 3 + MAX_EPOCH_ADVANCE));
+    assert!(!accept_group_key_epoch(true, 3, 3 + MAX_EPOCH_ADVANCE + 1));
+
+    // Rollbacks.
     assert!(!accept_group_key_epoch(true, 3, 2));
     assert!(!accept_group_key_epoch(true, 3, 0));
 
-    // u8 wrap: current 255, next rotation is 0.
+    // u8 wrap: current 255, the next rotations are 0, 1, ...
     assert!(accept_group_key_epoch(true, 255, 255));
     assert!(accept_group_key_epoch(true, 255, 0));
-    assert!(!accept_group_key_epoch(true, 255, 1));
+    assert!(accept_group_key_epoch(true, 255, 1));
+    assert!(!accept_group_key_epoch(true, 0, 255));
+}
+
+/// The 2026-09-12 split: a desktop held epoch 1 while the keyer rotated
+/// `default` to 5 without it. It refused 4 and 5 as jumps, the keyer gave up
+/// resending, and it stayed deaf both ways to everyone keyed since.
+#[test]
+fn a_member_that_missed_rotations_takes_the_rooms_epoch() {
+    assert!(accept_group_key_epoch(true, 1, 4));
+    assert!(accept_group_key_epoch(true, 1, 5));
+}
+
+/// When the keyer reopens distribution to a member still on an old epoch.
+#[test]
+fn keyer_reseals_only_to_a_member_left_behind() {
+    let settled = Duration::from_secs(60);
+    assert!(
+        should_reseal_to_lagging_member(1, 5, settled),
+        "left behind"
+    );
+    assert!(!should_reseal_to_lagging_member(5, 5, settled), "current");
+    assert!(
+        !should_reseal_to_lagging_member(6, 5, settled),
+        "ahead of us is not behind"
+    );
+    assert!(
+        !should_reseal_to_lagging_member(1, 5, Duration::from_millis(200)),
+        "just after a rotation an old epoch is a frame in flight"
+    );
+    assert!(
+        !should_reseal_to_lagging_member(0, MAX_EPOCH_ADVANCE + 1, settled),
+        "too far behind to take the offer"
+    );
+}
+
+/// An identity whose `public_id` sorts after `than`, making `than` the elected
+/// keyer of any room the two share.
+fn identity_sorting_after(than: &str) -> crate::identity::Identity {
+    loop {
+        let id = crate::identity::Identity::generate();
+        if id.public_id().trim_end_matches('=') > than.trim_end_matches('=') {
+            return id;
+        }
+    }
+}
+
+/// An identity whose `public_id` sorts before `than`, electing it over `than`.
+fn identity_sorting_before(than: &str) -> crate::identity::Identity {
+    loop {
+        let id = crate::identity::Identity::generate();
+        if id.public_id().trim_end_matches('=') < than.trim_end_matches('=') {
+            return id;
+        }
+    }
+}
+
+/// Signed room audio from `sender` whose frame claims `epoch`. The body is not a
+/// real seal: the keyer only reads the epoch, and cannot open it either way.
+fn room_audio_on_epoch(
+    sender: &crate::identity::Identity,
+    room_id: &str,
+    epoch: u8,
+) -> crate::protocol::SignalingMessage {
+    use base64::Engine;
+    use serde_json::Value;
+    let mut frame = vec![epoch];
+    frame.extend_from_slice(&[0u8; 12 + 32]);
+    let mut msg = crate::protocol::SignalingMessage::new(MessageType::SfuAudio, sender.public_id());
+    msg.payload.insert(
+        "audio".into(),
+        Value::String(base64::engine::general_purpose::URL_SAFE.encode(&frame)),
+    );
+    msg.payload.insert("e2e".into(), Value::Bool(true));
+    msg.payload
+        .insert("room_id".into(), Value::String(room_id.into()));
+    msg.payload.insert("seq".into(), Value::Number(1u64.into()));
+    harness::sign(sender, &mut msg);
+    msg
+}
+
+/// Epochs of the `SfuGroupKey`s in `sent` that were sealed to `member`.
+fn group_key_epochs_sealed_to(
+    member: &crate::identity::Identity,
+    sent: &[crate::protocol::SignalingMessage],
+) -> Vec<u64> {
+    let id = member.public_id();
+    sent.iter()
+        .filter(|m| {
+            m.msg_type == MessageType::EncryptedSignal && m.target.as_deref() == Some(id.as_str())
+        })
+        .filter_map(|env| {
+            let key = member.derive_pairwise_relay_key(&env.sender).ok()?;
+            let ct = crate::crypto::b64url_decode(env.payload.get("ciphertext")?.as_str()?).ok()?;
+            let plain = crate::crypto::decrypt_blob(&key, &ct).ok()?;
+            let inner =
+                crate::protocol::SignalingMessage::from_json(std::str::from_utf8(&plain).ok()?)
+                    .ok()?;
+            if inner.msg_type != MessageType::SfuGroupKey {
+                return None;
+            }
+            inner.payload.get("epoch")?.as_u64()
+        })
+        .collect()
+}
+
+/// A member that outlasted every reseal of a rotation is re-armed from its own
+/// frames, rather than left on the old epoch until membership next changes.
+#[tokio::test]
+async fn keyer_reseals_the_current_epoch_to_a_member_still_on_an_old_one() {
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-A");
+    let member = identity_sorting_after(&t.identity.public_id());
+    t.cm.test_set_room_members("SN-A", "room", &[member.public_id()]);
+    t.cm.test_mint_group_key("room");
+    let epoch = t.cm.test_rotate_group_key("room");
+    t.cm.test_age_group_key("room", Duration::from_secs(60));
+
+    t.cm.handle_inbound(room_audio_on_epoch(&member, "room", 0))
+        .await;
+    assert_eq!(
+        group_key_epochs_sealed_to(&member, &harness::drain_ws(&mut sn)),
+        vec![u64::from(epoch)],
+        "the member must be offered the room's epoch"
+    );
+
+    // Still on its way: more stale frames must not pile on more seals.
+    t.cm.handle_inbound(room_audio_on_epoch(&member, "room", 0))
+        .await;
+    assert!(group_key_epochs_sealed_to(&member, &harness::drain_ws(&mut sn)).is_empty());
+}
+
+/// Right after a rotation, frames sealed under the old epoch are still in
+/// flight. Answering each with a reseal would trail every rotation with a burst
+/// of redundant ones.
+#[tokio::test]
+async fn keyer_leaves_frames_in_flight_across_a_rotation_alone() {
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-A");
+    let member = identity_sorting_after(&t.identity.public_id());
+    t.cm.test_set_room_members("SN-A", "room", &[member.public_id()]);
+    t.cm.test_mint_group_key("room");
+    t.cm.test_rotate_group_key("room");
+
+    t.cm.handle_inbound(room_audio_on_epoch(&member, "room", 0))
+        .await;
+    assert!(group_key_epochs_sealed_to(&member, &harness::drain_ws(&mut sn)).is_empty());
+}
+
+/// The member half of the 2026-09-12 split, through the real inbound pipeline:
+/// holding epoch 1, it installs the elected keyer's epoch 5 and acks it.
+#[tokio::test]
+async fn member_on_an_old_epoch_installs_the_keyers_current_one() {
+    use serde_json::Value;
+    let mut t = harness::test_cm();
+    let mut sn = t.cm.test_add_supernode_session("SN-A");
+    let keyer = identity_sorting_before(&t.identity.public_id());
+    t.cm.test_set_room_members("SN-A", "default", &[keyer.public_id()]);
+    t.cm.test_mint_group_key("default");
+    t.cm.test_rotate_group_key("default");
+    assert_eq!(t.cm.test_group_key_epoch("default"), 1);
+
+    let mut offer =
+        crate::protocol::SignalingMessage::new(MessageType::SfuGroupKey, keyer.public_id());
+    offer
+        .payload
+        .insert("room_id".into(), Value::String("default".into()));
+    offer
+        .payload
+        .insert("epoch".into(), Value::Number(5u64.into()));
+    offer.payload.insert(
+        "key".into(),
+        Value::String(crate::crypto::b64url_encode(&[7u8; 32])),
+    );
+    harness::sign(&keyer, &mut offer);
+    t.cm.handle_inbound(offer).await;
+
+    assert_eq!(t.cm.test_group_key_epoch("default"), 5);
+    let keyer_id = keyer.public_id();
+    assert!(
+        harness::drain_ws(&mut sn).iter().any(|m| {
+            m.msg_type == MessageType::EncryptedSignal
+                && m.target.as_deref() == Some(keyer_id.as_str())
+        }),
+        "the install must be acked so the keyer stops resending"
+    );
 }
 
 /// Solo key defer closes the dual-keyer bootstrap race (architecture + opacity).

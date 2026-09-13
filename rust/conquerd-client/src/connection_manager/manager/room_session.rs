@@ -50,16 +50,59 @@ pub fn is_elected_keyer(members: &[String], me: &str) -> bool {
     members.iter().any(|m| bare(m) == me_bare) && !members.iter().any(|m| bare(m) < me_bare)
 }
 
+/// How far ahead of our epoch an elected keyer's offer may be.
+///
+/// A member that misses rotations — unreachable through every reseal, or briefly
+/// absent from the keyer's membership view — is behind by however many it
+/// missed, and its only way back is to take the room's current epoch directly.
+/// Admitting nothing past `current + 1` left it deaf in both directions until it
+/// restarted, while every other health check stayed green.
+///
+/// Bounded rather than open so the far half of the `u8` ring still reads as a
+/// rollback.
+pub const MAX_EPOCH_ADVANCE: u8 = 64;
+
 /// Epoch acceptance once the sender is known to be the elected keyer.
 ///
 /// * No real key yet → accept any epoch (first install / dual-join race heal).
-/// * Otherwise only the current epoch (reseal after reconnect) or the next
-///   rotation (`cur.wrapping_add(1)`) — rejects hostile epoch jumps.
+/// * Otherwise the current epoch (reseal after reconnect) or a later one up to
+///   [`MAX_EPOCH_ADVANCE`] ahead (rotations we missed). Earlier epochs are
+///   refused as rollbacks.
+///
+/// A forward jump is not a hostile-keyer hole. Only the elected keyer gets this
+/// far, and it mints the key: it can silence a room with a bad `current + 1`
+/// just as well, so refusing `current + 2` protected nothing.
 pub fn accept_group_key_epoch(has_real_key: bool, current_epoch: u8, offered: u8) -> bool {
     if !has_real_key {
         return true;
     }
-    offered == current_epoch || offered == current_epoch.wrapping_add(1)
+    offered.wrapping_sub(current_epoch) <= MAX_EPOCH_ADVANCE
+}
+
+/// Whether the elected keyer should reopen distribution to a member whose frames
+/// are still sealed under `member_epoch` while the room is on `room_epoch`, which
+/// became current `epoch_age` ago.
+///
+/// Distribution gives up after [`GROUP_KEY_MAX_ATTEMPTS`] and nothing re-arms it
+/// short of a membership change, so a member unreachable for that long stays on
+/// its old epoch indefinitely. Its frames are the evidence.
+///
+/// Waits out the ordinary distribution first: until that has been acked or given
+/// up, an old epoch on the wire is a frame in flight across the rotation, not a
+/// member left behind. Never for a member too far behind to take the offer, nor
+/// one *ahead* of us — that is `rekey_room_if_behind`'s case.
+pub fn should_reseal_to_lagging_member(
+    member_epoch: u8,
+    room_epoch: u8,
+    epoch_age: Duration,
+) -> bool {
+    let behind = room_epoch.wrapping_sub(member_epoch);
+    behind != 0 && behind <= MAX_EPOCH_ADVANCE && epoch_age >= group_key_distribution_window()
+}
+
+/// How long one distribution runs before the keyer gives up on a member.
+fn group_key_distribution_window() -> Duration {
+    Duration::from_millis(GROUP_KEY_RETRY_INTERVAL_MS * u64::from(GROUP_KEY_MAX_ATTEMPTS))
 }
 
 /// Whether the elected keyer should mint the first real room key now.
@@ -835,6 +878,67 @@ impl ConnectionManager {
         self.pending_group_key_acks.retain(|(r, _), _| r != room_id);
         let all: Vec<String> = union.iter().cloned().collect();
         self.distribute_group_key(room_id, epoch, &key, &all).await;
+    }
+
+    /// Reopen distribution to a member still sealing under an old epoch.
+    ///
+    /// See [`should_reseal_to_lagging_member`] for when. It gets the member what a
+    /// rejoin would — the current epoch and nothing older — without the rejoin,
+    /// so it hands out nothing a member present in the room is not entitled to.
+    ///
+    /// No-op unless we are the elected keyer and `sender` is a member.
+    pub(super) async fn reseal_to_lagging_member(
+        &mut self,
+        room_id: &str,
+        sender: &str,
+        sender_epoch: u8,
+    ) {
+        let Some(age) = self.group_keys.current_epoch_age(room_id) else {
+            return;
+        };
+        let epoch = self.group_keys.current_epoch(room_id);
+        if !should_reseal_to_lagging_member(sender_epoch, epoch, age) {
+            return;
+        }
+        let union = union_members_for_room(&self.room_group_members, room_id);
+        // Membership can spell one id padded or not. Seal and track under the
+        // spelling membership uses, as every other distribution does.
+        let Some(member) = union
+            .iter()
+            .find(|m| m.trim_end_matches('=') == sender.trim_end_matches('='))
+            .cloned()
+        else {
+            return;
+        };
+        let me = self.identity.public_id();
+        let mut present: Vec<String> = union.into_iter().collect();
+        present.push(me.clone());
+        if !is_elected_keyer(&present, &me) {
+            return;
+        }
+        let pending = (room_id.to_owned(), member.clone());
+        if self
+            .pending_group_key_acks
+            .get(&pending)
+            .is_some_and(|p| p.epoch == epoch)
+        {
+            // Already on its way; the retry timer owns it.
+            return;
+        }
+        let Some(key) = self.group_keys.epoch_key(room_id, epoch) else {
+            return;
+        };
+        info!(
+            "[group-key] {} is still on epoch {} in room {}; resealing epoch {}",
+            &member[..8.min(member.len())],
+            sender_epoch,
+            &room_id[..8.min(room_id.len())],
+            epoch
+        );
+        // A fresh distribution, not one more attempt at a stale one.
+        self.pending_group_key_acks.remove(&pending);
+        self.distribute_group_key(room_id, epoch, &key, &[member])
+            .await;
     }
 
     /// Request a relay grant for `supernode_id` so room audio can ride QUIC

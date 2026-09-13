@@ -363,7 +363,7 @@ change as well as a code change** — that rule now lives in the Documentation A
 ## Crypto — group-key keyer handover on join
 
 Found 2026-09-06 while testing Android room voice against the live `acdc` cluster. Two distinct
-problems; the first is fixed, the second is not.
+problems; the first is fixed, and the second was addressed 2026-09-12 (below).
 
 **Fixed:** `is_elected_keyer` compared `public_id`s raw. Membership is a union of snapshots and the
 relay path spells ids un-padded while SFU/signaling spell them padded, so one identity appeared as

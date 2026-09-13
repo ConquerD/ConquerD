@@ -813,10 +813,19 @@ impl ConnectionManager {
                         if let Some(e) = epoch_u8 {
                             self.group_keys.note_observed_epoch(&room_id, e);
                             self.rekey_room_if_behind(&room_id).await;
+                            // The other direction: the sender is the one behind.
+                            self.reseal_to_lagging_member(&room_id, &msg.sender, e)
+                                .await;
                         }
                         return;
                     }
                 };
+                // A text-only member sends no audio; its chat is the only sign
+                // that it was left behind by a rotation.
+                if let Some(e) = epoch_u8 {
+                    self.reseal_to_lagging_member(&room_id, &msg.sender, e)
+                        .await;
+                }
                 if !body.is_empty() {
                     // Enforce the room.chat.v1 per-sender inbound quota,
                     // symmetric with the outbound gate in dispatch_outbound
@@ -960,10 +969,18 @@ impl ConnectionManager {
                         if let Some(e) = crate::group_key::media_frame_epoch(&raw) {
                             self.group_keys.note_observed_epoch(room_id, e);
                             self.rekey_room_if_behind(room_id).await;
+                            // The other direction: the sender is the one behind.
+                            self.reseal_to_lagging_member(room_id, &msg.sender, e).await;
                         }
                         return;
                     }
                 };
+                // Opening is not the same as being current. We keep a few
+                // rotated-out epochs, so a member left behind by a rotation stays
+                // audible to us while nobody keyed since can hear it.
+                if let Some(e) = crate::group_key::media_frame_epoch(&raw) {
+                    self.reseal_to_lagging_member(room_id, &msg.sender, e).await;
+                }
                 if opus_data.is_empty() {
                     return;
                 }

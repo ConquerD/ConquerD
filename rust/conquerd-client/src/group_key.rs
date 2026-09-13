@@ -37,6 +37,7 @@
 //! The relay stays a dumb forwarder — it never sees the key or the plaintext.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use crate::crypto::{aesgcm_decrypt, aesgcm_encrypt, generate_nonce, hkdf_derive_key};
 
@@ -84,6 +85,9 @@ struct GroupState {
     /// offer every member would refuse, since `accept_group_key_epoch` cannot
     /// tell a restart from a rollback.
     seen_high: Option<u8>,
+    /// When `current` became current. Lets a keyer tell a member left behind by
+    /// a rotation from a frame that was merely in flight across it.
+    current_since: Option<Instant>,
     keys: BTreeMap<u8, [u8; GROUP_KEY_LEN]>,
 }
 
@@ -92,6 +96,10 @@ impl GroupState {
     /// the retained key history.
     fn install(&mut self, epoch: u8, key: [u8; GROUP_KEY_LEN]) {
         self.keys.insert(epoch, key);
+        // A reseal of the epoch we already hold is not a new epoch.
+        if self.current != epoch || self.current_since.is_none() {
+            self.current_since = Some(Instant::now());
+        }
         // Treat the just-installed epoch as newest (owner rotates monotonically
         // and members receive increasing epochs within a session).
         self.current = epoch;
@@ -231,6 +239,24 @@ impl SenderKeysGroup {
     /// still in play for `conv_id`.
     pub fn has_real_key(&self, conv_id: &str) -> bool {
         self.groups.get(conv_id).is_some_and(GroupState::has_keys)
+    }
+
+    /// How long the current epoch has been current, or `None` without real key
+    /// material.
+    pub fn current_epoch_age(&self, conv_id: &str) -> Option<Duration> {
+        self.groups
+            .get(conv_id)
+            .filter(|s| s.has_keys())
+            .and_then(|s| s.current_since)
+            .map(|since| since.elapsed())
+    }
+
+    /// Test-only: pretend the current epoch became current `by` ago.
+    #[cfg(test)]
+    pub fn backdate_current_epoch(&mut self, conv_id: &str, by: Duration) {
+        if let Some(state) = self.groups.get_mut(conv_id) {
+            state.current_since = state.current_since.and_then(|since| since.checked_sub(by));
+        }
     }
 
     /// Forget any distributed key material for `conv_id` (the deterministic
@@ -954,6 +980,30 @@ mod tests {
         assert_eq!(epoch, 7);
         assert_eq!(group.epoch_key(CONV, 7), Some(key));
         assert!(!group.is_behind(CONV));
+    }
+
+    /// A keyer tells a member left behind from a frame in flight by how long the
+    /// epoch has been current, so installing the same epoch again must not
+    /// restart that clock. A new epoch starts its own.
+    #[test]
+    fn a_reseal_does_not_restart_the_epoch_clock() {
+        let mut group = SenderKeysGroup::new();
+        assert_eq!(
+            group.current_epoch_age(CONV),
+            None,
+            "no key, no epoch to age"
+        );
+
+        group.install(CONV, 5, [5u8; GROUP_KEY_LEN]);
+        group.backdate_current_epoch(CONV, Duration::from_secs(60));
+        group.install(CONV, 5, [5u8; GROUP_KEY_LEN]);
+        assert!(group.current_epoch_age(CONV).unwrap() >= Duration::from_secs(59));
+
+        group.install(CONV, 6, [6u8; GROUP_KEY_LEN]);
+        assert!(
+            group.current_epoch_age(CONV).unwrap() < Duration::from_secs(59),
+            "a new epoch starts its own clock"
+        );
     }
 
     /// Catching up must leave the room readable: frames sealed under the new
