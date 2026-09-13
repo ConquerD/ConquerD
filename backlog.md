@@ -371,22 +371,36 @@ both `A...sg` and `A...sg=`; the un-padded copy sorts first, so receivers reject
 keyer's `SfuGroupKey` as "not elected". Now normalised, with two regression tests. Invariant is in
 `agents.md`.
 
-**Open — a newly elected keyer cannot take over an established room.** Election picks the
+**Was open — a newly elected keyer could not take over an established room.** Election picks the
 lexicographically smallest member, so a *joining* member can legitimately become the new keyer. It
-then mints via `should_mint_first_room_key`, which fires on `!has_real_key` and therefore starts at
-**epoch 0**. Every existing member is already at epoch N and `accept_group_key_epoch` only admits
-`cur` or `cur.wrapping_add(1)` — deliberately, to refuse hostile epoch jumps — so the new keyer's
-key is rejected by everyone while it rejects theirs (they are, correctly, not the elected keyer).
-Observed live: a phone joining `default` became the elected keyer at epoch 0/1 while another member
-kept rotating 2 -> 3 -> 4, and neither side could open the other's frames. Both behave exactly as
-written; the protocol has no handover.
+mints via `should_mint_first_room_key`, which fires on `!has_real_key` and so starts at **epoch 0**,
+below every existing member. Observed live: a phone joining `default` became the elected keyer at
+epoch 0/1 while another member kept rotating 2 -> 3 -> 4, and neither side could open the other's
+frames.
 
-Whoever picks this up: the fix is *not* to loosen `accept_group_key_epoch`, which is the guard
-against hostile epoch jumps. Options worth weighing — have the incoming keyer adopt the highest
-epoch it has observed and mint at `+1` rather than 0; defer minting until it has either received the
-current key or confirmed no other member holds one; or make handover explicit (the outgoing keyer
-seals the current epoch to the new one). Note the retry loop gives up after 16 attempts and does not
-re-arm, so even once the conflict clears the room does not self-heal without a rejoin.
+**Addressed 2026-09-12 in three parts** (covered by unit and manager-harness tests; not yet verified
+live):
+
+- *The keyer catches up.* `GroupState.seen_high` makes a keyer mint above the highest epoch it has
+  seen on the wire, fed from both chat and audio decrypt failures (`rekey_room_if_behind`). A new
+  keyer that minted 0 moves above the room as soon as it receives room traffic.
+- *Members take forward jumps.* `accept_group_key_epoch` now admits any epoch up to
+  `MAX_EPOCH_ADVANCE` (64) ahead from the elected keyer, and still refuses rollbacks and non-keyers.
+  **This deliberately reverses the note that used to be here** ("the fix is *not* to loosen
+  `accept_group_key_epoch`"). Adjacent-only stranded any member that missed two or more rotations:
+  a desktop held epoch 1 in `default` while the phone keyer rotated to 5 without it, refused 4 and 5,
+  and stayed deaf both ways to everyone keyed since (18.7k unopenable frames) until restarted. The
+  rule guarded nothing — only the elected keyer's offer reaches the epoch check, and that keyer mints
+  the key, so it can silence a room with a bad `current + 1` just as well.
+- *Retries re-arm.* Distribution still gives up after 16 attempts, but the elected keyer now reseals
+  the current epoch to a member whose audio or chat frames carry an older one
+  (`reseal_to_lagging_member`), once the epoch has been current for a full distribution window
+  (12 s), so frames in flight across a rotation don't trigger it.
+
+Still open: a stranded member that only *listens* sends no frames, so the keyer cannot see it is
+behind; it recovers at the next membership change or rejoin. Also unexplained: why that desktop never
+received epochs 2 and 3 at all, which suggests the keyer's membership union briefly excluded it. The
+phone's logcat had already rolled past the event, so capture the keyer's log next time.
 
 **Testing note:** the public `default` room is a bad place to test room E2E. It carries members on
 clients you do not control, and a single un-upgraded participant acting as a competing keyer is

@@ -545,8 +545,9 @@ impl ConnectionManager {
     /// Whether to install a sealed `SfuGroupKey` from `sender` for `room_id` at
     /// `epoch`. Requires the sender to be the elected keyer for the current
     /// membership view (including the sender if our snapshot is still empty —
-    /// join race) and the epoch to be the current one, the next rotation, or
-    /// any epoch when we have no real key yet.
+    /// join race) and the epoch to pass [`accept_group_key_epoch`]: current or
+    /// ahead by at most [`MAX_EPOCH_ADVANCE`], or any epoch when we have no real
+    /// key yet.
     pub(super) fn accept_group_key_from(&self, sender: &str, room_id: &str, epoch: u8) -> bool {
         let me = self.identity.public_id();
         let union = union_members_for_room(&self.room_group_members, room_id);

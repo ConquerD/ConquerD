@@ -3533,7 +3533,11 @@ impl ffi::AppBridge {
         QString::from(rep.as_str())
     }
 
-    fn room_node_status(self: Pin<&mut Self>, supernode_id: &QString, room_id: &QString) -> QString {
+    fn room_node_status(
+        self: Pin<&mut Self>,
+        supernode_id: &QString,
+        room_id: &QString,
+    ) -> QString {
         let r = self.rust();
         let id = supernode_id.to_string();
         let rid = room_id.to_string();
@@ -9832,8 +9836,7 @@ mod room_voice_count_tests {
 mod cluster_grouping_tests {
     use super::{
         cluster_full_set, cluster_node_rows, cluster_representative, cluster_rollup_connected,
-        pick_live_cluster_member, pub_id_eq, ClusterNodeSources, ClusterSiblings,
-        MemberConnected,
+        pick_live_cluster_member, pub_id_eq, ClusterNodeSources, ClusterSiblings, MemberConnected,
     };
     use std::collections::HashMap;
 
@@ -9937,8 +9940,9 @@ mod cluster_grouping_tests {
         ]
         .into_iter()
         .collect();
-        let addrs: HashMap<String, String> =
-            [("C".to_owned(), "10.0.0.3:3778".to_owned())].into_iter().collect();
+        let addrs: HashMap<String, String> = [("C".to_owned(), "10.0.0.3:3778".to_owned())]
+            .into_iter()
+            .collect();
         let rosters: HashMap<String, Vec<String>> = [
             ("C:room1".to_owned(), vec!["p1".to_owned(), "p2".to_owned()]),
             ("C:other".to_owned(), vec!["p3".to_owned()]),
@@ -9958,7 +9962,10 @@ mod cluster_grouping_tests {
 
         // Serving member, then the other live one, then the dead one — and the
         // padded and unpadded forms of A collapse to a single row.
-        let ids: Vec<&str> = rows.iter().map(|r| r["node_id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|r| r["node_id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, vec!["C", "A", "B"]);
         assert_eq!(rows[0]["active"], true);
         assert_eq!(rows[0]["relay_addr"], "10.0.0.3:3778");
