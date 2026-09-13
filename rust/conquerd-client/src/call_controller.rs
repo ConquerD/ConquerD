@@ -47,6 +47,20 @@ const MAX_JITTER_DEPTH: usize = 12;
 const JITTER_GROW_RATIO: f64 = 0.05;
 const JITTER_SHRINK_RATIO: f64 = 0.005;
 const JITTER_SHRINK_STREAK: u32 = 5;
+/// Longest run of empty playout slots still counted as underruns once a peer's
+/// audio resumes.
+///
+/// A started peer's queue running dry is either a frame arriving late or the
+/// sender going quiet — push-to-talk released, muted — and the two look
+/// identical at the slot. Counting every one as an underrun made each
+/// push-to-talk release read as ~27 underruns: the listener cut its own bitrate
+/// and grew its jitter buffer after every sentence someone else finished, and
+/// never recovered while the conversation went on. A gap the deepest buffer
+/// could have covered is late audio; anything longer is a speaker who stopped.
+const MAX_UNDERRUN_GAP_FRAMES: u32 = MAX_JITTER_DEPTH as u32;
+/// One playout tick of voice: each peer with its next frame, or `None` where
+/// Opus should conceal.
+type VoiceSlots = Vec<(String, Option<Vec<u8>>)>;
 /// Room ABR: only treat underruns above this window ratio as congestion. Higher
 /// than the jitter shrink threshold so sporadic PLC across several speakers
 /// does not pin the loss EMA in the mid band.
@@ -1185,6 +1199,10 @@ pub struct CallController {
     /// Tracks whether a peer has accumulated enough frames to begin playout
     /// (i.e. has passed the initial buffering phase).
     peer_playout_started: HashMap<String, bool>,
+    /// Empty playout slots per peer since its queue ran dry, not yet known to be
+    /// underruns. Settled when the peer's audio resumes, discarded when the peer
+    /// went quiet instead (see [`MAX_UNDERRUN_GAP_FRAMES`]).
+    peer_dry_slots: HashMap<String, u32>,
     /// Jitter buffer depth in Opus frames (1 frame = 20 ms). Adapts to network
     /// conditions (see [`Self::adapt_jitter_buffer`]) unless overridden by
     /// `CallCommand::SetJitterDepth`.
@@ -1250,6 +1268,14 @@ impl CallController {
         mpsc::Receiver<CallEvent>,
         impl std::future::Future<Output = ()>,
     ) {
+        let (ctrl, cmd_tx, event_rx) = Self::new(cm_cmd_tx);
+        (cmd_tx, event_rx, ctrl.run())
+    }
+
+    /// The controller and its channels, before it is running.
+    fn new(
+        cm_cmd_tx: Option<mpsc::Sender<ConnectionCommand>>,
+    ) -> (Self, mpsc::Sender<CallCommand>, mpsc::Receiver<CallEvent>) {
         let (event_tx, event_rx) = mpsc::channel::<CallEvent>(256);
         let (cmd_tx, cmd_rx) = mpsc::channel::<CallCommand>(64);
         let ctrl = Self {
@@ -1272,6 +1298,7 @@ impl CallController {
             room_peer_last_level: HashMap::new(),
             peer_jitter_queues: HashMap::new(),
             peer_playout_started: HashMap::new(),
+            peer_dry_slots: HashMap::new(),
             jitter_depth: 3,
             content_playout: crate::content_playout::ContentPlayout::new(),
             video_playout: None,
@@ -1290,7 +1317,7 @@ impl CallController {
             net_loss_ema: 0.0,
             abr_warmup_ticks: 0,
         };
-        (cmd_tx, event_rx, ctrl.run())
+        (ctrl, cmd_tx, event_rx)
     }
 
     // -- Internal helpers ---------------------------------------------------
@@ -1429,6 +1456,7 @@ impl CallController {
         self.peer_playout_started.remove(peer_id);
         self.room_peer_last_level.remove(peer_id);
         self.room_peer_last_audio.remove(peer_id);
+        self.peer_dry_slots.remove(peer_id);
         // Including their content timeline: a peer who rejoins starts a new
         // session clock, and the old one would steer their video against it.
         self.content_playout.forget(peer_id);
@@ -1469,6 +1497,15 @@ impl CallController {
             });
         }
 
+        // The slots this peer's queue sat empty were late audio rather than a
+        // pause if it is back soon enough. See `MAX_UNDERRUN_GAP_FRAMES`.
+        if let Some(dry) = self.peer_dry_slots.remove(&peer_id) {
+            if dry <= MAX_UNDERRUN_GAP_FRAMES {
+                self.playout_frames += u64::from(dry);
+                self.playout_underruns += u64::from(dry);
+            }
+        }
+
         // Enqueue for jitter-buffered playout; decode happens on the 20 ms
         // playout tick so irregular network arrivals don't cause clicks/pops.
         let queue = self.peer_jitter_queues.entry(peer_id).or_default();
@@ -1480,24 +1517,22 @@ impl CallController {
         }
     }
 
-    /// Advance jitter buffers by one 20 ms Opus frame for every active room
-    /// peer.  Called from the 20 ms `playout_tick` in `run()`.
+    /// Take one 20 ms slot from every room peer's voice queue, as of `now`.
+    ///
+    /// Returns what to decode — `None` asks Opus for concealment — and the
+    /// peers that went silent, whose decoders the caller frees. Needs no audio
+    /// device, so the underrun accounting can be tested on its own.
     ///
     /// - If a peer's queue hasn't yet reached `jitter_depth`, we skip it
     ///   (initial buffering phase — introduces target_depth × 20 ms latency).
     /// - Once playout has started, an empty queue triggers Opus PLC so the
-    ///   decoder state stays coherent during brief packet-loss gaps.
+    ///   decoder state stays coherent during brief packet-loss gaps. The slot is
+    ///   held in `peer_dry_slots`, not yet counted as an underrun.
     /// - If the peer goes fully silent (last packet > PEER_SILENCE_TIMEOUT ago)
     ///   and the queue is empty, we clean up its playout state.
-    fn tick_playout(&mut self) {
-        use std::time::{Duration, Instant};
+    fn advance_voice_queues(&mut self, now: std::time::Instant) -> (VoiceSlots, Vec<String>) {
+        use std::time::Duration;
         const PEER_SILENCE_TIMEOUT: Duration = Duration::from_millis(600);
-        const LEVEL_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
-
-        if self.audio.is_none() {
-            return;
-        }
-        let now = Instant::now();
 
         // Two-pass to avoid simultaneous mutable borrow of peer_jitter_queues
         // while also needing to remove entries from it.
@@ -1544,21 +1579,43 @@ impl CallController {
                 .peer_jitter_queues
                 .get_mut(&peer_id)
                 .and_then(|q| q.pop_front());
-            self.playout_frames += 1;
-            if frame.is_none() {
-                self.playout_underruns += 1;
+            if frame.is_some() {
+                self.playout_frames += 1;
+            } else {
+                // Late audio or a speaker who stopped. Which one is known only
+                // once this peer's next frame does, or does not, arrive.
+                *self.peer_dry_slots.entry(peer_id.clone()).or_default() += 1;
             }
             to_decode.push((peer_id, frame));
         }
 
-        for peer_id in to_remove {
-            self.peer_jitter_queues.remove(&peer_id);
-            self.peer_playout_started.remove(&peer_id);
-            self.room_peer_last_level.remove(&peer_id);
-            // Free the peer's decoder so silent/departed room peers don't
-            // accumulate decoder state for the lifetime of the call.
-            if let Some(ref mut pipeline) = self.audio {
-                pipeline.drop_decoder(&peer_id);
+        for peer_id in &to_remove {
+            self.peer_jitter_queues.remove(peer_id);
+            self.peer_playout_started.remove(peer_id);
+            self.room_peer_last_level.remove(peer_id);
+            // It went quiet, so what ran dry before that was the pause.
+            self.peer_dry_slots.remove(peer_id);
+        }
+        (to_decode, to_remove)
+    }
+
+    /// Advance every room peer's jitter buffer by one 20 ms Opus frame (see
+    /// [`Self::advance_voice_queues`]), then decode and mix. Called from the
+    /// 20 ms `playout_tick` in `run()`.
+    fn tick_playout(&mut self) {
+        use std::time::Duration;
+        const LEVEL_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+
+        if self.audio.is_none() {
+            return;
+        }
+        let (mut to_decode, to_remove) = self.advance_voice_queues(std::time::Instant::now());
+
+        // Free the peer's decoder so silent/departed room peers don't
+        // accumulate decoder state for the lifetime of the call.
+        if let Some(ref mut pipeline) = self.audio {
+            for peer_id in &to_remove {
+                pipeline.drop_decoder(peer_id);
             }
         }
 
@@ -3161,6 +3218,80 @@ mod tests {
     fn jitter_no_frames_is_noop() {
         let (depth, streak) = next_jitter_depth(7, 2, 0, 0);
         assert_eq!((depth, streak), (7, 2));
+    }
+
+    // ── Underrun accounting (advance_voice_queues) ──────────────────────────
+
+    const SLOT: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// A controller with `peer` already playing: a full jitter buffer queued and
+    /// played out. Returns it with the instant slots are counted from.
+    fn playing_peer(peer: &str) -> (CallController, std::time::Instant) {
+        let (mut ctrl, _cmd_tx, _event_rx) = CallController::new(None);
+        let t0 = std::time::Instant::now();
+        for _ in 0..ctrl.jitter_depth {
+            ctrl.handle_room_audio(peer.to_owned(), vec![0xF8]);
+        }
+        for slot in 1..=ctrl.jitter_depth as u32 {
+            ctrl.advance_voice_queues(t0 + SLOT * slot);
+        }
+        (ctrl, t0)
+    }
+
+    /// The bug this accounting exists for. A speaker releasing push-to-talk
+    /// left ~27 empty slots before timing out as silent, every one was counted
+    /// as an underrun, and each listener cut its own bitrate after every
+    /// sentence someone else finished.
+    #[test]
+    fn a_push_to_talk_release_is_not_an_underrun() {
+        let (mut ctrl, t0) = playing_peer("alice");
+        let depth = ctrl.jitter_depth as u32;
+        let mut slot = depth;
+        while ctrl.peer_jitter_queues.contains_key("alice") {
+            slot += 1;
+            assert!(slot < 100, "the peer never timed out as silent");
+            ctrl.advance_voice_queues(t0 + SLOT * slot);
+        }
+        assert!(slot > depth + 20, "precondition: a long run of empty slots");
+        assert_eq!(ctrl.playout_underruns, 0);
+        assert_eq!(ctrl.playout_frames, u64::from(depth));
+    }
+
+    /// Audio that resumes within what a jitter buffer could absorb was late, and
+    /// still has to grow the buffer and back the bitrate off.
+    #[test]
+    fn a_brief_stall_still_counts_as_underruns() {
+        let (mut ctrl, t0) = playing_peer("alice");
+        let depth = ctrl.jitter_depth as u32;
+        for slot in depth + 1..=depth + 3 {
+            ctrl.advance_voice_queues(t0 + SLOT * slot);
+        }
+        assert_eq!(
+            ctrl.playout_underruns, 0,
+            "not known to be late until the audio is back"
+        );
+
+        ctrl.handle_room_audio("alice".to_owned(), vec![0xF8]);
+        assert_eq!(ctrl.playout_underruns, 3);
+        assert_eq!(ctrl.playout_frames, u64::from(depth) + 3);
+    }
+
+    /// Resuming after longer than the deepest buffer is a speaker pressing
+    /// push-to-talk again, not a network stall.
+    #[test]
+    fn a_gap_longer_than_the_deepest_buffer_is_a_pause() {
+        let (mut ctrl, t0) = playing_peer("alice");
+        let depth = ctrl.jitter_depth as u32;
+        for slot in depth + 1..=depth + MAX_UNDERRUN_GAP_FRAMES + 1 {
+            ctrl.advance_voice_queues(t0 + SLOT * slot);
+        }
+        assert!(
+            ctrl.peer_jitter_queues.contains_key("alice"),
+            "precondition: not yet timed out as silent"
+        );
+
+        ctrl.handle_room_audio("alice".to_owned(), vec![0xF8]);
+        assert_eq!(ctrl.playout_underruns, 0);
     }
 
     // ── Adaptive bitrate (next_bitrate) ─────────────────────────────────────
